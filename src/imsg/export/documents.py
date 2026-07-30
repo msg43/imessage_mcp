@@ -12,13 +12,23 @@ duplicate and orphaning the old one (the exact v1.0 bug D6 fixed).
 always be addressed even if a stored `gcs_uri` were lost — no orphaned
 objects from unmapped ids.
 
-NOTE (flagged for the Phase 7 live integration, not resolvable
-offline): the spec's ids are 64-char lowercase-hex sha256 digests.
-Some Discovery Engine documentation versions constrain `Document.id`
-to RFC-1034 with a 63-character limit. If the live API rejects 64-hex
-ids, the external id derivation needs an owner-approved change (and a
-migration for `export_document.document_id`) BEFORE any first push —
-do not truncate silently here.
+**External ids are `d` + 62 hex characters = 63 total.** This is not a
+cosmetic choice; both properties are load-bearing against a documented
+API constraint, resolved 2026-07-30 before any first push (so no
+migration was needed — changing this after export begins would break
+the stability guarantee above):
+
+- **Length ≤ 63.** Discovery Engine constrains `Document.id` to
+  RFC-1034 with a 1-63 character limit, so the spec's bare 64-char
+  sha256 would have been rejected on the first push.
+- **Leading letter.** RFC-1034's preferred label syntax requires a
+  label to *start with a letter*. A bare hex digest beginning with a
+  digit (`7a3f…`) violates that at any length, so truncating alone
+  would have fixed the length and left a second, subtler rejection in
+  place. The `d` prefix removes that class entirely.
+
+248 bits of entropy remain, which puts the birthday bound around 2^124
+documents — irrelevant beside a corpus of ~10^6.
 """
 
 from __future__ import annotations
@@ -35,17 +45,33 @@ REPORT_FILENAME = "report.txt"
 DOCS_SUBDIR = "docs"
 
 
+#: RFC-1034 allows 1-63 characters; one is spent on the leading letter.
+_ID_HEX_CHARS = 62
+_ID_PREFIX = "d"
+
+
+def _external_document_id(payload: str) -> str:
+    """Derive an RFC-1034-safe external document id from `payload`.
+
+    See this module's docstring: `d` + 62 hex = 63 chars, starts with a
+    letter. Both properties are required by Discovery Engine's stated
+    `Document.id` constraint; neither is decorative.
+    """
+    return f"{_ID_PREFIX}{sha256_text(payload)[:_ID_HEX_CHARS]}"
+
+
 def segment_document_id(stable_key: str) -> str:
-    """SPEC §11.3: `sha256("segment:" || stable_key)` — content-independent."""
-    return sha256_text(f"segment:{stable_key}")
+    """SPEC §11.3 (as amended, D9): content-independent id for a segment."""
+    return _external_document_id(f"segment:{stable_key}")
 
 
 def attachment_chunk_document_id(
     stable_key: str, attachment_source_guid: str, kind: str, seq: int
 ) -> str:
-    """SPEC §11.3: `sha256("attachment_chunk:" || segment.stable_key ||
-    ":" || attachment.source_guid || ":" || kind || ":" || seq)`."""
-    return sha256_text(f"attachment_chunk:{stable_key}:{attachment_source_guid}:{kind}:{seq}")
+    """SPEC §11.3 (as amended, D9): keyed on structural coordinates only."""
+    return _external_document_id(
+        f"attachment_chunk:{stable_key}:{attachment_source_guid}:{kind}:{seq}"
+    )
 
 
 def gcs_object_for(document_id: str) -> str:

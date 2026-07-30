@@ -3,6 +3,7 @@ attachments) and document identity (content-independent ids, D6)."""
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 
 from imsg.export.documents import (
@@ -155,7 +156,22 @@ def test_segment_document_id_is_content_independent() -> None:
     c = segment_document_id("stable-other")
     assert a == b
     assert a != c
-    assert len(a) == 64 and all(ch in "0123456789abcdef" for ch in a)
+    _assert_rfc1034_document_id(a)
+
+
+def _assert_rfc1034_document_id(document_id: str) -> None:
+    """D9: Discovery Engine constrains `Document.id` to RFC-1034, 1-63 chars.
+
+    Asserted as properties rather than a fixed digest so the test fails on
+    a real constraint violation instead of on any change to the hash input.
+    Both properties matter and only one is about length: a bare hex digest
+    starting with a digit is a valid 63-char string that still violates
+    RFC-1034's leading-letter rule.
+    """
+    assert 1 <= len(document_id) <= 63, f"exceeds RFC-1034 limit: {len(document_id)}"
+    assert re.fullmatch(r"[a-z][a-z0-9-]*", document_id), (
+        f"not RFC-1034 preferred syntax (must start with a letter): {document_id!r}"
+    )
 
 
 def test_chunk_document_id_uses_structural_coordinates_only() -> None:
@@ -165,6 +181,8 @@ def test_chunk_document_id_uses_structural_coordinates_only() -> None:
     other_parent = attachment_chunk_document_id("stable-zzz", "att-guid", "pdf_text", 0)
     assert a == same
     assert len({a, other_seq, other_parent}) == 3
+    for document_id in (a, other_seq, other_parent):
+        _assert_rfc1034_document_id(document_id)
 
 
 def test_gcs_object_is_a_pure_function_of_the_document_id() -> None:

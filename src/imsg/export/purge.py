@@ -5,7 +5,9 @@ Flow: flag the person's allowlist row to deny (the row is RETAINED for
 audit — deleting it would erase the record that they were ever
 allowed), then produce a `mode='purge'` plan whose reconciliation
 naturally emits deletes for every now-ineligible document. The plan
-contains deletes, so §11.4 requires owner approval; `push_export` then
+contains deletes; per D9 a purge run is exempt from the §11.4 approval
+gate (retraction only narrows scope), though every drift check still
+applies. `push_export` then
 executes the deletes and positively verifies absence by document id
 before recording anything as purged.
 

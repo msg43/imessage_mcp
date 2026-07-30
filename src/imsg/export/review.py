@@ -45,13 +45,32 @@ def _last_ok_run(conn: psycopg.Connection) -> tuple[Any, str] | None:
 
 
 def compute_approval_requirements(
-    conn: psycopg.Connection, manifest: dict[str, Any]
+    conn: psycopg.Connection, manifest: dict[str, Any], *, mode: str = "normal"
 ) -> tuple[str, ...]:
     """The §11.4 triggers, computed conservatively: anything that
     cannot be positively shown to be previously-approved territory
     counts as new (e.g. a pushed document whose segment row has since
     vanished no longer vouches for its thread). Returns () only when
-    the plan is a pure content-update of already-approved scope."""
+    the plan is a pure content-update of already-approved scope.
+
+    **Purge plans are exempt (D9, owner decision 2026-07-30).**
+    Retraction is the safe direction: it only ever removes documents
+    from the corporate index, it can never widen scope, and the local
+    corpus remains the source of truth so a mistaken purge is
+    recoverable by re-export. Requiring the full plan/approve ceremony
+    would make the safe operation as slow as the dangerous one --
+    precisely wrong when the owner has just discovered that something
+    should not have been exported and wants it gone now. Purges remain
+    fully recorded in run history: unapproved does not mean unlogged.
+
+    The exemption is deliberately narrow. A `mode='normal'` plan that
+    happens to contain deletes still requires approval, because an
+    unexpected delete in a routine run is a signal worth a human look
+    rather than a deliberate retraction.
+    """
+    if mode == "purge":
+        return ()
+
     reasons: list[str] = []
     upserts: list[dict[str, Any]] = list(manifest.get("upserts", []))
     deletes: list[dict[str, Any]] = list(manifest.get("deletes", []))

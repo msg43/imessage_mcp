@@ -202,7 +202,7 @@ def push_export(
         row = cur.fetchone()
     if row is None:
         raise ExportPushError(f"export run {run_id} does not exist")
-    status, _mode, manifest_sha_db, approved_sha, allowlist_stored, config_sha_db = row
+    status, mode, manifest_sha_db, approved_sha, allowlist_stored, config_sha_db = row
     if str(status) not in _PUSHABLE_STATES:
         raise ExportPushError(
             f"export run {run_id} is '{status}' — only {_PUSHABLE_STATES} can push"
@@ -238,8 +238,11 @@ def push_export(
     # Approval: recomputed NOW, not read from the plan — drift in the
     # delta conditions themselves (e.g. the last ok run changed) must
     # be reflected. First push and every qualifying delta require the
-    # pinned approval (SPEC §11.4).
-    approval_reasons = compute_approval_requirements(conn, manifest)
+    # pinned approval (SPEC §11.4). Purge runs are exempt per D9 —
+    # retraction only narrows scope, so gating it would slow the safe
+    # operation to the speed of the dangerous one. Every drift check
+    # above still applies to a purge; only the approval step is skipped.
+    approval_reasons = compute_approval_requirements(conn, manifest, mode=str(mode))
     if approval_reasons:
         if approved_sha is None:
             raise ExportPushError(
