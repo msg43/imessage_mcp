@@ -1,0 +1,8 @@
+# Pinned per this repo's toolchain policy ("stable, pinned in rust-toolchain.toml").
+# Pinned to an exact version rather than a floating `channel = "stable"` tag so a
+# `rustup update` on the Mac mini can't silently change what this GPL-boundary shim
+# builds with. 1.97.1 is the confirmed-working toolchain this crate was built and
+# verified against (imessage-database 4.2.0 requires edition 2024, which needs a
+# fairly recent stable compiler). Bump deliberately, not by drift.
+[toolchain]
+channel = "1.97.1"

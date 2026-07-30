@@ -13,6 +13,8 @@ dependencies = [
     "structlog>=24",
     "psycopg[binary]>=3.2",
     "phonenumbers>=8.13",
+    "apsw>=3.45",
+    "pyobjc-framework-Contacts>=10",
 ]
 
 [project.optional-dependencies]
@@ -61,6 +63,13 @@ plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
 module = ["phonenumbers.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# pyobjc's Contacts bridge (S3 identity resolution) ships no py.typed
+# marker / stubs — same untyped-ObjC-bridge situation as every other
+# pyobjc-framework-* package.
+module = ["Contacts.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

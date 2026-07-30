@@ -69,3 +69,40 @@ class StageNotImplementedError(ImsgError):
             f"'{stage}' is not implemented yet — this is a CLI stub from the "
             f"foundation build. A later build adds the {stage} pipeline stage."
         )
+
+
+class SnapshotError(ImsgError):
+    """S1 snapshot of the live ``chat.db`` failed (SPEC §8 S1) — e.g.
+    the live database stayed locked past the busy-timeout retry budget,
+    the destination volume lacked the required free-space margin, or
+    the backed-up file failed its post-backup integrity check
+    (``PRAGMA quick_check`` / a missing expected core table)."""
+
+
+class ExtractionError(ImsgError):
+    """S2 extraction from a snapshot failed outside its normal per-row
+    degrade-and-continue handling (SPEC §8 S2) — e.g. the snapshot file
+    is not a valid ``chat.db``-shaped SQLite database."""
+
+
+class ImsgDumpError(ExtractionError):
+    """The ``tools/imsg-dump`` GPL subprocess (SPEC §4.2) could not be
+    started, exited nonzero, or emitted a line that does not parse as
+    the NDJSON contract S2 expects. This is about the *subprocess
+    boundary* failing, not an individual message's decode failure —
+    the shim itself is specified to degrade per-row (log + null body)
+    rather than raise, so this error means the boundary itself broke."""
+
+
+class IdentityError(ImsgError):
+    """S3 identity resolution failed outside its normal per-handle
+    review-stub/conflict handling (SPEC §8 S3) — e.g. the pre-S4
+    invariant report found unresolved senders/participants, or Contacts
+    import was requested but the framework is unavailable in a way that
+    must fail loudly rather than silently degrade to raw handles."""
+
+
+class SyncError(ImsgError):
+    """S7 incremental sync failed outside the normal error handling of
+    the stages it orchestrates (SPEC §8 S7)."""
+
