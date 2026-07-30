@@ -1,0 +1,118 @@
+# config.example.yaml — placeholder shape of config.yaml (SPEC §6).
+#
+# Copy this to config.yaml (never committed — see .gitignore) and fill
+# in real values. Secrets are NEVER literals: every field marked
+# (secret) must be `keychain:<item-name>` or `env:<VAR>`.
+#
+# Unknown keys are validation errors, and `mcp.public.scope` has no
+# default — both are deliberate (SPEC §6, D6).
+
+paths:
+  data_root: /Volumes/Data-Encrypted/imsgindex   # must be on an encrypted, mounted volume (§5.4)
+  live_chat_db: ~/Library/Messages/chat.db       # read-only source; the ONLY path permitted under ~/Library/Messages
+
+database:
+  dsn: postgresql://imsg@127.0.0.1:5433/imsgindex   # port must be 5433 — the dedicated instance (§1.6)
+  password: keychain:imsgindex-pg                    # (secret)
+  cluster_fingerprint_file: pg17/.imsgindex-cluster   # relative to data_root
+
+sync:
+  interval_seconds: 900          # >= 300
+  sources:
+    - name: mini
+      chat_db: ~/Library/Messages/chat.db
+    # - name: studio-seed
+    #   chat_db: /path/to/transferred/studio-snapshot.db
+
+identity:
+  default_region: US             # E.164 region for bare national numbers
+  contacts_import: true
+
+policy:
+  index_unsent: false
+  index_edit_history: false
+
+segmentation:
+  session_gap_hours: 3.0
+  topical_min_messages: 10
+  max_messages: 50
+  max_tokens: 2000
+  boundary_model: qwen3.5-35b-a3b-4bit
+  boundary_prompt: prompts/segment_boundaries.txt
+
+enrichment:
+  egress: local_only
+  window: "01:00-07:00"
+  concurrency: { ocr: 4, caption: 1, transcribe: 1, pdf: 4 }
+  max_attempts: 5
+  video_max_frames: 20
+  pdf_scanned_threshold_chars_per_page: 50
+  limits:
+    max_file_bytes: 1073741824
+    max_pdf_pages: 1000
+    max_media_seconds: 14400
+    task_timeout_seconds: 1800
+    temp_bytes_per_task: 10737418240
+
+embedding:
+  model: Qwen/Qwen3-Embedding-8B
+  revision: <hf-revision-sha>
+  quantization: 8bit
+  dim: 2048                      # must match migration 0001's DDL; <= 4000 (halfvec HNSW cap)
+  batch_size: 32
+  query_instruction: "Given a personal message search query, retrieve relevant conversation segments"
+  multimodal:
+    enabled: true
+    provider: local               # only 'local' is implemented — D3a
+    scope: full                   # only 'full' is implemented — D3a
+    model: facebook/PE-Core-G14-448
+    revision: <hf-revision-sha>
+    dim: 1280                     # must match migration 0002's DDL
+
+retrieval:
+  k_fts: 100
+  k_vector: 100
+  rrf_k: 60
+  rerank_top: 50
+  reranker_model: Qwen/Qwen3-Reranker-8B
+  reranker_revision: <hf-revision-sha>
+  default_limit: 10
+
+render:
+  timezone: America/Los_Angeles
+  attachment_snippet_chars: 200
+
+mcp:
+  local:
+    enabled: true
+  public:
+    enabled: false                # flip on only at Phase 6, after AT-1 passes
+    bind: 127.0.0.1:8700
+    external_url: https://example.invalid/mcp
+    scope: allowlist               # REQUIRED — no default. 'full' or 'allowlist'; see SPEC §6, D6
+    scope_approval_id: null        # required when scope: full AND enabled: true
+    allowed_origins: []
+    allowed_hosts: []
+    protocol_versions: ["2025-11-25", "2026-07-28"]
+    rate_limit_per_minute: 60
+    oauth:
+      issuer: google
+      client_id: env:IMSG_OAUTH_CLIENT_ID
+      client_secret: keychain:imsgindex-oauth        # (secret)
+      owner_subject: keychain:imsgindex-owner-sub     # (secret)
+      tokeninfo_cache_ttl_seconds: 60
+
+export:
+  gcp_project: example-project-id
+  gcs_bucket: example-bucket
+  data_store_id: example-datastore-id
+  format: txt
+  batch_max_files: 100000
+
+eval:
+  seed_queries: private/eval/queries.yaml   # relative to data_root
+  runs_dir: eval/runs                        # relative to data_root
+
+logging:
+  level: INFO
+  allow_content_debug: false

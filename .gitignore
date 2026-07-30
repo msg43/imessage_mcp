@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.python-version
+
+# uv
+uv.lock.bak
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Instance config and secrets — never belong in the core repo (SPEC §3)
+config.yaml
+config.local.yaml
+*.local.yaml
+.env
+.env.*
+
+# Anything a developer might accidentally point at the encrypted volume
+private/
