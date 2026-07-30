@@ -71,6 +71,60 @@ class StageNotImplementedError(ImsgError):
         )
 
 
+class SegmentationError(ImsgError):
+    """S4 sessionization/segmentation failed in a way that isn't a normal,
+    loudly-logged fallback (SPEC §8 S4). A boundary-model failure is
+    *not* this — that degrades to session-as-segment and is logged, not
+    raised."""
+
+
+class BoundaryDetectionError(SegmentationError):
+    """The boundary-detection provider failed or returned malformed
+    output (SPEC §8 S4: "malformed LLM JSON -> one retry, then
+    fallback"). Callers catch this specifically to trigger the
+    session-as-segment fallback rather than aborting the whole run."""
+
+
+class AttachmentBackfillError(ImsgError):
+    """S5a attachment materialization failed outside its normal per-file
+    retry/backoff state machine (SPEC §8 S5a) — e.g. disk full, or the
+    trial-gate refusal before ``--yes-full-run``."""
+
+
+class EnrichmentError(ImsgError):
+    """S5b enrichment queue worker failed outside its normal per-task
+    retry/backoff state machine (SPEC §8 S5b)."""
+
+
+class UnsupportedEnrichmentTypeError(EnrichmentError):
+    """The sniffed MIME type doesn't match what the requested
+    enrichment `kind` can do anything with (SPEC §8 S5b failure modes:
+    "unsupported type (skipped)") — distinct from `EnrichmentError`'s
+    normal retry/backoff and from `UntrustedAttachmentError`'s
+    permanent-fail: this one routes to the queue's `skipped` state, not
+    `failed`."""
+
+
+class UntrustedAttachmentError(EnrichmentError):
+    """An attachment violated the untrusted-input boundary (SPEC §8 S5b,
+    D6): path escaped the Messages attachments root, a resource ceiling
+    in ``enrichment.limits`` was hit, or the sniffed MIME type is not an
+    enrichable kind. Recorded as a typed permanent failure, never a
+    hang or a silent skip."""
+
+
+class EmbeddingError(ImsgError):
+    """S6 embedding failed outside its normal per-batch-transaction
+    handling (SPEC §8 S6) — e.g. the provider returned a vector of the
+    wrong dimension."""
+
+
+class FtsSidecarError(ImsgError):
+    """The SQLite FTS5 sidecar (SPEC §7.3) is missing, corrupt, or its
+    schema/tokenizer version is stale. The sidecar is disposable — the
+    caller's recovery path is ``imsg fts rebuild``, not a bypass."""
+
+
 class SnapshotError(ImsgError):
     """S1 snapshot of the live ``chat.db`` failed (SPEC §8 S1) — e.g.
     the live database stayed locked past the busy-timeout retry budget,
@@ -105,4 +159,3 @@ class IdentityError(ImsgError):
 class SyncError(ImsgError):
     """S7 incremental sync failed outside the normal error handling of
     the stages it orchestrates (SPEC §8 S7)."""
-
