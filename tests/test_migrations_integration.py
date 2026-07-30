@@ -88,12 +88,17 @@ def test_apply_pending_creates_every_table_and_hnsw_index(
 ) -> None:
     runner = PostgresMigrationRunner(scratch_db, REAL_MIGRATIONS_DIR)
     applied = runner.apply_pending()
-    assert [m.version for m in applied] == [1, 2]
+    # Asserted as a property -- applied in ascending version order, with no
+    # gaps or repeats -- rather than a literal list that must be edited
+    # every time a migration is added.
+    versions = [m.version for m in applied]
+    assert versions == sorted(versions)
+    assert versions == list(range(1, len(versions) + 1))
 
     plan = runner.plan()
     assert plan.pending == ()
     assert plan.is_clean
-    assert [a.version for a in plan.applied] == [1, 2]
+    assert [a.version for a in plan.applied] == versions
 
     with scratch_db.cursor() as cur:
         cur.execute("SELECT indexname FROM pg_indexes WHERE indexname LIKE '%_hnsw'")
@@ -115,8 +120,12 @@ def test_apply_pending_creates_every_table_and_hnsw_index(
 
 def test_apply_pending_is_idempotent(scratch_db: psycopg.Connection) -> None:
     runner = PostgresMigrationRunner(scratch_db, REAL_MIGRATIONS_DIR)
+    # Counted from the directory rather than hardcoded: the property under
+    # test is "every pending migration applies exactly once", which must
+    # not need editing each time a migration is added.
+    expected = len(sorted(REAL_MIGRATIONS_DIR.glob("*.sql")))
     first = runner.apply_pending()
-    assert len(first) == 2
+    assert len(first) == expected
 
     second = runner.apply_pending()
     assert second == []

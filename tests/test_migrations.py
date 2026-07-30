@@ -19,7 +19,11 @@ REAL_MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
 
 def test_discover_real_migrations() -> None:
     files = discover_migrations(REAL_MIGRATIONS_DIR)
-    assert [f.version for f in files] == [1, 2]
+    # Versions are contiguous from 1 with no gaps or repeats -- asserted
+    # as a property so adding a migration does not require editing this
+    # test, while a misnumbered or duplicated file still fails loudly.
+    versions = [f.version for f in files]
+    assert versions == list(range(1, len(files) + 1))
     assert files[0].name == "initial"
     assert files[1].name == "multimodal_vectors"
     assert all(len(f.sha256) == 64 for f in files)
@@ -53,7 +57,8 @@ def test_discover_sorts_by_version_not_filename_order(tmp_path: Path) -> None:
 def test_compute_plan_all_pending_when_nothing_applied() -> None:
     discovered = discover_migrations(REAL_MIGRATIONS_DIR)
     plan = compute_plan(discovered, applied=[])
-    assert [p.version for p in plan.pending] == [1, 2]
+    # With nothing applied, every discovered migration is pending.
+    assert [p.version for p in plan.pending] == [f.version for f in discovered]
     assert plan.applied == ()
     assert plan.is_clean
 
@@ -70,7 +75,10 @@ def test_compute_plan_partial_apply() -> None:
     discovered = discover_migrations(REAL_MIGRATIONS_DIR)
     applied = [AppliedMigration(version=discovered[0].version, sha256=discovered[0].sha256)]
     plan = compute_plan(discovered, applied)
-    assert [p.version for p in plan.pending] == [2]
+    # Property, not a literal: with only the first migration applied,
+    # pending is exactly the remainder, in order. Adding a migration
+    # should not require editing this test.
+    assert [p.version for p in plan.pending] == [f.version for f in discovered[1:]]
     assert plan.is_clean
 
 

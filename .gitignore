@@ -31,3 +31,7 @@ config.local.yaml
 
 # Anything a developer might accidentally point at the encrypted volume
 private/
+
+# Rust build artifacts (also embed absolute build paths containing the
+# username, so this matters for D5 public-safety, not just tidiness).
+target/
