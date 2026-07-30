@@ -26,6 +26,15 @@ class EnrichmentTask:
     attempts: int
 
 
+@dataclass(frozen=True, slots=True)
+class EnrichPreviewReport:
+    """Read-only preview of what `claim_tasks` would claim right now
+    (SPEC §8: dry-run for S5b), broken down by `kind`."""
+
+    total: int
+    by_kind: dict[str, int]
+
+
 def enqueue(conn: psycopg.Connection, attachment_id: int, kinds: tuple[str, ...]) -> None:
     """Idempotent enqueue: a `(attachment_id, kind)` pair already
     present (in any state) is left untouched — routing an
@@ -79,6 +88,50 @@ def claim_tasks(
         )
         rows = cur.fetchall()
     return [EnrichmentTask(attachment_id=a, kind=k, attempts=att) for a, k, att in rows]
+
+
+def preview_claimable_tasks(
+    conn: psycopg.Connection,
+    *,
+    lease_seconds: int = DEFAULT_LEASE_SECONDS,
+) -> EnrichPreviewReport:
+    """Read-only preview of what `claim_tasks` would claim right now,
+    broken down by `kind` (SPEC §8: "takes --dry-run where writes
+    leave the machine", applied to S5b).
+
+    Runs the exact same selection WHERE clause `claim_tasks` uses —
+    pending tasks whose backoff has elapsed, plus `running` tasks
+    whose lease has expired — but with no `FOR UPDATE SKIP LOCKED` and
+    no state mutation, so it never claims a lease (claiming is itself
+    a side effect other workers would observe, and a dry run must not
+    cause one).
+
+    This is the honest limit of "dry-run" for S5b: a full per-task
+    preview isn't meaningful, because a task's actual output (OCR
+    text, a caption, a transcript) can only be known by running the
+    real model/subprocess against it — ffmpeg/pdftotext/Vision/whisper
+    have no side-effect-free preview mode. So dry-run for this stage
+    reports only "N tasks are claimable, broken down by kind," and
+    touches nothing else.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT kind, count(*)
+            FROM enrichment
+            WHERE next_attempt_at <= now()
+              AND (
+                state = 'pending'
+                OR (state = 'running'
+                    AND locked_at < now() - (%(lease_seconds)s || ' seconds')::interval)
+              )
+            GROUP BY kind
+            """,
+            {"lease_seconds": lease_seconds},
+        )
+        rows = cur.fetchall()
+    by_kind = {kind: int(count) for kind, count in rows}
+    return EnrichPreviewReport(total=sum(by_kind.values()), by_kind=by_kind)
 
 
 def complete_task(
@@ -192,11 +245,13 @@ def skip_task(conn: psycopg.Connection, attachment_id: int, kind: str, *, reason
 
 __all__ = [
     "DEFAULT_LEASE_SECONDS",
+    "EnrichPreviewReport",
     "EnrichmentTask",
     "claim_tasks",
     "complete_task",
     "enqueue",
     "fail_task",
     "fail_task_permanently",
+    "preview_claimable_tasks",
     "skip_task",
 ]

@@ -164,11 +164,65 @@ TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
 
 TOOL_DEFINITIONS_BY_NAME: dict[str, ToolDefinition] = {t.name: t for t in TOOL_DEFINITIONS}
 
+# --------------------------------------------------------------------------
+# Public surface (SPEC §10.4, §10.2) — a strict subset of the local surface.
+# --------------------------------------------------------------------------
+#
+# The public registration omits, per the build task and SPEC §10.2:
+#   - `include_handles` on `list_people` ("the public registration omits the
+#     property entirely" — never raw handles leave the box over the public
+#     transport);
+#   - `find_similar_attachments` and `mark_relevant` (local-surface-only,
+#     out of scope for this build regardless);
+#   - `check_permissions` ("local surface only (operational state has no
+#     use on the GE surface)" — SPEC §10.2's own tool entry says so
+#     explicitly).
+#
+# `search_messages`, `get_conversation`, and `get_attachment_text` carry no
+# local-only fields, so the public copies are structurally identical to the
+# local ones — reused by reference rather than redefined, so the two
+# surfaces cannot silently drift apart on those three schemas.
+
+LIST_PEOPLE_PUBLIC = ToolDefinition(
+    name="list_people",
+    description=LIST_PEOPLE.description,
+    input_schema={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "optional name filter"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+        },
+        "additionalProperties": False,
+    },
+)
+"""SPEC §10.2: "The **local** registration extends the schema with
+`include_handles: true`; the public registration omits the property
+entirely." This is that omission, kept as its own definition (rather
+than a schema mutation of `LIST_PEOPLE`) so neither copy can be edited
+in a way that silently changes the other."""
+
+PUBLIC_TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
+    SEARCH_MESSAGES,
+    GET_CONVERSATION,
+    LIST_PEOPLE_PUBLIC,
+    GET_ATTACHMENT_TEXT,
+)
+"""The exhaustive public-surface tool set (SPEC §10.2, §10.4). Closed —
+same "no generic query escape hatch" rule as the local surface; adding
+a tool here is a spec change, not an implementation detail."""
+
+PUBLIC_TOOL_DEFINITIONS_BY_NAME: dict[str, ToolDefinition] = {
+    t.name: t for t in PUBLIC_TOOL_DEFINITIONS
+}
+
 __all__ = [
     "CHECK_PERMISSIONS",
     "GET_ATTACHMENT_TEXT",
     "GET_CONVERSATION",
     "LIST_PEOPLE",
+    "LIST_PEOPLE_PUBLIC",
+    "PUBLIC_TOOL_DEFINITIONS",
+    "PUBLIC_TOOL_DEFINITIONS_BY_NAME",
     "SEARCH_MESSAGES",
     "STANDARD_ANNOTATIONS",
     "TOOL_DEFINITIONS",

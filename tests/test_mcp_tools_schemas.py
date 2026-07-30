@@ -9,6 +9,9 @@ from imsg.mcp.tools.schemas import (
     GET_ATTACHMENT_TEXT,
     GET_CONVERSATION,
     LIST_PEOPLE,
+    LIST_PEOPLE_PUBLIC,
+    PUBLIC_TOOL_DEFINITIONS,
+    PUBLIC_TOOL_DEFINITIONS_BY_NAME,
     SEARCH_MESSAGES,
     STANDARD_ANNOTATIONS,
     TOOL_DEFINITIONS,
@@ -114,3 +117,47 @@ def test_get_attachment_text_schema_matches_spec_exactly() -> None:
 def test_check_permissions_schema_is_an_empty_object() -> None:
     schema = CHECK_PERMISSIONS.input_schema
     assert schema == {"type": "object", "properties": {}, "additionalProperties": False}
+
+
+# ---------------------------------------------------------------------------
+# Public surface (SPEC §10.2, §10.4) — a strict subset of the local one
+# ---------------------------------------------------------------------------
+
+
+def test_public_surface_is_exactly_four_tools() -> None:
+    # check_permissions ("local surface only"), find_similar_attachments,
+    # and mark_relevant are never registered on the public transport.
+    assert {t.name for t in PUBLIC_TOOL_DEFINITIONS} == {
+        "search_messages",
+        "get_conversation",
+        "list_people",
+        "get_attachment_text",
+    }
+    assert "check_permissions" not in PUBLIC_TOOL_DEFINITIONS_BY_NAME
+    assert "run_sql" not in PUBLIC_TOOL_DEFINITIONS_BY_NAME
+    assert "find_similar_attachments" not in PUBLIC_TOOL_DEFINITIONS_BY_NAME
+    assert "mark_relevant" not in PUBLIC_TOOL_DEFINITIONS_BY_NAME
+
+
+def test_public_search_get_conversation_and_attachment_text_are_identical_to_local() -> None:
+    # No local-only fields on these three — reused by reference so the
+    # two surfaces cannot silently drift apart on them.
+    assert PUBLIC_TOOL_DEFINITIONS_BY_NAME["search_messages"] is SEARCH_MESSAGES
+    assert PUBLIC_TOOL_DEFINITIONS_BY_NAME["get_conversation"] is GET_CONVERSATION
+    assert PUBLIC_TOOL_DEFINITIONS_BY_NAME["get_attachment_text"] is GET_ATTACHMENT_TEXT
+
+
+def test_public_list_people_omits_include_handles_entirely() -> None:
+    schema = LIST_PEOPLE_PUBLIC.input_schema
+    assert schema["additionalProperties"] is False
+    props = schema["properties"]
+    assert set(props) == {"query", "limit"}
+    assert "include_handles" not in props
+    # Everything else matches the local schema exactly.
+    assert props["query"] == LIST_PEOPLE.input_schema["properties"]["query"]
+    assert props["limit"] == LIST_PEOPLE.input_schema["properties"]["limit"]
+
+
+def test_public_tools_all_use_the_standard_readonly_annotations() -> None:
+    for tool in PUBLIC_TOOL_DEFINITIONS:
+        assert tool.annotations == STANDARD_ANNOTATIONS

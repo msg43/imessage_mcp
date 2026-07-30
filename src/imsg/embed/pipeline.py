@@ -56,6 +56,13 @@ class EmbedRunReport:
     GC already reclaimed them (SPEC §5.3). Not an error: the caption/
     OCR text already made it into the primary text index; only the
     secondary multimodal vector for that attachment is skipped."""
+    dry_run: bool = False
+    """True when this report came from `run_embed(dry_run=True)` (SPEC
+    §8: "takes --dry-run where writes leave the machine") — the
+    embedding/multimodal providers were never called (avoiding wasted
+    compute) and nothing was written; the counts above are `len(...)`
+    of the same read-only pending-lookup helpers the real path uses,
+    i.e. "how many would be embedded," not confirmed successes."""
 
 
 def _pending_segments(conn: psycopg.Connection) -> list[tuple[int, str, str]]:
@@ -308,11 +315,23 @@ def run_embed(
     *,
     multimodal_provider: MultimodalEmbeddingProvider | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    dry_run: bool = False,
 ) -> EmbedRunReport:
     """One full embedding pass: every segment/chunk lacking an
     up-to-date embedding, then (if `multimodal_provider` is given)
     every image/video attachment lacking an up-to-date
-    `attachment_mm_embedding` (D3a)."""
+    `attachment_mm_embedding` (D3a).
+
+    `dry_run=True` (SPEC §8: "takes --dry-run where writes leave the
+    machine") never calls `text_provider`/`multimodal_provider` at all
+    — model calls are real compute worth avoiding on a preview — and
+    never calls `_embed_segments`/`_embed_chunks`/`_embed_multimodal`.
+    It only calls the existing read-only pending-lookup helpers and
+    reports their lengths. The dimension checks below still run first:
+    they are plain attribute reads on the provider objects, not model
+    calls, so there is no reason to skip that validation even in a
+    preview.
+    """
     if text_provider.dim != constants.PRIMARY_EMBEDDING_DIM:
         raise EmbeddingError(
             f"text_provider.dim ({text_provider.dim}) does not match the primary "
@@ -324,6 +343,17 @@ def run_embed(
             f"multimodal_provider.dim ({multimodal_provider.dim}) does not match the "
             f"multimodal embedding dimension migration 0002 requires "
             f"({constants.MULTIMODAL_EMBEDDING_DIM}) — refusing to embed anything with it"
+        )
+
+    if dry_run:
+        pending_images = _pending_multimodal_images(conn) if multimodal_provider is not None else []
+        pending_videos = _pending_multimodal_videos(conn) if multimodal_provider is not None else []
+        return EmbedRunReport(
+            segments_embedded=len(_pending_segments(conn)),
+            chunks_embedded=len(_pending_chunks(conn)),
+            attachments_embedded=len(pending_images) + len(pending_videos),
+            attachments_skipped_no_frames=0,
+            dry_run=True,
         )
 
     segments_written = _embed_segments(conn, text_provider, _pending_segments(conn), batch_size)

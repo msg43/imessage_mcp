@@ -20,6 +20,7 @@ from imsg.enrich.queue import (
     enqueue,
     fail_task,
     fail_task_permanently,
+    preview_claimable_tasks,
     skip_task,
 )
 
@@ -257,6 +258,56 @@ def test_fail_task_permanently_skips_backoff(scratch_db: psycopg.Connection) -> 
         )
         (err,) = cur.fetchone()  # type: ignore[misc]
     assert "too large" in err
+
+
+def test_preview_claimable_tasks_reports_counts_by_kind_without_claiming(
+    scratch_db: psycopg.Connection,
+) -> None:
+    att_id = _insert_attachment(scratch_db)
+    enqueue(scratch_db, att_id, ("ocr", "caption"))
+    other_att_id = _insert_attachment(scratch_db)
+    enqueue(scratch_db, other_att_id, ("ocr",))
+
+    preview = preview_claimable_tasks(scratch_db)
+
+    assert preview.total == 3
+    assert preview.by_kind == {"ocr": 2, "caption": 1}
+
+    # A read-only preview must never claim a lease — every row is still
+    # 'pending', untouched, and a real claim afterward sees them all.
+    assert _state(scratch_db, att_id, "ocr") == "pending"
+    assert _state(scratch_db, att_id, "caption") == "pending"
+    assert _state(scratch_db, other_att_id, "ocr") == "pending"
+
+    claimed = claim_tasks(scratch_db, worker_id="worker-1", limit=10)
+    assert len(claimed) == 3
+
+
+def test_preview_claimable_tasks_includes_expired_leases(scratch_db: psycopg.Connection) -> None:
+    att_id = _insert_attachment(scratch_db)
+    enqueue(scratch_db, att_id, ("transcript",))
+    claim_tasks(scratch_db, worker_id="worker-1", limit=10)
+    assert _state(scratch_db, att_id, "transcript") == "running"
+
+    # Simulate a worker that died mid-task: back-date the lease.
+    with scratch_db.cursor() as cur:
+        cur.execute(
+            "UPDATE enrichment SET locked_at = now() - interval '1 hour' "
+            "WHERE attachment_id = %s AND kind = %s",
+            (att_id, "transcript"),
+        )
+
+    preview = preview_claimable_tasks(scratch_db, lease_seconds=60)
+    assert preview.total == 1
+    assert preview.by_kind == {"transcript": 1}
+    # Still 'running' — the preview does not touch state.
+    assert _state(scratch_db, att_id, "transcript") == "running"
+
+
+def test_preview_claimable_tasks_empty_queue(scratch_db: psycopg.Connection) -> None:
+    preview = preview_claimable_tasks(scratch_db)
+    assert preview.total == 0
+    assert preview.by_kind == {}
 
 
 def test_skip_task_sets_skipped_state(scratch_db: psycopg.Connection) -> None:

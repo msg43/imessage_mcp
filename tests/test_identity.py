@@ -438,6 +438,42 @@ def test_run_identity_is_idempotent(
         assert cur.fetchone() == first_count
 
 
+def test_run_identity_dry_run_writes_nothing(
+    pg_conn: psycopg.Connection, tmp_path: Path, config_dict_factory: ConfigDictFactory
+) -> None:
+    _seed_extraction(pg_conn, tmp_path)
+    config = _identity_config(config_dict_factory, contacts_import=False)
+
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM person")
+        persons_before = cur.fetchone()
+        cur.execute("SELECT count(*) FROM handle")
+        handles_before = cur.fetchone()
+        cur.execute("SELECT count(*) FROM message WHERE sender_person_id IS NOT NULL")
+        resolved_before = cur.fetchone()
+
+    result = run_identity(conn=pg_conn, config=config, dry_run=True)
+    assert result.dry_run is True
+    # The preview reports what a real run would do...
+    assert result.persons_created > 0
+    assert result.invariant.ok is True
+
+    # ...but nothing was actually written.
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM person")
+        assert cur.fetchone() == persons_before
+        cur.execute("SELECT count(*) FROM handle")
+        assert cur.fetchone() == handles_before
+        cur.execute("SELECT count(*) FROM message WHERE sender_person_id IS NOT NULL")
+        assert cur.fetchone() == resolved_before
+
+    # A real run afterward is unaffected by the rolled-back preview and
+    # produces the same counts the preview predicted.
+    real_result = run_identity(conn=pg_conn, config=config)
+    assert real_result.dry_run is False
+    assert real_result.persons_created == result.persons_created
+
+
 def test_compute_invariant_report_and_assert_raises(pg_conn: psycopg.Connection, tmp_path: Path) -> None:
     _seed_extraction(pg_conn, tmp_path)
     # Deliberately do NOT run identity resolution — everything is unresolved.

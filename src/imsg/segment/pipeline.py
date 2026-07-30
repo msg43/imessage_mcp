@@ -423,6 +423,23 @@ def _fetch_edit_history(
     return result
 
 
+def _count_segments_for_sessions(conn: psycopg.Connection, session_ids: list[int]) -> int:
+    """Read-only count of how many `segment` rows `session_ids` would
+    delete — the dry-run counterpart to
+    `_delete_stale_and_emit_delete_events`'s own count, without the
+    DELETE (SPEC §8: "takes --dry-run where writes leave the
+    machine")."""
+    if not session_ids:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM segment WHERE session_id = ANY(%s)",
+            (session_ids,),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+
 def _delete_stale_and_emit_delete_events(
     conn: psycopg.Connection, stale_session_ids: list[int]
 ) -> int:
@@ -609,11 +626,25 @@ def run_segment_for_chat(
     boundary_prompt_bytes: bytes,
     *,
     earliest_changed_at: datetime,
+    dry_run: bool = False,
 ) -> SegmentationRunReport:
     """Re-segment one chat from the point the incremental frontier
     (`imsg.segment.sessionize.compute_recompute_start`) says is safe,
     in one Postgres transaction. Pass `earliest_changed_at=
     REBUILD_ALL_SENTINEL` to force a full rebuild (config change).
+
+    `dry_run=True` (SPEC §8: "takes --dry-run where writes leave the
+    machine") runs the exact same sessionize/boundary-detection/render
+    computation as a real run — `boundary_provider` still runs, since
+    it is a scoring call, not a write, and dry-run should report
+    accurate segment counts — but skips the final `with
+    conn.transaction():` write block entirely: no session/segment rows
+    are inserted or deleted, and no `search_index_event` rows are
+    emitted. `segments_written` reuses the count already computed
+    during the per-session loop above (`segments_written_count`);
+    `segments_deleted` comes from a read-only count
+    (`_count_segments_for_sessions`) of the same `stale_session_ids`
+    the real path would delete.
     """
     seg_cfg = config.segmentation
     policy = config.policy
@@ -690,6 +721,18 @@ def run_segment_for_chat(
         rendered_by_session_start[session.started_at] = segment_list
         segments_written_count += len(segment_list)
 
+    if dry_run:
+        deleted = _count_segments_for_sessions(conn, stale_session_ids)
+        return SegmentationRunReport(
+            chat_id=chat_id,
+            sessions_written=len(sessions),
+            segments_written=segments_written_count,
+            segments_deleted=deleted,
+            fallback_sessions=fallback_count,
+            dry_run=True,
+            notes=("dry run — no sessions/segments were written or deleted",),
+        )
+
     with conn.transaction():
         deleted = _delete_stale_and_emit_delete_events(conn, stale_session_ids)
         session_ids = _insert_sessions(conn, sessions)
@@ -711,12 +754,17 @@ def run_segment(
     boundary_prompt_bytes: bytes,
     *,
     chat_ids: set[int] | None = None,
+    dry_run: bool = False,
 ) -> list[SegmentationRunReport]:
     """Top-level incremental entry point (SPEC §8 S7's S4 step): find
     every dirty chat and re-segment each. `chat_ids`, if given,
     restricts the run to that subset (still driven by dirtiness, not a
     forced rebuild — use `run_segment_for_chat` with
-    `REBUILD_ALL_SENTINEL` directly for `--rebuild`)."""
+    `REBUILD_ALL_SENTINEL` directly for `--rebuild`).
+
+    `dry_run` is threaded straight through to each
+    `run_segment_for_chat` call (SPEC §8: "takes --dry-run where
+    writes leave the machine")."""
     dirty = find_dirty_chats(conn, index_unsent=config.policy.index_unsent)
     if chat_ids is not None:
         dirty = {cid: ts for cid, ts in dirty.items() if cid in chat_ids}
@@ -731,6 +779,7 @@ def run_segment(
                 boundary_provider,
                 boundary_prompt_bytes,
                 earliest_changed_at=earliest,
+                dry_run=dry_run,
             )
         )
     return reports

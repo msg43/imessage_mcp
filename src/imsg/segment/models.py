@@ -131,3 +131,10 @@ class SegmentationRunReport:
     boundary model failed or returned malformed output (SPEC §8 S4)."""
     skipped_unchanged: int = 0
     notes: tuple[str, ...] = field(default_factory=tuple)
+    dry_run: bool = False
+    """True when this report came from `run_segment_for_chat(dry_run=
+    True)` (SPEC §8: "takes --dry-run where writes leave the
+    machine") — `sessions_written`/`segments_written`/`segments_deleted`
+    are the counts that *would* have been written/deleted (the real
+    sessionize/boundary-detection/render computation still ran), but
+    nothing was actually written to Postgres."""

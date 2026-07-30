@@ -75,6 +75,15 @@ class BackfillRunReport:
     trial_gate_capped: bool = False
     halted_low_disk_space: bool = False
     notes: list[str] = field(default_factory=list)
+    dry_run: bool = False
+    """True when this report came from `run_backfill(dry_run=True)`
+    (SPEC §8: "takes --dry-run where writes leave the machine").
+    `considered`/`detected_dataless`/`detected_already_local`/
+    `trial_gate_capped` are accurate (the same read-only candidate
+    selection and dataless classification ran); `materialized`/
+    `errored`/`marked_missing` are always 0 — see `notes` — because
+    materialization outcome (success/failure) can only be known by
+    attempting it, which a dry run never does."""
 
 
 def _count_pending(conn: psycopg.Connection) -> int:
@@ -179,6 +188,7 @@ def run_backfill(
     min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
     throttle: RateThrottle | None = None,
     disk_free_fn: DiskFreeFn | None = None,
+    dry_run: bool = False,
 ) -> BackfillRunReport:
     """Run one backfill pass. `attachments_root` is the live
     `~/Library/Messages/Attachments` directory — every candidate's
@@ -186,6 +196,15 @@ def run_backfill(
     already comes from our own DB, populated by S2, but path
     containment goes through `imsg.paths` everywhere per convention,
     never a trusted-by-construction shortcut).
+
+    `dry_run=True` (SPEC §8: "takes --dry-run where writes leave the
+    machine") still does the read-only candidate selection
+    (`_fetch_candidates`), trial-gate accounting, and `is_dataless`
+    classification, but never calls `throttle.wait()`,
+    `_mark_materializing`, `materialize_attachment`, or
+    `_mark_materialized`/`_mark_failure` — no filesystem copy and no
+    Postgres write happens. See `BackfillRunReport.dry_run`'s docstring
+    for why `materialized`/`errored`/`marked_missing` stay 0.
     """
     disk_free_fn = disk_free_fn or _default_disk_free
     throttle = throttle or RateThrottle(rate_per_minute)
@@ -197,7 +216,7 @@ def run_backfill(
     total_pending = _count_pending(conn)
     candidates = _fetch_candidates(conn, limit=limit)
 
-    report = BackfillRunReport(considered=len(candidates))
+    report = BackfillRunReport(considered=len(candidates), dry_run=dry_run)
     if trial_gate_active and total_pending > trial_limit:
         report.trial_gate_capped = True
         report.notes.append(
@@ -207,6 +226,38 @@ def run_backfill(
 
     resolved_attachments_root = resolve_path(attachments_root)
     resolved_data_root = resolve_path(data_root)
+
+    if dry_run:
+        for i, candidate in enumerate(candidates, start=1):
+            if i == 1 or i % free_space_check_interval == 0:
+                free = disk_free_fn(resolved_data_root)
+                if free < min_free_bytes:
+                    report.halted_low_disk_space = True
+                    report.notes.append(
+                        f"dry run: a real run would halt after {i - 1} file(s): "
+                        f"free space {free} bytes < minimum {min_free_bytes} bytes"
+                    )
+                    break
+
+            source_path = resolve_path(candidate.source_path)
+            if not is_contained_in(source_path, resolved_attachments_root):
+                # Never stat/read a path outside the trusted attachments
+                # root, even for read-only classification — the same
+                # defense-in-depth boundary the real path enforces
+                # before ever calling is_dataless() on it.
+                continue
+
+            if is_dataless(source_path):
+                report.detected_dataless += 1
+            else:
+                report.detected_already_local += 1
+
+        report.notes.append(
+            "dry run — materialized/errored/marked_missing are always 0: whether "
+            "materialization would succeed or fail can't be known without "
+            "attempting it"
+        )
+        return report
 
     for i, candidate in enumerate(candidates, start=1):
         if i == 1 or i % free_space_check_interval == 0:

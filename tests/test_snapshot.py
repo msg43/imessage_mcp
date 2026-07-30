@@ -193,6 +193,62 @@ def test_run_snapshot_gives_up_after_max_attempts(tmp_path: Path) -> None:
     assert leftovers == []
 
 
+def test_run_snapshot_dry_run_writes_nothing(tmp_path: Path) -> None:
+    live = _make_live_chat_db(tmp_path / "chat.db")
+    data_root = tmp_path / "data_root"
+    data_root.mkdir()
+
+    result = run_snapshot(live_chat_db=live, data_root=data_root, dry_run=True)
+
+    assert isinstance(result, SnapshotResult)
+    assert result.dry_run is True
+    assert result.path == data_root / "snapshots" / SNAPSHOT_FILENAME
+    assert result.reused_existing is False
+    assert result.byte_size > 0
+    assert len(result.sha256) == 64
+
+    from imsg.hashing import sha256_file
+
+    assert result.sha256 == sha256_file(live)
+    # Nothing was actually written — not even the snapshots/ directory.
+    assert not (data_root / "snapshots").exists()
+
+    # A real run afterward behaves exactly as if the dry run never happened
+    # (it wrote nothing for the real run to react to — no reused_existing,
+    # no rotation). Its sha256 is NOT required to equal the dry-run preview's:
+    # the online-backup API produces a fresh logical copy of the database,
+    # not a byte-for-byte file copy, so hashing the live source directly
+    # (the dry-run's best-effort stand-in) can legitimately diverge from a
+    # real backup's hash even though both represent "the same data".
+    real = run_snapshot(live_chat_db=live, data_root=data_root)
+    assert real.dry_run is False
+    assert real.reused_existing is False
+    assert real.path.is_file()
+
+
+def test_run_snapshot_dry_run_still_raises_for_missing_source(tmp_path: Path) -> None:
+    data_root = tmp_path / "data_root"
+    data_root.mkdir()
+    with pytest.raises(SnapshotError, match="not found"):
+        run_snapshot(live_chat_db=tmp_path / "does-not-exist.db", data_root=data_root, dry_run=True)
+
+
+def test_run_snapshot_dry_run_still_raises_when_disk_nearly_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live = _make_live_chat_db(tmp_path / "chat.db")
+    data_root = tmp_path / "data_root"
+    data_root.mkdir()
+
+    class _FakeUsage:
+        free = 1  # far below any real chat.db's size * 2
+
+    monkeypatch.setattr(shutil, "disk_usage", lambda _path: _FakeUsage())
+
+    with pytest.raises(SnapshotError, match="free"):
+        run_snapshot(live_chat_db=live, data_root=data_root, dry_run=True)
+
+
 def test_run_snapshot_refuses_when_disk_nearly_full(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     live = _make_live_chat_db(tmp_path / "chat.db")
     data_root = tmp_path / "data_root"

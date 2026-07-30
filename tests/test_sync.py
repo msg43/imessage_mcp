@@ -159,10 +159,10 @@ def test_run_sync_calls_stages_in_order(config_dict_factory: ConfigDictFactory, 
         order.append("identity")
         return _fake_identity_result(_ok_invariant())
 
-    def fake_segment(conn: object, cfg: object) -> None:
+    def fake_segment(conn: object, cfg: object, **kw: object) -> None:
         order.append("segment")
 
-    def fake_embed(conn: object, cfg: object) -> None:
+    def fake_embed(conn: object, cfg: object, **kw: object) -> None:
         order.append("embed")
 
     run_sync(
@@ -193,8 +193,8 @@ def test_run_sync_reports_segment_and_embed_ran_when_wired(
         run_snapshot_fn=lambda **kw: _fake_snapshot_result(tmp_path / "snapshot.db"),
         run_extract_fn=lambda **kw: _fake_extract_result(),
         run_identity_fn=lambda **kw: _fake_identity_result(_ok_invariant()),
-        segment_fn=lambda conn, cfg: "segmented",
-        embed_fn=lambda conn, cfg: "embedded",
+        segment_fn=lambda conn, cfg, **kw: "segmented",
+        embed_fn=lambda conn, cfg, **kw: "embedded",
     )
     assert result.segment_ran is True
     assert result.embed_ran is True
@@ -274,7 +274,7 @@ def test_run_sync_wraps_s3_failure(config_dict_factory: ConfigDictFactory, tmp_p
 def test_run_sync_wraps_s4_failure(config_dict_factory: ConfigDictFactory, tmp_path: Path) -> None:
     config = _minimal_config(config_dict_factory)
 
-    def boom(conn: object, cfg: object) -> None:
+    def boom(conn: object, cfg: object, **kw: object) -> None:
         raise ImsgError("simulated S4 failure")
 
     with pytest.raises(SyncError, match="S4 segment"):
@@ -526,7 +526,9 @@ def test_run_sync_real_end_to_end_snapshot_extract_identity(
 
     assert result.snapshot is not None
     assert result.snapshot.path.is_file()
+    assert result.extract is not None
     assert result.extract.messages_upserted == 1
+    assert result.identity is not None
     assert result.identity.invariant.ok is True
     assert result.segment_ran is False
     assert result.embed_ran is False

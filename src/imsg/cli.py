@@ -33,15 +33,19 @@ traceback reach the terminal for an expected failure mode.
 from __future__ import annotations
 
 import json
+import shutil
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import anyio
 import apsw
 import typer
+import uvicorn
 
+from imsg.agents.plists import render_agent_plists
 from imsg.backfill.pipeline import DEFAULT_RATE_PER_MINUTE, run_backfill
-from imsg.config.loader import load_config
+from imsg.config.loader import default_config_path, load_config
 from imsg.db.connection import connect
 from imsg.db.fingerprint import ensure_cluster_fingerprint, verify_data_directory
 from imsg.db.migrations import PostgresMigrationRunner, format_mismatches
@@ -58,10 +62,13 @@ from imsg.embed.pipeline import run_embed
 from imsg.embed.provider import FakeMultimodalEmbeddingProvider, FakeTextEmbeddingProvider
 from imsg.enrich.pipeline import EnrichmentProviders, process_one_task
 from imsg.enrich.provider import FakeCaptionProvider, FakeOcrProvider, FakeTranscriptionProvider
-from imsg.enrich.queue import claim_tasks
-from imsg.errors import ImsgError, StageNotImplementedError
+from imsg.enrich.queue import claim_tasks, preview_claimable_tasks
+from imsg.errors import AgentInstallError, ImsgError, StageNotImplementedError
+from imsg.eval.cli import eval_app
 from imsg.mcp.audit import PostgresAuditSink
+from imsg.mcp.auth import build_public_gate
 from imsg.mcp.tools.local_server import LocalMcpServer, run_local_server
+from imsg.mcp.tools.public_server import PublicMcpServer, build_public_asgi_app, parse_bind_address
 from imsg.mount.guard import run_guard_mount_or_exit
 from imsg.retrieval.reranker import FakeRerankerProvider
 from imsg.retrieval.service import RetrievalService
@@ -72,6 +79,7 @@ from imsg.stages.identity import run_identity
 from imsg.stages.imsg_dump import default_binary_path
 from imsg.stages.snapshot import SNAPSHOT_FILENAME, SNAPSHOT_SUBDIR, run_snapshot
 from imsg.stages.sync import EmbedFn, SegmentFn, run_sync_all_sources
+from imsg.verify.cli import reconcile_attachments, verify_seed
 
 if TYPE_CHECKING:
     import psycopg
@@ -88,6 +96,9 @@ app = typer.Typer(
 
 mcp_app = typer.Typer(name="mcp", help="MCP surfaces (SPEC §10).", no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp")
+app.add_typer(eval_app, name="eval")
+app.command("verify-seed")(verify_seed)
+app.command("reconcile-attachments")(reconcile_attachments)
 
 ConfigOption = Annotated[
     Path | None,
@@ -97,6 +108,19 @@ ConfigOption = Annotated[
         help="Path to config.yaml. Defaults to $IMSG_CONFIG, then ./config.yaml.",
     ),
 ]
+
+DryRunOption = Annotated[
+    bool,
+    typer.Option(
+        "--dry-run",
+        help="Preview what this stage would do without writing anything (SPEC §8).",
+    ),
+]
+
+DRY_RUN_MARKER = "DRY RUN — nothing was written"
+"""Printed verbatim (and grep-able) on every `--dry-run` invocation's
+output, alongside the normal report line (SPEC §8: "takes --dry-run
+where writes leave the machine")."""
 
 
 def _repo_root() -> Path:
@@ -353,12 +377,14 @@ def status(
 
 
 @app.command()
-def snapshot(config: ConfigOption = None) -> None:
+def snapshot(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
     """S1 — snapshot the live chat.db via the SQLite online-backup API (SPEC §8 S1)."""
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
     try:
-        result = run_snapshot(live_chat_db=cfg.paths.live_chat_db, data_root=cfg.paths.data_root)
+        result = run_snapshot(
+            live_chat_db=cfg.paths.live_chat_db, data_root=cfg.paths.data_root, dry_run=dry_run
+        )
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -366,6 +392,8 @@ def snapshot(config: ConfigOption = None) -> None:
         f"snapshot: {result.path} sha256={result.sha256} "
         f"reused_existing={result.reused_existing}"
     )
+    if dry_run:
+        typer.echo(DRY_RUN_MARKER)
 
 
 @app.command()
@@ -375,6 +403,7 @@ def extract(
         str | None,
         typer.Option(help="Source name from sync.sources; defaults to the first configured source."),
     ] = None,
+    dry_run: DryRunOption = False,
 ) -> None:
     """S2 — extract chats/messages/attachments from the current snapshot (SPEC §8 S2)."""
     cfg = _load_config_or_die(config)
@@ -395,6 +424,7 @@ def extract(
             source_name=source_name,
             snapshot_path=snapshot_path,
             imsg_dump_binary=default_binary_path(_repo_root()),
+            dry_run=dry_run,
         )
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
@@ -406,17 +436,19 @@ def extract(
         f"watermark {result.watermark_before}->{result.watermark_after} "
         f"bodies_missing={result.bodies_missing}"
     )
+    if dry_run:
+        typer.echo(DRY_RUN_MARKER)
 
 
 @app.command()
-def identity(config: ConfigOption = None) -> None:
+def identity(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
     """S3 — resolve handles to person_id via Contacts + manual curation (SPEC §8 S3)."""
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
 
     conn = _connect_and_verify_or_die(cfg)
     try:
-        result = run_identity(conn=conn, config=cfg)
+        result = run_identity(conn=conn, config=cfg, dry_run=dry_run)
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -438,6 +470,8 @@ def identity(config: ConfigOption = None) -> None:
             "until this is clean (SPEC §8 S3)",
             err=True,
         )
+    if dry_run:
+        typer.echo(DRY_RUN_MARKER)
 
 
 @app.command()
@@ -450,6 +484,7 @@ def segment(
             "--rebuild", help="Force a full rebuild of --chat (e.g. after a config change)."
         ),
     ] = False,
+    dry_run: DryRunOption = False,
 ) -> None:
     """S4 — sessionize and segment messages for indexing (SPEC §8 S4)."""
     cfg = _load_config_or_die(config)
@@ -466,7 +501,13 @@ def segment(
         if rebuild:
             assert chat is not None
             report = run_segment_for_chat(
-                conn, chat, cfg, provider, prompt_bytes, earliest_changed_at=REBUILD_ALL_SENTINEL
+                conn,
+                chat,
+                cfg,
+                provider,
+                prompt_bytes,
+                earliest_changed_at=REBUILD_ALL_SENTINEL,
+                dry_run=dry_run,
             )
             typer.echo(
                 f"segment: chat {chat} rebuilt — segments_written={report.segments_written} "
@@ -474,13 +515,15 @@ def segment(
             )
         else:
             chat_ids = {chat} if chat is not None else None
-            reports = run_segment(conn, cfg, provider, prompt_bytes, chat_ids=chat_ids)
+            reports = run_segment(conn, cfg, provider, prompt_bytes, chat_ids=chat_ids, dry_run=dry_run)
             total_written = sum(r.segments_written for r in reports)
             total_fallback = sum(r.fallback_sessions for r in reports)
             typer.echo(
                 f"segment: {len(reports)} chat(s) processed, {total_written} segment(s) "
                 f"written, {total_fallback} fallback session(s)"
             )
+        if dry_run:
+            typer.echo(DRY_RUN_MARKER)
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -489,26 +532,34 @@ def segment(
 
 
 @app.command()
-def embed(config: ConfigOption = None) -> None:
+def embed(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
     """S6 — embed segments/attachment chunks and update the FTS sidecar (SPEC §8 S6)."""
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
 
     conn = _connect_and_verify_or_die(cfg)
-    fts_conn = _open_fts_conn(cfg)
+    # `_open_fts_conn` creates `fts/` and the sqlite sidecar file on disk
+    # (a real filesystem write) — skip it entirely in dry-run mode, since
+    # `run_embed(dry_run=True)` never needs it and a dry run must not
+    # write anything (SPEC §8).
+    fts_conn = _open_fts_conn(cfg) if not dry_run else None
     try:
         report = run_embed(
             conn,
             _text_provider(cfg),
             multimodal_provider=_multimodal_provider(cfg),
             batch_size=cfg.embedding.batch_size,
+            dry_run=dry_run,
         )
-        sync_report = sync_fts(conn, fts_conn)
+        if not dry_run:
+            assert fts_conn is not None
+            sync_report = sync_fts(conn, fts_conn)
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     finally:
-        fts_conn.close()
+        if fts_conn is not None:
+            fts_conn.close()
         conn.close()
 
     typer.echo(
@@ -516,18 +567,21 @@ def embed(config: ConfigOption = None) -> None:
         f"chunks_embedded={report.chunks_embedded} "
         f"attachments_embedded={report.attachments_embedded}"
     )
-    typer.echo(
-        f"embed: fts events_applied={sync_report.events_applied} "
-        f"(upserts={sync_report.upserts} deletes={sync_report.deletes})"
-    )
+    if dry_run:
+        typer.echo(DRY_RUN_MARKER)
+    else:
+        typer.echo(
+            f"embed: fts events_applied={sync_report.events_applied} "
+            f"(upserts={sync_report.upserts} deletes={sync_report.deletes})"
+        )
 
 
 def _make_segment_fn(cfg: Config) -> SegmentFn:
     prompt_bytes = _boundary_prompt_bytes_or_die(cfg)
     provider = FakeBoundaryProvider()  # PLACEHOLDER — see module docstring.
 
-    def _segment_fn(conn: psycopg.Connection, config: Config) -> object:
-        return run_segment(conn, config, provider, prompt_bytes)
+    def _segment_fn(conn: psycopg.Connection, config: Config, *, dry_run: bool = False) -> object:
+        return run_segment(conn, config, provider, prompt_bytes, dry_run=dry_run)
 
     return _segment_fn
 
@@ -535,13 +589,18 @@ def _make_segment_fn(cfg: Config) -> SegmentFn:
 def _make_embed_fn(cfg: Config) -> EmbedFn:
     del cfg  # unused: each invocation reads whatever `config` `run_sync` hands it
 
-    def _embed_fn(conn: psycopg.Connection, config: Config) -> object:
+    def _embed_fn(conn: psycopg.Connection, config: Config, *, dry_run: bool = False) -> object:
         report = run_embed(
             conn,
             _text_provider(config),
             multimodal_provider=_multimodal_provider(config),
             batch_size=config.embedding.batch_size,
+            dry_run=dry_run,
         )
+        if dry_run:
+            # See `embed`'s own CLI command: opening the FTS sidecar
+            # creates it on disk, a real write a dry run must not do.
+            return report
         fts_conn = _open_fts_conn(config)
         try:
             sync_fts(conn, fts_conn)
@@ -553,7 +612,7 @@ def _make_embed_fn(cfg: Config) -> EmbedFn:
 
 
 @app.command()
-def sync(config: ConfigOption = None) -> None:
+def sync(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
     """S7 — incremental S1→S2→S3→S4→S6 sync for every configured source (SPEC §8 S7)."""
     cfg = _load_config_or_die(config)
     segment_fn = _make_segment_fn(cfg)  # validates the boundary prompt exists up front
@@ -567,6 +626,7 @@ def sync(config: ConfigOption = None) -> None:
             imsg_dump_binary=default_binary_path(_repo_root()),
             segment_fn=segment_fn,
             embed_fn=embed_fn,
+            dry_run=dry_run,
         )
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
@@ -575,10 +635,15 @@ def sync(config: ConfigOption = None) -> None:
         conn.close()
 
     for r in results:
+        if r.extract is None:
+            typer.echo(f"sync: source={r.source_name} {r.note}")
+            continue
         typer.echo(
             f"sync: source={r.source_name} messages_upserted={r.extract.messages_upserted} "
             f"segment_ran={r.segment_ran} embed_ran={r.embed_ran}"
         )
+    if dry_run:
+        typer.echo(DRY_RUN_MARKER)
 
 
 @app.command()
@@ -592,12 +657,30 @@ def enrich(
         bool,
         typer.Option("--retry-failed", help="Reset permanently-failed tasks to pending first."),
     ] = False,
+    dry_run: DryRunOption = False,
 ) -> None:
     """S5b — OCR/caption/transcribe/pdftotext enrichment queue worker (SPEC §8 S5b)."""
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
 
     conn = _connect_and_verify_or_die(cfg)
+
+    if dry_run:
+        # No lease claim, no dispatch — see `preview_claimable_tasks`'s
+        # docstring for why full per-task dry-run isn't meaningful here.
+        try:
+            preview = preview_claimable_tasks(conn)
+        except ImsgError as exc:
+            typer.echo(f"imsg: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        finally:
+            conn.close()
+
+        by_kind = " ".join(f"{kind}={count}" for kind, count in sorted(preview.by_kind.items())) or "none"
+        typer.echo(f"enrich: claimable={preview.total} {by_kind}")
+        typer.echo(DRY_RUN_MARKER)
+        return
+
     providers = EnrichmentProviders(  # PLACEHOLDER — see module docstring.
         ocr=FakeOcrProvider(), caption=FakeCaptionProvider(), transcription=FakeTranscriptionProvider()
     )
@@ -634,6 +717,7 @@ def backfill_attachments(
             "--yes-full-run", help="Skip the first-run 12-file trial gate (SPEC §8 S5a)."
         ),
     ] = False,
+    dry_run: DryRunOption = False,
 ) -> None:
     """S5a — materialize iCloud-optimized attachments locally (SPEC §8 S5a)."""
     cfg = _load_config_or_die(config)
@@ -648,6 +732,7 @@ def backfill_attachments(
             attachments_root,
             rate_per_minute=rate,
             yes_full_run=yes_full_run,
+            dry_run=dry_run,
         )
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
@@ -668,6 +753,8 @@ def backfill_attachments(
         )
     if report.halted_low_disk_space:
         typer.echo("backfill-attachments: halted — low disk space", err=True)
+    if dry_run:
+        typer.echo(DRY_RUN_MARKER)
 
 
 @mcp_app.command("local")
@@ -706,6 +793,81 @@ def mcp_local(config: ConfigOption = None) -> None:
         conn.close()
 
 
+@mcp_app.command("public")
+def mcp_public(config: ConfigOption = None) -> None:
+    """`imsg mcp public` — StreamableHTTP MCP server behind cloudflared,
+    OAuth subject validation, fail closed (SPEC §10.4). Binds loopback
+    only (`mcp.public.bind`); cloudflared is the only process that ever
+    faces a public interface. Every request — including `initialize`
+    and `tools/list`, not only tool calls — passes through
+    `imsg.mcp.auth.PublicAuthGate` before anything else runs (hard
+    requirement 4: no unauthenticated path, no config flag to disable
+    it); scope (`mcp.public.scope`, REQUIRED with no default, SPEC
+    §10.3a/D6) is fixed for the life of this process.
+    """
+    cfg = _load_config_or_die(config)
+    if not cfg.mcp.public.enabled:
+        typer.echo("imsg: mcp.public.enabled is false in config", err=True)
+        raise typer.Exit(code=1)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+
+    conn = _connect_and_verify_or_die(cfg)
+    fts_conn = _open_fts_conn(cfg)
+    try:
+        assert_schema_current(fts_conn)
+    except ImsgError as exc:
+        fts_conn.close()
+        conn.close()
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        host, port = parse_bind_address(cfg.mcp.public.bind)
+    except ImsgError as exc:
+        fts_conn.close()
+        conn.close()
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    service = RetrievalService(
+        pg_conn=conn,
+        fts_conn=fts_conn,
+        config=cfg,
+        text_provider=_text_provider(cfg),  # PLACEHOLDER — see module docstring.
+        reranker=FakeRerankerProvider(),  # PLACEHOLDER — see module docstring.
+        multimodal_provider=_multimodal_provider(cfg),
+    )
+    audit = PostgresAuditSink(lambda: connect(cfg.database, autocommit=True))
+    try:
+        # `build_public_gate` refuses to construct (raises, never
+        # allow-all) if `owner_subject`/`client_id` are missing or
+        # unresolvable — hard requirement 4's fail-closed startup.
+        gate = build_public_gate(cfg.mcp.public, audit=audit)
+    except ImsgError as exc:
+        fts_conn.close()
+        conn.close()
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    public = PublicMcpServer(service=service, gate=gate, scope=cfg.mcp.public.scope)
+    asgi_app = build_public_asgi_app(
+        public,
+        allowed_hosts=cfg.mcp.public.allowed_hosts,
+        allowed_origins=cfg.mcp.public.allowed_origins,
+        external_url=cfg.mcp.public.external_url,
+    )
+
+    typer.echo(
+        f"mcp public: listening on {host}:{port}, scope={cfg.mcp.public.scope}, "
+        f"external_url={cfg.mcp.public.external_url}"
+    )
+    try:
+        uvicorn.run(asgi_app, host=host, port=port, log_level="info")
+    finally:
+        fts_conn.close()
+        conn.close()
+
+
 # --------------------------------------------------------------------------
 # Pipeline-stage stubs still pending (SPEC §8/§5.5) — not this build's scope
 # --------------------------------------------------------------------------
@@ -725,10 +887,79 @@ def export() -> None:
     _stub("export")
 
 
+# --------------------------------------------------------------------------
+# install-agents (SPEC §5.5) — real, wired up
+# --------------------------------------------------------------------------
+
+
+def _resolve_binary_or_die(name: str) -> Path:
+    """`shutil.which(name)`, or a clean `AgentInstallError` — never a
+    silently-guessed hardcoded fallback path (SPEC §5.5: `install-
+    agents` must not invent a path for a binary it cannot find)."""
+    found = shutil.which(name)
+    if found is None:
+        raise AgentInstallError(
+            f"'{name}' binary not found on $PATH — install it (or make it "
+            f"reachable on PATH) before running 'imsg install-agents'"
+        )
+    return Path(found)
+
+
+def _resolve_imsg_binary() -> Path:
+    """The installed `imsg` console-script, if this environment has
+    one on `PATH`; otherwise the sibling `bin/imsg` next to the
+    running interpreter (`sys.executable`) — the shape a `uv`/venv
+    install normally takes. Never guesses a hardcoded absolute path."""
+    found = shutil.which("imsg")
+    if found is not None:
+        return Path(found)
+    return Path(sys.executable).resolve().parent / "imsg"
+
+
 @app.command("install-agents")
-def install_agents() -> None:
-    """Render and install the thin LaunchAgent plists (SPEC §5.5). Not implemented yet."""
-    _stub("install-agents")
+def install_agents(
+    config: ConfigOption = None,
+    dest: Annotated[
+        Path,
+        typer.Option(
+            help="Directory to write rendered plists into. Defaults to the real "
+            "~/Library/LaunchAgents; tests point this at a tmp_path instead."
+        ),
+    ] = Path("~/Library/LaunchAgents"),
+) -> None:
+    """Render and install the thin, content-free LaunchAgent plists
+    (SPEC §5.5) into `~/Library/LaunchAgents` — the only place launchd
+    discovers user agents. The rendered plists reference `--config
+    <path>` and fixed bootstrap paths only; every real value (hostname,
+    secrets) lives in that config file, never in the plist itself, and
+    the rendered plists are written only here, on a real machine at
+    install time — never committed to this repo.
+    """
+    cfg = _load_config_or_die(config)
+    resolved_config_path = (config if config is not None else default_config_path()).resolve()
+
+    try:
+        imsg_binary = _resolve_imsg_binary()
+        postgres_binary = _resolve_binary_or_die("postgres")
+        cloudflared_binary = _resolve_binary_or_die("cloudflared")
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    plists = render_agent_plists(
+        cfg,
+        imsg_binary=imsg_binary,
+        postgres_binary=postgres_binary,
+        cloudflared_binary=cloudflared_binary,
+        config_path=resolved_config_path,
+    )
+
+    dest_dir = dest.expanduser()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for label, content in sorted(plists.items()):
+        out_path = dest_dir / f"{label}.plist"
+        out_path.write_bytes(content)
+        typer.echo(f"install-agents: wrote {out_path}")
 
 
 if __name__ == "__main__":  # pragma: no cover

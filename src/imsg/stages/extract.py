@@ -78,7 +78,7 @@ from __future__ import annotations
 
 import plistlib
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -485,6 +485,15 @@ class ExtractResult:
     all (a boundary anomaly, distinct from the shim's own per-row
     null-body degrade, which *does* appear)."""
     dump_stderr_line_count: int
+    dry_run: bool = False
+    """True when this result came from `run_extract(dry_run=True)`
+    (SPEC §8: "takes --dry-run where writes leave the machine"): every
+    count above is accurate (the real extraction logic ran end to
+    end, including the read-only `imsg-dump` subprocess call), but the
+    transaction that produced them was rolled back — nothing was
+    actually written to Postgres, and `run_id` refers to an
+    `extraction_run` row that existed only for the rolled-back
+    transaction's duration."""
 
 
 RunImsgDumpFn = Callable[[Path, Path, int], ImsgDumpRun]
@@ -517,6 +526,70 @@ def _fetch_last_successful_run_start(cur: psycopg.Cursor[Any], source_name: str)
     return started_at
 
 
+class _DryRunRollback(Exception):
+    """Internal sentinel: forces the outer `with conn.transaction():`
+    block `_do_extract_dry_run` opens to ROLLBACK — a psycopg3 ROLLBACK
+    undoes nested SAVEPOINTs too, so `run_extract(dry_run=True)`
+    genuinely writes nothing to Postgres while still running the real
+    extraction logic (accurate counts, including the read-only
+    `imsg-dump` subprocess call). Caught immediately below; never
+    allowed to escape this module."""
+
+    def __init__(self, result: ExtractResult) -> None:
+        self.result = result
+
+
+def _do_extract_dry_run(
+    *,
+    conn: psycopg.Connection,
+    reader: SnapshotReader,
+    source_name: str,
+    snapshot_path: Path,
+    snapshot_sha256: str,
+    watermark_before: int,
+    last_run_start: datetime,
+    snapshot_max_rowid: int,
+    imsg_dump_binary: Path,
+    run_imsg_dump_fn: RunImsgDumpFn,
+) -> ExtractResult:
+    """SPEC §8 dry-run for S2: `_begin_extraction_run` and `_do_extract`
+    each already open their own `conn.transaction()`; calling both from
+    inside one outer `with conn.transaction():` turns those into
+    SAVEPOINTs instead of independent top-level transactions, so
+    raising `_DryRunRollback` after they both complete rolls back
+    everything at once. If `_do_extract` raises a real error instead,
+    that (not `_DryRunRollback`) propagates out of the `with` block —
+    the transaction still rolls back (any exception does that), but
+    this function deliberately does not call `_fail_extraction_run`
+    itself: nothing was ever going to be persisted either way, so
+    there is nothing to mark failed.
+    """
+    try:
+        with conn.transaction():
+            run_id = _begin_extraction_run(
+                conn,
+                source_name=source_name,
+                snapshot_path=snapshot_path,
+                snapshot_sha256=snapshot_sha256,
+                rowid_before=watermark_before,
+            )
+            result = _do_extract(
+                conn=conn,
+                reader=reader,
+                source_name=source_name,
+                snapshot_path=snapshot_path,
+                watermark_before=watermark_before,
+                last_run_start=last_run_start,
+                snapshot_max_rowid=snapshot_max_rowid,
+                run_id=run_id,
+                imsg_dump_binary=imsg_dump_binary,
+                run_imsg_dump_fn=run_imsg_dump_fn,
+            )
+            raise _DryRunRollback(result)
+    except _DryRunRollback as sentinel:
+        return replace(sentinel.result, dry_run=True)
+
+
 def run_extract(
     *,
     conn: psycopg.Connection,
@@ -526,6 +599,7 @@ def run_extract(
     imsg_dump_binary: Path,
     open_snapshot: OpenSnapshotFn = _default_open_snapshot,
     run_imsg_dump_fn: RunImsgDumpFn = _default_run_imsg_dump,
+    dry_run: bool = False,
 ) -> ExtractResult:
     """Extract one snapshot into Postgres (SPEC §8 S2).
 
@@ -535,6 +609,14 @@ def run_extract(
     snapshot does not open as SQLite, `imsg-dump` fails to run); a
     single message's decode failure inside `imsg-dump` degrades to a
     null body there and is *not* an `ExtractionError` here.
+
+    `dry_run=True` (SPEC §8: "takes --dry-run where writes leave the
+    machine") runs the entire real extraction body — including the
+    `imsg-dump` subprocess call, which is read-only — inside one outer
+    transaction, then forces a ROLLBACK before returning (see
+    `_do_extract_dry_run`), so every count in the returned
+    `ExtractResult` is accurate but nothing is actually written to
+    Postgres.
     """
     if snapshot_sha256 is None:
         snapshot_sha256 = sha256_file(snapshot_path)
@@ -551,6 +633,20 @@ def run_extract(
             watermark_before = _fetch_watermark(cur, source_name)
             last_run_start = _fetch_last_successful_run_start(cur, source_name)
             snapshot_max_rowid = reader.fetch_max_message_rowid()
+
+        if dry_run:
+            return _do_extract_dry_run(
+                conn=conn,
+                reader=reader,
+                source_name=source_name,
+                snapshot_path=snapshot_path,
+                snapshot_sha256=snapshot_sha256,
+                watermark_before=watermark_before,
+                last_run_start=last_run_start,
+                snapshot_max_rowid=snapshot_max_rowid,
+                imsg_dump_binary=imsg_dump_binary,
+                run_imsg_dump_fn=run_imsg_dump_fn,
+            )
 
         run_id = _begin_extraction_run(
             conn,

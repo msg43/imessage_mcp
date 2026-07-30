@@ -79,11 +79,11 @@ def cli_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("command", ["export", "install-agents"])
+@pytest.mark.parametrize("command", ["export"])
 def test_stub_stage_exits_nonzero_and_names_the_stage(command: str) -> None:
-    """`export` (a parallel agent's scope this wave) and `install-agents`
-    (nobody's scope yet) remain stubs; every other stage this build
-    wires up is exercised below instead."""
+    """`export` (a parallel agent's scope this wave) remains a stub;
+    `install-agents` is now real (exercised below), and every other
+    stage this build wires up is exercised elsewhere in this file."""
     result = runner.invoke(app, [command])
     assert result.exit_code == 1
     assert command.replace("-", "-") in result.output  # the stage name appears
@@ -313,9 +313,10 @@ def test_snapshot_wires_run_snapshot(
 
     captured: dict[str, Any] = {}
 
-    def fake_run_snapshot(*, live_chat_db: Path, data_root: Path) -> SnapshotResult:
+    def fake_run_snapshot(*, live_chat_db: Path, data_root: Path, **kw: Any) -> SnapshotResult:
         captured["live_chat_db"] = live_chat_db
         captured["data_root"] = data_root
+        captured["kw"] = kw
         return SnapshotResult(
             path=data_root / "snapshots" / "snapshot.db",
             sha256="a" * 64,
@@ -328,6 +329,32 @@ def test_snapshot_wires_run_snapshot(
     assert result.exit_code == 0, result.output
     assert "sha256=" + "a" * 64 in result.output
     assert captured["data_root"] == _data_root_from_config(mocked_pg_env)
+    assert "DRY RUN" not in result.output
+    assert captured["kw"] == {"dry_run": False}
+
+
+def test_snapshot_dry_run_passes_the_flag_and_prints_the_marker(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.stages.snapshot import SnapshotResult
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_snapshot(*, live_chat_db: Path, data_root: Path, **kw: Any) -> SnapshotResult:
+        captured["kw"] = kw
+        return SnapshotResult(
+            path=data_root / "snapshots" / "snapshot.db",
+            sha256="b" * 64,
+            byte_size=10,
+            reused_existing=False,
+            dry_run=True,
+        )
+
+    monkeypatch.setattr(cli_module, "run_snapshot", fake_run_snapshot)
+    result = runner.invoke(app, ["snapshot", "--config", str(mocked_pg_env), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert captured["kw"] == {"dry_run": True}
+    assert "DRY RUN — nothing was written" in result.output
 
 
 def test_extract_without_a_snapshot_exits_cleanly(mocked_pg_env: Path) -> None:
@@ -370,6 +397,36 @@ def test_extract_wires_run_extract(
     assert result.exit_code == 0, result.output
     assert "messages_upserted=5" in result.output
     assert captured["source_name"] == "mini"
+    assert captured["dry_run"] is False
+    assert "DRY RUN" not in result.output
+
+
+def test_extract_dry_run_passes_the_flag_and_prints_the_marker(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.stages.extract import ExtractResult
+
+    data_root = _data_root_from_config(mocked_pg_env)
+    snapshot_dir = data_root / "snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    (snapshot_dir / "snapshot.db").write_text("")
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_extract(**kwargs: Any) -> ExtractResult:
+        captured.update(kwargs)
+        return ExtractResult(
+            run_id=1, watermark_before=0, watermark_after=0, chats_upserted=0,
+            handles_upserted=0, messages_upserted=0, tapbacks_upserted=0,
+            system_messages_skipped=0, attachments_upserted=0, link_previews_upserted=0,
+            bodies_missing=0, dump_stderr_line_count=0, dry_run=True,
+        )
+
+    monkeypatch.setattr(cli_module, "run_extract", fake_run_extract)
+    result = runner.invoke(app, ["extract", "--config", str(mocked_pg_env), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert captured["dry_run"] is True
+    assert "DRY RUN — nothing was written" in result.output
 
 
 def test_identity_wires_run_identity_and_warns_on_degraded_contacts(
@@ -538,6 +595,38 @@ def test_sync_wires_run_sync_all_sources(
     assert "segment_ran=True" in result.output
     assert callable(captured["segment_fn"])
     assert callable(captured["embed_fn"])
+    assert captured["dry_run"] is False
+    assert "DRY RUN" not in result.output
+
+
+def test_sync_dry_run_passes_the_flag_and_prints_the_marker(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.stages.sync import SyncResult
+
+    data_root = _data_root_from_config(mocked_pg_env)
+    prompt_path = data_root / "prompts" / "segment_boundaries.txt"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text("x")
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_sync_all_sources(**kwargs: Any) -> list[SyncResult]:
+        captured.update(kwargs)
+        return [
+            SyncResult(
+                source_name="mini", snapshot=None, extract=None, identity=None,
+                segment_ran=False, embed_ran=False, dry_run=True,
+                note="dry run stopped after S1 snapshot — no real snapshot file exists yet",
+            )
+        ]
+
+    monkeypatch.setattr(cli_module, "run_sync_all_sources", fake_run_sync_all_sources)
+    result = runner.invoke(app, ["sync", "--config", str(mocked_pg_env), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert captured["dry_run"] is True
+    assert "dry run stopped after S1 snapshot" in result.output
+    assert "DRY RUN — nothing was written" in result.output
 
 
 def test_enrich_wires_claim_and_process(
@@ -553,6 +642,34 @@ def test_enrich_wires_claim_and_process(
     assert result.exit_code == 0, result.output
     assert "claimed=2" in result.output
     assert "done=2" in result.output
+    assert "DRY RUN" not in result.output
+
+
+def test_enrich_dry_run_uses_preview_claimable_tasks(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.enrich.queue import EnrichPreviewReport
+
+    def boom_claim(conn: Any, **kw: Any) -> Any:
+        raise AssertionError("claim_tasks must not be called in dry-run mode")
+
+    def boom_process(conn: Any, config: Any, providers: Any, task: Any) -> str:
+        raise AssertionError("process_one_task must not be called in dry-run mode")
+
+    monkeypatch.setattr(cli_module, "claim_tasks", boom_claim)
+    monkeypatch.setattr(cli_module, "process_one_task", boom_process)
+    monkeypatch.setattr(
+        cli_module,
+        "preview_claimable_tasks",
+        lambda conn, **kw: EnrichPreviewReport(total=3, by_kind={"ocr": 2, "caption": 1}),
+    )
+
+    result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "claimable=3" in result.output
+    assert "ocr=2" in result.output
+    assert "caption=1" in result.output
+    assert "DRY RUN — nothing was written" in result.output
 
 
 def test_enrich_retry_failed_resets_rows_before_claiming(
@@ -612,6 +729,126 @@ def test_backfill_attachments_wires_run_backfill(
     assert "materialized=4" in result.output
     assert captured["attachments_root"].name == "Attachments"
     assert captured["kw"]["yes_full_run"] is True
+
+
+# --------------------------------------------------------------------------
+# install-agents (SPEC §5.5) — real, no live Postgres/mount required
+# --------------------------------------------------------------------------
+
+
+def _fake_which(name: str) -> str | None:
+    return {
+        "imsg": "/usr/local/bin/imsg",
+        "postgres": "/opt/homebrew/bin/postgres",
+        "cloudflared": "/opt/homebrew/bin/cloudflared",
+    }.get(name)
+
+
+_FIXED_DATA_ROOT = "/Volumes/Data-Encrypted/imsgindex"
+"""Deliberately NOT `tmp_path`-derived: pytest's own tmp dirs
+(`/…/pytest-of-<local-username>/…`) embed the real local OS username,
+which would make the leak-substring check below fire for a reason that
+has nothing to do with `install-agents`'s own output."""
+
+
+def test_install_agents_writes_all_seven_plists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import plistlib
+    import shutil
+
+    fake_home = tmp_path / "home"
+    messages_dir = fake_home / "Library" / "Messages"
+    messages_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    import imsg.config.schema as schema_module
+
+    monkeypatch.setattr(schema_module, "MESSAGES_DIR", messages_dir)
+
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, Path(_FIXED_DATA_ROOT), messages_dir)
+
+    monkeypatch.setattr(shutil, "which", _fake_which)
+
+    dest = tmp_path / "LaunchAgents"
+    result = runner.invoke(
+        app, ["install-agents", "--config", str(config_path), "--dest", str(dest)]
+    )
+    assert result.exit_code == 0, result.output
+
+    expected_labels = {
+        "com.imsgindex.pg",
+        "com.imsgindex.sync",
+        "com.imsgindex.enrich",
+        "com.imsgindex.mcp-public",
+        "com.imsgindex.tunnel",
+        "com.imsgindex.report",
+        "com.imsgindex.backup",
+    }
+    written = {p.stem for p in dest.glob("*.plist")}
+    assert written == expected_labels
+
+    # Note: this end-to-end CLI invocation necessarily writes a real
+    # config.yaml under pytest's own tmp dir and passes that real path
+    # via --config, so scanning *this* test's rendered output for
+    # forbidden substrings would just be checking pytest's tmp-dir
+    # naming, not this command's own behavior — the substring leak
+    # check that actually matters (given a config_path this test does
+    # not control) lives in test_launchagents.py's
+    # `render_agent_plists` unit tests, which hold every input path
+    # fixed and fictional.
+    for plist_path in dest.glob("*.plist"):
+        content = plist_path.read_bytes()
+        parsed = plistlib.loads(content)  # must round-trip as valid XML plist
+        assert parsed["Label"] == plist_path.stem
+        assert isinstance(parsed["ProgramArguments"], list) and parsed["ProgramArguments"]
+
+    pg_plist = plistlib.loads((dest / "com.imsgindex.pg.plist").read_bytes())
+    assert pg_plist["KeepAlive"] is True
+    assert "5433" in " ".join(pg_plist["ProgramArguments"])
+
+    sync_plist = plistlib.loads((dest / "com.imsgindex.sync.plist").read_bytes())
+    assert sync_plist["StartInterval"] == 900
+
+    enrich_plist = plistlib.loads((dest / "com.imsgindex.enrich.plist").read_bytes())
+    assert isinstance(enrich_plist["StartCalendarInterval"], list)
+    assert len(enrich_plist["StartCalendarInterval"]) > 1
+
+    report_plist = plistlib.loads((dest / "com.imsgindex.report.plist").read_bytes())
+    assert report_plist["StartCalendarInterval"] == {"Weekday": 1, "Hour": 8, "Minute": 0}
+
+    backup_plist = plistlib.loads((dest / "com.imsgindex.backup.plist").read_bytes())
+    assert backup_plist["StartCalendarInterval"] == {"Hour": 4, "Minute": 0}
+
+
+def test_install_agents_missing_postgres_binary_exits_cleanly(
+    cli_config: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    result = runner.invoke(
+        app,
+        ["install-agents", "--config", str(cli_config), "--dest", str(tmp_path / "LaunchAgents")],
+    )
+    assert result.exit_code == 1
+    assert "postgres" in result.output
+
+
+def test_install_agents_missing_cloudflared_binary_exits_cleanly(
+    cli_config: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import shutil
+
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/opt/homebrew/bin/postgres" if name == "postgres" else None
+    )
+    result = runner.invoke(
+        app,
+        ["install-agents", "--config", str(cli_config), "--dest", str(tmp_path / "LaunchAgents")],
+    )
+    assert result.exit_code == 1
+    assert "cloudflared" in result.output
 
 
 def test_mcp_local_disabled_in_config_exits_cleanly(
@@ -693,3 +930,120 @@ def test_mcp_local_wires_server_and_runs_it(
     assert captured["func"] is run_local_server
     local = captured["args"][0]
     assert isinstance(local, LocalMcpServer)
+
+
+# --------------------------------------------------------------------------
+# mcp public (SPEC §10.4) — mirrors the mcp local tests immediately above,
+# with uvicorn.run monkeypatched instead of anyio.run.
+# --------------------------------------------------------------------------
+
+
+def test_mcp_public_disabled_in_config_exits_cleanly(mocked_pg_env: Path) -> None:
+    # `cli_config`'s base fixture never sets `mcp.public.enabled` — the
+    # schema default (`False`) applies, matching "flipped on at Phase 6,
+    # never before" (SPEC §6).
+    result = runner.invoke(app, ["mcp", "public", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 1
+    assert "mcp.public.enabled is false" in result.output
+
+
+def _write_public_enabled_config(path: Path, data_root: Path, messages_dir: Path) -> None:
+    live_chat_db = messages_dir / "chat.db"
+    live_chat_db.parent.mkdir(parents=True, exist_ok=True)
+    live_chat_db.write_text("")
+    path.write_text(
+        f"""
+paths:
+  data_root: {data_root}
+  live_chat_db: {live_chat_db}
+database:
+  dsn: postgresql://imsg@127.0.0.1:5433/imsgindex
+  password: env:IMSG_TEST_PG_PASSWORD
+sync:
+  interval_seconds: 900
+  sources:
+    - name: mini
+      chat_db: {live_chat_db}
+embedding:
+  revision: deadbeef
+  query_instruction: "test instruction"
+  multimodal:
+    revision: cafef00d
+retrieval:
+  reranker_revision: f00dcafe
+mcp:
+  public:
+    enabled: true
+    external_url: https://mcp.fictional.example/mcp
+    allowed_origins: [https://vertexaisearch.fictional.example]
+    allowed_hosts: [mcp.fictional.example]
+    scope: allowlist
+    oauth:
+      client_id: fictional-client-id.apps.example
+      owner_subject: env:IMSG_TEST_OWNER_SUBJECT
+export:
+  gcp_project: example-project
+  gcs_bucket: example-bucket
+  data_store_id: example-datastore
+"""
+    )
+
+
+@pytest.fixture
+def mocked_pg_env_public_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Same DB/mount mocking as `mocked_pg_env`, but with `mcp.public`
+    fully enabled — `mocked_pg_env` itself can't be reused here since it
+    is bound to `cli_config`'s fixed (public-disabled) config content."""
+    fake_home = tmp_path / "home"
+    messages_dir = fake_home / "Library" / "Messages"
+    messages_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("IMSG_TEST_OWNER_SUBJECT", "300000000000000000009")
+    import imsg.config.schema as schema_module
+
+    monkeypatch.setattr(schema_module, "MESSAGES_DIR", messages_dir)
+
+    data_root = tmp_path / "data_root"
+    data_root.mkdir()
+    (data_root / ".imsgindex-volume").write_text("")
+
+    config_path = tmp_path / "config.yaml"
+    _write_public_enabled_config(config_path, data_root, messages_dir)
+
+    monkeypatch.setattr(
+        cli_module,
+        "run_guard_mount_or_exit",
+        lambda data_root: MountInfo(mount_point=data_root, encrypted=True, volume_name="fake"),
+    )
+    monkeypatch.setattr(cli_module, "connect", lambda database, **kw: _FakePgConn())
+    monkeypatch.setattr(
+        cli_module, "verify_data_directory", lambda conn, data_root: Path(str(data_root))
+    )
+    return config_path
+
+
+def test_mcp_public_wires_server_and_runs_it(
+    mocked_pg_env_public_enabled: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import uvicorn
+
+    from imsg.mcp.tools.public_server import TransportGuardASGIApp
+
+    captured: dict[str, Any] = {}
+
+    def fake_uvicorn_run(app_arg: Any, **kw: Any) -> None:
+        # Real `uvicorn.run` blocks until the server stops; the fake must
+        # not actually bind a socket or serve anything in a unit test.
+        captured["app"] = app_arg
+        captured["kw"] = kw
+
+    monkeypatch.setattr(uvicorn, "run", fake_uvicorn_run)
+    result = runner.invoke(
+        app, ["mcp", "public", "--config", str(mocked_pg_env_public_enabled)]
+    )
+    assert result.exit_code == 0, result.output
+    assert isinstance(captured["app"], TransportGuardASGIApp)
+    assert captured["kw"]["host"] == "127.0.0.1"
+    assert captured["kw"]["port"] == 8700

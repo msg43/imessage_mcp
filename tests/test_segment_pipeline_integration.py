@@ -216,6 +216,61 @@ def test_small_session_becomes_one_segment(
     assert events[0][1] is not None
 
 
+def test_run_segment_for_chat_dry_run_writes_nothing(
+    scratch_db: psycopg.Connection, dm_chat: tuple[int, int, int], config: Config
+) -> None:
+    chat_id, owner_id, alice_id = dm_chat
+    for i in range(5):
+        sender = owner_id if i % 2 == 0 else alice_id
+        _insert_message(
+            scratch_db,
+            chat_id=chat_id,
+            sender_person_id=sender,
+            is_from_me=(i % 2 == 0),
+            sent_at=_BASE + timedelta(minutes=i),
+            text=f"message {i}",
+        )
+    scratch_db.commit()
+
+    provider = FakeBoundaryProvider(always_fail=True)  # must never be called: 5 <= topical_min_messages
+    report = run_segment_for_chat(
+        scratch_db,
+        chat_id,
+        config,
+        provider,
+        PROMPT_BYTES,
+        earliest_changed_at=REBUILD_ALL_SENTINEL,
+        dry_run=True,
+    )
+    scratch_db.commit()
+
+    # The preview reports what a real run would write...
+    assert report.dry_run is True
+    assert report.sessions_written == 1
+    assert report.segments_written == 1
+    assert report.segments_deleted == 0
+
+    # ...but nothing was actually written.
+    with scratch_db.cursor() as cur:
+        cur.execute("SELECT count(*) FROM session WHERE chat_id = %s", (chat_id,))
+        assert cur.fetchone() == (0,)
+        cur.execute("SELECT count(*) FROM segment WHERE chat_id = %s", (chat_id,))
+        assert cur.fetchone() == (0,)
+        cur.execute("SELECT count(*) FROM search_index_event")
+        assert cur.fetchone() == (0,)
+
+    # A real run afterward produces exactly what the preview predicted.
+    real_report = run_segment_for_chat(
+        scratch_db, chat_id, config, provider, PROMPT_BYTES, earliest_changed_at=REBUILD_ALL_SENTINEL
+    )
+    scratch_db.commit()
+    assert real_report.dry_run is False
+    assert real_report.segments_written == report.segments_written
+    with scratch_db.cursor() as cur:
+        cur.execute("SELECT count(*) FROM segment WHERE chat_id = %s", (chat_id,))
+        assert cur.fetchone() == (1,)
+
+
 def test_second_run_with_nothing_changed_is_a_noop(
     scratch_db: psycopg.Connection, dm_chat: tuple[int, int, int], config: Config
 ) -> None:

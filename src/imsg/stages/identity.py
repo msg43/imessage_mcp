@@ -51,7 +51,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import phonenumbers
@@ -366,6 +366,12 @@ class IdentityResult:
     chat_participants_resolved: int
     contacts: ContactsImportOutcome
     invariant: InvariantReport
+    dry_run: bool = False
+    """True when this result came from `run_identity(dry_run=True)`
+    (SPEC §8: "takes --dry-run where writes leave the machine") — every
+    count and the invariant report reflect what the real resolution
+    logic would have produced (computed inside a transaction that was
+    then rolled back), but nothing was actually written to Postgres."""
 
 
 def compute_invariant_report(conn: psycopg.Connection) -> InvariantReport:
@@ -428,33 +434,25 @@ def assert_invariant_or_raise(report: InvariantReport) -> None:
     )
 
 
-def run_identity(
-    *,
+class _DryRunRollback(Exception):
+    """Internal sentinel: forces the outer `with conn.transaction():`
+    block `run_identity`'s dry-run path opens to ROLLBACK, the same
+    savepoint-and-forced-rollback pattern `imsg.stages.extract` uses.
+    Caught immediately below; never allowed to escape this module."""
+
+    def __init__(self, result: IdentityResult) -> None:
+        self.result = result
+
+
+def _run_identity_body(
     conn: psycopg.Connection,
     config: Config,
-    contacts_importer: ContactsImporterFn = _default_contacts_importer,
+    contacts_index: ContactsIndex | None,
+    contacts_outcome: ContactsImportOutcome,
 ) -> IdentityResult:
-    """Resolve every unresolved `source_handle`, backfill sender/participant
-    `person_id`s, and compute the pre-S4 invariant report (SPEC §8 S3)."""
-    contacts_index: ContactsIndex | None = None
-    contacts_outcome: ContactsImportOutcome
-    if config.identity.contacts_import:
-        try:
-            records = contacts_importer(config.identity.default_region)
-            contacts_index = ContactsIndex(records)
-            contacts_outcome = ContactsImportOutcome(
-                attempted=True, contacts_loaded=len(records), degraded=False, degraded_reason=None
-            )
-        except ContactsAccessDeniedError as exc:
-            logger.error("identity.contacts_degraded", reason=str(exc))
-            contacts_outcome = ContactsImportOutcome(
-                attempted=True, contacts_loaded=0, degraded=True, degraded_reason=str(exc)
-            )
-    else:
-        contacts_outcome = ContactsImportOutcome(
-            attempted=False, contacts_loaded=0, degraded=False, degraded_reason=None
-        )
-
+    """The real resolution logic, factored out of `run_identity` so the
+    dry-run path (below) can run it unchanged inside an outer
+    transaction it then rolls back."""
     with conn.transaction(), conn.cursor() as cur:
         owner_person_id = _resolve_owner_person(cur)
 
@@ -577,6 +575,57 @@ def run_identity(
         contacts=contacts_outcome,
         invariant=invariant,
     )
+
+
+def run_identity(
+    *,
+    conn: psycopg.Connection,
+    config: Config,
+    contacts_importer: ContactsImporterFn = _default_contacts_importer,
+    dry_run: bool = False,
+) -> IdentityResult:
+    """Resolve every unresolved `source_handle`, backfill sender/participant
+    `person_id`s, and compute the pre-S4 invariant report (SPEC §8 S3).
+
+    `dry_run=True` (SPEC §8: "takes --dry-run where writes leave the
+    machine") runs `_run_identity_body` unchanged inside one outer
+    transaction — including `compute_invariant_report`, which reads
+    back the (still-uncommitted, but visible within the same
+    transaction) resolution it just performed — then forces a
+    ROLLBACK before returning, so every count and the invariant report
+    are accurate but nothing is actually written to Postgres. Contacts
+    import (a read against the `Contacts` framework, not a Postgres
+    write) still runs for real either way — dry-run has nothing to
+    preview there, it already does no writing.
+    """
+    contacts_index: ContactsIndex | None = None
+    contacts_outcome: ContactsImportOutcome
+    if config.identity.contacts_import:
+        try:
+            records = contacts_importer(config.identity.default_region)
+            contacts_index = ContactsIndex(records)
+            contacts_outcome = ContactsImportOutcome(
+                attempted=True, contacts_loaded=len(records), degraded=False, degraded_reason=None
+            )
+        except ContactsAccessDeniedError as exc:
+            logger.error("identity.contacts_degraded", reason=str(exc))
+            contacts_outcome = ContactsImportOutcome(
+                attempted=True, contacts_loaded=0, degraded=True, degraded_reason=str(exc)
+            )
+    else:
+        contacts_outcome = ContactsImportOutcome(
+            attempted=False, contacts_loaded=0, degraded=False, degraded_reason=None
+        )
+
+    if not dry_run:
+        return _run_identity_body(conn, config, contacts_index, contacts_outcome)
+
+    try:
+        with conn.transaction():
+            result = _run_identity_body(conn, config, contacts_index, contacts_outcome)
+            raise _DryRunRollback(result)
+    except _DryRunRollback as sentinel:
+        return replace(sentinel.result, dry_run=True)
 
 
 def _count_persons(cur: psycopg.Cursor[Any]) -> int:

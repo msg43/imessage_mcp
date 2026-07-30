@@ -85,6 +85,12 @@ class SnapshotResult:
     the prior current snapshot, so the prior file was kept in place
     rather than rotated (SPEC §8 S1 idempotency: "identical sha reuses
     the existing snapshot")."""
+    dry_run: bool = False
+    """True when this result came from a `run_snapshot(dry_run=True)`
+    preview (SPEC §8: "takes --dry-run where writes leave the
+    machine") — no backup, verification, or rotation happened; `path`
+    is the *would-be* destination and `sha256`/`byte_size` were
+    computed directly from the live source file, not a real backup."""
 
 
 # --- dependency-injection seams (mirrors imsg.mount.guard's DiskutilInfoFn pattern) ---
@@ -194,6 +200,7 @@ def run_snapshot(
     retry_wait_seconds: float = RETRY_WAIT_SECONDS,
     free_space_multiplier: float = FREE_SPACE_MULTIPLIER,
     max_previous_retained: int = MAX_PREVIOUS_RETAINED,
+    dry_run: bool = False,
 ) -> SnapshotResult:
     """Back up `live_chat_db` into `data_root/snapshots/snapshot.db`.
 
@@ -211,15 +218,57 @@ def run_snapshot(
     live database's size free, or the backed-up file fails its
     post-backup integrity check. On any failure, no partial snapshot
     file is left behind under `snapshots/`.
+
+    `dry_run=True` (SPEC §8: "takes --dry-run where writes leave the
+    machine") runs only the read-only precondition checks this
+    function already does first — the live database exists, and the
+    destination volume has the required free-space margin — and
+    returns without ever opening SQLite's online-backup API, creating
+    `snapshots/`, writing a temp file, verifying anything, or rotating
+    `.previous` files. The returned `SnapshotResult.path` is the
+    *would-be* destination (the same fixed `snapshots/snapshot.db`
+    path a real run would (re)write); `sha256`/`byte_size` are
+    computed directly from the live source file — a best-effort
+    stand-in, not a guaranteed match for what a real backup's hash
+    would be. **`byte_size` is exact** (S1's backup is content-
+    faithful, so the source file's own size is the real answer), but
+    **`sha256` is only approximate**: SQLite's online-backup API
+    writes a fresh logical copy of the database (its own page
+    layout), not a byte-for-byte clone of the source file, so even a
+    live db nobody wrote to between the preview and a subsequent real
+    run can legitimately produce a different file hash despite
+    carrying the same data — hashing the source directly is the
+    cheapest available preview, not a promise the two hashes will
+    match. `reused_existing` is always `False` in dry-run mode: whether
+    a real run would reuse the existing snapshot depends on comparing
+    hashes of two backups, and only one side of that comparison (the
+    source) was actually read.
     """
     source_path = resolve_path(live_chat_db)
     if not source_path.is_file():
         raise SnapshotError(f"live chat.db not found at '{source_path}'")
 
     snapshots_dir = resolve_path(data_root) / SNAPSHOT_SUBDIR
+    live_size = source_path.stat().st_size
+
+    if dry_run:
+        free = _free_space_bytes(snapshots_dir)
+        required = int(live_size * free_space_multiplier)
+        if free < required:
+            raise SnapshotError(
+                f"refusing to snapshot: {free} bytes free under '{snapshots_dir}', need >= "
+                f"{required} bytes ({free_space_multiplier}x the live chat.db's {live_size} bytes)"
+            )
+        return SnapshotResult(
+            path=snapshots_dir / SNAPSHOT_FILENAME,
+            sha256=sha256_file(source_path),
+            byte_size=live_size,
+            reused_existing=False,
+            dry_run=True,
+        )
+
     snapshots_dir.mkdir(parents=True, exist_ok=True)
 
-    live_size = source_path.stat().st_size
     free = _free_space_bytes(snapshots_dir)
     required = int(live_size * free_space_multiplier)
     if free < required:

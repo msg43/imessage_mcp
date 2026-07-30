@@ -190,6 +190,61 @@ def test_run_extract_basic_dm_message(pg_conn: psycopg.Connection, tmp_path: Pat
         assert row[0] == "1"
 
 
+def test_run_extract_dry_run_writes_nothing(pg_conn: psycopg.Connection, tmp_path: Path) -> None:
+    builder = ChatDbBuilder()
+    chat = builder.add_chat(FixtureChat(guid="chat-1", style=45))
+    handle = builder.add_handle(FixtureHandle(raw_value="+15551234567"))
+    builder.link_participant(chat.guid, handle.raw_value)
+    builder.add_message(
+        FixtureMessage(guid="msg-1", chat_guid=chat.guid, handle_raw_value=handle.raw_value)
+    )
+    snapshot_path = builder.build(tmp_path / "snapshot.db")
+
+    def fake_run(binary_path: Path, snap: Path, since_rowid: int) -> ImsgDumpRun:
+        return ImsgDumpRun(messages=(_dump_message(guid="msg-1", rowid=1),), stderr_lines=())
+
+    result = run_extract(
+        conn=pg_conn,
+        source_name="mini",
+        snapshot_path=snapshot_path,
+        imsg_dump_binary=_fake_binary(tmp_path),
+        run_imsg_dump_fn=fake_run,
+        dry_run=True,
+    )
+
+    # The preview reports exactly what a real run would have done...
+    assert result.dry_run is True
+    assert result.messages_upserted == 1
+    assert result.chats_upserted == 1
+    assert result.watermark_before == 0
+    assert result.watermark_after == 1
+
+    # ...but nothing was actually committed to Postgres.
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM message")
+        assert cur.fetchone() == (0,)
+        cur.execute("SELECT count(*) FROM chat")
+        assert cur.fetchone() == (0,)
+        cur.execute("SELECT count(*) FROM extraction_run")
+        assert cur.fetchone() == (0,)
+        cur.execute("SELECT count(*) FROM sync_state WHERE key = 'watermark.rowid.mini'")
+        assert cur.fetchone() == (0,)
+
+    # A real run afterward is unaffected by the rolled-back preview.
+    real_result = run_extract(
+        conn=pg_conn,
+        source_name="mini",
+        snapshot_path=snapshot_path,
+        imsg_dump_binary=_fake_binary(tmp_path),
+        run_imsg_dump_fn=fake_run,
+    )
+    assert real_result.dry_run is False
+    assert real_result.messages_upserted == 1
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM message")
+        assert cur.fetchone() == (1,)
+
+
 def test_run_extract_is_idempotent(pg_conn: psycopg.Connection, tmp_path: Path) -> None:
     builder = ChatDbBuilder()
     chat = builder.add_chat(FixtureChat(guid="chat-1"))

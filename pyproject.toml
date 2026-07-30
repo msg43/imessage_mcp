@@ -17,6 +17,9 @@ dependencies = [
     "pyobjc-framework-Contacts>=10",
     "mcp>=2.0.0",
     "jsonschema>=4.26.0",
+    "google-cloud-storage>=2",
+    "google-cloud-discoveryengine>=0.13",
+    "google-auth>=2",
 ]
 
 [project.optional-dependencies]
@@ -77,3 +80,12 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[[tool.mypy.overrides]]
+# google-cloud-storage ships no py.typed marker (verified 2026-07-30) —
+# same untyped-third-party situation as the phonenumbers/Contacts
+# overrides above (imsg.export.gcp_transport, SPEC §11.1, Phase 7 —
+# real GCS+Discovery Engine export transport, unverified against the
+# live API in this build).
+module = ["google.cloud.storage", "google.cloud.storage.*"]
+ignore_missing_imports = true

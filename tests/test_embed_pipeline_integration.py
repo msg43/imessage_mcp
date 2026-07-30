@@ -241,6 +241,54 @@ def test_batching_embeds_more_segments_than_one_batch(
     assert count == 10
 
 
+class _NeverCallMeTextProvider:
+    """Wraps `FakeTextEmbeddingProvider` but fails the test if
+    `embed_documents` is ever called — proves `run_embed(dry_run=True)`
+    genuinely never invokes the provider (SPEC §8: avoid wasted compute
+    on a preview), not just that it skips writing the result."""
+
+    model_id = "never-call-me/text"
+
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        raise AssertionError("embed_documents must not be called in dry-run mode")
+
+    def embed_query(self, text: str, *, instruction: str) -> list[float]:
+        raise AssertionError("embed_query must not be called in dry-run mode")
+
+
+def test_run_embed_dry_run_writes_nothing_and_never_calls_the_provider(
+    scratch_db: psycopg.Connection,
+) -> None:
+    chat_id, session_id = _insert_chat_and_session(scratch_db)
+    _insert_segment(scratch_db, chat_id=chat_id, session_id=session_id, rendered_text="hello world")
+    _insert_attachment_and_chunk(scratch_db, text="chunk text")
+
+    spy_provider = _NeverCallMeTextProvider(dim=constants.PRIMARY_EMBEDDING_DIM)
+    report = run_embed(scratch_db, spy_provider, dry_run=True)
+
+    assert report.dry_run is True
+    assert report.segments_embedded == 1
+    assert report.chunks_embedded == 1
+
+    with scratch_db.cursor() as cur:
+        cur.execute("SELECT count(*) FROM segment_embedding")
+        assert cur.fetchone() == (0,)
+        cur.execute("SELECT count(*) FROM attachment_chunk_embedding")
+        assert cur.fetchone() == (0,)
+
+    # A real run afterward embeds normally.
+    real_provider = FakeTextEmbeddingProvider(dim=constants.PRIMARY_EMBEDDING_DIM)
+    real_report = run_embed(scratch_db, real_provider)
+    assert real_report.dry_run is False
+    assert real_report.segments_embedded == 1
+    with scratch_db.cursor() as cur:
+        cur.execute("SELECT count(*) FROM segment_embedding")
+        assert cur.fetchone() == (1,)
+
+
 def test_wrong_dimension_provider_raises(scratch_db: psycopg.Connection) -> None:
     chat_id, session_id = _insert_chat_and_session(scratch_db)
     _insert_segment(scratch_db, chat_id=chat_id, session_id=session_id, rendered_text="hello")

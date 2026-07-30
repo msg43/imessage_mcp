@@ -137,6 +137,47 @@ def test_run_backfill_materializes_real_files(
     assert cache_path.endswith(f"{sha[:2]}/{sha}")
 
 
+def test_run_backfill_dry_run_writes_nothing(
+    scratch_db: psycopg.Connection, tmp_path: Path, no_sleep_throttle: RateThrottle
+) -> None:
+    attachments_root = tmp_path / "Attachments"
+    attachments_root.mkdir()
+    data_root = tmp_path / "data_root"
+
+    f1 = attachments_root / "a" / "photo.jpg"
+    f1.parent.mkdir(parents=True)
+    f1.write_bytes(b"fake jpeg bytes")
+    att_id = _insert_attachment(scratch_db, source_path=str(f1))
+
+    report = run_backfill(
+        scratch_db,
+        data_root,
+        attachments_root,
+        yes_full_run=True,
+        throttle=no_sleep_throttle,
+        dry_run=True,
+    )
+
+    assert report.dry_run is True
+    assert report.considered == 1
+    assert report.detected_already_local == 1
+    # Outcome can't be known without attempting it — always 0 in dry-run.
+    assert report.materialized == 0
+    assert report.errored == 0
+    assert report.marked_missing == 0
+
+    # Nothing was actually written: state untouched, no file copied.
+    assert _fetch_state(scratch_db, att_id) == "dataless"
+    assert not (data_root / "attachments").exists()
+
+    # A real run afterward materializes it normally.
+    real_report = run_backfill(
+        scratch_db, data_root, attachments_root, yes_full_run=True, throttle=no_sleep_throttle
+    )
+    assert real_report.materialized == 1
+    assert _fetch_state(scratch_db, att_id) == "materialized"
+
+
 def test_trial_gate_caps_first_run_at_default_limit(
     scratch_db: psycopg.Connection, tmp_path: Path, no_sleep_throttle: RateThrottle
 ) -> None:

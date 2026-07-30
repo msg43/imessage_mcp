@@ -159,3 +159,11 @@ class IdentityError(ImsgError):
 class SyncError(ImsgError):
     """S7 incremental sync failed outside the normal error handling of
     the stages it orchestrates (SPEC §8 S7)."""
+
+
+class AgentInstallError(ImsgError):
+    """`imsg install-agents` (SPEC §5.5) could not render/install the
+    LaunchAgent plists — e.g. a required raw binary (`postgres`,
+    `cloudflared`) is not on `PATH` and was not supplied explicitly.
+    Deliberately does not guess a hardcoded fallback path for a missing
+    binary; the caller must install it or point at it explicitly."""
