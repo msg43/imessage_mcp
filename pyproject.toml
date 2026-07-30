@@ -15,10 +15,12 @@ dependencies = [
     "phonenumbers>=8.13",
     "apsw>=3.45",
     "pyobjc-framework-Contacts>=10",
+    "mcp>=2.0.0",
+    "jsonschema>=4.26.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6", "mypy>=1.11", "types-PyYAML"]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6", "mypy>=1.11", "types-PyYAML", "types-jsonschema"]
 
 [project.scripts]
 imsg = "imsg.cli:app"

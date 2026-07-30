@@ -71,6 +71,21 @@ def _format_message(message: MessageForSegmentation, *, tz: ZoneInfo, snippet_ch
     return f"[{local_time:%H:%M}] {message.sender_short_name}: {body}"
 
 
+def render_message_line(
+    message: MessageForSegmentation, *, timezone: str, attachment_snippet_chars: int
+) -> str:
+    """Public one-message wrapper around the same per-message rendering
+    `render_segment` uses internally (SPEC §9.1's `[HH:MM] sender: ...`
+    line shape) — reused by `imsg.retrieval` for `get_conversation`
+    (§10.2), which returns a message-granular window rather than a
+    whole rendered segment. Keeping exactly one implementation of the
+    per-message line format means a segment's rendered text and a
+    `get_conversation` window can never drift out of sync with each
+    other."""
+    tz = ZoneInfo(timezone)
+    return _format_message(message, tz=tz, snippet_chars=attachment_snippet_chars)
+
+
 def render_segment(
     draft: SegmentDraft,
     *,
@@ -117,4 +132,4 @@ def render_segment(
     return "\n".join(lines)
 
 
-__all__ = ["RENDERER_VERSION", "render_segment"]
+__all__ = ["RENDERER_VERSION", "render_message_line", "render_segment"]

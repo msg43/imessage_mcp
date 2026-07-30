@@ -65,6 +65,21 @@ class MultimodalEmbeddingProvider(Protocol):
         """One L2-normalized vector per input image path, same order."""
         ...
 
+    def embed_text(self, text: str) -> list[float]:
+        """Embed free text into the same visual embedding space, via the
+        model's paired text tower (PE-Core-G14-448 is 1.88B vision +
+        0.47B text params, D3a) — a CLIP-style dual encoder, not the
+        instruction-asymmetric scheme `TextEmbeddingProvider.embed_query`
+        uses, so no instruction prefix here.
+
+        Retrieval-service concern (SPEC §9.4/§9.5 channel C): the only
+        caller is query-time text-to-image search via `search_messages`
+        — "text-to-image retrieval remains available through
+        search_messages" (§10.2). Included on this Protocol, not a
+        separate one, because it is the same model/weights as
+        `embed_images`, just the other tower."""
+        ...
+
 
 def _deterministic_vector(seed: str, dim: int) -> list[float]:
     """A deterministic, seed-derived unit vector of length `dim`. Not
@@ -113,6 +128,9 @@ class FakeMultimodalEmbeddingProvider:
 
     def embed_images(self, image_paths: list[Path]) -> list[list[float]]:
         return [_deterministic_vector(f"img:{p}", self.dim) for p in image_paths]
+
+    def embed_text(self, text: str) -> list[float]:
+        return _deterministic_vector(f"txt:{text}", self.dim)
 
 
 __all__ = [
