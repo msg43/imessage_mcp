@@ -10,6 +10,43 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-07-30 — Published: this repo is now public at `msg43/imessage_mcp`
+
+- **Made public.** The repo was built public-safe by construction from
+  its first commit, so publishing required no history rewrite and no
+  cleaned-snapshot re-initialization — which is the whole reason it was
+  built as a separate repo rather than carved out of the design record
+  later.
+- **README rewritten.** The previous one was written at foundation time
+  and had gone stale in the way most likely to mislead: it claimed the
+  pipeline stages "exit with a not-implemented-yet error", which
+  stopped being true five commits earlier. The rewrite leads with what
+  a stranger would otherwise discover the hard way — this has never run
+  against a real corpus, and it ships deterministic fake model
+  providers, so running the pipeline reports success at every stage
+  while producing meaningless results.
+- Test counts stated as 639 passing plus 197 integration tests that
+  skip without a live database. An earlier draft said "836 passing",
+  true only with PostgreSQL running — a cloner would have seen 197
+  skips and reasonably concluded the setup was broken.
+- The README also carries the traps this build hit, since they cost
+  real time and are not discoverable from the code: pgvector's index
+  caps sitting below its type limits, why audience and subject
+  validation are not redundant, migration immutability,
+  trigger-enforced `updated_at`, overfetch-not-post-filter, and
+  normalization parity.
+- **`LICENSE` (MIT) and `NOTICE` added, deliberately as two files.**
+  GitHub's detector reported `NOASSERTION` while the GPL note was
+  appended to `LICENSE` — licensee matches the whole file against known
+  texts, so trailing prose defeats detection and costs the repo its
+  machine-readable license metadata. `LICENSE` is now the canonical MIT
+  text alone; `NOTICE` carries why the GPL parser is not optional, why
+  the subprocess boundary is shaped as it is, and what changes if
+  someone vendors it differently.
+- **Adopted the doc-lifecycle protocol** (this file, `GAMEPLAN.md`, a
+  `CLAUDE.md`, and a warn-only pre-commit nudge). The repo had been
+  `git init`'d as a build target without it.
+
 ## 2026-07-30 — Consolidation: migration 0003
 
 - **`updated_at` is now enforced by the database, not by convention.**

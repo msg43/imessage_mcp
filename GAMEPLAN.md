@@ -11,10 +11,13 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
-**Code complete, unrun.** Every buildable component of the governing
-spec is implemented: 8 pipeline stages, hybrid retrieval, both MCP
-surfaces, the export gate, the eval harness, 18 CLI commands, migrations
-0001–0003. 836 tests; ruff and mypy strict clean; DDL lint clean.
+**Code complete, unrun — and now public** at
+[`msg43/imessage_mcp`](https://github.com/msg43/imessage_mcp) (MIT).
+Every buildable component of the governing spec is implemented: 8
+pipeline stages, hybrid retrieval, both MCP surfaces, the export gate,
+the eval harness, 18 CLI commands, migrations 0001–0003. 836 tests (639
+without a database, 197 integration tests that skip without one); ruff
+and mypy strict clean; DDL lint clean.
 
 Nothing has executed against a real corpus. The pipeline runs end to end
 on **deterministic fake model providers** (marked `PLACEHOLDER`), which
