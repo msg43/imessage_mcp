@@ -1,0 +1,46 @@
+imessage-index
+Copyright (c) 2026 msg43
+
+This product is licensed under the MIT License. See LICENSE.
+
+================================================================================
+GPL-3.0 COMPONENT — tools/imsg-dump/
+================================================================================
+
+`tools/imsg-dump/` is NOT covered by the MIT license above. It is licensed
+under GPL-3.0 and carries its own LICENSE file in that directory.
+
+WHY IT EXISTS
+
+It links the GPL-licensed `imessage-database` crate to parse Apple's
+`attributedBody` typedstream format. That parser is not optional: since macOS
+Big Sur, much of a message's text is not stored in the `text` column at all,
+and readers that only query that column silently return empty strings for
+large portions of modern message history. Getting this wrong produces a system
+that appears to work while missing much of its corpus.
+
+WHY THE BOUNDARY IS SHAPED THIS WAY
+
+`imsg-dump` is invoked strictly as a SUBPROCESS. It is never linked, imported,
+or otherwise combined into the Python code under `src/`. Communication is via
+process invocation and structured output on stdout.
+
+That process boundary is deliberate and load-bearing: it is what allows the
+core to remain MIT-licensed while the GPL parser does the typedstream work.
+
+IF YOU CHANGE HOW IT IS INVOKED
+
+Vendoring `imsg-dump` into the core, linking the `imessage-database` crate
+directly, or otherwise combining the two beyond a process boundary changes the
+licensing analysis. That is yours to reason about — the arrangement here was
+chosen specifically to avoid that question, and it only holds while the
+boundary does.
+
+================================================================================
+THIRD-PARTY DEPENDENCIES
+================================================================================
+
+Python and Rust dependencies are declared in `pyproject.toml`,
+`tools/imsg-dump/Cargo.toml`, and their respective lockfiles, and retain their
+own licenses. Nothing in this repository redistributes them; they are resolved
+at install time.

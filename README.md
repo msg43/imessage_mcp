@@ -222,13 +222,15 @@ and skip cleanly when it isn't; the unit suite never needs a database.
 
 ## Licensing
 
-The core is **MIT** — see [`LICENSE`](LICENSE).
+The core is **MIT** — see [`LICENSE`](LICENSE). Component licensing and
+the reasoning behind the split are in [`NOTICE`](NOTICE).
 
-`tools/imsg-dump/` is **GPL-3.0** and carries its own `LICENSE`. It
-links the GPL `imessage-database` crate to parse the `attributedBody`
-typedstream format, which is not optional: since Big Sur much of a
-message's text is not in the `text` column at all, and naive readers
-silently return empty strings for large portions of modern history.
+In short: `tools/imsg-dump/` is **GPL-3.0** and carries its own
+`LICENSE`. It links the GPL `imessage-database` crate to parse the
+`attributedBody` typedstream format, which is not optional — since Big
+Sur much of a message's text is not in the `text` column at all, and
+readers that only query that column silently return empty strings for
+large portions of modern history.
 
 **It is invoked strictly across a process boundary** — spawned as a
 subprocess, never linked into the Python code. That boundary is

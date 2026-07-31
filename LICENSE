@@ -19,17 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-NOTE ON THE GPL COMPONENT
-
-`tools/imsg-dump/` is NOT covered by this license. It is licensed under
-GPL-3.0 and carries its own LICENSE file in that directory, because it links
-the GPL-licensed `imessage-database` crate.
-
-It is invoked strictly as a subprocess and is never linked into the Python
-code in `src/`. That process boundary is deliberate: it is what keeps the
-core MIT-licensed while allowing the GPL parser to do the typedstream work
-that nothing else does correctly. If you change how it is invoked or vendor
-it into the core, re-examine the licensing consequences.
