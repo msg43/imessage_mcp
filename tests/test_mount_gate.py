@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from imsg.errors import MountGateError
 from imsg.mount.guard import (
     EX_CONFIG,
     MountInfo,
+    containing_mount_point,
     guard_mount,
     run_guard_mount_or_exit,
 )
@@ -104,3 +106,36 @@ def test_run_guard_mount_or_exit_exits_78_and_logs_content_free(
     # reason and a timestamp. We can at least assert it stays a single line
     # per failure and never embeds anything resembling message content.
     assert content.count("\n") == 1
+
+
+# --------------------------------------------------------------------------
+# containing_mount_point — regression, 2026-08-12
+#
+# `real_diskutil_info` had no test at all: every test above injects a fake
+# `diskutil_info`, so the one line that actually shells out to `diskutil`
+# was never exercised. It passed `data_root` straight to
+# `diskutil info`, which accepts a device or a *mount point* and exits 1
+# for any path inside a volume — and `data_root` is always inside one
+# (`/Volumes/Data-Encrypted/imsgindex`). The gate therefore failed on
+# every real deployment while 836 tests stayed green.
+# --------------------------------------------------------------------------
+
+
+def test_containing_mount_point_walks_a_subdirectory_up_to_its_mount_point() -> None:
+    # "/" is always a mount point, so any path under it must resolve to a
+    # real mount point rather than to the path itself.
+    deep = Path("/usr/share/dict")
+    mp = containing_mount_point(deep)
+    assert mp != deep
+    assert os.path.ismount(mp)
+
+
+def test_containing_mount_point_is_identity_on_a_mount_point() -> None:
+    assert containing_mount_point(Path("/")) == Path("/")
+
+
+def test_containing_mount_point_terminates_on_a_nonexistent_path() -> None:
+    # Must not loop forever when nothing along the chain is a mount point
+    # until "/" — the loop's `p != p.parent` guard is what stops it.
+    mp = containing_mount_point(Path("/nonexistent-abc/def/ghi"))
+    assert os.path.ismount(mp)

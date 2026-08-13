@@ -16,6 +16,7 @@ write (SPEC §5.4).
 
 from __future__ import annotations
 
+import os
 import plistlib
 import subprocess
 import sys
@@ -46,6 +47,21 @@ class MountInfo:
 DiskutilInfoFn = Callable[[Path], MountInfo]
 
 
+def containing_mount_point(path: Path) -> Path:
+    """Walk `path` up to the mount point of the volume containing it.
+
+    `diskutil info` accepts a device node or a **mount point** — never
+    an arbitrary path inside a volume. `data_root` is always inside one
+    (`/Volumes/Data-Encrypted/imsgindex`, per SPEC §6 and the
+    implementation guide §0.6), so passing it to `diskutil` directly
+    fails with exit 1 on every valid deployment.
+    """
+    p = path
+    while p != p.parent and not os.path.ismount(p):
+        p = p.parent
+    return p
+
+
 def real_diskutil_info(path: Path) -> MountInfo:
     """Query `diskutil info -plist` for the volume containing `path`.
 
@@ -56,7 +72,7 @@ def real_diskutil_info(path: Path) -> MountInfo:
     """
     try:
         proc = subprocess.run(
-            ["diskutil", "info", "-plist", str(path)],
+            ["diskutil", "info", "-plist", str(containing_mount_point(path))],
             capture_output=True,
             check=False,
         )

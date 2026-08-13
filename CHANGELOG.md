@@ -10,6 +10,43 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-08-12 — first run against real infrastructure; the mount gate never worked
+
+The code had never been run against a real Postgres instance or a real
+encrypted volume (836 tests, zero real deployments). Standing it up on
+the Mac Studio for the Track C build surfaced two defects immediately —
+both invisible to the test suite, both in the code↔system boundary.
+
+- **`real_diskutil_info` passed `data_root` straight to
+  `diskutil info`**, which accepts a device node or a *mount point* and
+  exits 1 for any path inside a volume. `data_root` is *always* inside
+  one (`/Volumes/Data-Encrypted/imsgindex`), so `guard_mount` failed on
+  every valid deployment — including the mini's. Fixed by walking up to
+  the containing mount point first (`containing_mount_point`), which is
+  what the docstring already claimed the function did.
+  **Why 836 tests missed it:** every existing mount test injects a fake
+  `diskutil_info`; the one line that actually shells out had *no test at
+  all*. Three regression tests added.
+- **`verify_data_directory` does `Path(str(row[0]))`, which corrupts
+  `bytes`.** Under a `SQL_ASCII` cluster psycopg3 returns `bytes`, so
+  `str()` yields the literal `"b'/Volumes/…'"` — a *relative* path,
+  silently resolved against the process CWD. The fingerprint check then
+  refused the correct cluster. Root cause is upstream and is a
+  documentation defect, not a code one: the implementation guide's
+  mandatory `export LC_ALL=C` (its rule #1, which exists to stop the
+  "postmaster became multithreaded" crash) makes `initdb` create a
+  **SQL_ASCII** cluster. Fixed at the root — the cluster is now
+  `initdb --encoding=UTF8 --locale=C` (C locale keeps the crash fix;
+  UTF8 fixes the encoding).
+  ⚠️ **The bytes hazard is a class, not one site:** 11 call sites do
+  `str(row[...])` over fetched text, including `verify/seed.py:82`
+  (the AT-2 GUID sets — the seed-completeness gate) and
+  `export/review.py:258` (the manifest SHA on the export gate). Under
+  SQL_ASCII those corrupt *silently*. Left unpatched deliberately: the
+  UTF8 cluster makes the whole class unrepresentable, which is the
+  structural fix. A connect-time assertion that `server_encoding` is
+  UTF8 is the belt-and-braces follow-up and is **not yet written**.
+
 ## 2026-07-30 — Published: this repo is now public at `msg43/imessage_mcp`
 
 - **Made public.** The repo was built public-safe by construction from
