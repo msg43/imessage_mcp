@@ -77,7 +77,7 @@ visibility in retrieval ever matters.
 from __future__ import annotations
 
 import plistlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -91,7 +91,7 @@ from imsg.errors import ExtractionError
 from imsg.hashing import sha256_file
 from imsg.keys import attachment_key, message_key, thread_key
 from imsg.stages.imsg_dump import ImsgDumpMessage, ImsgDumpRun, run_imsg_dump
-from imsg.textnorm import normalize_text
+from imsg.textnorm import normalize_text, strip_nul
 
 logger = structlog.get_logger(__name__)
 
@@ -116,6 +116,23 @@ CHAT_STYLE_GROUP = 43
 CHAT_STYLE_DM = 45
 
 _KNOWN_SERVICES = {"imessage": "imessage", "sms": "sms", "rcs": "rcs"}
+
+# SQLite caps host parameters per statement (SQLITE_MAX_VARIABLE_NUMBER:
+# 999 on builds before 3.32, 32766 after). Any `IN (...)` whose
+# placeholder count is sized by caller data will therefore fail on a real
+# corpus — a full extract passes every target message rowid at once, so
+# this is not an edge case but the normal path. 900 sits under the
+# conservative floor and costs nothing: these are indexed lookups.
+#
+# INVARIANT: never build a placeholder list directly from a caller-sized
+# sequence. Route it through `_sql_var_chunks` and accumulate.
+_SQL_VAR_CHUNK = 900
+
+
+def _sql_var_chunks(values: Sequence[int], size: int = _SQL_VAR_CHUNK) -> Iterator[list[int]]:
+    """Yield `values` in chunks that fit SQLite's host-parameter limit."""
+    for start in range(0, len(values), size):
+        yield list(values[start : start + size])
 
 
 def _normalize_service(raw: str | None) -> str:
@@ -299,14 +316,21 @@ class SnapshotReader:
         — flagged as an assumption)."""
         if not message_rowids:
             return [], {}
-        placeholders = ",".join("?" for _ in message_rowids)
-        joins = list(
-            self._conn.execute(
-                f"SELECT message_id, attachment_id FROM message_attachment_join "
-                f"WHERE message_id IN ({placeholders}) ORDER BY message_id, attachment_id",
-                message_rowids,
+        joins: list[tuple[int, int]] = []
+        for chunk in _sql_var_chunks(message_rowids):
+            placeholders = ",".join("?" for _ in chunk)
+            joins.extend(
+                self._conn.execute(
+                    f"SELECT message_id, attachment_id FROM message_attachment_join "
+                    f"WHERE message_id IN ({placeholders})",
+                    chunk,
+                )
             )
-        )
+        # Ordering is applied here rather than per-chunk: an ORDER BY inside
+        # each chunk only sorts that chunk, so the concatenation would not be
+        # globally ordered. This preserves the documented contract.
+        joins.sort(key=lambda r: (r[0], r[1]))
+
         by_message: dict[int, list[int]] = {}
         attachment_ids: list[int] = []
         for message_id, attachment_id in joins:
@@ -316,15 +340,17 @@ class SnapshotReader:
         if not attachment_ids:
             return [], by_message
 
-        att_placeholders = ",".join("?" for _ in attachment_ids)
-        rows = list(
-            self._conn.execute(
-                f"SELECT ROWID, guid, filename, transfer_name, uti, mime_type, "
-                f"total_bytes, COALESCE(is_sticker, 0) FROM attachment "
-                f"WHERE ROWID IN ({att_placeholders})",
-                attachment_ids,
+        rows: list[tuple[Any, ...]] = []
+        for chunk in _sql_var_chunks(attachment_ids):
+            att_placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                self._conn.execute(
+                    f"SELECT ROWID, guid, filename, transfer_name, uti, mime_type, "
+                    f"total_bytes, COALESCE(is_sticker, 0) FROM attachment "
+                    f"WHERE ROWID IN ({att_placeholders})",
+                    chunk,
+                )
             )
-        )
         attachments = [
             AttachmentRow(
                 rowid=r[0],
@@ -959,6 +985,11 @@ def _upsert_message(
         sender_source_handle_id = handle_id_by_rowid.get(msg.handle_rowid)
 
     body_text = dump_msg.body_text if dump_msg is not None else None
+    if body_text is not None:
+        # Strip NUL before it reaches ANY text column, including the verbatim
+        # `text_original` — psycopg rejects the whole statement otherwise
+        # (see textnorm.strip_nul). Real chat.db bodies contain NUL.
+        body_text = strip_nul(body_text)
     text_for_index = None
     if body_text is not None:
         text_for_index = normalize_text(body_text.replace(OBJECT_REPLACEMENT_CHAR, ""))
@@ -1049,7 +1080,7 @@ def _upsert_message_version(
         ON CONFLICT (message_id, version_idx) DO UPDATE SET
             text = EXCLUDED.text, edited_at = EXCLUDED.edited_at
         """,
-        (message_id, version_idx, version.text or "", edited_at),
+        (message_id, version_idx, strip_nul(version.text or ""), edited_at),
     )
 
 

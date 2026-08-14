@@ -43,13 +43,34 @@ _VARIATION_SELECTOR_HIGH = 0xFE0F
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
+_NUL = "\x00"
+
+
+def strip_nul(text: str) -> str:
+    """Remove NUL (U+0000), which PostgreSQL `text` columns cannot store.
+
+    This is a **storage-representability** strip, not a normalization
+    choice, so it applies to the verbatim `text_original` copy too — the
+    module docstring's "kept verbatim" promise is bounded by what the
+    column can physically hold, and psycopg raises
+    `DataError: PostgreSQL text fields cannot contain NUL (0x00) bytes`
+    rather than truncating. Real `chat.db` bodies do contain NUL: hit on
+    the first full extract of a 690k-message corpus (Studio, 2026-08-12).
+
+    NUL carries no textual meaning here — it is a C-string terminator
+    artifact of the typedstream decode — so removing it loses nothing a
+    reader or an FTS index would want.
+    """
+    return text.replace(_NUL, "")
+
+
 def normalize_text(text: str) -> str:
     """Return the normalized, FTS/embedding-ready copy of `text`.
 
     Deterministic and pure — safe to call repeatedly (idempotent:
     `normalize_text(normalize_text(x)) == normalize_text(x)`).
     """
-    folded = unicodedata.normalize("NFC", text)
+    folded = unicodedata.normalize("NFC", strip_nul(text))
     folded = "".join(_CURLY_TO_ASCII.get(ch, ch) for ch in folded)
     folded = "".join(
         ch
@@ -59,4 +80,4 @@ def normalize_text(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", folded).strip()
 
 
-__all__ = ["normalize_text"]
+__all__ = ["normalize_text", "strip_nul"]
