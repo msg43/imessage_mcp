@@ -493,6 +493,26 @@ def _identity_import(cfg: Config, dry_run: bool) -> None:
         f"identity: persons_created={result.persons_created} "
         f"handles_created={result.handles_created} invariant_ok={result.invariant.ok}"
     )
+    # Always report the Contacts outcome, not only on degrade.
+    #
+    # `contacts_loaded` was computed and discarded before 2026-08-15, so a run
+    # that reached Contacts successfully and matched NOTHING was indistinguishable
+    # from a healthy one: the summary line looked identical either way. That is
+    # exactly what happened on the first real run — 10,725 stubs, one named
+    # person (the owner), and no signal at all that anything was wrong.
+    # A zero here is the single number that separates "Contacts returned nothing"
+    # from "returned plenty and none of it matched", which are different bugs.
+    typer.echo(
+        f"identity: contacts attempted={result.contacts.attempted} "
+        f"loaded={result.contacts.contacts_loaded}"
+    )
+    if result.contacts.attempted and result.contacts.contacts_loaded == 0 and not result.contacts.degraded:
+        typer.echo(
+            "identity: WARNING Contacts access succeeded but returned 0 records — "
+            "every handle will become an unnamed review stub. Check that the "
+            "account holding your contacts has Contacts enabled and has synced.",
+            err=True,
+        )
     if result.contacts.degraded:
         typer.echo(
             f"identity: WARNING contacts import degraded: {result.contacts.degraded_reason}",
