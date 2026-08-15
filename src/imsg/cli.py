@@ -75,7 +75,13 @@ from imsg.retrieval.service import RetrievalService
 from imsg.segment.boundaries import FakeBoundaryProvider
 from imsg.segment.pipeline import REBUILD_ALL_SENTINEL, run_segment, run_segment_for_chat
 from imsg.stages.extract import run_extract
-from imsg.stages.identity import run_identity
+from imsg.stages.identity import (
+    assign_handle,
+    compute_invariant_report,
+    merge_persons,
+    rename_person,
+    run_identity,
+)
 from imsg.stages.imsg_dump import default_binary_path
 from imsg.stages.snapshot import SNAPSHOT_FILENAME, SNAPSHOT_SUBDIR, run_snapshot
 from imsg.stages.sync import EmbedFn, SegmentFn, run_sync_all_sources
@@ -159,6 +165,28 @@ def _connect_and_verify_or_die(cfg: Config) -> psycopg.Connection:
         conn.close()
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
+
+    # Close the implicit transaction the fingerprint check just opened.
+    #
+    # `connect()` is autocommit=False, and `verify_data_directory` issues a
+    # `SHOW data_directory` — so by the time any stage runs, a transaction is
+    # already open. Every `with conn.transaction():` in the stages below then
+    # nests inside it as a SAVEPOINT instead of a top-level transaction, and
+    # because no command here calls `conn.commit()`, the `finally: conn.close()`
+    # in each command discarded ALL of its writes while reporting success and
+    # exiting 0.
+    #
+    # Measured 2026-08-14: a full `extract` reported messages_upserted=655494
+    # and left n_tup_ins=1511805 / n_live_tup=0 / n_tup_del=0 — inserted, then
+    # rolled back. `migrate` was unaffected only because `fingerprint.py`
+    # commits explicitly, which made the database look healthy throughout.
+    #
+    # This is the chokepoint for the whole class: every command that reaches
+    # Postgres through this helper (identity, segment, embed, sync, enrich,
+    # backfill-attachments, export, verify-seed, reconcile-attachments) had
+    # the same defect. Fixing it here rather than per-stage is what keeps a
+    # future stage from silently inheriting it.
+    conn.rollback()
     return conn
 
 
@@ -440,12 +468,18 @@ def extract(
         typer.echo(DRY_RUN_MARKER)
 
 
-@app.command()
-def identity(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
-    """S3 — resolve handles to person_id via Contacts + manual curation (SPEC §8 S3)."""
-    cfg = _load_config_or_die(config)
-    run_guard_mount_or_exit(cfg.paths.data_root)
+identity_app = typer.Typer(
+    name="identity",
+    help="S3 — resolve handles to person_id, then curate them (SPEC §8 S3).",
+)
+app.add_typer(identity_app, name="identity")
 
+
+def _identity_import(cfg: Config, dry_run: bool) -> None:
+    """The S3 resolve pass. Shared by `identity` and `identity import` so the
+    bare form keeps working — it was the only form that existed before the
+    curation subcommands landed."""
+    run_guard_mount_or_exit(cfg.paths.data_root)
     conn = _connect_and_verify_or_die(cfg)
     try:
         result = run_identity(conn=conn, config=cfg, dry_run=dry_run)
@@ -472,6 +506,146 @@ def identity(config: ConfigOption = None, dry_run: DryRunOption = False) -> None
         )
     if dry_run:
         typer.echo(DRY_RUN_MARKER)
+
+
+@identity_app.callback(invoke_without_command=True)
+def identity(
+    ctx: typer.Context,
+    config: ConfigOption = None,
+    dry_run: DryRunOption = False,
+) -> None:
+    """S3 — resolve handles to person_id via Contacts + manual curation (SPEC §8 S3)."""
+    if ctx.invoked_subcommand is not None:
+        return
+    _identity_import(_load_config_or_die(config), dry_run)
+
+
+@identity_app.command("import")
+def identity_import(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
+    """Resolve every source handle to a person_id (Contacts + review stubs)."""
+    _identity_import(_load_config_or_die(config), dry_run)
+
+
+@identity_app.command("review-report")
+def identity_review_report(
+    config: ConfigOption = None,
+    limit: Annotated[int, typer.Option(help="How many persons to list.")] = 40,
+    all_persons: Annotated[
+        bool, typer.Option("--all", help="Include persons already reviewed, not just needs_review.")
+    ] = False,
+) -> None:
+    """The curation worklist — persons ranked by message volume (SPEC §8 S3).
+
+    Ordered by messages descending on purpose: the value of this review is
+    concentrated in your top correspondents, and a long tail of one-message
+    strangers never needs a name.
+    """
+    cfg = _load_config_or_die(config)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        report = compute_invariant_report(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT p.person_id, p.display_name, p.needs_review,
+                       count(DISTINCT h.handle_id) AS handles,
+                       count(m.message_id) AS messages
+                FROM person p
+                LEFT JOIN handle h ON h.person_id = p.person_id
+                LEFT JOIN message m ON m.sender_person_id = p.person_id
+                WHERE (%s OR p.needs_review)
+                GROUP BY p.person_id, p.display_name, p.needs_review
+                ORDER BY messages DESC, handles DESC, p.person_id
+                LIMIT %s
+                """,
+                (all_persons, limit),
+            )
+            rows = cur.fetchall()
+            cur.execute("SELECT count(*) FROM person WHERE needs_review")
+            pending = cur.fetchone()
+            cur.execute("SELECT count(*) FROM person")
+            total = cur.fetchone()
+    finally:
+        conn.close()
+
+    typer.echo(f"persons: {total[0] if total else 0} total, {pending[0] if pending else 0} needing review")
+    typer.echo(
+        "invariant: "
+        f"unresolved_message_senders={report.unresolved_message_senders} "
+        f"unresolved_tapback_senders={report.unresolved_tapback_senders} "
+        f"unresolved_chat_participants={report.unresolved_chat_participants} "
+        f"ok={report.ok}"
+    )
+    typer.echo("")
+    typer.echo(f"{'id':>7}  {'msgs':>8}  {'hdls':>5}  {'review':<7} name")
+    for pid, name, needs, handles, messages in rows:
+        flag = "YES" if needs else "-"
+        typer.echo(f"{pid:>7}  {messages:>8}  {handles:>5}  {flag:<7} {name}")
+
+
+@identity_app.command("merge")
+def identity_merge(
+    keep: Annotated[int, typer.Option(help="person_id to KEEP.")],
+    absorb: Annotated[int, typer.Option(help="person_id to absorb and delete.")],
+    config: ConfigOption = None,
+) -> None:
+    """Fold `absorb` into `keep` — handles, messages, tapbacks, participants."""
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        merge_persons(conn, keep_person_id=keep, absorb_person_id=absorb)
+        conn.commit()
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+    typer.echo(f"identity: merged person {absorb} into {keep}")
+
+
+@identity_app.command("rename")
+def identity_rename(
+    person: Annotated[int, typer.Option(help="person_id to rename.")],
+    name: Annotated[str, typer.Option(help="New display_name.")],
+    short: Annotated[str | None, typer.Option(help="Optional new short_name.")] = None,
+    config: ConfigOption = None,
+) -> None:
+    """Set a person's display name (and optionally short name)."""
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        rename_person(conn, person_id=person, display_name=name, short_name=short)
+        conn.commit()
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+    typer.echo(f"identity: renamed person {person} to {name!r}")
+
+
+@identity_app.command("assign")
+def identity_assign(
+    value: Annotated[str, typer.Option(help="Normalized handle value (E.164 phone or email).")],
+    kind: Annotated[str, typer.Option(help="Handle kind: 'phone' or 'email'.")],
+    person: Annotated[int, typer.Option(help="person_id to attach it to.")],
+    config: ConfigOption = None,
+) -> None:
+    """Repoint one canonical handle onto a different person."""
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        assign_handle(conn, normalized_value=value, kind=kind, person_id=person)
+        conn.commit()
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+    typer.echo(f"identity: assigned {kind} {value!r} to person {person}")
 
 
 @app.command()

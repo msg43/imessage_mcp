@@ -278,10 +278,28 @@ def test_migrate_with_bad_config_reports_config_error_not_a_traceback(tmp_path: 
 class _FakePgConn:
     """A no-op stand-in wherever `_connect_and_verify_or_die` hands back a
     connection — every stage function itself is monkeypatched in these
-    tests, so nothing here needs real query behavior."""
+    tests, so nothing here needs real query behavior.
+
+    It DOES have to model transaction control, though. This double
+    originally exposed only `close()`, so no test could observe whether a
+    command committed — which is exactly how the 2026-08-14 defect
+    survived: `extract` reported success while every write rolled back at
+    `conn.close()`. `commit`/`rollback` are recorded here so a test can
+    assert on them rather than on the absence of an exception."""
+
+    def __init__(self) -> None:
+        self.committed = 0
+        self.rolled_back = 0
+        self.closed = False
+
+    def commit(self) -> None:
+        self.committed += 1
+
+    def rollback(self) -> None:
+        self.rolled_back += 1
 
     def close(self) -> None:
-        pass
+        self.closed = True
 
 
 @pytest.fixture
@@ -1047,3 +1065,38 @@ def test_mcp_public_wires_server_and_runs_it(
     assert isinstance(captured["app"], TransportGuardASGIApp)
     assert captured["kw"]["host"] == "127.0.0.1"
     assert captured["kw"]["port"] == 8700
+
+
+# --------------------------------------------------------------------------
+# Regression, 2026-08-14 — the persistence defect.
+#
+# `connect()` is autocommit=False and `verify_data_directory` issues a
+# `SHOW`, so a transaction is open before any stage runs. Every
+# `conn.transaction()` then nested as a SAVEPOINT, and since no command
+# called `conn.commit()`, `finally: conn.close()` discarded every write
+# while the command printed its success line and exited 0. A full extract
+# reported messages_upserted=655494 and left n_live_tup=0.
+#
+# The fix is in `_connect_and_verify_or_die`; this pins it there so a
+# future refactor cannot quietly drop it again.
+# --------------------------------------------------------------------------
+
+
+def test_connect_and_verify_clears_the_implicit_read_transaction(
+    cli_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = _FakePgConn()
+    monkeypatch.setattr(cli_module, "connect", lambda database, **kw: conn)
+    monkeypatch.setattr(
+        cli_module, "verify_data_directory", lambda c, data_root: Path(str(data_root))
+    )
+    cfg = cli_module._load_config_or_die(cli_config)
+    returned = cli_module._connect_and_verify_or_die(cfg)
+
+    assert returned is conn
+    assert conn.rolled_back == 1, (
+        "the fingerprint check leaves a transaction open; without ending it, every "
+        "stage's conn.transaction() degrades to a SAVEPOINT and its writes are "
+        "discarded at close()"
+    )
+    assert not conn.closed
