@@ -340,8 +340,15 @@ class SnapshotReader:
         if not attachment_ids:
             return [], by_message
 
+        # Dedupe BEFORE chunking. `IN (...)` is a per-row predicate, so a
+        # repeated id in one list never duplicated output — but running the
+        # query once per chunk does, whenever the two references land in
+        # different chunks. The real chat.db has 98 attachments joined to more
+        # than one message, so this was over-counting `attachments_upserted`
+        # and upserting each shared attachment twice per run. Harmless to the
+        # data (both upserts are ON CONFLICT idempotent), wrong in the counts.
         rows: list[tuple[Any, ...]] = []
-        for chunk in _sql_var_chunks(attachment_ids):
+        for chunk in _sql_var_chunks(sorted(set(attachment_ids))):
             att_placeholders = ",".join("?" for _ in chunk)
             rows.extend(
                 self._conn.execute(
@@ -660,24 +667,12 @@ def run_extract(
             last_run_start = _fetch_last_successful_run_start(cur, source_name)
             snapshot_max_rowid = reader.fetch_max_message_rowid()
 
-        # Close the implicit read transaction those SELECTs opened.
-        #
-        # `conn` is autocommit=False (db.connection.connect's default), so the
-        # first execute above silently BEGINs a transaction that stays open.
-        # Every `conn.transaction()` below would then nest inside it as a
-        # SAVEPOINT rather than the "independent top-level transactions" this
-        # module documents (see `_do_extract_dry_run`) — and since no CLI
-        # command calls `conn.commit()`, `conn.close()` rolled the entire
-        # extraction back while the command reported success and exited 0.
-        #
-        # Measured 2026-08-14 on the Studio: a full real run reported
-        # `messages_upserted=655494` and left `n_tup_ins=1511805, n_live_tup=0,
-        # n_tup_del=0` — 1.5M rows inserted, none live, none deleted, and
-        # `extraction_run` empty. Rolled back, not deleted.
-        #
-        # These are reads, so discarding them costs nothing; what it buys is
-        # that the transactions below really are top-level and really commit.
-        conn.rollback()
+        # NOTE: no transaction management here on purpose. `connect()` sets
+        # autocommit=True (see db/connection.py), so the reads above leave the
+        # connection idle and each `conn.transaction()` below is a genuine
+        # top-level transaction. This function must NOT call rollback/commit
+        # itself — it does not own the connection's lifecycle, and a caller may
+        # legitimately hold state on it.
 
         if dry_run:
             return _do_extract_dry_run(

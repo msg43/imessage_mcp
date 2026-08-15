@@ -259,16 +259,32 @@ def _lookup_handle(cur: psycopg.Cursor[Any], normalized_value: str, kind: str) -
 
 
 def _create_person(
-    cur: psycopg.Cursor[Any], *, display_name: str, organization: str | None, note: str | None
+    cur: psycopg.Cursor[Any],
+    *,
+    display_name: str,
+    organization: str | None,
+    note: str | None,
+    needs_review: bool = True,
 ) -> int:
+    """`needs_review` is the review worklist's only filter, so it must
+    actually discriminate.
+
+    Before 2026-08-15 this INSERT omitted the column entirely and let it
+    fall to its `DEFAULT true`, which meant a person named confidently from
+    a unique Contacts match was flagged exactly like an unnamed stub. The
+    flag carried no signal, and `identity review-report` — whose whole job
+    is "who still needs a name" — would have listed all 10,726 persons as
+    equally unreviewed, burying the ~10,119 that genuinely need attention
+    under the 607 that do not.
+    """
     short_name = _generate_unique_short_name(cur, display_name)
     cur.execute(
         """
-        INSERT INTO person (display_name, short_name, organization, notes)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO person (display_name, short_name, organization, notes, needs_review)
+        VALUES (%s, %s, %s, %s, %s)
         RETURNING person_id
         """,
-        (display_name, short_name, organization, note),
+        (display_name, short_name, organization, note, needs_review),
     )
     row = cur.fetchone()
     assert row is not None
@@ -293,8 +309,14 @@ def _find_or_create_person(
                 existing = _lookup_handle(cur, other_value, other_kind)
                 if existing is not None:
                     return existing[1]
+            # A unique Contacts match is a confident name, not a guess —
+            # it does not belong on the review worklist.
             return _create_person(
-                cur, display_name=contact.display_name, organization=contact.organization, note=None
+                cur,
+                display_name=contact.display_name,
+                organization=contact.organization,
+                note=None,
+                needs_review=False,
             )
 
     return _create_person(
@@ -689,18 +711,36 @@ def merge_persons(conn: psycopg.Connection, *, keep_person_id: int, absorb_perso
 
 
 def rename_person(
-    conn: psycopg.Connection, *, person_id: int, display_name: str, short_name: str | None = None
+    conn: psycopg.Connection,
+    *,
+    person_id: int,
+    display_name: str,
+    short_name: str | None = None,
+    mark_reviewed: bool = True,
 ) -> None:
+    """Naming a person IS reviewing them, so this clears `needs_review`
+    by default.
+
+    Before 2026-08-15 rename left the flag set, which meant the worklist
+    could never shrink through curation: an operator who renamed their
+    top 50 correspondents saw an unchanged pending count, and the only
+    way off the list was `merge` (i.e. deletion). Pass
+    `mark_reviewed=False` to rename without clearing the flag.
+    """
     with conn.transaction(), conn.cursor() as cur:
         if short_name is not None:
             cur.execute(
-                "UPDATE person SET display_name = %s, short_name = %s, updated_at = now() WHERE person_id = %s",
-                (display_name, short_name, person_id),
+                "UPDATE person SET display_name = %s, short_name = %s, "
+                "needs_review = CASE WHEN %s THEN false ELSE needs_review END, "
+                "updated_at = now() WHERE person_id = %s",
+                (display_name, short_name, mark_reviewed, person_id),
             )
         else:
             cur.execute(
-                "UPDATE person SET display_name = %s, updated_at = now() WHERE person_id = %s",
-                (display_name, person_id),
+                "UPDATE person SET display_name = %s, "
+                "needs_review = CASE WHEN %s THEN false ELSE needs_review END, "
+                "updated_at = now() WHERE person_id = %s",
+                (display_name, mark_reviewed, person_id),
             )
         if cur.rowcount == 0:
             raise IdentityError(f"person_id {person_id} not found")
@@ -708,14 +748,68 @@ def rename_person(
 
 def assign_handle(conn: psycopg.Connection, *, normalized_value: str, kind: str, person_id: int) -> None:
     """Manual override: repoint an already-canonical handle onto a
-    different person (SPEC §8 S3 `identity assign`)."""
+    different person (SPEC §8 S3 `identity assign`).
+
+    **Repoints existing attributions too, not just the handle row.**
+    Before 2026-08-15 this updated `handle.person_id` alone. That was
+    incoherent: `message.sender_person_id` / `tapback.sender_person_id`
+    are stamped at resolve time and `run_identity` only ever backfills
+    them `WHERE sender_person_id IS NULL`, so every message already
+    attributed to the old person stayed there forever while new
+    resolutions went to the new one — silently splitting one real sender
+    across two `person_id`s, which is precisely what non-negotiable #3
+    exists to prevent. `merge_persons` always did this correctly; this
+    function did not.
+
+    The UPDATEs below deliberately omit the `IS NULL` guard the backfill
+    uses: the whole point here is to *re*-attribute rows that already
+    have a person.
+    """
     with conn.transaction(), conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM person WHERE person_id = %s", (person_id,))
+        if cur.fetchone() is None:
+            raise IdentityError(f"person_id {person_id} not found")
+
         cur.execute(
-            "UPDATE handle SET person_id = %s WHERE normalized_value = %s AND kind = %s",
-            (person_id, normalized_value, kind),
+            "SELECT handle_id FROM handle WHERE normalized_value = %s AND kind = %s",
+            (normalized_value, kind),
         )
-        if cur.rowcount == 0:
+        row = cur.fetchone()
+        if row is None:
             raise IdentityError(f"no handle found for ({normalized_value!r}, {kind!r})")
+        handle_id = int(row[0])
+
+        cur.execute("UPDATE handle SET person_id = %s WHERE handle_id = %s", (person_id, handle_id))
+
+        cur.execute(
+            """
+            UPDATE message m SET sender_person_id = %s
+            FROM source_handle_resolution shr
+            WHERE m.sender_source_handle_id = shr.source_handle_id
+              AND shr.handle_id = %s
+            """,
+            (person_id, handle_id),
+        )
+        cur.execute(
+            """
+            UPDATE tapback t SET sender_person_id = %s
+            FROM source_handle_resolution shr
+            WHERE t.sender_source_handle_id = shr.source_handle_id
+              AND shr.handle_id = %s
+            """,
+            (person_id, handle_id),
+        )
+        cur.execute(
+            """
+            INSERT INTO chat_participant (chat_id, person_id)
+            SELECT DISTINCT cps.chat_id, %s
+            FROM chat_participant_source cps
+            JOIN source_handle_resolution shr ON shr.source_handle_id = cps.source_handle_id
+            WHERE shr.handle_id = %s
+            ON CONFLICT DO NOTHING
+            """,
+            (person_id, handle_id),
+        )
 
 
 __all__ = [

@@ -3,8 +3,9 @@
 Applied to `message.text_normalized` (S2's concern, not this module's
 caller) and to segment `rendered_text` immediately before FTS insertion
 and embedding (S4/S6, this build's scope) — never to the stored,
-returned copy. `text_original` / `segment.rendered_text` are always
-kept verbatim; this function only ever touches a transient copy used to
+returned copy. `text_original` / `segment.rendered_text` are kept verbatim **except for
+NUL (U+0000), which PostgreSQL text columns cannot physically store** —
+see `strip_nul`; this function only ever touches a transient copy used to
 build an index key or an embedding input.
 
 Rules, in order (D2):

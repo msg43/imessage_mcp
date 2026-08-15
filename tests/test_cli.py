@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 import imsg.cli as cli_module
@@ -287,10 +289,20 @@ class _FakePgConn:
     `conn.close()`. `commit`/`rollback` are recorded here so a test can
     assert on them rather than on the absence of an exception."""
 
-    def __init__(self) -> None:
+    def __init__(self, transaction_status: Any = None) -> None:
         self.committed = 0
         self.rolled_back = 0
         self.closed = False
+        # Model psycopg's transaction status. The CLI asserts the connection is
+        # IDLE after the fingerprint check; a double left this unmodelled and
+        # the suite could not see the difference between a committed run and a
+        # discarded one.
+        import psycopg
+
+        status = (
+            psycopg.pq.TransactionStatus.IDLE if transaction_status is None else transaction_status
+        )
+        self.info = SimpleNamespace(transaction_status=status)
 
     def commit(self) -> None:
         self.committed += 1
@@ -1082,7 +1094,31 @@ def test_mcp_public_wires_server_and_runs_it(
 # --------------------------------------------------------------------------
 
 
-def test_connect_and_verify_clears_the_implicit_read_transaction(
+def test_connect_and_verify_rejects_a_connection_left_in_a_transaction(
+    cli_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The structural guarantee: stages must never receive a connection with an
+    open transaction, because their `conn.transaction()` blocks would nest as
+    SAVEPOINTs and be discarded at close() — silently, while reporting success.
+
+    `connect()` sets autocommit=True so reads leave the connection idle. This
+    pins the assertion that catches a regression of that setting.
+    """
+    import psycopg
+
+    conn = _FakePgConn(transaction_status=psycopg.pq.TransactionStatus.INTRANS)
+    monkeypatch.setattr(cli_module, "connect", lambda database, **kw: conn)
+    monkeypatch.setattr(
+        cli_module, "verify_data_directory", lambda c, data_root: Path(str(data_root))
+    )
+    cfg = cli_module._load_config_or_die(cli_config)
+    with pytest.raises(typer.Exit) as exc:
+        cli_module._connect_and_verify_or_die(cfg)
+    assert exc.value.exit_code == 1
+    assert conn.closed
+
+
+def test_connect_and_verify_accepts_an_idle_connection(
     cli_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conn = _FakePgConn()
@@ -1091,12 +1127,14 @@ def test_connect_and_verify_clears_the_implicit_read_transaction(
         cli_module, "verify_data_directory", lambda c, data_root: Path(str(data_root))
     )
     cfg = cli_module._load_config_or_die(cli_config)
-    returned = cli_module._connect_and_verify_or_die(cfg)
-
-    assert returned is conn
-    assert conn.rolled_back == 1, (
-        "the fingerprint check leaves a transaction open; without ending it, every "
-        "stage's conn.transaction() degrades to a SAVEPOINT and its writes are "
-        "discarded at close()"
-    )
+    assert cli_module._connect_and_verify_or_die(cfg) is conn
     assert not conn.closed
+
+
+def test_connect_defaults_to_autocommit() -> None:
+    """autocommit=True is the whole fix — pin the default so it cannot drift."""
+    import inspect
+
+    from imsg.db.connection import connect as real_connect
+
+    assert inspect.signature(real_connect).parameters["autocommit"].default is True

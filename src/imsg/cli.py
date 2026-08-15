@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Annotated
 
 import anyio
 import apsw
+import psycopg
 import typer
 import uvicorn
 
@@ -166,27 +167,30 @@ def _connect_and_verify_or_die(cfg: Config) -> psycopg.Connection:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
-    # Close the implicit transaction the fingerprint check just opened.
+    # Assert the connection is idle before any stage touches it.
     #
-    # `connect()` is autocommit=False, and `verify_data_directory` issues a
-    # `SHOW data_directory` — so by the time any stage runs, a transaction is
-    # already open. Every `with conn.transaction():` in the stages below then
-    # nests inside it as a SAVEPOINT instead of a top-level transaction, and
-    # because no command here calls `conn.commit()`, the `finally: conn.close()`
-    # in each command discarded ALL of its writes while reporting success and
-    # exiting 0.
+    # `connect()` sets autocommit=True precisely so that reads — including
+    # the fingerprint `SHOW` above — never open a transaction, which makes
+    # every `with conn.transaction():` in the stages a genuine top-level
+    # transaction that commits on exit. See db/connection.py for the full
+    # incident: with autocommit off, every stage silently rolled back its
+    # writes while reporting success.
     #
-    # Measured 2026-08-14: a full `extract` reported messages_upserted=655494
-    # and left n_tup_ins=1511805 / n_live_tup=0 / n_tup_del=0 — inserted, then
-    # rolled back. `migrate` was unaffected only because `fingerprint.py`
-    # commits explicitly, which made the database look healthy throughout.
-    #
-    # This is the chokepoint for the whole class: every command that reaches
-    # Postgres through this helper (identity, segment, embed, sync, enrich,
-    # backfill-attachments, export, verify-seed, reconcile-attachments) had
-    # the same defect. Fixing it here rather than per-stage is what keeps a
-    # future stage from silently inheriting it.
-    conn.rollback()
+    # An earlier fix issued `conn.rollback()` here instead. That was wrong in
+    # kind, not just degree: it closed only the transaction THIS function
+    # opened, so any stage whose first statement was a bare read re-opened
+    # one immediately — `segment`, `embed`, `enrich` and `sync` all still
+    # lost their writes. This assertion is what a regression should hit,
+    # loudly, instead of silently discarding a multi-hour run.
+    if conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+        conn.close()
+        typer.echo(
+            "imsg: internal error — connection is not idle after the fingerprint "
+            "check, so stage writes would nest as savepoints and be discarded at "
+            "close. Check that db.connection.connect() still sets autocommit=True.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     return conn
 
 
@@ -536,6 +540,19 @@ def identity(
 ) -> None:
     """S3 — resolve handles to person_id via Contacts + manual curation (SPEC §8 S3)."""
     if ctx.invoked_subcommand is not None:
+        # Options parsed HERE belong to the group, not the subcommand, and
+        # typer will not forward them. Silently dropping them was dangerous:
+        # `identity --config other.yaml merge --keep A --absorb B` merged
+        # persons in the DEFAULT database, and `identity --dry-run import`
+        # performed real writes. Fail loudly instead of guessing.
+        if config is not None or dry_run:
+            typer.echo(
+                f"imsg: put --config/--dry-run AFTER the subcommand "
+                f"(e.g. 'imsg identity {ctx.invoked_subcommand} --config ...'). "
+                "Options before a subcommand apply to the group and would be ignored.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
         return
     _identity_import(_load_config_or_die(config), dry_run)
 
@@ -569,7 +586,7 @@ def identity_review_report(
                 """
                 SELECT p.person_id, p.display_name, p.needs_review,
                        count(DISTINCT h.handle_id) AS handles,
-                       count(m.message_id) AS messages
+                       count(DISTINCT m.message_id) AS messages
                 FROM person p
                 LEFT JOIN handle h ON h.person_id = p.person_id
                 LEFT JOIN message m ON m.sender_person_id = p.person_id

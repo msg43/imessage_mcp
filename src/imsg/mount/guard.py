@@ -135,6 +135,21 @@ def guard_mount(
             f"mount point '{resolved_mount_point}'"
         )
 
+    # `/` is never a legitimate data_root mount point (SPEC §6: derived state
+    # lives on the dedicated encrypted volume). Verified 2026-08-15 that this
+    # is reachable: os.path.ismount('/Volumes') is False, so when the volume is
+    # UNMOUNTED the walk-up lands on '/', diskutil answers for the FileVault
+    # boot volume, and both the containment check (everything is under '/') and
+    # the encrypted check pass. The gate would then rest entirely on the
+    # sentinel file — and a stale sentinel on the boot volume would put the
+    # whole derived index on an unintended volume.
+    if resolved_mount_point == Path("/"):
+        raise MountGateError(
+            f"data_root '{resolved_root}' resolved to the boot volume ('/') — the "
+            "encrypted data volume is not mounted. Refusing to treat the boot "
+            "volume as the data volume (CLAUDE.md non-negotiable #2)."
+        )
+
     if not info.encrypted:
         raise MountGateError(
             f"volume '{info.volume_name or resolved_mount_point}' containing "
