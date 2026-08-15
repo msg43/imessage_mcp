@@ -660,6 +660,25 @@ def run_extract(
             last_run_start = _fetch_last_successful_run_start(cur, source_name)
             snapshot_max_rowid = reader.fetch_max_message_rowid()
 
+        # Close the implicit read transaction those SELECTs opened.
+        #
+        # `conn` is autocommit=False (db.connection.connect's default), so the
+        # first execute above silently BEGINs a transaction that stays open.
+        # Every `conn.transaction()` below would then nest inside it as a
+        # SAVEPOINT rather than the "independent top-level transactions" this
+        # module documents (see `_do_extract_dry_run`) — and since no CLI
+        # command calls `conn.commit()`, `conn.close()` rolled the entire
+        # extraction back while the command reported success and exited 0.
+        #
+        # Measured 2026-08-14 on the Studio: a full real run reported
+        # `messages_upserted=655494` and left `n_tup_ins=1511805, n_live_tup=0,
+        # n_tup_del=0` — 1.5M rows inserted, none live, none deleted, and
+        # `extraction_run` empty. Rolled back, not deleted.
+        #
+        # These are reads, so discarding them costs nothing; what it buys is
+        # that the transactions below really are top-level and really commit.
+        conn.rollback()
+
         if dry_run:
             return _do_extract_dry_run(
                 conn=conn,
