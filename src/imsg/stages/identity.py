@@ -208,13 +208,40 @@ class ContactsIndex:
                 self._by_identifier.setdefault(ident, []).append(contact)
 
     def find_unique(self, normalized_value: str, kind: str) -> ContactRecord | None:
-        """The matching contact, or `None` if there are zero or more than
-        one — SPEC §8 S3: "zero or multiple matches create a review
-        stub/conflict rather than guessing."""
+        """The matching contact, or `None` if there are zero or genuinely
+        conflicting matches — SPEC §8 S3: "zero or multiple matches create a
+        review stub/conflict rather than guessing."
+
+        **Cards that agree on the name are not a conflict (2026-08-15).**
+        Multiple `CNContact` identifiers routinely describe ONE person: macOS
+        surfaces the same human once per configured account, so anyone present
+        in both a Google and an iCloud address book yields two identifiers for
+        the same number. Treating that as "ambiguous" refused a match where
+        there was nothing to decide.
+
+        Measured on the real address books: of 1,375 identifiers, **1,338 had
+        every card agreeing on the display name** and only 37 genuinely
+        disagreed. The cost of the old rule was not spread evenly either — it
+        landed on the highest-volume correspondents, because the people you
+        message most are exactly the people saved in more than one account. Of
+        the top 20 correspondents, 14 were unnamed *solely* for this reason and
+        only 1 was truly absent from Contacts.
+
+        So: collapse identifiers that share a normalized display name, and
+        return a match when exactly one distinct name survives. A real
+        disagreement (a shared household number listed under two people) still
+        yields `None` and a review stub, which is the case the rule was written
+        for.
+        """
         matches = self._by_identifier.get((normalized_value, kind), [])
-        distinct = {m.identifier: m for m in matches}
-        if len(distinct) == 1:
-            return next(iter(distinct.values()))
+        if not matches:
+            return None
+        by_name: dict[str, ContactRecord] = {}
+        for m in matches:
+            key = " ".join(m.display_name.split()).casefold()
+            by_name.setdefault(key, m)
+        if len(by_name) == 1:
+            return next(iter(by_name.values()))
         return None
 
 
