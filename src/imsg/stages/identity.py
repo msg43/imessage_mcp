@@ -198,6 +198,21 @@ def _contact_to_record(contact: Any, default_region: str) -> ContactRecord:
     )
 
 
+_EMOJI_PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
+
+
+def _name_key(display_name: str) -> str:
+    """Comparison key for deciding whether two contact cards name one person.
+
+    Casefolds, collapses whitespace, and strips emoji/punctuation — real
+    address books carry the same person as "Melissa\U0001F41D?" and
+    "Melissa\U0001F41D\U0001F41D", or "Jules\U0001F99E? Narvaez" and
+    "Jules\U0001F99E\U0001F980 Narvaez", where the only difference is decoration.
+    """
+    stripped = _EMOJI_PUNCT_RE.sub(" ", display_name)
+    return " ".join(stripped.split()).casefold()
+
+
 class ContactsIndex:
     """Looks up Contacts matches by normalized `(value, kind)`."""
 
@@ -236,12 +251,33 @@ class ContactsIndex:
         matches = self._by_identifier.get((normalized_value, kind), [])
         if not matches:
             return None
+
         by_name: dict[str, ContactRecord] = {}
         for m in matches:
-            key = " ".join(m.display_name.split()).casefold()
-            by_name.setdefault(key, m)
+            by_name.setdefault(_name_key(m.display_name), m)
         if len(by_name) == 1:
             return next(iter(by_name.values()))
+
+        # One name's words being a subset of another's is the same person
+        # recorded at two levels of completeness — "Noel" / "Noel Painter",
+        # "Hudson" / "Doctor Hudson", "Laura Haim" / "Laura Greer Haim".
+        # Prefer the most complete name. This is a containment test, NOT a
+        # fuzzy-match: it deliberately does not fire on "Nexon Pool" vs
+        # "Roberto Pool" (shared surname, different first names) or on
+        # "Chelsea Sirkman" vs "Jeffrey Roth" (a shared front-desk number for
+        # two real people, owner-confirmed 2026-08-15). Nickname equivalence
+        # — Joe/Joseph, Becca/Rebecca — is deliberately NOT inferred either:
+        # the same reasoning would wrongly fuse Chris/Christina.
+        token_sets = {k: frozenset(k.split()) for k in by_name}
+        keys = list(by_name)
+        winner: str | None = None
+        for cand in keys:
+            if all(token_sets[other] <= token_sets[cand] for other in keys):
+                if winner is not None and token_sets[cand] != token_sets[winner]:
+                    return None
+                winner = cand
+        if winner is not None:
+            return by_name[winner]
         return None
 
 

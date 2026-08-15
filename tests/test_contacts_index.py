@@ -51,3 +51,53 @@ def test_find_unique_returns_none_when_absent() -> None:
     from imsg.stages.identity import ContactsIndex
 
     assert ContactsIndex([]).find_unique("+15550000000", "phone") is None
+
+
+def test_subset_names_collapse_to_the_most_complete() -> None:
+    from imsg.stages.identity import ContactRecord, ContactsIndex
+
+    ident = ("+15551110000", "phone")
+    short = ContactRecord(identifier="a", display_name="Noel", organization=None,
+                          normalized_identifiers=(ident,))
+    full = ContactRecord(identifier="b", display_name="Noel Painter", organization=None,
+                         normalized_identifiers=(ident,))
+    m = ContactsIndex([short, full]).find_unique(*ident)
+    assert m is not None and m.display_name == "Noel Painter"
+
+
+def test_shared_surname_with_different_first_names_is_still_a_conflict() -> None:
+    """Real case: a company and its owner on one number ("Nexon Pool" /
+    "Roberto Pool"). Neither token set contains the other, so this must NOT
+    collapse — the same laxity would fuse two siblings."""
+    from imsg.stages.identity import ContactRecord, ContactsIndex
+
+    ident = ("+15552220000", "phone")
+    a = ContactRecord(identifier="a", display_name="Nexon Pool", organization=None,
+                      normalized_identifiers=(ident,))
+    b = ContactRecord(identifier="b", display_name="Roberto Pool", organization=None,
+                      normalized_identifiers=(ident,))
+    assert ContactsIndex([a, b]).find_unique(*ident) is None
+
+
+def test_emoji_decoration_is_not_a_different_person() -> None:
+    from imsg.stages.identity import ContactRecord, ContactsIndex
+
+    ident = ("+15553330000", "phone")
+    a = ContactRecord(identifier="a", display_name="Melissa\U0001F41D?", organization=None,
+                      normalized_identifiers=(ident,))
+    b = ContactRecord(identifier="b", display_name="Melissa\U0001F41D\U0001F41D",
+                      organization=None, normalized_identifiers=(ident,))
+    assert ContactsIndex([a, b]).find_unique(*ident) is not None
+
+
+def test_nickname_equivalence_is_deliberately_not_inferred() -> None:
+    """Joe/Joseph is the same person; Chris/Christina is not, and no rule
+    distinguishes them. These stay review stubs on purpose."""
+    from imsg.stages.identity import ContactRecord, ContactsIndex
+
+    ident = ("+15554440000", "phone")
+    a = ContactRecord(identifier="a", display_name="Joe Rubinsztain", organization=None,
+                      normalized_identifiers=(ident,))
+    b = ContactRecord(identifier="b", display_name="Joseph Rubinsztain", organization=None,
+                      normalized_identifiers=(ident,))
+    assert ContactsIndex([a, b]).find_unique(*ident) is None
