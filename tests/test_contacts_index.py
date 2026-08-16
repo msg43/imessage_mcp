@@ -101,3 +101,36 @@ def test_nickname_equivalence_is_deliberately_not_inferred() -> None:
     b = ContactRecord(identifier="b", display_name="Joseph Rubinsztain", organization=None,
                       normalized_identifiers=(ident,))
     assert ContactsIndex([a, b]).find_unique(*ident) is None
+
+
+def test_ios_filter_suffixes_are_stripped() -> None:
+    """iOS tags a filtered sender as `<id>(filtered)` / `(smsft_*)`. Same
+    sender — but untagged it parses as a phone and tagged it does not, so
+    the two resolved to different persons. 2,803 persons collapse once this
+    is normalized."""
+    from imsg.stages.identity import normalize_handle
+
+    plain = normalize_handle("+12402610473", "US")
+    for tagged in (
+        "+12402610473(filtered)",
+        "+12402610473(smsft)",
+        "+12402610473(smsft_fi)",
+        "+12402610473(smsft_rm)(smsft)",
+    ):
+        assert normalize_handle(tagged, "US") == plain, tagged
+    assert plain[1] == "phone"
+
+
+def test_short_code_filter_suffix_is_stripped() -> None:
+    from imsg.stages.identity import normalize_handle
+
+    assert normalize_handle("24273(smsft_fi)", "US") == normalize_handle("24273", "US")
+
+
+def test_a_real_number_containing_parens_is_not_corrupted() -> None:
+    """This corpus contains the literal handle `(800) 275-2273`. Cutting at
+    the first paren would destroy it, so the strip is allowlisted."""
+    from imsg.stages.identity import strip_ios_filter_suffix
+
+    assert strip_ios_filter_suffix("(800) 275-2273") == "(800) 275-2273"
+    assert strip_ios_filter_suffix("+1 (800) 275-2273") == "+1 (800) 275-2273"

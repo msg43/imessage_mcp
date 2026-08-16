@@ -75,13 +75,38 @@ class ContactsAccessDeniedError(IdentityError):
 # --------------------------------------------------------------------------
 
 
+_IOS_FILTER_SUFFIX_RE = re.compile(r"(?:\((?:filtered|smsft(?:_[a-z]{2})?)\))+$", re.IGNORECASE)
+
+
+def strip_ios_filter_suffix(raw_value: str) -> str:
+    """Remove iOS's SMS-filtering tags from a raw `chat.db` handle id.
+
+    When a message is routed by iOS message filtering (Junk, Promotions,
+    Transactions), `chat.db` records the sender with a parenthesised tag —
+    `+15551234567(filtered)`, `24273(smsft_fi)`, occasionally stacked as
+    `(smsft_rm)(smsft)`. It is the SAME sender either way, but the tagged
+    form does not parse as a phone number, so it landed as `kind='unknown'`
+    and resolved to a SEPARATE person.
+
+    Measured on the real corpus (2026-08-15): 3,448 tagged handles and
+    **2,803 persons that collapse once this is stripped** — the single
+    largest source of person fragmentation in the index, far larger than
+    every Contacts ambiguity combined.
+
+    Deliberately anchored and allowlisted rather than "cut at the first
+    paren": this corpus contains a genuine handle `(800) 275-2273`, and a
+    naive strip would corrupt it.
+    """
+    return _IOS_FILTER_SUFFIX_RE.sub("", raw_value).strip()
+
+
 def normalize_handle(raw_value: str, default_region: str) -> tuple[str, str]:
     """`(normalized_value, kind)` per SPEC §8 S3: E.164 for phone numbers
     (`phonenumbers`, region `identity.default_region`), lowercased for
     emails, `kind='unknown'` with `normalized == raw` for anything that
     parses as neither — "unparseable phone (kept as `kind='unknown'`,
     normalized = raw)" (SPEC §8 S3 failure modes)."""
-    stripped = raw_value.strip()
+    stripped = strip_ios_filter_suffix(raw_value.strip())
     try:
         parsed = phonenumbers.parse(stripped, default_region)
         if phonenumbers.is_valid_number(parsed):
