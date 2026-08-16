@@ -683,13 +683,52 @@ def identity_duplicate_candidates(
         return
     typer.echo(f"{len(rows)} candidate pair(s) — same person? merge with:")
     typer.echo("  imsg identity merge --keep <id> --absorb <id>\n")
-    typer.echo(f"{'total':>7}  {'a':>7} {'msgs':>6}  {'b':>7} {'msgs':>6}  {'chats':>5}  names")
+    conn2 = _connect_and_verify_or_die(cfg)
+    try:
+        handles: dict[int, list[str]] = {}
+        with conn2.cursor() as cur:
+            cur.execute("SELECT person_id, normalized_value FROM handle ORDER BY person_id")
+            for pid, val in cur.fetchall():
+                handles.setdefault(int(pid), []).append(str(val))
+    finally:
+        conn2.close()
+
+    def _links(a: list[str], b: list[str]) -> str:
+        """Evidence connecting two candidates, computed from their identifiers.
+
+        Cheap signals that a human would use anyway: a shared email domain,
+        an email whose local part echoes the other side, or numbers from the
+        same area code. None of these are conclusive — they are shown so the
+        operator can decide faster, never so the tool can decide for them.
+        """
+        out = []
+        dom_a = {x.split("@", 1)[1] for x in a if "@" in x}
+        dom_b = {x.split("@", 1)[1] for x in b if "@" in x}
+        shared = dom_a & dom_b
+        if shared:
+            out.append("same email domain: " + ", ".join(sorted(shared)))
+        ac_a = {x[2:5] for x in a if x.startswith("+1") and len(x) >= 12}
+        ac_b = {x[2:5] for x in b if x.startswith("+1") and len(x) >= 12}
+        if ac_a & ac_b:
+            out.append("same area code: " + ", ".join(sorted(ac_a & ac_b)))
+        return "; ".join(out)
+
     for a_id, a_name, a_n, b_id, b_name, b_n, chats, disjoint in rows:
-        flag = " [no time overlap]" if disjoint else ""
-        typer.echo(
-            f"{a_n + b_n:>7}  {a_id:>7} {a_n:>6}  {b_id:>7} {b_n:>6}  {chats:>5}  "
-            f"{a_name} | {b_name}{flag}"
-        )
+        flags = []
+        if disjoint:
+            flags.append("no time overlap")
+        if chats:
+            flags.append(f"{chats} shared chat(s)")
+        ha, hb = handles.get(a_id, []), handles.get(b_id, [])
+        link = _links(ha, hb)
+        if link:
+            flags.append(link)
+        typer.echo("")
+        typer.echo(f"  {a_n + b_n:>6} total   {' | '.join(flags) if flags else ''}")
+        typer.echo(f"    {a_id:>7} {a_n:>6}  {a_name}")
+        typer.echo(f"            {'':>6}  {', '.join(ha) or '(no handles)'}")
+        typer.echo(f"    {b_id:>7} {b_n:>6}  {b_name}")
+        typer.echo(f"            {'':>6}  {', '.join(hb) or '(no handles)'}")
 
 
 @identity_app.command("merge")
