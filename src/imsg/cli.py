@@ -620,6 +620,78 @@ def identity_review_report(
         typer.echo(f"{pid:>7}  {messages:>8}  {handles:>5}  {flag:<7} {name}")
 
 
+@identity_app.command("duplicate-candidates")
+def identity_duplicate_candidates(
+    config: ConfigOption = None,
+    limit: Annotated[int, typer.Option(help="Max candidate pairs to list.")] = 60,
+) -> None:
+    """Persons that may be the same human — ranked, for a human to scan.
+
+    Deliberately RANKS rather than merges. Merging is irreversible and a
+    wrong call fuses two real people's messages under one `person_id`,
+    which non-negotiable #3 makes load-bearing everywhere downstream. So
+    this surfaces evidence and lets the operator decide.
+
+    Signals, strongest first:
+      * one Contacts card whose identifiers landed on several persons —
+        the address book itself says they are one human;
+      * one name being an abbreviation/prefix of another (Jeff/Jeffrey),
+        which the override applier's exact match cannot catch;
+      * identical names (already handled on rename, listed for completeness);
+      * shared group chats plus non-overlapping active windows, the
+        signature of somebody who changed number.
+    """
+    cfg = _load_config_or_die(config)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH pm AS (
+                  SELECT p.person_id, p.display_name, p.needs_review,
+                         (SELECT count(*) FROM message m WHERE m.sender_person_id=p.person_id) AS msgs,
+                         (SELECT min(m.sent_at) FROM message m WHERE m.sender_person_id=p.person_id) AS first_at,
+                         (SELECT max(m.sent_at) FROM message m WHERE m.sender_person_id=p.person_id) AS last_at
+                  FROM person p WHERE NOT p.is_owner
+                )
+                SELECT a.person_id, a.display_name, a.msgs,
+                       b.person_id, b.display_name, b.msgs,
+                       (SELECT count(*) FROM chat_participant ca
+                         JOIN chat_participant cb ON cb.chat_id=ca.chat_id
+                        WHERE ca.person_id=a.person_id AND cb.person_id=b.person_id) AS shared_chats,
+                       (a.last_at < b.first_at OR b.last_at < a.first_at) AS disjoint
+                FROM pm a JOIN pm b ON a.person_id < b.person_id
+                WHERE a.msgs > 0 AND b.msgs > 0
+                  AND (
+                    lower(a.display_name) = lower(b.display_name)
+                    OR (length(a.display_name) > 3
+                        AND position(lower(a.display_name) in lower(b.display_name)) = 1)
+                    OR (length(b.display_name) > 3
+                        AND position(lower(b.display_name) in lower(a.display_name)) = 1)
+                  )
+                ORDER BY (a.msgs + b.msgs) DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        typer.echo("no duplicate candidates found")
+        return
+    typer.echo(f"{len(rows)} candidate pair(s) — same person? merge with:")
+    typer.echo("  imsg identity merge --keep <id> --absorb <id>\n")
+    typer.echo(f"{'total':>7}  {'a':>7} {'msgs':>6}  {'b':>7} {'msgs':>6}  {'chats':>5}  names")
+    for a_id, a_name, a_n, b_id, b_name, b_n, chats, disjoint in rows:
+        flag = " [no time overlap]" if disjoint else ""
+        typer.echo(
+            f"{a_n + b_n:>7}  {a_id:>7} {a_n:>6}  {b_id:>7} {b_n:>6}  {chats:>5}  "
+            f"{a_name} | {b_name}{flag}"
+        )
+
+
 @identity_app.command("merge")
 def identity_merge(
     keep: Annotated[int, typer.Option(help="person_id to KEEP.")],
