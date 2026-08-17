@@ -570,6 +570,13 @@ def identity_review_report(
     all_persons: Annotated[
         bool, typer.Option("--all", help="Include persons already reviewed, not just needs_review.")
     ] = False,
+    sample: Annotated[
+        bool,
+        typer.Option(
+            "--sample",
+            help="Show one representative message per person — usually identifies them outright.",
+        ),
+    ] = False,
 ) -> None:
     """The curation worklist — persons ranked by message volume (SPEC §8 S3).
 
@@ -598,6 +605,28 @@ def identity_review_report(
                 (all_persons, limit),
             )
             rows = cur.fetchall()
+            samples: dict[int, str] = {}
+            if sample and rows:
+                # One message per person, and it is very often decisive: automated
+                # senders announce themselves outright ("Siren Marine: ... Battery
+                # Low", "Your SimpliSafe system..."), which no amount of contact
+                # lookup would ever have revealed. Added 2026-08-15 after chasing
+                # several unknown numbers through Gmail and web search when the
+                # answer was sitting in the corpus the whole time.
+                cur.execute(
+                    """
+                    SELECT DISTINCT ON (m.sender_person_id)
+                           m.sender_person_id,
+                           left(regexp_replace(m.text_original, E'[\n\r]+', ' ', 'g'), 100)
+                    FROM message m
+                    WHERE m.sender_person_id = ANY(%s)
+                      AND m.text_original IS NOT NULL
+                      AND length(m.text_original) BETWEEN 20 AND 400
+                    ORDER BY m.sender_person_id, m.sent_at DESC
+                    """,
+                    ([r[0] for r in rows],),
+                )
+                samples = {int(pid): txt for pid, txt in cur.fetchall()}
             cur.execute("SELECT count(*) FROM person WHERE needs_review")
             pending = cur.fetchone()
             cur.execute("SELECT count(*) FROM person")
@@ -618,6 +647,8 @@ def identity_review_report(
     for pid, name, needs, handles, messages in rows:
         flag = "YES" if needs else "-"
         typer.echo(f"{pid:>7}  {messages:>8}  {handles:>5}  {flag:<7} {name}")
+        if sample:
+            typer.echo(f"{'':>7}  {'':>8}  {'':>5}  {'':<7} \u21b3 {samples.get(pid, '(no text messages)')}")
 
 
 @identity_app.command("duplicate-candidates")
