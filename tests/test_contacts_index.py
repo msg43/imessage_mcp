@@ -40,9 +40,9 @@ def test_find_unique_still_refuses_a_genuine_name_conflict() -> None:
     from imsg.stages.identity import ContactRecord, ContactsIndex
 
     ident = ("+15559998888", "phone")
-    a = ContactRecord(identifier="a", display_name="Jason Haim", organization=None,
+    a = ContactRecord(identifier="a", display_name="Dave Carter", organization=None,
                       normalized_identifiers=(ident,))
-    b = ContactRecord(identifier="b", display_name="Laura Greer Haim", organization=None,
+    b = ContactRecord(identifier="b", display_name="Alice Bell Carter", organization=None,
                       normalized_identifiers=(ident,))
     assert ContactsIndex([a, b]).find_unique(*ident) is None
 
@@ -57,24 +57,24 @@ def test_subset_names_collapse_to_the_most_complete() -> None:
     from imsg.stages.identity import ContactRecord, ContactsIndex
 
     ident = ("+15551110000", "phone")
-    short = ContactRecord(identifier="a", display_name="Noel", organization=None,
+    short = ContactRecord(identifier="a", display_name="Erin", organization=None,
                           normalized_identifiers=(ident,))
-    full = ContactRecord(identifier="b", display_name="Noel Painter", organization=None,
+    full = ContactRecord(identifier="b", display_name="Erin Delgado", organization=None,
                          normalized_identifiers=(ident,))
     m = ContactsIndex([short, full]).find_unique(*ident)
-    assert m is not None and m.display_name == "Noel Painter"
+    assert m is not None and m.display_name == "Erin Delgado"
 
 
 def test_shared_surname_with_different_first_names_is_still_a_conflict() -> None:
-    """Real case: a company and its owner on one number ("Nexon Pool" /
-    "Roberto Pool"). Neither token set contains the other, so this must NOT
+    """Real case: a company and its owner on one number ("Acme Pool" /
+    "Bob Pool"). Neither token set contains the other, so this must NOT
     collapse — the same laxity would fuse two siblings."""
     from imsg.stages.identity import ContactRecord, ContactsIndex
 
     ident = ("+15552220000", "phone")
-    a = ContactRecord(identifier="a", display_name="Nexon Pool", organization=None,
+    a = ContactRecord(identifier="a", display_name="Acme Pool", organization=None,
                       normalized_identifiers=(ident,))
-    b = ContactRecord(identifier="b", display_name="Roberto Pool", organization=None,
+    b = ContactRecord(identifier="b", display_name="Bob Pool", organization=None,
                       normalized_identifiers=(ident,))
     assert ContactsIndex([a, b]).find_unique(*ident) is None
 
@@ -83,9 +83,9 @@ def test_emoji_decoration_is_not_a_different_person() -> None:
     from imsg.stages.identity import ContactRecord, ContactsIndex
 
     ident = ("+15553330000", "phone")
-    a = ContactRecord(identifier="a", display_name="Melissa\U0001F41D?", organization=None,
+    a = ContactRecord(identifier="a", display_name="Carol\U0001F41D?", organization=None,
                       normalized_identifiers=(ident,))
-    b = ContactRecord(identifier="b", display_name="Melissa\U0001F41D\U0001F41D",
+    b = ContactRecord(identifier="b", display_name="Carol\U0001F41D\U0001F41D",
                       organization=None, normalized_identifiers=(ident,))
     assert ContactsIndex([a, b]).find_unique(*ident) is not None
 
@@ -96,9 +96,9 @@ def test_nickname_equivalence_is_deliberately_not_inferred() -> None:
     from imsg.stages.identity import ContactRecord, ContactsIndex
 
     ident = ("+15554440000", "phone")
-    a = ContactRecord(identifier="a", display_name="Joe Rubinsztain", organization=None,
+    a = ContactRecord(identifier="a", display_name="Joe Marsh", organization=None,
                       normalized_identifiers=(ident,))
-    b = ContactRecord(identifier="b", display_name="Joseph Rubinsztain", organization=None,
+    b = ContactRecord(identifier="b", display_name="Joseph Marsh", organization=None,
                       normalized_identifiers=(ident,))
     assert ContactsIndex([a, b]).find_unique(*ident) is None
 
@@ -110,12 +110,12 @@ def test_ios_filter_suffixes_are_stripped() -> None:
     is normalized."""
     from imsg.stages.identity import normalize_handle
 
-    plain = normalize_handle("+12402610473", "US")
+    plain = normalize_handle("+12025550123", "US")
     for tagged in (
-        "+12402610473(filtered)",
-        "+12402610473(smsft)",
-        "+12402610473(smsft_fi)",
-        "+12402610473(smsft_rm)(smsft)",
+        "+12025550123(filtered)",
+        "+12025550123(smsft)",
+        "+12025550123(smsft_fi)",
+        "+12025550123(smsft_rm)(smsft)",
     ):
         assert normalize_handle(tagged, "US") == plain, tagged
     assert plain[1] == "phone"
@@ -128,9 +128,9 @@ def test_short_code_filter_suffix_is_stripped() -> None:
 
 
 def test_a_real_number_containing_parens_is_not_corrupted() -> None:
-    """This corpus contains the literal handle `(800) 275-2273`. Cutting at
+    """Real corpora contain literal handles like `(800) 555-0199`. Cutting at
     the first paren would destroy it, so the strip is allowlisted."""
     from imsg.stages.identity import strip_ios_filter_suffix
 
-    assert strip_ios_filter_suffix("(800) 275-2273") == "(800) 275-2273"
-    assert strip_ios_filter_suffix("+1 (800) 275-2273") == "+1 (800) 275-2273"
+    assert strip_ios_filter_suffix("(800) 555-0199") == "(800) 555-0199"
+    assert strip_ios_filter_suffix("+1 (800) 555-0199") == "+1 (800) 555-0199"

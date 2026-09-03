@@ -94,7 +94,7 @@ def strip_ios_filter_suffix(raw_value: str) -> str:
     every Contacts ambiguity combined.
 
     Deliberately anchored and allowlisted rather than "cut at the first
-    paren": this corpus contains a genuine handle `(800) 275-2273`, and a
+    paren": real corpora contain genuine handles like `(800) 555-0199`, and a
     naive strip would corrupt it.
     """
     return _IOS_FILTER_SUFFIX_RE.sub("", raw_value).strip()
@@ -230,9 +230,9 @@ def _name_key(display_name: str) -> str:
     """Comparison key for deciding whether two contact cards name one person.
 
     Casefolds, collapses whitespace, and strips emoji/punctuation — real
-    address books carry the same person as "Melissa\U0001F41D?" and
-    "Melissa\U0001F41D\U0001F41D", or "Jules\U0001F99E? Narvaez" and
-    "Jules\U0001F99E\U0001F980 Narvaez", where the only difference is decoration.
+    address books carry the same person as "Carol\U0001F41D?" and
+    "Carol\U0001F41D\U0001F41D", or "Dana\U0001F99E? Okafor" and
+    "Dana\U0001F99E\U0001F980 Okafor", where the only difference is decoration.
     """
     stripped = _EMOJI_PUNCT_RE.sub(" ", display_name)
     return " ".join(stripped.split()).casefold()
@@ -284,12 +284,12 @@ class ContactsIndex:
             return next(iter(by_name.values()))
 
         # One name's words being a subset of another's is the same person
-        # recorded at two levels of completeness — "Noel" / "Noel Painter",
-        # "Hudson" / "Doctor Hudson", "Laura Haim" / "Laura Greer Haim".
+        # recorded at two levels of completeness — "Erin" / "Erin Delgado",
+        # "Whitfield" / "Doctor Whitfield", "Alice Carter" / "Alice Bell Carter".
         # Prefer the most complete name. This is a containment test, NOT a
-        # fuzzy-match: it deliberately does not fire on "Nexon Pool" vs
-        # "Roberto Pool" (shared surname, different first names) or on
-        # "Chelsea Sirkman" vs "Jeffrey Roth" (a shared front-desk number for
+        # fuzzy-match: it deliberately does not fire on "Acme Pool" vs
+        # "Bob Pool" (shared surname, different first names) or on
+        # "Alice Nguyen" vs "Bob Feldman" (a shared front-desk number for
         # two real people, owner-confirmed 2026-08-15). Nickname equivalence
         # — Joe/Joseph, Becca/Rebecca — is deliberately NOT inferred either:
         # the same reasoning would wrongly fuse Chris/Christina.

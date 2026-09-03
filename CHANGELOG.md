@@ -10,6 +10,40 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-03 — real contact data had reached the fixtures; scrubbed
+
+The repo's single governing rule is that it is public-safe by construction:
+no real names, numbers, or addresses in code, comments, tests, or fixtures —
+fictional personas only. The identity work of 2026-08-14→17 was written while
+debugging against the real corpus, and **the corpus leaked into the fixtures**:
+nine real personal names across `tests/test_contacts_index.py` and the
+explanatory comments in `src/imsg/stages/identity.py`, one real mobile number,
+and two real vendor brands quoted as automated-sender examples.
+
+All of it is replaced with fictional personas that preserve the exact
+structural property each case was written to test — a name-subset pair stays a
+subset pair, a shared-surname conflict stays a non-subset conflict, an
+emoji-decoration pair stays a decoration pair. 655 tests pass unchanged, so
+the fixtures were carrying the *shape* of the real data, not depending on its
+identity.
+
+**Why it happened, and the cheap check that finds it:** every one of these
+entered as an illustration in a commit that was otherwise correct — the real
+example is the most convincing one to reach for while the debugging session is
+still in your head, and no test can fail for it. A grep of the diff for
+capitalized word-pairs and for phone/email patterns finds the whole class in
+seconds, and is worth running before any branch built against the real corpus
+is pushed.
+
+Aggregate statistics measured on the corpus (2,803 fragmented persons;
+1,338 of 1,375 identifiers agreeing) are deliberately **kept** — they identify
+no one and they are the entire rationale for the rules they justify.
+
+Fictional numbers now use the reserved 555-01xx range inside a real area code
+(`+1 202 555 0123`), which `phonenumbers.is_valid_number` accepts — the older
+`+1555…` fixtures parse as invalid, which is fine where the value is only a
+dict key but not where a test asserts `kind == "phone"`.
+
 ## 2026-08-12 — first run against real infrastructure; the mount gate never worked
 
 The code had never been run against a real Postgres instance or a real
