@@ -11,19 +11,28 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
-**Code complete, unrun — and now public** at
+**Running against a real corpus; Phase 1 in progress.** Public at
 [`msg43/imessage_mcp`](https://github.com/msg43/imessage_mcp) (MIT).
 Every buildable component of the governing spec is implemented: 8
 pipeline stages, hybrid retrieval, both MCP surfaces, the export gate,
-the eval harness, 18 CLI commands, migrations 0001–0003. 836 tests (639
-without a database, 197 integration tests that skip without one); ruff
-and mypy strict clean; DDL lint clean.
+the eval harness, 32 CLI commands (counting subcommands), migrations
+0001–0003. 858 tests (661 without a database, 197 integration tests
+that skip without one); ruff and mypy strict clean; DDL lint clean.
 
-Nothing has executed against a real corpus. The pipeline runs end to end
-on **deterministic fake model providers** (marked `PLACEHOLDER`), which
-means it completes successfully and the results are meaningless until
-real loaders replace them. Deployment is blocked on hardware,
-permissions, and credentials — not on code. (2026-07-30)
+**This status previously read "code complete, unrun" and stayed that way
+for three weeks after it stopped being true** — see `CHANGELOG.md`
+2026-08-12 and 2026-08-17. S1→S3 have executed against a real Postgres
+cluster and a real corpus, and doing so immediately surfaced a class of
+defect no test could see: stages that printed success, exited 0, and
+persisted nothing. Identity resolution and Contacts curation have run
+against real address books.
+
+Still true, and the thing most likely to be mistaken for success: the
+pipeline runs end to end on **deterministic fake model providers**
+(marked `PLACEHOLDER`), so segmentation, embedding, and retrieval
+complete successfully and return meaningless results until real loaders
+replace them. Phase 1's exit criteria — seed completeness (AT-2) and a
+hand-verified `person` table — are **not** met. (2026-09-03)
 
 ## Gate ladder
 
