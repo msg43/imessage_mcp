@@ -1138,3 +1138,154 @@ def test_connect_defaults_to_autocommit() -> None:
     from imsg.db.connection import connect as real_connect
 
     assert inspect.signature(real_connect).parameters["autocommit"].default is True
+
+
+# --------------------------------------------------------------------------
+# The one-shot seed path (SPEC §8 S7): `--snapshot` bypasses S1 and feeds a
+# prepared database straight to S2.
+#
+# The guard matters more than the feature. A seed advances the ROWID watermark
+# of whatever source it lands on, and ROWIDs are meaningless across database
+# files — seed a file whose ROWIDs run past the live source's and every real
+# message below the new watermark is skipped forever, with no error. So the
+# seed must carry its own --source, and that source must not be one the
+# pipeline snapshots from a live chat.db.
+# --------------------------------------------------------------------------
+
+
+def test_seed_requires_a_source(mocked_pg_env: Path, tmp_path: Path) -> None:
+    seed = tmp_path / "seed.db"
+    seed.write_text("")
+    result = runner.invoke(
+        app, ["extract", "--config", str(mocked_pg_env), "--snapshot", str(seed)]
+    )
+    assert result.exit_code == 1
+    assert "--snapshot requires --source" in result.output
+
+
+def test_seed_refuses_a_configured_live_source(mocked_pg_env: Path, tmp_path: Path) -> None:
+    """`mini` is the configured sync.sources entry in the test config — the
+    exact shape of the collision this guard exists to prevent."""
+    seed = tmp_path / "seed.db"
+    seed.write_text("")
+    result = runner.invoke(
+        app,
+        ["extract", "--config", str(mocked_pg_env), "--snapshot", str(seed), "--source", "mini"],
+    )
+    assert result.exit_code == 1
+    assert "configured sync.sources entry" in result.output
+    assert "skipped forever" in result.output
+
+
+def test_seed_refuses_a_missing_file(mocked_pg_env: Path, tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "extract", "--config", str(mocked_pg_env),
+            "--snapshot", str(tmp_path / "nope.db"), "--source", "seed-2026",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "--snapshot file not found" in result.output
+
+
+def test_extract_seed_uses_the_given_file_and_source(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The positive case, and the reason it is checked by value: the whole
+    point is that S2 reads the seed and NOT `snapshots/snapshot.db`."""
+    from imsg.stages.extract import ExtractResult
+
+    data_root = _data_root_from_config(mocked_pg_env)
+    pipeline_snapshot = data_root / "snapshots" / "snapshot.db"
+    pipeline_snapshot.parent.mkdir(parents=True, exist_ok=True)
+    pipeline_snapshot.write_text("")  # present, and must still be ignored
+
+    seed = tmp_path / "corpus-merged.db"
+    seed.write_text("")
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_extract(**kwargs: Any) -> ExtractResult:
+        captured.update(kwargs)
+        return ExtractResult(
+            run_id=1, watermark_before=0, watermark_after=9195, chats_upserted=0,
+            handles_upserted=0, messages_upserted=9195, tapbacks_upserted=0,
+            system_messages_skipped=0, attachments_upserted=0, link_previews_upserted=0,
+            bodies_missing=0, dump_stderr_line_count=0,
+        )
+
+    monkeypatch.setattr(cli_module, "run_extract", fake_run_extract)
+    result = runner.invoke(
+        app,
+        [
+            "extract", "--config", str(mocked_pg_env),
+            "--snapshot", str(seed), "--source", "recovered-2026",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["snapshot_path"] == seed
+    assert captured["snapshot_path"] != pipeline_snapshot
+    assert captured["source_name"] == "recovered-2026"
+
+
+def test_sync_seed_skips_s1_and_targets_one_source(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SPEC §8 S7's shape: `imsg sync --source <seed> --snapshot <path>`
+    forwards to `run_sync(snapshot_override=...)`, which skips S1."""
+    from imsg.stages.sync import SyncResult
+
+    data_root = _data_root_from_config(mocked_pg_env)
+    prompt_path = data_root / "prompts" / "segment_boundaries.txt"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text("x")
+
+    seed = tmp_path / "corpus-merged.db"
+    seed.write_text("")
+    captured: dict[str, Any] = {}
+
+    def fake_run_sync(**kwargs: Any) -> SyncResult:
+        captured.update(kwargs)
+        return SyncResult(
+            source_name=kwargs["source_name"], snapshot=None, extract=None,
+            identity=None, segment_ran=False, embed_ran=False, note="seeded",
+        )
+
+    def fail_all_sources(**kwargs: Any) -> list[SyncResult]:
+        raise AssertionError("--source must not fan out to every configured source")
+
+    monkeypatch.setattr(cli_module, "run_sync", fake_run_sync)
+    monkeypatch.setattr(cli_module, "run_sync_all_sources", fail_all_sources)
+    result = runner.invoke(
+        app,
+        [
+            "sync", "--config", str(mocked_pg_env),
+            "--snapshot", str(seed), "--source", "recovered-2026",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["snapshot_override"] == seed
+    assert captured["source_name"] == "recovered-2026"
+
+
+def test_sync_without_overrides_still_syncs_every_source(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.stages.sync import SyncResult
+
+    data_root = _data_root_from_config(mocked_pg_env)
+    prompt_path = data_root / "prompts" / "segment_boundaries.txt"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text("x")
+
+    called: dict[str, Any] = {}
+
+    def fake_all(**kwargs: Any) -> list[SyncResult]:
+        called.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cli_module, "run_sync_all_sources", fake_all)
+    result = runner.invoke(app, ["sync", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert called, "the no-override path must still fan out to all sources"

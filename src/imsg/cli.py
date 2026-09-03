@@ -85,7 +85,7 @@ from imsg.stages.identity import (
 )
 from imsg.stages.imsg_dump import default_binary_path
 from imsg.stages.snapshot import SNAPSHOT_FILENAME, SNAPSHOT_SUBDIR, run_snapshot
-from imsg.stages.sync import EmbedFn, SegmentFn, run_sync_all_sources
+from imsg.stages.sync import EmbedFn, SegmentFn, run_sync, run_sync_all_sources
 from imsg.verify.cli import reconcile_attachments, verify_seed
 
 if TYPE_CHECKING:
@@ -428,6 +428,44 @@ def snapshot(config: ConfigOption = None, dry_run: DryRunOption = False) -> None
         typer.echo(DRY_RUN_MARKER)
 
 
+def _validate_seed_or_die(cfg: Config, snapshot: Path | None, source: str | None) -> None:
+    """Gate the one-shot seed path (SPEC §8 S7): `--snapshot` feeds a prepared
+    database straight to S2, bypassing S1.
+
+    Two rules, both fail-closed, because the failure they prevent is silent
+    and permanent. A seed advances the **ROWID watermark of whatever source
+    it is ingested under**, and a ROWID means something only inside one
+    database file. Seed a file whose ROWIDs run past the live source's and
+    the watermark jumps past real messages that were never looked at — they
+    are then below the watermark forever, and nothing reports rows it never
+    read. So a seed must carry its own `--source`, and that source must not
+    be one the pipeline is actively snapshotting.
+    """
+    if snapshot is None:
+        return
+    if source is None:
+        typer.echo(
+            "imsg: --snapshot requires --source. A seed must be ingested under its own "
+            "source name so it gets its own ROWID watermark namespace.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    configured = {s.name for s in cfg.sync.sources}
+    if source in configured:
+        typer.echo(
+            f"imsg: --snapshot may not be used with --source '{source}' — that is a "
+            f"configured sync.sources entry, which the pipeline snapshots from the live "
+            f"chat.db. Seeding it would advance that source's ROWID watermark to this "
+            f"file's row count; every live message below the new watermark is then "
+            f"skipped forever, with no error. Use a fresh source name for the seed.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if not snapshot.is_file():
+        typer.echo(f"imsg: --snapshot file not found: '{snapshot}'", err=True)
+        raise typer.Exit(code=1)
+
+
 @app.command()
 def extract(
     config: ConfigOption = None,
@@ -435,14 +473,30 @@ def extract(
         str | None,
         typer.Option(help="Source name from sync.sources; defaults to the first configured source."),
     ] = None,
+    snapshot: Annotated[
+        Path | None,
+        typer.Option(
+            help="One-shot seed: extract from this prepared database instead of the "
+            "pipeline snapshot. Requires --source, which must not name a configured "
+            "sync.sources entry.",
+        ),
+    ] = None,
     dry_run: DryRunOption = False,
 ) -> None:
-    """S2 — extract chats/messages/attachments from the current snapshot (SPEC §8 S2)."""
+    """S2 — extract chats/messages/attachments from the current snapshot (SPEC §8 S2).
+
+    `--snapshot` is the seed path: it never touches `snapshots/snapshot.db`,
+    which S1 atomically replaces from the live chat.db every
+    `sync.interval_seconds` — anything staged there is destroyed on the next
+    tick. It requires `--source` because a seed advances that source's ROWID
+    watermark, and ROWIDs mean nothing across database files.
+    """
     cfg = _load_config_or_die(config)
+    _validate_seed_or_die(cfg, snapshot, source)
     run_guard_mount_or_exit(cfg.paths.data_root)
 
     source_name = source or cfg.sync.sources[0].name
-    snapshot_path = cfg.paths.data_root / SNAPSHOT_SUBDIR / SNAPSHOT_FILENAME
+    snapshot_path = snapshot or cfg.paths.data_root / SNAPSHOT_SUBDIR / SNAPSHOT_FILENAME
     if not snapshot_path.is_file():
         typer.echo(
             f"imsg: no snapshot found at '{snapshot_path}' — run 'imsg snapshot' first", err=True
@@ -965,22 +1019,58 @@ def _make_embed_fn(cfg: Config) -> EmbedFn:
 
 
 @app.command()
-def sync(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
-    """S7 — incremental S1→S2→S3→S4→S6 sync for every configured source (SPEC §8 S7)."""
+def sync(
+    config: ConfigOption = None,
+    source: Annotated[
+        str | None,
+        typer.Option(help="Sync only this source instead of every configured one."),
+    ] = None,
+    snapshot: Annotated[
+        Path | None,
+        typer.Option(
+            help="One-shot seed: skip S1 and feed this prepared database straight to S2 "
+            "(SPEC §8 S7). Requires --source, which must not name a configured "
+            "sync.sources entry.",
+        ),
+    ] = None,
+    dry_run: DryRunOption = False,
+) -> None:
+    """S7 — incremental S1→S2→S3→S4→S6 sync for every configured source (SPEC §8 S7).
+
+    With `--source`, syncs that one source. With `--source` and `--snapshot`,
+    runs the studio-seed one-shot path SPEC §8 S7 specifies: S1 is skipped
+    entirely and the already-prepared file feeds S2→S3→S4→S6, so the seed
+    lands under its own source name and its own ROWID watermark.
+    """
     cfg = _load_config_or_die(config)
+    _validate_seed_or_die(cfg, snapshot, source)
     segment_fn = _make_segment_fn(cfg)  # validates the boundary prompt exists up front
     embed_fn = _make_embed_fn(cfg)
 
     conn = _connect_and_verify_or_die(cfg)
     try:
-        results = run_sync_all_sources(
-            conn=conn,
-            config=cfg,
-            imsg_dump_binary=default_binary_path(_repo_root()),
-            segment_fn=segment_fn,
-            embed_fn=embed_fn,
-            dry_run=dry_run,
-        )
+        if source is not None:
+            results = [
+                run_sync(
+                    conn=conn,
+                    config=cfg,
+                    source_name=source,
+                    imsg_dump_binary=default_binary_path(_repo_root()),
+                    snapshot_override=snapshot,
+                    segment_fn=segment_fn,
+                    embed_fn=embed_fn,
+                    dry_run=dry_run,
+                )
+            ]
+        else:
+            results = run_sync_all_sources(
+                conn=conn,
+                config=cfg,
+                imsg_dump_binary=default_binary_path(_repo_root()),
+                segment_fn=segment_fn,
+                embed_fn=embed_fn,
+                dry_run=dry_run,
+            )
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
