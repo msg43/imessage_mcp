@@ -128,9 +128,9 @@ def test_short_code_filter_suffix_is_stripped() -> None:
 
 
 def test_a_real_number_containing_parens_is_not_corrupted() -> None:
-    """This corpus contains the literal handle `(800) 275-2273`. Cutting at
+    """Real corpora contain literal handles like `(800) 555-0199`. Cutting at
     the first paren would destroy it, so the strip is allowlisted."""
     from imsg.stages.identity import strip_ios_filter_suffix
 
-    assert strip_ios_filter_suffix("(800) 275-2273") == "(800) 275-2273"
-    assert strip_ios_filter_suffix("+1 (800) 275-2273") == "+1 (800) 275-2273"
+    assert strip_ios_filter_suffix("(800) 555-0199") == "(800) 555-0199"
+    assert strip_ios_filter_suffix("+1 (800) 555-0199") == "+1 (800) 555-0199"

@@ -94,7 +94,7 @@ def strip_ios_filter_suffix(raw_value: str) -> str:
     every Contacts ambiguity combined.
 
     Deliberately anchored and allowlisted rather than "cut at the first
-    paren": this corpus contains a genuine handle `(800) 275-2273`, and a
+    paren": real corpora contain genuine handles like `(800) 555-0199`, and a
     naive strip would corrupt it.
     """
     return _IOS_FILTER_SUFFIX_RE.sub("", raw_value).strip()
@@ -289,7 +289,7 @@ class ContactsIndex:
         # Prefer the most complete name. This is a containment test, NOT a
         # fuzzy-match: it deliberately does not fire on "Acme Pool" vs
         # "Bob Pool" (shared surname, different first names) or on
-        # "Alice Nguyen" vs "Robert Feldman" (a shared front-desk number for
+        # "Alice Nguyen" vs "Bob Feldman" (a shared front-desk number for
         # two real people, owner-confirmed 2026-08-15). Nickname equivalence
         # — Joe/Joseph, Becca/Rebecca — is deliberately NOT inferred either:
         # the same reasoning would wrongly fuse Chris/Christina.

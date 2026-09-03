@@ -609,7 +609,7 @@ def identity_review_report(
             if sample and rows:
                 # One message per person, and it is very often decisive: automated
                 # senders announce themselves outright ("Acme Marine: ... Battery
-                # Low", "Your Acme Alarm system..."), which no amount of contact
+                # Low", "Your HomeGuard system..."), which no amount of contact
                 # lookup would ever have revealed. Added 2026-08-15 after chasing
                 # several unknown numbers through Gmail and web search when the
                 # answer was sitting in the corpus the whole time.
