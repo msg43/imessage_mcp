@@ -10,6 +10,59 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-08-17 — first real corpus run: the write-loss class, and identity curation
+
+Recorded late (2026-09-03). This work landed across 2026-08-14→17 with no
+CHANGELOG entry, so for three weeks the only record of it was eleven commit
+messages — exactly the failure the living-documents rule exists to prevent.
+The entry is written now rather than skipped, because the findings below are
+the reason several of the current rules exist.
+
+**The write-loss class — stages reported success and persisted nothing.**
+Found only by running against a real corpus, because no test could see it.
+A stage that opened with a bare read left the connection `INTRANS`, and
+`transaction()` could not rescue it; segment, embed, enrich, and sync's S4–S6
+half all open that way. Each printed a success line, exited 0, and wrote
+nothing. The first fix closed only the fingerprint check's transaction and
+was found by adversarial review not to fix the class it claimed to; the real
+fix is `connect()` defaulting to `autocommit=True`, with per-stage rollbacks
+replaced by an idle assertion that fails loudly. Verified both directions:
+with autocommit off a read leaves the connection `INTRANS`, with it on reads
+stay `IDLE` and `transaction()` commits.
+
+**Other defects that only a real corpus surfaces**, from the same window:
+SQL variable chunking and NUL stripping (both fatal on any real corpus);
+chunking double-upserted attachments shared across messages; `identity assign`
+updated only `handle.person_id` and left existing messages attributed to the
+old person, splitting one sender across two `person_id`s in violation of
+non-negotiable #3; options before a subcommand were parsed then dropped, so
+`identity --config other.yaml merge` hit the *default* database;
+`review-report` inflated message counts 2x through handle fan-out, distorting
+the ranking it exists to produce; `rename` never cleared `needs_review`, so
+the worklist could not shrink; the mount gate accepted `/` when the volume was
+unmounted, leaving a stale sentinel as the only protection.
+
+**Identity curation, built against real address books.** `imsg identity
+duplicate-candidates` ranks possible same-person pairs and shows both sides'
+identifiers; `review-report --sample` shows one message per person, which is
+very often decisive because automated senders announce themselves in the text.
+Contacts matching gained three rules, each measured rather than guessed:
+duplicate accounts naming the same person are not a conflict (1,338 of 1,375
+identifiers had every card agreeing; the old rule cost the top correspondents
+disproportionately, since the people you message most are the ones saved in
+more than one account); a name whose words are a subset of another's is the
+same person at two levels of completeness; emoji decoration is not a different
+person. Nickname equivalence is deliberately **not** inferred — the rule that
+merges Joe/Joseph also merges Chris/Christina.
+
+**Handle normalization: 2,803 persons were fragmented by iOS filter tags.**
+iOS writes a filtered sender as `<id>(filtered)` / `(smsft_*)`; untagged the
+handle parses as a phone and tagged it does not, so one sender resolved to two
+persons. Stripping the suffix is anchored and allowlisted rather than "cut at
+the first paren", because real handles contain parens. This was the single
+largest source of person fragmentation in the index — larger than every
+Contacts ambiguity combined.
+
 ## 2026-09-03 — `--snapshot`: the one-shot seed path, and a guard against it
 
 SPEC §8 S7 specifies a seed as `imsg sync --source <name> --snapshot <path>`,
