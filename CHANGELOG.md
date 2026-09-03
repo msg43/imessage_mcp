@@ -10,6 +10,37 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-03 — `--snapshot`: the one-shot seed path, and a guard against it
+
+SPEC §8 S7 specifies a seed as `imsg sync --source <name> --snapshot <path>`,
+and `run_sync(snapshot_override=...)` has implemented it since the build — but
+**neither option existed on the CLI**, so the only ways to run a seed were to
+overwrite `snapshots/snapshot.db` or to call the library by hand. The first is
+destructive: S1 atomically replaces that file from the live chat.db every
+`sync.interval_seconds`, so a file staged there is gone within the interval.
+
+- **`imsg sync --source <name> [--snapshot <path>]`** — `--source` alone syncs
+  that one source instead of fanning out; with `--snapshot` it is the
+  studio-seed one-shot path, skipping S1 and feeding the prepared file to
+  S2→S3→S4→S6.
+- **`imsg extract --snapshot <path> --source <name>`** — the S2-only
+  equivalent.
+
+**The guard is the point of the change, more than the option is.** A seed
+advances the ROWID watermark of whatever source it is ingested under, and a
+ROWID means something only inside one database file. Ingest a prepared corpus
+under a live source whose file has fewer rows, and the watermark jumps past
+real messages that were never read — they sit below it forever, and nothing
+reports rows it never looked at. There is no error, no count discrepancy at
+ingest time, and no way to notice except by missing data much later.
+
+So `--snapshot` fails closed on all three of: no `--source`; a `--source` that
+names a configured `sync.sources` entry (the live-source collision); and a
+missing file. Six tests cover the refusals and both positive paths, and the
+positive extract test asserts the seed path was used **by value** against the
+pipeline snapshot path — a test that only checked "it ran" would pass while S2
+read the wrong file.
+
 ## 2026-09-03 — real contact data had reached the fixtures; scrubbed
 
 The repo's single governing rule is that it is public-safe by construction:
