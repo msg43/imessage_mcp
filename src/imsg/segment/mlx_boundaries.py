@@ -3,12 +3,18 @@
 Qwen3.5-35B-A3B 4-bit, temperature 0, fixed prompt, JSON boundary
 indices).
 
-Contract with the caller (``imsg.segment.boundaries``): every failure —
-runtime missing, weights unloadable, generation timing out, malformed
-or out-of-range output — raises :class:`~imsg.errors.
-BoundaryDetectionError`, and a returned list is always sorted, unique
-and strictly inside ``0 < index < len(window)``. The caller applies the
-one-retry-then-session-fallback policy; nothing here retries.
+Contract with the caller (``imsg.segment.boundaries``): every failure of
+the *model's output* — generation timing out, malformed or out-of-range
+JSON, a chat template that rejects the conversation — raises
+:class:`~imsg.errors.BoundaryDetectionError`, and a returned list is
+always sorted, unique and strictly inside ``0 < index < len(window)``.
+The caller applies the one-retry-then-session-fallback policy; nothing
+here retries. A missing runtime or unloadable weights is *not*
+downgraded to that error: it propagates as
+:class:`~imsg.mlx_runtime.MlxRuntimeError` so the run aborts. Mapping it
+to ``BoundaryDetectionError`` would have every session in the corpus
+degrade to a ``fallback:session`` segment under a run that reports
+success — the silent failure ``models: backend=real`` exists to prevent.
 
 Prompting: the owner-authored template (config
 ``segmentation.boundary_prompt``, read by the CLI and passed in as
@@ -38,7 +44,6 @@ from typing import Any
 
 from imsg.errors import BoundaryDetectionError, SegmentationError
 from imsg.mlx_runtime import (
-    MlxRuntimeError,
     format_model_id,
     import_mlx_lm,
     load_model_and_tokenizer,
@@ -173,10 +178,10 @@ class MlxBoundaryProvider:
 
     Constructor arguments are plain values; the CLI reads
     ``segmentation.boundary_model`` and the prompt file and passes them
-    here. Weights load lazily on the first :meth:`detect_boundaries` (or
-    explicitly via :meth:`load`, which raises the underlying
-    ``MlxRuntimeError`` rather than ``BoundaryDetectionError`` so a
-    startup check fails loudly).
+    here. Weights load lazily on the first :meth:`detect_boundaries` or
+    explicitly via :meth:`load`; either way a load failure is the
+    underlying ``MlxRuntimeError`` (see the module docstring on why it
+    is never downgraded to ``BoundaryDetectionError``).
     """
 
     def __init__(
@@ -218,12 +223,11 @@ class MlxBoundaryProvider:
     def detect_boundaries(self, window: Sequence[MessageForSegmentation]) -> list[int]:
         if len(window) < 2:
             return []  # no index can satisfy 0 < i < len(window); nothing to ask the model
-        try:
-            self.load()
-        except MlxRuntimeError as exc:
-            raise BoundaryDetectionError(
-                f"boundary model {self.model_id} unavailable: {exc}"
-            ) from exc
+        # Deliberately not wrapped: a missing runtime / unloadable weights
+        # is an environment failure, not a property of this window, and
+        # must abort the run rather than trigger the caller's fallback
+        # (module docstring).
+        self.load()
         prompt = self._chat_prompt(render_boundary_prompt(self.prompt_template, window))
         response = self._generate(prompt)
         indices = parse_boundary_response(response)
