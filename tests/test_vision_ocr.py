@@ -74,6 +74,7 @@ def vision(monkeypatch: pytest.MonkeyPatch) -> VisionStub:
             self.level: Any = None
             self.language_correction: bool | None = None
             self.languages: list[str] | None = None
+            self.auto_detect: bool | None = None
             self.minimum_text_height: float | None = None
             self.recognized: list[_Observation] | None = None
 
@@ -93,6 +94,9 @@ def vision(monkeypatch: pytest.MonkeyPatch) -> VisionStub:
 
         def setRecognitionLanguages_(self, languages: list[str]) -> None:
             self.languages = list(languages)
+
+        def setAutomaticallyDetectsLanguage_(self, flag: bool) -> None:
+            self.auto_detect = flag
 
         def setMinimumTextHeight_(self, height: float) -> None:
             self.minimum_text_height = height
@@ -247,7 +251,11 @@ def test_recognize_text_configures_accurate_level_and_language_correction(
     (request,) = vision.requests
     assert request.level is ACCURATE_LEVEL
     assert request.language_correction is True
-    assert request.languages is None  # Vision's default language set is left alone
+    # No languages configured means "detect" (the config contract for
+    # `ocr_languages: null`), which Vision does NOT do by default — its
+    # default is a fixed en-US list with automaticallyDetectsLanguage off.
+    assert request.languages is None
+    assert request.auto_detect is True
     assert request.minimum_text_height is None
 
 
@@ -260,6 +268,7 @@ def test_recognize_text_passes_languages_and_minimum_height_when_given(
     provider.recognize_text(image)
     (request,) = vision.requests
     assert request.languages == ["en-US", "es-ES"]
+    assert request.auto_detect is None  # an explicit list is honoured as given
     assert request.minimum_text_height == 0.02
 
 

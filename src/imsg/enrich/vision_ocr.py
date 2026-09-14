@@ -95,7 +95,10 @@ class AppleVisionOcrProvider:
     identifier of which model actually ran. `recognition_languages`
     (BCP-47 tags, in priority order) and `minimum_text_height` (a
     fraction of the image height) are passed straight through to the
-    request when given; Vision's defaults apply otherwise.
+    request when given. With no languages configured the request's
+    `automaticallyDetectsLanguage` is switched on — Vision's own default
+    is a fixed en-US list with detection off, which is not what
+    `enrichment.ocr_languages: null` promises.
     """
 
     def __init__(
@@ -133,6 +136,13 @@ class AppleVisionOcrProvider:
         request.setUsesLanguageCorrection_(True)
         if self.recognition_languages is not None:
             request.setRecognitionLanguages_(self.recognition_languages)
+        else:
+            # Vision's own default is a fixed ['en-US'] with automatic
+            # detection OFF (read back from a live VNRecognizeTextRequest,
+            # pyobjc 12.2.2 on macOS 26, 2026-09-14). The config contract
+            # for `enrichment.ocr_languages: null` is detection, so ask for
+            # it explicitly (macOS 13+, the manifest's floor).
+            request.setAutomaticallyDetectsLanguage_(True)
         if self.minimum_text_height is not None:
             request.setMinimumTextHeight_(self.minimum_text_height)
 
