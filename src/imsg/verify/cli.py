@@ -22,6 +22,7 @@ from imsg.errors import ImsgError
 from imsg.verify.attachments import build_at3_report, format_report_text, report_to_csv
 from imsg.verify.seed import (
     build_seed_snapshot,
+    build_seed_snapshot_from_chat_db,
     snapshot_from_json,
     snapshot_to_json,
     verify_against_reference,
@@ -77,6 +78,14 @@ def verify_seed(
         Path | None,
         typer.Option(help="A snapshot exported (via --export) from the other host; verify against it."),
     ] = None,
+    reference_db: Annotated[
+        Path | None,
+        typer.Option(
+            help="A chat.db-shaped SQLite corpus to build the reference from directly, "
+            "for when no other host can run --export (e.g. a recovered/merged corpus). "
+            "Opened read-only and immutable; never written to.",
+        ),
+    ] = None,
     source_label: Annotated[
         str, typer.Option(help="Label for this host in the snapshot/report (e.g. 'mini', 'studio').")
     ] = "local",
@@ -87,15 +96,27 @@ def verify_seed(
     report_out: Annotated[Path | None, typer.Option(help="Also write the text report here.")] = None,
 ) -> None:
     """AT-2 — seed completeness (SPEC §12 AT-2). Exactly one of
-    `--export`/`--reference` is required: run with `--export <file>`
-    on the *other* machine, copy that file here (e.g. `rsync` over the
-    tailnet — SPEC §8 S7's Studio-seed transfer already assumes exactly
-    that path), then run with `--reference <file>` on this one. See
+    `--export`/`--reference`/`--reference-db` is required.
+
+    `--export <file>` on the *other* machine, copied here (e.g. `rsync`
+    over the tailnet — SPEC §8 S7's Studio-seed transfer already assumes
+    exactly that path), then `--reference <file>` on this one. See
     `imsg.verify.seed` for why this two-step file exchange replaces the
     literal `--reference <studio-snapshot.db>` spec text (both hosts
-    are never reachable at once here)."""
-    if (export is None) == (reference is None):
-        typer.echo("imsg: verify-seed requires exactly one of --export or --reference", err=True)
+    are never reachable at once here).
+
+    `--reference-db <sqlite>` skips the exchange when the thing being
+    verified is a prepared corpus file rather than another host: it
+    builds the reference from that file directly. A recovered or merged
+    corpus has no host to run `--export` on, which left AT-2 unrunnable
+    for exactly the seed it was written to check.
+    """
+    chosen = [opt is not None for opt in (export, reference, reference_db)]
+    if sum(chosen) != 1:
+        typer.echo(
+            "imsg: verify-seed requires exactly one of --export, --reference or --reference-db",
+            err=True,
+        )
         raise typer.Exit(code=2)
 
     cfg = _load_config_or_die(config)
@@ -110,8 +131,17 @@ def verify_seed(
             )
             return
 
-        assert reference is not None
-        ref_snapshot = snapshot_from_json(reference.read_text(encoding="utf-8"))
+        if reference is not None:
+            ref_snapshot = snapshot_from_json(reference.read_text(encoding="utf-8"))
+        else:
+            assert reference_db is not None
+            try:
+                ref_snapshot = build_seed_snapshot_from_chat_db(
+                    reference_db, source_label=f"reference-db:{reference_db.name}"
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                typer.echo(f"imsg: {exc}", err=True)
+                raise typer.Exit(code=2) from exc
         accepted: frozenset[str] = frozenset()
         if accept_missing is not None:
             accepted = frozenset(
