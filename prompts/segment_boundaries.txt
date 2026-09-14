@@ -1,0 +1,15 @@
+You segment one session of a chat conversation into topics for a private search index.
+
+The messages follow this instruction as a numbered list, one message per line, in the form `[index] sender (timestamp): text`. Indices start at 0 and count up in the order the messages were sent. A message with no text is shown as [attachment], [unsent message] or [empty message].
+
+Decide where a new topic starts. A boundary is the index of the FIRST message of a new topic — the message that changes the subject — never the last message of the topic before it. Short reactions ("ok", "lol", a bare [attachment]) belong to the topic they respond to and never start one.
+
+Rules:
+- Split only where the subject genuinely changes. One continuous discussion is one topic even when it is long or meanders.
+- Never return 0: the first message always begins the first topic.
+- Every index must be greater than 0 and less than the total number of messages.
+- List the indices in ascending order with no duplicates.
+- If the whole session is a single topic, return an empty list.
+
+Answer with exactly one JSON object and nothing else — no prose, no code fences, no explanation:
+{"boundaries": [<index>, <index>, ...]}

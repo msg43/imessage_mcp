@@ -14,6 +14,7 @@ import typer
 from typer.testing import CliRunner
 
 import imsg.cli as cli_module
+import imsg.providers.factory as factory_module
 from imsg.cli import app
 from imsg.db.migrations import AppliedMigration, MigrationFile, MigrationPlan
 from imsg.diagnostics import AtRestPosture, MountCheck, PostgresCheck
@@ -522,10 +523,64 @@ def test_segment_wires_run_segment(
     assert captured["kw"]["chat_ids"] is None
 
 
-def test_segment_missing_boundary_prompt_exits_cleanly(mocked_pg_env: Path) -> None:
+def _hide_the_shipped_prompts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Simulate a checkout without `prompts/`: the data_root copy is then
+    the only candidate, so the "missing prompt" error paths are reachable."""
+    monkeypatch.setattr(factory_module, "default_prompt_root", lambda: tmp_path / "no-checkout")
+
+
+def test_segment_missing_boundary_prompt_exits_cleanly(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _hide_the_shipped_prompts(monkeypatch, tmp_path)
     result = runner.invoke(app, ["segment", "--config", str(mocked_pg_env)])
     assert result.exit_code == 1
     assert "boundary prompt not found" in result.output
+
+
+def test_segment_falls_back_to_the_repo_shipped_boundary_prompt(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh data_root has no prompts yet. The shipped
+    `prompts/segment_boundaries.txt` is used — its exact bytes, since they
+    feed `seg_config_hash` — and the run says so."""
+    from imsg.segment.models import SegmentationRunReport
+
+    shipped = factory_module.default_prompt_root() / "prompts" / "segment_boundaries.txt"
+    assert shipped.is_file()
+    captured: dict[str, Any] = {}
+
+    def fake_run_segment(conn: Any, config: Any, provider: Any, prompt_bytes: bytes, **kw: Any) -> list[SegmentationRunReport]:
+        captured["prompt_bytes"] = prompt_bytes
+        return [SegmentationRunReport(chat_id=1, segments_written=1)]
+
+    monkeypatch.setattr(cli_module, "run_segment", fake_run_segment)
+    result = runner.invoke(app, ["segment", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert captured["prompt_bytes"] == shipped.read_bytes()
+    assert f"segmentation prompt: {shipped} (repo-shipped default)" in result.output
+
+
+def test_segment_prefers_the_data_root_boundary_prompt_and_says_so(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.segment.models import SegmentationRunReport
+
+    data_root = _data_root_from_config(mocked_pg_env)
+    prompt_path = data_root / "prompts" / "segment_boundaries.txt"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text("operator override")
+    captured: dict[str, Any] = {}
+
+    def fake_run_segment(conn: Any, config: Any, provider: Any, prompt_bytes: bytes, **kw: Any) -> list[SegmentationRunReport]:
+        captured["prompt_bytes"] = prompt_bytes
+        return [SegmentationRunReport(chat_id=1, segments_written=1)]
+
+    monkeypatch.setattr(cli_module, "run_segment", fake_run_segment)
+    result = runner.invoke(app, ["segment", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert captured["prompt_bytes"] == b"operator override"
+    assert f"segmentation prompt: {prompt_path} (data_root)" in result.output
 
 
 def test_segment_rebuild_wires_run_segment_for_chat(
@@ -579,7 +634,10 @@ def test_embed_wires_run_embed_and_fts_sync(
     assert "events_applied=3" in result.output
 
 
-def test_sync_missing_boundary_prompt_exits_cleanly(mocked_pg_env: Path) -> None:
+def test_sync_missing_boundary_prompt_exits_cleanly(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _hide_the_shipped_prompts(monkeypatch, tmp_path)
     result = runner.invoke(app, ["sync", "--config", str(mocked_pg_env)])
     assert result.exit_code == 1
     assert "boundary prompt not found" in result.output
@@ -1413,9 +1471,12 @@ def test_embed_prints_the_backend_line_and_uses_the_factory(
     assert isinstance(captured["kw"]["multimodal_provider"], FakeMultimodalEmbeddingProvider)
 
 
-def test_sync_prints_the_backend_line_before_building_providers(mocked_pg_env: Path) -> None:
-    # No boundary prompt on disk: sync exits 1 while building its segment
+def test_sync_prints_the_backend_line_before_building_providers(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # No boundary prompt anywhere: sync exits 1 while building its segment
     # function — the backend line must already be out by then.
+    _hide_the_shipped_prompts(monkeypatch, tmp_path)
     result = runner.invoke(app, ["sync", "--config", str(mocked_pg_env)])
     assert result.exit_code == 1
     assert "models: backend=fake" in result.output
@@ -1445,6 +1506,34 @@ def test_enrich_prints_the_backend_line_and_uses_the_factory(
     assert isinstance(providers.ocr, FakeOcrProvider)
     assert isinstance(providers.caption, FakeCaptionProvider)
     assert isinstance(providers.transcription, FakeTranscriptionProvider)
+
+
+def test_enrich_real_backend_prints_the_caption_prompt_it_used(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the real backend, `enrich` reads the fixed caption prompt —
+    the shipped `prompts/caption.txt` when data_root has none — hands its
+    exact text to the factory, and prints which file it used."""
+    from imsg.enrich.pipeline import EnrichmentProviders
+    from imsg.enrich.provider import FakeCaptionProvider, FakeOcrProvider, FakeTranscriptionProvider
+
+    _strip_models_section(mocked_pg_env)  # schema default: backend=real
+    shipped = factory_module.default_prompt_root() / "prompts" / "caption.txt"
+    captured: dict[str, Any] = {}
+
+    def fake_build(cfg: Any, *, caption_prompt: str | None = None) -> EnrichmentProviders:
+        captured["caption_prompt"] = caption_prompt
+        return EnrichmentProviders(
+            ocr=FakeOcrProvider(), caption=FakeCaptionProvider(), transcription=FakeTranscriptionProvider()
+        )
+
+    monkeypatch.setattr(cli_module, "build_enrichment_providers", fake_build)
+    monkeypatch.setattr(cli_module, "claim_tasks", lambda conn, **kw: [])
+    result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert "models: backend=real" in result.output
+    assert f"caption prompt: {shipped} (repo-shipped default)" in result.output
+    assert captured["caption_prompt"] == shipped.read_bytes().decode("utf-8")
 
 
 def test_mcp_local_sends_the_backend_line_to_stderr_not_the_stdio_channel(
