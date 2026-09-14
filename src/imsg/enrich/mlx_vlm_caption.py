@@ -143,8 +143,16 @@ class MlxVlmCaptionProvider:
         prompt_utils = import_runtime_module("mlx_vlm.prompt_utils", install_hint=_INSTALL_HINT)
         model, processor, config = self._load()
         try:
+            # `enable_thinking=False`: rendered against the pinned Qwen3.5
+            # repo's chat_template.jinja (2026-09-14) it closes an empty
+            # <think></think> block so the answer starts at once; left to
+            # the template's default the model thinks first and can spend
+            # `max_tokens` before any caption appears. mlx_vlm 0.7.1 happens
+            # to default this off for qwen3_5_moe; the provider's contract
+            # (temperature 0, the budget spent on the caption) must not rest
+            # on a third-party default.
             formatted_prompt = prompt_utils.apply_chat_template(
-                processor, config, self.prompt, num_images=1
+                processor, config, self.prompt, num_images=1, enable_thinking=False
             )
             output = mlx_vlm.generate(
                 model,

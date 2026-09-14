@@ -161,6 +161,16 @@ def _run_ocr(
     )
 
 
+def _caption_provenance(providers: EnrichmentProviders) -> dict[str, object]:
+    """What, besides `model`, determined a caption: the fixed prompt's
+    SHA-256 when the provider exposes one (`MlxVlmCaptionProvider.
+    prompt_sha256`; the fakes do not). SPEC §4.1 makes the prompt part
+    of the captioning contract, so it is recorded in `detail` — the role
+    `boundary_prompt_sha256` plays inside `seg_config_hash`."""
+    sha = getattr(providers.caption, "prompt_sha256", None)
+    return {"prompt_sha256": sha} if isinstance(sha, str) and sha else {}
+
+
 def _run_caption_image(
     cache_path: Path, config: Config, providers: EnrichmentProviders
 ) -> EnrichmentResult:
@@ -169,6 +179,7 @@ def _run_caption_image(
         model=providers.caption.model_id,
         model_version=None,
         text=providers.caption.caption(cache_path),
+        detail=_caption_provenance(providers) or None,
     )
 
 
@@ -231,7 +242,11 @@ def _run_caption_video(
         model=providers.caption.model_id,
         model_version=None,
         text=text,
-        detail={"frames": per_frame, "duration_seconds": duration},
+        detail={
+            "frames": per_frame,
+            "duration_seconds": duration,
+            **_caption_provenance(providers),
+        },
     )
 
 
