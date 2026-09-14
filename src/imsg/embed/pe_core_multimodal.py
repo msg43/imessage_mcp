@@ -69,7 +69,8 @@ revision=, cache_dir=, allow_patterns=)`;
 `torch.backends.mps.is_available()`, `torch.cuda.is_available()`,
 `torch.inference_mode()`, `torch.stack(...)`, `Tensor.to/float/cpu/
 tolist`; `PIL.Image.open`, `PIL.ImageOps.exif_transpose`,
-`Image.convert("RGB")`.
+`Image.convert("RGB")`; `pillow_heif.register_heif_opener()` (1.7.0:
+`(**kwargs) -> None`), optional — see `_register_heif_opener`.
 
 Everything heavy is imported lazily inside `_load()` — via
 `importlib.import_module`, so mypy strict (with `warn_unused_ignores`)
@@ -149,6 +150,30 @@ def _import_runtime(module: str) -> Any:
             f"the PE-Core multimodal runtime is not installed: could not import "
             f"{module!r} ({exc}) — {MODELS_EXTRA_HINT}"
         ) from exc
+
+
+def _register_heif_opener() -> bool:
+    """Teach PIL to decode HEIC/HEIF — the iPhone camera's default format,
+    so a large share of image attachments — through `pillow-heif`
+    (pinned in the `models` extra) when it is importable. Without it
+    `Image.open` raises `UnidentifiedImageError` for every HEIC and each
+    one fails as `UnreadableImageError`. Returns whether the opener was
+    registered; the call is idempotent and cheap, so it runs on every
+    load."""
+    try:
+        pillow_heif = importlib.import_module("pillow_heif")
+    except ImportError:
+        logger.warning(
+            "pe_core.heif_unsupported",
+            hint="install pillow-heif (`uv sync --extra models`) to embed HEIC attachments",
+        )
+        return False
+    try:
+        pillow_heif.register_heif_opener()
+    except Exception as exc:  # a broken libheif build: HEICs fail per item, not the run
+        logger.warning("pe_core.heif_registration_failed", error=f"{type(exc).__name__}: {exc}")
+        return False
+    return True
 
 
 def _config_embed_dim(config_path: Path) -> int:
@@ -266,6 +291,7 @@ class PeCoreMultimodalEmbeddingProvider:
         hf_hub = _import_runtime("huggingface_hub")
         pil_image = _import_runtime("PIL.Image")
         pil_image_ops = _import_runtime("PIL.ImageOps")
+        _register_heif_opener()
 
         # Fail on the cheap checks (device, config width) before
         # pulling several GB of weights.

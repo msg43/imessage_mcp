@@ -307,6 +307,10 @@ def _install_fakes(world: FakeWorld, monkeypatch: pytest.MonkeyPatch) -> None:
         "PIL": pil,
         "PIL.Image": pil_image,
         "PIL.ImageOps": pil_image_ops,
+        # Blocked by default: the real package (installed with the `models`
+        # extra) would try to register itself with the *fake* PIL above.
+        # The HEIC tests install their own stand-in.
+        "pillow_heif": None,
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
 
@@ -752,3 +756,34 @@ def test_provider_satisfies_the_protocol_surface(world: FakeWorld, tmp_path: Pat
     (vec,) = provider.embed_images(_images(tmp_path, ["p.png"]))
     assert len(vec) == provider.dim
     assert len(provider.embed_text("p")) == provider.dim
+
+
+# --------------------------------------------------------------------------
+# HEIC: PIL only decodes iPhone's default photo format once pillow-heif has
+# registered its opener — without that every HEIC attachment fails as
+# UnreadableImageError.
+# --------------------------------------------------------------------------
+
+
+def test_load_registers_the_heif_opener_once(world: FakeWorld, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+    heif = types.ModuleType("pillow_heif")
+
+    def register_heif_opener(**kwargs: Any) -> None:  # pillow-heif 1.7.0's signature
+        calls.append(kwargs)
+
+    heif.register_heif_opener = register_heif_opener  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pillow_heif", heif)
+
+    provider = _provider(world)
+    assert calls == []  # construction stays side-effect free
+    provider.embed_text("a photo")
+    provider.embed_text("another")
+    assert calls == [{}]  # registered on load, not per call
+
+
+def test_load_survives_a_missing_pillow_heif(world: FakeWorld, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The opener is a decoding capability, not a load prerequisite: the
+    provider comes up without it and only HEIC files fail, per item."""
+    monkeypatch.setitem(sys.modules, "pillow_heif", None)
+    assert len(_provider(world).embed_text("a photo")) == world.dim
