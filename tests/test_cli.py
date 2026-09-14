@@ -1253,6 +1253,88 @@ def test_seed_refuses_a_missing_file(mocked_pg_env: Path, tmp_path: Path) -> Non
     assert "--snapshot file not found" in result.output
 
 
+def _live_chat_db_from_config(config_path: Path) -> Path:
+    for line in config_path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("live_chat_db:"):
+            return Path(stripped.split(":", 1)[1].strip())
+    raise AssertionError("live_chat_db not found in test config fixture")
+
+
+def _refuse_to_extract(**kwargs: Any) -> Any:
+    raise AssertionError("run_extract must not be reached for a refused seed")
+
+
+def test_seed_refuses_the_live_chat_db_itself(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-negotiable #1: the live chat.db is read exactly once, by S1's
+    SQLite backup. `--snapshot` handing it straight to S2 would be a
+    second reader of the live file — refused by name, before anything
+    is opened."""
+    live = _live_chat_db_from_config(mocked_pg_env)
+    assert live.is_file()
+    monkeypatch.setattr(cli_module, "run_extract", _refuse_to_extract)
+    result = runner.invoke(
+        app,
+        ["extract", "--config", str(mocked_pg_env), "--snapshot", str(live), "--source", "seed-2026"],
+    )
+    assert result.exit_code == 1
+    assert "is the live Messages database" in result.output
+    assert "non-negotiable #1" in result.output
+
+
+def test_seed_refuses_a_symlink_to_the_live_chat_db(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    live = _live_chat_db_from_config(mocked_pg_env)
+    link = tmp_path / "innocent-looking-seed.db"
+    link.symlink_to(live)
+    monkeypatch.setattr(cli_module, "run_extract", _refuse_to_extract)
+    result = runner.invoke(
+        app,
+        ["extract", "--config", str(mocked_pg_env), "--snapshot", str(link), "--source", "seed-2026"],
+    )
+    assert result.exit_code == 1
+    assert "is the live Messages database" in result.output
+
+
+def test_seed_refuses_anything_inside_the_live_messages_directory(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copy placed next to the live database is still inside the
+    directory S1 alone may touch — and Messages keeps -wal/-shm sidecars
+    there that a second SQLite reader would interact with."""
+    live = _live_chat_db_from_config(mocked_pg_env)
+    beside = live.parent / "chat-copy.db"
+    beside.write_text("")
+    monkeypatch.setattr(cli_module, "run_extract", _refuse_to_extract)
+    result = runner.invoke(
+        app,
+        ["extract", "--config", str(mocked_pg_env), "--snapshot", str(beside), "--source", "seed-2026"],
+    )
+    assert result.exit_code == 1
+    assert "inside the live Messages directory" in result.output
+    assert "non-negotiable #1" in result.output
+
+
+def test_sync_seed_refuses_the_live_chat_db(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live = _live_chat_db_from_config(mocked_pg_env)
+
+    def refuse(**kwargs: Any) -> Any:
+        raise AssertionError("run_sync must not be reached for a refused seed")
+
+    monkeypatch.setattr(cli_module, "run_sync", refuse)
+    result = runner.invoke(
+        app,
+        ["sync", "--config", str(mocked_pg_env), "--snapshot", str(live), "--source", "seed-2026"],
+    )
+    assert result.exit_code == 1
+    assert "is the live Messages database" in result.output
+
+
 def test_extract_seed_uses_the_given_file_and_source(
     mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
