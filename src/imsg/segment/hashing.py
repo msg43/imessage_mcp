@@ -30,24 +30,33 @@ def compute_seg_config_hash(
     max_messages: int,
     max_tokens: int,
     boundary_model: str,
+    boundary_revision: str,
     boundary_prompt_bytes: bytes,
     index_unsent: bool,
     index_edit_history: bool,
 ) -> str:
     """One hash covering every input that changes segment *content* or
     *membership*: the numeric D4 thresholds, the D1 policy flags, the
-    exact boundary prompt bytes, the boundary model identifier, the
-    renderer's own version, and the fixed (non-configurable) windowing
-    constants — any of these changing must force re-segmentation.
+    exact boundary prompt bytes, the boundary model identifier *and its
+    pinned revision* (D4: "boundary-model revision" — the same repo id
+    at a different commit is a different model), the renderer's own
+    version, and the fixed (non-configurable) windowing constants — any
+    of these changing must force re-segmentation.
+
+    Payload version ``v2`` (2026-09-14) added ``boundary_revision``; the
+    bump alone changes every hash, so an install segmented under ``v1``
+    re-segments every chat on its next run — deliberate, since those
+    segments were produced without the revision being recorded.
     """
     payload = " ".join(
         [
-            "seg_config_hash/v1",
+            "seg_config_hash/v2",
             f"session_gap_hours={session_gap_hours!r}",
             f"topical_min_messages={topical_min_messages}",
             f"max_messages={max_messages}",
             f"max_tokens={max_tokens}",
             f"boundary_model={boundary_model}",
+            f"boundary_revision={boundary_revision}",
             f"boundary_prompt_sha256={sha256_text(boundary_prompt_bytes.decode('utf-8', 'replace'))}",
             f"index_unsent={index_unsent}",
             f"index_edit_history={index_edit_history}",
