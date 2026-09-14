@@ -110,6 +110,9 @@ def _base_config_dict(data_root: Path, live_chat_db: Path) -> dict[str, Any]:
             "reranker_revision": "f00dcafe",
             "default_limit": 10,
         },
+        # Explicit: `real` is the default, and no test may load model
+        # weights. Tests asserting the default delete this key.
+        "models": {"backend": "fake"},
         "render": {"timezone": "America/Los_Angeles", "attachment_snippet_chars": 200},
         "mcp": {
             "local": {"enabled": True},

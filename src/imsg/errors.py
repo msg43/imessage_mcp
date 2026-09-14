@@ -167,3 +167,20 @@ class AgentInstallError(ImsgError):
     `cloudflared`) is not on `PATH` and was not supplied explicitly.
     Deliberately does not guess a hardcoded fallback path for a missing
     binary; the caller must install it or point at it explicitly."""
+
+
+class ProviderUnavailableError(ImsgError):
+    """`imsg.providers.factory` could not construct a real model
+    provider: the provider module is absent from this build, a runtime
+    package from the `models` extra is not installed, a prompt file the
+    provider needs is missing, or the provider's own constructor failed
+    (model download, revision not found, ...). Always carries an
+    operator-actionable message — never a bare `ModuleNotFoundError`
+    traceback."""
+
+
+class ModelManifestError(ImsgError):
+    """`models/manifest.lock.yaml` is missing, malformed, or could not
+    be re-verified against the Hugging Face API (SPEC model-manifest
+    requirement: exact repo, immutable revision, license, dimension,
+    runtime floors — "a build MUST NOT silently advance a model")."""

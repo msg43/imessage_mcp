@@ -46,6 +46,8 @@ embedding:
     revision: cafef00d
 retrieval:
   reranker_revision: f00dcafe
+models:
+  backend: fake
 mcp:
   public:
     scope: allowlist
@@ -918,6 +920,8 @@ embedding:
     revision: cafef00d
 retrieval:
   reranker_revision: f00dcafe
+models:
+  backend: fake
 mcp:
   local:
     enabled: false
@@ -1001,6 +1005,8 @@ embedding:
     revision: cafef00d
 retrieval:
   reranker_revision: f00dcafe
+models:
+  backend: fake
 mcp:
   public:
     enabled: true
@@ -1289,3 +1295,212 @@ def test_sync_without_overrides_still_syncs_every_source(
     result = runner.invoke(app, ["sync", "--config", str(mocked_pg_env)])
     assert result.exit_code == 0, result.output
     assert called, "the no-override path must still fan out to all sources"
+
+
+# --------------------------------------------------------------------------
+# Model providers come from imsg.providers.factory (`models.backend`);
+# every provider-building command prints `models: backend=<real|fake>`
+# --------------------------------------------------------------------------
+
+
+def _patch_status_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli_module, "check_mount", lambda data_root: MountCheck(ok=True, reason=None, info=None)
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "check_at_rest_posture",
+        lambda data_root: AtRestPosture(
+            label="unattended",
+            boot_volume_encrypted=False,
+            auto_login_enabled=True,
+            data_volume_encrypted=True,
+            caveat="test caveat",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "check_postgres",
+        lambda config: PostgresCheck(reachable=True, cluster_fingerprint_ok=True, reason=None),
+    )
+    monkeypatch.setattr(cli_module, "disk_free_bytes", lambda path: 1)
+
+
+def _strip_models_section(config_path: Path) -> None:
+    """Remove the fixture's explicit `models: backend: fake` so the config
+    exercises the schema default (`real`)."""
+    text = config_path.read_text()
+    assert "models:\n  backend: fake\n" in text
+    config_path.write_text(text.replace("models:\n  backend: fake\n", ""))
+
+
+def _point_provider_at_a_missing_module(monkeypatch: pytest.MonkeyPatch, role: str) -> str:
+    from imsg.providers import factory as factory_module
+
+    module = f"imsg.absent_provider_module_for_{role}"
+    spec = factory_module.RealProviderSpec(role, module, "Provider")
+    monkeypatch.setitem(factory_module.REAL_PROVIDERS, role, spec)
+    return module
+
+
+def test_status_prints_the_backend_line_and_reports_it_in_json(
+    cli_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_status_probes(monkeypatch)
+
+    result = runner.invoke(app, ["status", "--config", str(cli_config)])
+    assert result.exit_code == 0, result.output
+    assert "models: backend=fake" in result.output
+    assert "models_backend:" not in result.output  # printed once, in its canonical form
+
+    result = runner.invoke(app, ["status", "--config", str(cli_config), "--json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["models_backend"] == "fake"
+
+
+def test_status_reports_the_real_default_when_config_is_silent(
+    cli_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_status_probes(monkeypatch)
+    _strip_models_section(cli_config)
+    result = runner.invoke(app, ["status", "--config", str(cli_config)])
+    assert result.exit_code == 0, result.output
+    assert "models: backend=real" in result.output
+
+
+def test_segment_prints_the_backend_line_and_uses_the_factory(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.segment.boundaries import FakeBoundaryProvider
+    from imsg.segment.models import SegmentationRunReport
+
+    data_root = _data_root_from_config(mocked_pg_env)
+    prompt_path = data_root / "prompts" / "segment_boundaries.txt"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text("segment this")
+    captured: dict[str, Any] = {}
+
+    def fake_run_segment(conn: Any, config: Any, provider: Any, prompt_bytes: bytes, **kw: Any) -> list[SegmentationRunReport]:
+        captured["provider"] = provider
+        return [SegmentationRunReport(chat_id=1, segments_written=1)]
+
+    monkeypatch.setattr(cli_module, "run_segment", fake_run_segment)
+    result = runner.invoke(app, ["segment", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert "models: backend=fake" in result.output
+    assert isinstance(captured["provider"], FakeBoundaryProvider)
+
+
+def test_embed_prints_the_backend_line_and_uses_the_factory(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.embed.pipeline import EmbedRunReport
+    from imsg.embed.provider import FakeMultimodalEmbeddingProvider, FakeTextEmbeddingProvider
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_embed(conn: Any, provider: Any, **kw: Any) -> EmbedRunReport:
+        captured["provider"] = provider
+        captured["kw"] = kw
+        return EmbedRunReport(segments_embedded=0, chunks_embedded=0, attachments_embedded=0)
+
+    monkeypatch.setattr(cli_module, "run_embed", fake_run_embed)
+    result = runner.invoke(app, ["embed", "--config", str(mocked_pg_env), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "models: backend=fake" in result.output
+    assert "DRY RUN — nothing was written" in result.output
+    assert isinstance(captured["provider"], FakeTextEmbeddingProvider)
+    assert isinstance(captured["kw"]["multimodal_provider"], FakeMultimodalEmbeddingProvider)
+
+
+def test_sync_prints_the_backend_line_before_building_providers(mocked_pg_env: Path) -> None:
+    # No boundary prompt on disk: sync exits 1 while building its segment
+    # function — the backend line must already be out by then.
+    result = runner.invoke(app, ["sync", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 1
+    assert "models: backend=fake" in result.output
+    assert "boundary prompt not found" in result.output
+
+
+def test_enrich_prints_the_backend_line_and_uses_the_factory(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.enrich.provider import FakeCaptionProvider, FakeOcrProvider, FakeTranscriptionProvider
+    from imsg.enrich.queue import EnrichmentTask
+
+    captured: dict[str, Any] = {}
+
+    def fake_process(conn: Any, config: Any, providers: Any, task: Any) -> str:
+        captured["providers"] = providers
+        return "done"
+
+    monkeypatch.setattr(
+        cli_module, "claim_tasks", lambda conn, **kw: [EnrichmentTask(attachment_id=1, kind="ocr", attempts=0)]
+    )
+    monkeypatch.setattr(cli_module, "process_one_task", fake_process)
+    result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert "models: backend=fake" in result.output
+    providers = captured["providers"]
+    assert isinstance(providers.ocr, FakeOcrProvider)
+    assert isinstance(providers.caption, FakeCaptionProvider)
+    assert isinstance(providers.transcription, FakeTranscriptionProvider)
+
+
+def test_mcp_local_sends_the_backend_line_to_stderr_not_the_stdio_channel(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import anyio
+
+    monkeypatch.setattr(anyio, "run", lambda func, *args: None)
+    result = runner.invoke(app, ["mcp", "local", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert "models: backend=fake" in result.stderr
+    assert "models: backend=fake" not in result.stdout
+
+
+def test_real_backend_with_a_missing_provider_module_exits_cleanly(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default backend, before a provider branch is merged (or with
+    the `models` extra absent): one `imsg: ...` line, exit 1, nothing
+    run — never a traceback."""
+    _strip_models_section(mocked_pg_env)
+    module = _point_provider_at_a_missing_module(monkeypatch, "text_embedding")
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("run_embed must not run without providers")
+
+    monkeypatch.setattr(cli_module, "run_embed", boom)
+    result = runner.invoke(app, ["embed", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 1
+    assert "models: backend=real" in result.output
+    assert "imsg: this build has no real 'text_embedding' provider" in result.output
+    assert module in result.output
+    assert "models.backend: fake" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_enrich_dry_run_builds_no_providers_even_on_the_real_backend(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.enrich.queue import EnrichPreviewReport
+
+    _strip_models_section(mocked_pg_env)
+    _point_provider_at_a_missing_module(monkeypatch, "ocr")
+    monkeypatch.setattr(
+        cli_module, "preview_claimable_tasks", lambda conn, **kw: EnrichPreviewReport(total=0, by_kind={})
+    )
+    result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "models: backend=real" in result.output
+    assert "DRY RUN — nothing was written" in result.output
+
+
+def test_help_lists_the_models_command_group() -> None:
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "models" in result.output
+    result = runner.invoke(app, ["models", "--help"])
+    assert result.exit_code == 0
+    assert "verify" in result.output
