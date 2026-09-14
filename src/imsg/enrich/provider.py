@@ -5,12 +5,13 @@ in this package — `pdftotext`, `pdftoppm`, `ffmpeg` audio/video
 handling — is ordinary deterministic subprocess tooling, not a model,
 and is implemented for real rather than behind a provider interface.
 
-No model weights exist in this build environment, and there is no
-corpus to run them against. `Fake*Provider` implementations are
-deterministic stand-ins used by every test in this build; the real
-Vision/MLX-backed implementations are Phase 3/5 work and drop in
-behind the same Protocols — nothing above this layer should need to
-change.
+No model weights exist in the build environment. `Fake*Provider`
+implementations are deterministic stand-ins used by the pipeline
+tests; the real implementations sit behind the same Protocols in
+`vision_ocr` (Apple Vision), `mlx_vlm_caption` (a local VLM through
+`mlx_vlm`), and `mlx_whisper_transcription` (Whisper through
+`mlx_whisper`). Each imports its runtime on first use, so nothing above
+this layer — and no test — needs a model runtime installed.
 """
 
 from __future__ import annotations
