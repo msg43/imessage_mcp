@@ -655,6 +655,7 @@ def run_segment_for_chat(
         max_messages=seg_cfg.max_messages,
         max_tokens=seg_cfg.max_tokens,
         boundary_model=seg_cfg.boundary_model,
+        boundary_revision=seg_cfg.boundary_revision,
         boundary_prompt_bytes=boundary_prompt_bytes,
         index_unsent=policy.index_unsent,
         index_edit_history=policy.index_edit_history,

@@ -187,7 +187,8 @@ def _seed_minimal_segment(
 
         seg_hash = compute_seg_config_hash(
             session_gap_hours=3.0, topical_min_messages=10, max_messages=50, max_tokens=2000,
-            boundary_model="test-model", boundary_prompt_bytes=b"prompt", index_unsent=False,
+            boundary_model="test-model", boundary_revision="test-revision",
+            boundary_prompt_bytes=b"prompt", index_unsent=False,
             index_edit_history=False,
         )
         stable_key = compute_stable_key(

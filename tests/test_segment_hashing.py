@@ -10,6 +10,7 @@ _KWARGS = {
     "max_messages": 50,
     "max_tokens": 2000,
     "boundary_model": "qwen3.5-35b-a3b-4bit",
+    "boundary_revision": "1e20fd8d42056f870933bf98ca6211024744f7ec",
     "boundary_prompt_bytes": b"detect topic boundaries",
     "index_unsent": False,
     "index_edit_history": False,
@@ -44,6 +45,16 @@ def test_hash_changes_with_prompt_bytes() -> None:
 def test_hash_changes_with_boundary_model() -> None:
     a = compute_seg_config_hash(**_KWARGS)  # type: ignore[arg-type]
     kwargs = dict(_KWARGS, boundary_model="a-different-model")
+    b = compute_seg_config_hash(**kwargs)  # type: ignore[arg-type]
+    assert a != b
+
+
+def test_hash_changes_with_boundary_revision() -> None:
+    """D4: the pinned revision is part of what produced every segment —
+    the same repo id at another commit is another model, and must force
+    re-segmentation just as a changed prompt or threshold does."""
+    a = compute_seg_config_hash(**_KWARGS)  # type: ignore[arg-type]
+    kwargs = dict(_KWARGS, boundary_revision="0000000000000000000000000000000000000000")
     b = compute_seg_config_hash(**kwargs)  # type: ignore[arg-type]
     assert a != b
 
