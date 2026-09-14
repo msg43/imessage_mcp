@@ -239,14 +239,77 @@ def test_real_backend_reads_the_caption_prompt_from_data_root(
 
 
 def test_real_backend_missing_caption_prompt_is_one_clear_error(
-    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _install_stub_modules(monkeypatch)
+    monkeypatch.setattr(factory, "default_prompt_root", lambda: tmp_path / "no-checkout")
     cfg = _config(config_dict_factory, None)
     with pytest.raises(
         ProviderUnavailableError, match=r"caption prompt not found.*enrichment\.caption_prompt"
     ):
         build_enrichment_providers(cfg)
+
+
+def test_caption_prompt_falls_back_to_the_repo_shipped_file(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh data_root has no prompts yet; the repository ships the
+    canonical text at the same relative path, and that is what the real
+    caption provider is built with — verbatim, so `prompt_sha256` is the
+    shipped file's hash."""
+    calls = _install_stub_modules(monkeypatch)
+    cfg = _config(config_dict_factory, None)
+    assert not (cfg.paths.data_root / cfg.enrichment.caption_prompt).exists()
+    shipped = factory.default_prompt_root() / cfg.enrichment.caption_prompt
+    assert shipped.is_file()
+
+    resolved = factory.resolve_caption_prompt(cfg)
+    assert (resolved.path, resolved.source) == (shipped, "repo")
+    build_enrichment_providers(cfg)
+    assert calls["caption"][0][0][2] == shipped.read_bytes().decode("utf-8")
+
+
+def test_data_root_caption_prompt_wins_over_the_shipped_one(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_stub_modules(monkeypatch)
+    cfg = _config(config_dict_factory, None)
+    override = cfg.paths.data_root / cfg.enrichment.caption_prompt
+    override.parent.mkdir(parents=True, exist_ok=True)
+    override.write_text("Operator override.\n", encoding="utf-8")
+    resolved = factory.resolve_caption_prompt(cfg)
+    assert (resolved.path, resolved.source) == (override, "data_root")
+    assert factory.read_caption_prompt(cfg) == "Operator override.\n"
+
+
+def test_non_utf8_prompt_is_one_clear_error_not_a_traceback(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_stub_modules(monkeypatch)
+    cfg = _config(config_dict_factory, None)
+    bad = cfg.paths.data_root / cfg.enrichment.caption_prompt
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_bytes(b"\xff\xfe not utf-8")
+    with pytest.raises(ProviderUnavailableError, match="not valid UTF-8"):
+        build_enrichment_providers(cfg)
+
+
+def test_shipped_boundary_prompt_matches_the_parser_contract() -> None:
+    """The repo-shipped `prompts/segment_boundaries.txt` must ask for the
+    shape `MlxBoundaryProvider` parses and the range it validates: a
+    `{"boundaries": [...]}` object of indices where a NEW segment starts,
+    never 0, all inside the window."""
+    from imsg.config.schema import SegmentationConfig
+    from imsg.segment.mlx_boundaries import parse_boundary_response, validate_boundaries
+
+    relative = SegmentationConfig().boundary_prompt
+    text = (factory.default_prompt_root() / relative).read_text(encoding="utf-8")
+    assert '{"boundaries": [' in text
+    assert "Never return 0" in text
+    assert "FIRST message of a new topic" in text
+    # The literal answer shape the prompt requests round-trips through the parser.
+    assert validate_boundaries(parse_boundary_response('{"boundaries": [2, 5]}'), 8) == [2, 5]
+    assert parse_boundary_response('{"boundaries": []}') == []
 
 
 def test_fake_backend_never_needs_the_caption_prompt(config_dict_factory: Any) -> None:

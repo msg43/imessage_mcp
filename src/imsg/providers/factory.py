@@ -202,15 +202,79 @@ def _check_dim(spec: RealProviderSpec, provider: object, expected: int) -> None:
         )
 
 
-def _read_prompt_or_raise(path_description: str, path: Path, *, field_name: str) -> str:
+# --------------------------------------------------------------------------
+# prompt files: the operator's copy under data_root, else the shipped one
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedPrompt:
+    """Where a prompt file was found: the operator's copy under
+    `paths.data_root` (`source="data_root"`) or the one the repository
+    ships at the same relative path (`source="repo"`)."""
+
+    path: Path
+    source: str
+
+    @property
+    def description(self) -> str:
+        return "data_root" if self.source == "data_root" else "repo-shipped default"
+
+
+def default_prompt_root() -> Path:
+    """The repository root, under which the shipped `prompts/*.txt` live —
+    the fallback when `paths.data_root` has no operator-authored copy at
+    the same relative path. Tests patch this to simulate an absent
+    fallback."""
+    # src/imsg/providers/factory.py -> providers -> imsg -> src -> repo root
+    return Path(__file__).resolve().parents[3]
+
+
+def resolve_prompt_path(data_root: Path, relative: Path) -> ResolvedPrompt | None:
+    """`data_root/<relative>` when it exists, else the repo-shipped file at
+    the same relative path, else `None`. The data_root copy always wins,
+    so an operator overrides a shipped prompt without touching the
+    checkout — and `seg_config_hash` / `prompt_sha256` hash whichever
+    bytes were actually used, so the two never disagree with the model."""
+    candidate = data_root / relative
+    if candidate.is_file():
+        return ResolvedPrompt(candidate, "data_root")
+    shipped = default_prompt_root() / relative
+    if shipped.is_file():
+        return ResolvedPrompt(shipped, "repo")
+    return None
+
+
+def read_prompt_text(path: Path, *, field_name: str) -> str:
+    """The file's exact bytes decoded as strict UTF-8 — what the providers
+    hash into `prompt_sha256` — as one operator-facing error when it
+    cannot be read or is not UTF-8 (a `UnicodeDecodeError` would
+    otherwise escape the CLI's `ImsgError` boundary as a traceback)."""
     try:
-        return path.read_text(encoding="utf-8")
+        return path.read_bytes().decode("utf-8")
     except OSError as exc:
         raise ProviderUnavailableError(
-            f"{path_description} not found at '{path}' — author it before running "
-            f"with `models.backend: real` (config {field_name}; the path is relative to "
-            f"paths.data_root)"
+            f"prompt file '{path}' (config {field_name}) could not be read: {exc}"
         ) from exc
+    except UnicodeDecodeError as exc:
+        raise ProviderUnavailableError(
+            f"prompt file '{path}' (config {field_name}) is not valid UTF-8: {exc}"
+        ) from exc
+
+
+def resolve_caption_prompt(cfg: Config) -> ResolvedPrompt:
+    """Locate the fixed captioning prompt (SPEC §4.1): `enrichment.
+    caption_prompt` under `paths.data_root`, else the repo-shipped copy."""
+    relative = cfg.enrichment.caption_prompt
+    resolved = resolve_prompt_path(cfg.paths.data_root, relative)
+    if resolved is None:
+        raise ProviderUnavailableError(
+            f"enrichment caption prompt not found at '{cfg.paths.data_root / relative}' "
+            f"(and the repository ships no '{relative}' to fall back to) — author it "
+            f"before running with `models.backend: real` (config enrichment.caption_prompt; "
+            f"the path is relative to paths.data_root)"
+        )
+    return resolved
 
 
 # --------------------------------------------------------------------------
@@ -274,12 +338,12 @@ def build_reranker(cfg: Config) -> RerankerProvider:
 
 
 def read_caption_prompt(cfg: Config) -> str:
-    """The fixed captioning prompt (SPEC §4.1), `enrichment.caption_prompt`
-    resolved under `paths.data_root` — same convention as the boundary
-    prompt. Only the real backend needs it."""
-    path = cfg.paths.data_root / cfg.enrichment.caption_prompt
-    return _read_prompt_or_raise(
-        "enrichment caption prompt", path, field_name="enrichment.caption_prompt"
+    """The fixed captioning prompt (SPEC §4.1) as text — `enrichment.
+    caption_prompt` under `paths.data_root`, else the repo-shipped copy
+    (`resolve_caption_prompt`). Same convention as the boundary prompt;
+    only the real backend needs it."""
+    return read_prompt_text(
+        resolve_caption_prompt(cfg).path, field_name="enrichment.caption_prompt"
     )
 
 
@@ -324,11 +388,16 @@ __all__ = [
     "MODELS_EXTRA",
     "REAL_PROVIDERS",
     "RealProviderSpec",
+    "ResolvedPrompt",
     "backend_status_line",
     "build_boundary_provider",
     "build_enrichment_providers",
     "build_multimodal_provider",
     "build_reranker",
     "build_text_provider",
+    "default_prompt_root",
     "read_caption_prompt",
+    "read_prompt_text",
+    "resolve_caption_prompt",
+    "resolve_prompt_path",
 ]

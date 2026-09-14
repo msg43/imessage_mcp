@@ -72,12 +72,16 @@ from imsg.mcp.tools.local_server import LocalMcpServer, run_local_server
 from imsg.mcp.tools.public_server import PublicMcpServer, build_public_asgi_app, parse_bind_address
 from imsg.mount.guard import run_guard_mount_or_exit
 from imsg.providers.factory import (
+    ResolvedPrompt,
     backend_status_line,
     build_boundary_provider,
     build_enrichment_providers,
     build_multimodal_provider,
     build_reranker,
     build_text_provider,
+    read_prompt_text,
+    resolve_caption_prompt,
+    resolve_prompt_path,
 )
 from imsg.providers.manifest import verify_manifest
 from imsg.retrieval.service import RetrievalService
@@ -219,17 +223,44 @@ def _open_fts_conn(cfg: Config) -> apsw.Connection:
     return conn
 
 
+def _echo_prompt_line(label: str, resolved: ResolvedPrompt) -> None:
+    """Which prompt file a run used and where it came from — printed like
+    the backend line, because the bytes feed `seg_config_hash` /
+    `prompt_sha256` and a silent fallback to the shipped copy would be
+    invisible in the run's output otherwise."""
+    typer.echo(f"{label}: {resolved.path} ({resolved.description})")
+
+
 def _boundary_prompt_bytes_or_die(cfg: Config) -> bytes:
-    path = cfg.paths.data_root / cfg.segmentation.boundary_prompt
-    try:
-        return path.read_bytes()
-    except OSError as exc:
+    relative = cfg.segmentation.boundary_prompt
+    resolved = resolve_prompt_path(cfg.paths.data_root, relative)
+    if resolved is None:
         typer.echo(
-            f"imsg: segmentation boundary prompt not found at '{path}' — author "
-            f"it before running segmentation (SPEC §6 segmentation.boundary_prompt)",
+            f"imsg: segmentation boundary prompt not found at "
+            f"'{cfg.paths.data_root / relative}' (and the repository ships no '{relative}' "
+            f"to fall back to) — author it before running segmentation "
+            f"(SPEC §6 segmentation.boundary_prompt)",
             err=True,
         )
+        raise typer.Exit(code=1)
+    _echo_prompt_line("segmentation prompt", resolved)
+    try:
+        return resolved.path.read_bytes()
+    except OSError as exc:
+        typer.echo(f"imsg: segmentation boundary prompt '{resolved.path}' could not be read: {exc}", err=True)
         raise typer.Exit(code=1) from exc
+
+
+def _caption_prompt_or_die(cfg: Config) -> str | None:
+    """The fixed captioning prompt for the real backend, printed with its
+    provenance like the boundary prompt. The fake backend never reads one."""
+    if cfg.models.backend != "real":
+        return None
+    resolved = _build_or_die(lambda: resolve_caption_prompt(cfg))
+    _echo_prompt_line("caption prompt", resolved)
+    return _build_or_die(
+        lambda: read_prompt_text(resolved.path, field_name="enrichment.caption_prompt")
+    )
 
 
 def _echo_backend_line(cfg: Config, *, err: bool = False) -> None:
@@ -1183,7 +1214,12 @@ def enrich(
     _echo_backend_line(cfg)
     # Providers before the DB connection so a missing model runtime fails
     # fast; a dry run claims and dispatches nothing, so it builds none.
-    providers = None if dry_run else _build_or_die(lambda: build_enrichment_providers(cfg))
+    providers = None
+    if not dry_run:
+        caption_prompt = _caption_prompt_or_die(cfg)
+        providers = _build_or_die(
+            lambda: build_enrichment_providers(cfg, caption_prompt=caption_prompt)
+        )
 
     conn = _connect_and_verify_or_die(cfg)
 
