@@ -189,7 +189,11 @@ def test_caption_formats_the_fixed_prompt_through_the_chat_template(
     MlxVlmCaptionProvider(REPO, None, PROMPT).caption(image)
     ((args, kwargs),) = vlm.template_calls
     assert args == (vlm.processor, vlm.config, PROMPT)
-    assert kwargs == {"num_images": 1}
+    # Thinking is switched off explicitly: the pinned Qwen3.5 template
+    # honours `enable_thinking` (rendered 2026-09-14), and relying on
+    # mlx_vlm's per-model default would let a library upgrade silently
+    # spend the caption's token budget on a <think> block.
+    assert kwargs == {"num_images": 1, "enable_thinking": False}
 
 
 def test_model_is_loaded_once_and_reused_across_captions(vlm: VlmStub, image: Path) -> None:
