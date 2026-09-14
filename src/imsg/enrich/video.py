@@ -38,7 +38,7 @@ def sample_keyframes(
                 str(video_path),
                 "-vf",
                 f"select='gt(scene,{SCENE_CHANGE_THRESHOLD})',showinfo",
-                "-vsync",
+                "-fps_mode",
                 "vfr",
                 "-frames:v",
                 str(max_frames),
