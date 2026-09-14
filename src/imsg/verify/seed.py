@@ -27,6 +27,16 @@ full GUID set, not just per-year totals; per-year counts, timestamp
 range, decode-null counts, and attachment-join counts are carried as
 *diagnostics* alongside the exact-set verdict, matching the spec text.
 
+**`--reference-db` (added later)**: the `--export` exchange assumes
+the other side is a host running this software. A *recovered* or
+*merged* corpus has no such host — it is just a `chat.db`-shaped file —
+which left AT-2 unrunnable for exactly the kind of seed it was written
+to check. `build_seed_snapshot_from_chat_db` builds the same
+`SeedSnapshot` straight from that file, applying in SQL the same three
+inclusion filters `imsg.stages.extract._do_extract` applies in Python,
+so the verdict keeps its meaning: a missing GUID is a message the
+extractor should have landed and did not.
+
 Duplicate messages across sources are expected and are not a
 completeness gap (SPEC §12 AT-2: "duplicates across sources are
 expected and visible in `message_source`") — `message.source_guid` is
@@ -39,8 +49,10 @@ rows back it.
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -113,6 +125,199 @@ def build_seed_snapshot(conn: psycopg.Connection, *, source_label: str) -> SeedS
         body_decode_null_count=null_count,
         attachment_join_count=attach_count,
     )
+
+
+APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=UTC)
+"""chat.db's `message.date` epoch. Mirrors `imsg.stages.extract.APPLE_EPOCH`."""
+
+APPLE_EPOCH_UNIX_OFFSET = 978_307_200
+"""Seconds from the Unix epoch to `APPLE_EPOCH`, for SQLite's `unixepoch`."""
+
+CHAT_DB_TAPBACK_TYPES_SQL = (
+    "COALESCE(m.associated_message_type, 0) = 1000 "
+    "OR COALESCE(m.associated_message_type, 0) BETWEEN 2000 AND 3999"
+)
+"""Which `chat.db` rows the extractor routes to `tapback` instead of
+`message`.
+
+`imsg.stages.extract._do_extract` does not decide this from SQL at all
+— it asks `imsg-dump` (the typedstream decoder) and `continue`s on any
+row that comes back with a `tapback`. This clause is the SQL-only
+restatement of that decision, needed because a reference built from a
+bare SQLite file has no decoder to ask. The `2000..3999` half is the
+documented reaction range; the `1000` half (stickers) is the part that
+is easy to get wrong, and is included on evidence, not on inference:
+in the 2026-08-20 merged corpus all 17 `associated_message_type = 1000`
+rows are present in Postgres's `tapback` table and absent from
+`message`, so the live extractor did treat them as tapbacks.
+
+Getting this wrong does not corrupt anything — it makes AT-2 report
+tapbacks as "missing messages" — but it makes the verdict useless, so
+it is stated here once rather than re-derived per call site."""
+
+_ELIGIBLE_MESSAGE_WHERE = f"""
+    m.guid IS NOT NULL
+    AND NOT ({CHAT_DB_TAPBACK_TYPES_SQL})
+    AND COALESCE(m.item_type, 0) = 0
+    AND EXISTS (SELECT 1 FROM chat_message_join j WHERE j.message_id = m.ROWID)
+"""
+"""The three filters `_do_extract` applies before it upserts a `message`
+row, in the same order: tapbacks go to `tapback`, `item_type != 0` is a
+skipped system row, and a row with no `chat_message_join` is logged as
+`extract.message_without_chat` and dropped."""
+
+
+def _open_chat_db_read_only(db_path: Path) -> sqlite3.Connection:
+    """Open a `chat.db`-shaped file strictly read-only.
+
+    `immutable=1` is not just belt-and-braces: without it SQLite may
+    create `-wal`/`-shm` sidecar files next to the database even for a
+    read, and CLAUDE.md's first non-negotiable is that nothing in this
+    system writes anything next to a `chat.db`. Stdlib `sqlite3` rather
+    than `apsw` (used elsewhere in this package) because its URI form
+    carries both flags with no flag arithmetic.
+    """
+    if not db_path.is_file():
+        raise FileNotFoundError(f"reference database not found: {db_path}")
+    uri = f"file:{db_path.resolve().as_posix()}?mode=ro&immutable=1"
+    return sqlite3.connect(uri, uri=True)
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _has_table(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?", (table,)
+    ).fetchone()
+    return row is not None
+
+
+def build_seed_snapshot_from_chat_db(db_path: Path, *, source_label: str) -> SeedSnapshot:
+    """Build a reference `SeedSnapshot` from a `chat.db`-shaped SQLite
+    file instead of from another host's Postgres.
+
+    Why this exists alongside `build_seed_snapshot`: the `--export`
+    path answers "do these two Postgres instances agree?", which needs
+    the other host to be running this software. AT-2's actual question
+    during a seed is narrower and one-sided — "did every message in the
+    corpus file I just ingested land in `message`?" — and the corpus
+    file is right here. Requiring an export from a host that may not
+    exist any more (a recovered/merged corpus has no host) made AT-2
+    unrunnable for exactly the case it was written for.
+
+    The GUID set is **not** every row in the file: it is the set the
+    extractor is supposed to land in `message`, per
+    `_ELIGIBLE_MESSAGE_WHERE`. Comparing against every row would report
+    tapbacks and system rows as completeness failures, which inverts
+    the verdict's meaning — those rows are correctly elsewhere or
+    correctly absent.
+
+    Two diagnostics are weaker here than on the `--export` path and are
+    labelled as such:
+
+    * `body_decode_null_count` is a **proxy**. Postgres counts
+      `text_original IS NULL`, i.e. what `imsg-dump`'s typedstream
+      decoder actually produced; SQL alone cannot know that, so this
+      counts rows with neither a `text` value nor an `attributedBody`
+      blob — rows no decoder could have produced a body for. A row with
+      an `attributedBody` the decoder then failed on is counted here as
+      decodable and in Postgres as null, so reference <= local is
+      normal and is not a finding on its own.
+    * `attachment_join_count` counts eligible messages with at least one
+      `message_attachment_join` row. Postgres counts distinct
+      `message_attachment.message_id` across every source, so the two
+      agree only when the local database holds nothing outside this
+      corpus.
+
+    Timestamps use the same conversion as the extractor
+    (`imsg.stages.extract._apple_ns_to_datetime`): Apple-epoch
+    nanoseconds, divided by 1e9. SQLite's integer division floors, but
+    only ever by less than a second and only ever earlier, so it cannot
+    move a row across a year boundary that Postgres would not also
+    cross.
+    """
+    conn = _open_chat_db_read_only(db_path)
+    try:
+        if not _has_table(conn, "message"):
+            raise ValueError(f"{db_path} has no 'message' table — not a chat.db-shaped database")
+        if not _has_table(conn, "chat_message_join"):
+            raise ValueError(
+                f"{db_path} has no 'chat_message_join' table — not a chat.db-shaped database"
+            )
+
+        guids = frozenset(
+            str(row[0])
+            for row in conn.execute(f"SELECT m.guid FROM message m WHERE {_ELIGIBLE_MESSAGE_WHERE}")
+        )
+
+        per_year = {
+            str(int(year)): int(count)
+            for year, count in conn.execute(
+                f"""
+                SELECT CAST(strftime('%Y', datetime(
+                           m.date / 1000000000 + {APPLE_EPOCH_UNIX_OFFSET}, 'unixepoch'
+                       )) AS INTEGER) AS yr,
+                       count(*)
+                FROM message m
+                WHERE {_ELIGIBLE_MESSAGE_WHERE}
+                GROUP BY yr
+                ORDER BY yr
+                """
+            )
+            if year is not None
+        }
+
+        bounds = conn.execute(
+            f"SELECT min(m.date), max(m.date) FROM message m WHERE {_ELIGIBLE_MESSAGE_WHERE}"
+        ).fetchone()
+        min_ns, max_ns = (bounds[0], bounds[1]) if bounds is not None else (None, None)
+
+        message_columns = _table_columns(conn, "message")
+        if {"text", "attributedBody"} <= message_columns:
+            undecodable = conn.execute(
+                f"""
+                SELECT count(*) FROM message m
+                WHERE {_ELIGIBLE_MESSAGE_WHERE}
+                  AND COALESCE(m.text, '') = '' AND m.attributedBody IS NULL
+                """
+            ).fetchone()
+            body_null_count = int(undecodable[0]) if undecodable is not None else 0
+        else:
+            body_null_count = 0
+
+        if _has_table(conn, "message_attachment_join"):
+            attach = conn.execute(
+                f"""
+                SELECT count(DISTINCT j.message_id)
+                FROM message_attachment_join j
+                JOIN message m ON m.ROWID = j.message_id
+                WHERE {_ELIGIBLE_MESSAGE_WHERE}
+                """
+            ).fetchone()
+            attach_count = int(attach[0]) if attach is not None else 0
+        else:
+            attach_count = 0
+    finally:
+        conn.close()
+
+    return SeedSnapshot(
+        source_label=source_label,
+        generated_at=datetime.now(UTC).isoformat(),
+        guids=guids,
+        per_year_counts=per_year,
+        min_sent_at=_apple_ns_to_iso(min_ns),
+        max_sent_at=_apple_ns_to_iso(max_ns),
+        body_decode_null_count=body_null_count,
+        attachment_join_count=attach_count,
+    )
+
+
+def _apple_ns_to_iso(value: int | None) -> str | None:
+    if value is None or value == 0:
+        return None
+    return (APPLE_EPOCH + timedelta(seconds=value / 1_000_000_000)).isoformat()
 
 
 def snapshot_to_json(snapshot: SeedSnapshot) -> str:
@@ -258,10 +463,14 @@ def format_report_text(report: SeedVerificationReport) -> str:
 
 
 __all__ = [
+    "APPLE_EPOCH",
+    "APPLE_EPOCH_UNIX_OFFSET",
+    "CHAT_DB_TAPBACK_TYPES_SQL",
     "SEED_SNAPSHOT_FORMAT_VERSION",
     "SeedSnapshot",
     "SeedVerificationReport",
     "build_seed_snapshot",
+    "build_seed_snapshot_from_chat_db",
     "format_report_text",
     "snapshot_from_json",
     "snapshot_to_json",
