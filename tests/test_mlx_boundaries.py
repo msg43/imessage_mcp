@@ -1,8 +1,9 @@
 """`imsg.segment.mlx_boundaries.MlxBoundaryProvider` — the local-LLM
 boundary detector against the `_mlx_fakes` runtime: prompt rendering,
 JSON parsing (fences, bare lists, think blocks), validation, greedy
-decoding, the between-token timeout, and every failure path mapping to
-`BoundaryDetectionError`."""
+decoding, the between-token timeout, every *model-output* failure path
+mapping to `BoundaryDetectionError` — and the environment failures
+(runtime missing, weights unloadable) that must NOT map to it."""
 
 from __future__ import annotations
 
@@ -283,22 +284,57 @@ def test_chat_template_failure_raises_boundary_detection_error(
     assert "chat template failed" in str(excinfo.value)
 
 
-def test_missing_runtime_maps_to_boundary_detection_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_runtime_aborts_instead_of_degrading_to_the_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconciled 2026-09-14. Mapped to `BoundaryDetectionError`, a missing
+    runtime was answered by the caller's session-as-segment fallback —
+    for every session in the corpus, under a run that reported success —
+    which is exactly the silent degradation `models: backend=real` is
+    meant to rule out. An environment failure aborts."""
     uninstall_runtime(monkeypatch)
     provider = _provider()
-    with pytest.raises(BoundaryDetectionError) as excinfo:
+    with pytest.raises(MlxRuntimeUnavailableError) as excinfo:
         provider.detect_boundaries(_window(4))
-    assert "unavailable" in str(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, MlxRuntimeUnavailableError)
-    # The explicit startup check keeps the underlying error type.
+    assert not isinstance(excinfo.value, BoundaryDetectionError)
     with pytest.raises(MlxRuntimeUnavailableError):
         provider.load()
 
 
-def test_load_failure_maps_to_boundary_detection_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_failure_aborts_instead_of_degrading_to_the_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     FakeRuntime(load_error=ValueError("Model type qwen3_5_moe not supported")).install(monkeypatch)
     provider = _provider()
-    with pytest.raises(BoundaryDetectionError) as excinfo:
+    with pytest.raises(MlxRuntimeError) as excinfo:
         provider.detect_boundaries(_window(4))
+    assert not isinstance(excinfo.value, BoundaryDetectionError)
     assert "org/boundary@rev3" in str(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, MlxRuntimeError)
+
+
+def test_segment_session_propagates_a_missing_runtime_instead_of_falling_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Through the real caller: `segment_session` catches only
+    `BoundaryDetectionError` for its fallback, so the abort reaches the
+    stage instead of producing a 'fallback:session' segment."""
+    from imsg.segment.boundaries import segment_session
+    from imsg.segment.models import Session
+
+    uninstall_runtime(monkeypatch)
+    messages = tuple(_window(4))
+    session = Session(
+        chat_id=1,
+        started_at=messages[0].sent_at,
+        ended_at=messages[-1].sent_at,
+        messages=messages,
+        gap_hours=3.0,
+    )
+    with pytest.raises(MlxRuntimeUnavailableError):
+        segment_session(
+            session,
+            topical_min_messages=2,  # below the window size, so the model is consulted
+            max_messages=50,
+            max_tokens=2000,
+            boundary_provider=_provider(),
+        )
