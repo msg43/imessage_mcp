@@ -39,11 +39,12 @@ models = [
     "huggingface_hub>=1.31.0",        # verified: 1.31.0 (2026-09-10)
     "pillow>=12.3.0",                 # verified: 12.3.0 (2026-07-01)
     "torch>=2.14.0",                  # verified: 2.14.0 (2026-09-02); PE-Core (MPS) + mlx-whisper dependency
-    # PE-CORE BACKEND — INTEGRATOR FILLS IN from the multimodal agent's report:
-    # the package that loads facebook/PE-Core-G14-448 (imsg.embed.pe_core_multimodal).
-    # Verify its floor exists on PyPI, then add the same floor to
-    # models/manifest.lock.yaml `pe-core-g14-448.min_runtime`.
-    # "<pe-core-backend-package>>=<version>",
+    # PE-Core backend (imsg.embed.pe_core_multimodal): open_clip's PE-Core-bigG-14-448
+    # port over timm's vit_pe_core_gigantic_patch14_448, weights from the Apache-2.0
+    # mirror timm/PE-Core-bigG-14-448. Floors verified on PyPI 2026-09-14.
+    "open_clip_torch>=3.0.0",         # verified: 3.3.0 (2026-02-27); registers PE-Core-bigG-14-448 since 3.0.0
+    "timm>=1.0.17",                   # verified: 1.0.29 (2026-08-28); vit_pe_core_* present since 1.0.16
+    "pillow-heif>=1.7.0",             # verified: 1.7.0; HEIC/HEIF attachments are common in Messages
 ]
 
 [project.scripts]

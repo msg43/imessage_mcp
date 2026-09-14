@@ -111,7 +111,7 @@ models:
     expected_dim: 1280
     quantization: none
     artifact_sha256: null
-    min_runtime: {torch: '2.14.0', pillow: '12.3.0', huggingface_hub: '1.31.0'}
+    min_runtime: {torch: '2.14.0', open_clip_torch: '3.0.0', timm: '1.0.17', pillow: '12.3.0', pillow-heif: '1.7.0', huggingface_hub: '1.31.0'}
     smoke_test: {status: not_run}
     notes: >-
       Perception Encoder Core G/14 at 448px (D3a): 1.88B-param vision tower + 0.47B
