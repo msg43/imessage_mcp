@@ -423,3 +423,146 @@ def test_enrichment_egress_only_local_only_is_valid(config_dict_factory: object)
     raw["enrichment"]["egress"] = "hosted"
     with pytest.raises(ConfigError):
         load_config_dict(raw)
+
+
+# --------------------------------------------------------------------------
+# models.backend and the model-pin fields (SPEC §4.1, §6; imsg.providers)
+# --------------------------------------------------------------------------
+
+
+def test_models_backend_defaults_to_real(config_dict_factory: object) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    del raw["models"]
+    cfg = load_config_dict(raw)
+    assert cfg.models.backend == "real"
+
+
+def test_models_backend_fake_is_an_explicit_opt_in(config_dict_factory: object) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["models"] = {"backend": "fake"}
+    assert load_config_dict(raw).models.backend == "fake"
+
+
+@pytest.mark.parametrize("value", ["stub", "mock", "", "REAL", None])
+def test_models_backend_rejects_anything_but_real_or_fake(
+    config_dict_factory: object, value: object
+) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["models"] = {"backend": value}
+    with pytest.raises(ConfigError, match=r"models\.backend"):
+        load_config_dict(raw)
+
+
+def test_models_unknown_key_rejected(config_dict_factory: object) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["models"] = {"backend": "fake", "device": "mps"}
+    with pytest.raises(ConfigError, match=r"models\.device"):
+        load_config_dict(raw)
+
+
+def test_boundary_revision_defaults_to_the_manifest_pin(config_dict_factory: object) -> None:
+    from imsg import constants
+
+    cfg = load_config_dict(config_dict_factory())  # type: ignore[operator]
+    assert cfg.segmentation.boundary_revision == constants.BOUNDARY_MODEL_REVISION
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["segmentation"]["boundary_revision"] = "abc123"
+    assert load_config_dict(raw).segmentation.boundary_revision == "abc123"
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        ("segmentation", "boundary_revision"),
+        ("segmentation", "boundary_model"),
+        ("enrichment", "transcription_revision"),
+        ("enrichment", "caption_model"),
+        ("embedding", "model"),
+        ("retrieval", "reranker_model"),
+    ],
+)
+def test_model_pin_fields_reject_empty_strings(
+    config_dict_factory: object, section: str, field: str
+) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw[section][field] = ""
+    with pytest.raises(ConfigError, match=rf"{section}\.{field}"):
+        load_config_dict(raw)
+
+
+def test_enrichment_model_fields_default_to_the_manifest_pins(config_dict_factory: object) -> None:
+    from imsg import constants
+
+    cfg = load_config_dict(config_dict_factory())  # type: ignore[operator]
+    e = cfg.enrichment
+    assert (e.transcription_model, e.transcription_revision) == (
+        constants.TRANSCRIPTION_MODEL_REPO,
+        constants.TRANSCRIPTION_MODEL_REVISION,
+    )
+    assert (e.caption_model, e.caption_revision) == (
+        constants.CAPTION_MODEL_REPO,
+        constants.CAPTION_MODEL_REVISION,
+    )
+    assert e.caption_prompt == Path("prompts/caption.txt")
+    assert e.transcription_language is None
+    assert e.ocr_languages is None
+    assert e.ocr_minimum_text_height is None
+    assert cfg.embedding.multimodal.batch_size == 16
+
+
+def test_caption_prompt_must_resolve_under_data_root(
+    config_dict_factory: object, tmp_path: Path
+) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["enrichment"]["caption_prompt"] = str(tmp_path / "elsewhere" / "caption.txt")
+    with pytest.raises(ConfigError, match=r"enrichment\.caption_prompt.*must resolve under"):
+        load_config_dict(raw)
+
+
+def test_caption_prompt_may_not_escape_via_dotdot(config_dict_factory: object) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["enrichment"]["caption_prompt"] = "../caption.txt"
+    with pytest.raises(ConfigError, match=r"enrichment\.caption_prompt"):
+        load_config_dict(raw)
+
+
+def test_ocr_languages_validation(config_dict_factory: object) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["enrichment"]["ocr_languages"] = []
+    with pytest.raises(ConfigError, match=r"enrichment\.ocr_languages"):
+        load_config_dict(raw)
+
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["enrichment"]["ocr_languages"] = ["en-US", "  "]
+    with pytest.raises(ConfigError, match=r"enrichment\.ocr_languages"):
+        load_config_dict(raw)
+
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["enrichment"]["ocr_languages"] = [" en-US ", "fr-FR"]
+    assert load_config_dict(raw).enrichment.ocr_languages == ["en-US", "fr-FR"]
+
+
+def test_transcription_language_blank_rejected(config_dict_factory: object) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["enrichment"]["transcription_language"] = "   "
+    with pytest.raises(ConfigError, match=r"enrichment\.transcription_language"):
+        load_config_dict(raw)
+    raw["enrichment"]["transcription_language"] = " en "
+    assert load_config_dict(raw).enrichment.transcription_language == "en"
+
+
+@pytest.mark.parametrize("value", [0, -0.1, 1.5])
+def test_ocr_minimum_text_height_must_be_a_fraction(
+    config_dict_factory: object, value: float
+) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["enrichment"]["ocr_minimum_text_height"] = value
+    with pytest.raises(ConfigError, match=r"enrichment\.ocr_minimum_text_height"):
+        load_config_dict(raw)
+
+
+def test_multimodal_batch_size_must_be_positive(config_dict_factory: object) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["embedding"]["multimodal"]["batch_size"] = 0
+    with pytest.raises(ConfigError, match=r"embedding\.multimodal\.batch_size"):
+        load_config_dict(raw)

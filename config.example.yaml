@@ -32,13 +32,25 @@ policy:
   index_unsent: false
   index_edit_history: false
 
+# Model providers (SPEC §4.1) are built by imsg.providers.factory from the
+# `models`, `embedding`, `retrieval`, `segmentation` and `enrichment`
+# sections below. Every repo id + revision here is pinned in
+# models/manifest.lock.yaml (the source of truth; `imsg models verify`
+# reports drift). Real backends need the `models` extra:
+#   uv sync --extra models
+models:
+  backend: real                  # real | fake. `fake` = deterministic test stand-ins, explicit
+                                 # opt-in only; every command prints `models: backend=<...>` so a
+                                 # fake run (meaningless search results) is never mistaken for real.
+
 segmentation:
   session_gap_hours: 3.0
   topical_min_messages: 10
   max_messages: 50
   max_tokens: 2000
-  boundary_model: qwen3.5-35b-a3b-4bit
-  boundary_prompt: prompts/segment_boundaries.txt
+  boundary_model: mlx-community/Qwen3.5-35B-A3B-4bit          # folded into seg_config_hash (D4): changing it re-segments everything
+  boundary_revision: 1e20fd8d42056f870933bf98ca6211024744f7ec  # immutable commit sha (manifest pin)
+  boundary_prompt: prompts/segment_boundaries.txt             # relative to data_root
 
 enrichment:
   egress: local_only
@@ -53,11 +65,20 @@ enrichment:
     max_media_seconds: 14400
     task_timeout_seconds: 1800
     temp_bytes_per_task: 10737418240
+  # Model providers for S5b (defaults shown; all pinned in models/manifest.lock.yaml)
+  transcription_model: mlx-community/whisper-large-v3-mlx
+  transcription_revision: 49e6aa286ad60c14352c404340ded53710378a11
+  transcription_language: null   # e.g. "en"; null = Whisper auto-detects per file
+  caption_model: mlx-community/Qwen3.5-35B-A3B-4bit             # same weights as segmentation.boundary_model
+  caption_revision: 1e20fd8d42056f870933bf98ca6211024744f7ec
+  caption_prompt: prompts/caption.txt                           # relative to data_root, like boundary_prompt
+  ocr_languages: null            # e.g. ["en-US"]; null = Apple Vision automatic language detection (macOS 13+)
+  ocr_minimum_text_height: null  # Vision minimumTextHeight, fraction of image height; null = framework default
 
 embedding:
-  model: Qwen/Qwen3-Embedding-8B
-  revision: <hf-revision-sha>
-  quantization: 8bit
+  model: mlx-community/Qwen3-Embedding-8B-mxfp8
+  revision: 51c773b7464b630a6c67b4f75dbd796b658d6236   # immutable commit sha (manifest pin)
+  quantization: mxfp8            # informational — fixed by the artifact `model`@`revision` names
   dim: 2048                      # must match migration 0001's DDL; <= 4000 (halfvec HNSW cap)
   batch_size: 32
   query_instruction: "Given a personal message search query, retrieve relevant conversation segments"
@@ -66,16 +87,17 @@ embedding:
     provider: local               # only 'local' is implemented — D3a
     scope: full                   # only 'full' is implemented — D3a
     model: facebook/PE-Core-G14-448
-    revision: <hf-revision-sha>
+    revision: a6046680086f67d1f24d4b465a240de0578dfc0b   # immutable commit sha (manifest pin)
     dim: 1280                     # must match migration 0002's DDL
+    batch_size: 16
 
 retrieval:
   k_fts: 100
   k_vector: 100
   rrf_k: 60
   rerank_top: 50
-  reranker_model: Qwen/Qwen3-Reranker-8B
-  reranker_revision: <hf-revision-sha>
+  reranker_model: mlx-community/Qwen3-Reranker-8B-mxfp8
+  reranker_revision: a8947a5fe4c62cc1feb8dffa89d49502c8c80923   # immutable commit sha (manifest pin)
   default_limit: 10
 
 render:

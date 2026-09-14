@@ -23,7 +23,6 @@ from imsg.config.loader import load_config
 from imsg.db.connection import connect
 from imsg.db.fingerprint import verify_data_directory
 from imsg.embed.fts.schema import create_schema
-from imsg.embed.provider import FakeMultimodalEmbeddingProvider, FakeTextEmbeddingProvider
 from imsg.errors import ImsgError
 from imsg.eval.backend import LocalEvalBackend, PassthroughReranker
 from imsg.eval.diff import diff_runs, format_diff_markdown
@@ -45,8 +44,13 @@ from imsg.eval.io import (
 from imsg.eval.models import EvalQuery
 from imsg.eval.pool import build_pool, import_pool_worksheet, pool_to_worksheet_yaml
 from imsg.eval.runner import run_eval
+from imsg.providers.factory import (
+    backend_status_line,
+    build_multimodal_provider,
+    build_reranker,
+    build_text_provider,
+)
 from imsg.retrieval.access import LOCAL_FULL_ACCESS
-from imsg.retrieval.reranker import FakeRerankerProvider
 from imsg.retrieval.service import RetrievalService
 
 if TYPE_CHECKING:
@@ -122,15 +126,16 @@ def _build_local_backend(
         )
         raise typer.Exit(code=2)
     flags = VARIANT_REGISTRY[variant]
-    multimodal_provider = None
-    if not flags["no_multimodal"] and cfg.embedding.multimodal.enabled:
-        multimodal_provider = FakeMultimodalEmbeddingProvider(dim=cfg.embedding.multimodal.dim)
+    # Providers come from imsg.providers.factory (`models.backend`), the
+    # same source every other model-backed command uses — raises
+    # `ImsgError` when a real provider cannot be built; callers catch it.
+    multimodal_provider = None if flags["no_multimodal"] else build_multimodal_provider(cfg)
     service = RetrievalService(
         pg_conn=conn,
         fts_conn=fts_conn,
         config=cfg,
-        text_provider=FakeTextEmbeddingProvider(dim=cfg.embedding.dim),  # PLACEHOLDER — see imsg.cli's module docstring
-        reranker=PassthroughReranker() if flags["no_rerank"] else FakeRerankerProvider(),
+        text_provider=build_text_provider(cfg),
+        reranker=PassthroughReranker() if flags["no_rerank"] else build_reranker(cfg),
         multimodal_provider=multimodal_provider,
     )
     return LocalEvalBackend(service=service, context=LOCAL_FULL_ACCESS)
@@ -280,6 +285,7 @@ def run_cmd(
         raise typer.Exit(code=1)
 
     cfg = _load_config_or_die(config)
+    typer.echo(backend_status_line(cfg))
     conn = _connect_and_verify_or_die(cfg)
     fts_conn = _open_fts_conn(cfg)
     try:
@@ -362,12 +368,16 @@ def pool_cmd(
         raise typer.Exit(code=2)
 
     cfg = _load_config_or_die(config)
+    typer.echo(backend_status_line(cfg))
     conn = _connect_and_verify_or_die(cfg)
     fts_conn = _open_fts_conn(cfg)
     try:
         backends = {name: _build_local_backend(conn, fts_conn, cfg, variant=name) for name in names}
         queries: list[EvalQuery] = load_queries(conn, target=target)
         entries = build_pool(conn, backends, queries, top_n=top_n, seed=seed)
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     finally:
         fts_conn.close()
         conn.close()
