@@ -31,15 +31,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import structlog
+
 from imsg import constants
 from imsg.embed.provider import MultimodalEmbeddingProvider, TextEmbeddingProvider
 from imsg.embed.vector_codec import vector_literal
-from imsg.errors import EmbeddingError
+from imsg.errors import EmbeddingError, ImageEmbeddingError
 from imsg.hashing import sha256_text
 from imsg.textnorm import normalize_text
 
 if TYPE_CHECKING:
     import psycopg
+
+logger = structlog.get_logger(__name__)
 
 DEFAULT_BATCH_SIZE = 32
 
@@ -56,6 +60,14 @@ class EmbedRunReport:
     GC already reclaimed them (SPEC §5.3). Not an error: the caption/
     OCR text already made it into the primary text index; only the
     secondary multimodal vector for that attachment is skipped."""
+    attachments_failed: int = 0
+    """Image/video attachments the multimodal provider could not embed
+    because of the *input* — an unreadable or undecodable file, or a
+    keyframe the image tower rejected (`imsg.errors.ImageEmbeddingError`).
+    Each is logged with its attachment id and left without an
+    `attachment_mm_embedding` row, so the next run tries it again; the
+    rest of the run continues. Runtime/model failures are not counted
+    here — they still abort the run (SPEC §8 S6)."""
     dry_run: bool = False
     """True when this report came from `run_embed(dry_run=True)` (SPEC
     §8: "takes --dry-run where writes leave the machine") — the
@@ -275,12 +287,32 @@ def _upsert_mm_embedding(
 
 def _embed_multimodal(
     conn: psycopg.Connection, provider: MultimodalEmbeddingProvider
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
+    """Returns `(written, skipped_no_frames, failed)`.
+
+    One attachment's bad *input* (`ImageEmbeddingError`: an unreadable
+    or undecodable file, a frame the image tower rejects) is logged,
+    counted in `failed`, and left without a row — never allowed to abort
+    the run, which would leave every attachment after it unembedded
+    because of one corrupt photo. Every other `EmbeddingError` is a
+    runtime/model problem and still aborts (SPEC §8 S6).
+    """
     written = 0
     skipped_no_frames = 0
+    failed = 0
 
     for attachment_id, cache_path, media_sha256 in _pending_multimodal_images(conn):
-        vectors = provider.embed_images([Path(cache_path)])
+        try:
+            vectors = provider.embed_images([Path(cache_path)])
+        except ImageEmbeddingError as exc:
+            failed += 1
+            logger.warning(
+                "embed.multimodal_attachment_failed",
+                attachment_id=attachment_id,
+                kind="image",
+                reason=exc.reason,
+            )
+            continue
         if len(vectors) != 1:
             raise EmbeddingError(
                 f"multimodal provider returned {len(vectors)} vectors for 1 image "
@@ -296,7 +328,18 @@ def _embed_multimodal(
             skipped_no_frames += 1
             continue
         media_hash = sha256_text("\n".join(str(p) for p in frame_paths))
-        vectors = provider.embed_images(existing_paths)
+        try:
+            vectors = provider.embed_images(existing_paths)
+        except ImageEmbeddingError as exc:
+            failed += 1
+            logger.warning(
+                "embed.multimodal_attachment_failed",
+                attachment_id=attachment_id,
+                kind="video",
+                frame=exc.path.name,
+                reason=exc.reason,
+            )
+            continue
         if len(vectors) != len(existing_paths):
             raise EmbeddingError(
                 f"multimodal provider returned {len(vectors)} vectors for "
@@ -306,7 +349,7 @@ def _embed_multimodal(
         _upsert_mm_embedding(conn, attachment_id, provider, media_hash, pooled)
         written += 1
 
-    return written, skipped_no_frames
+    return written, skipped_no_frames, failed
 
 
 def run_embed(
@@ -361,14 +404,18 @@ def run_embed(
 
     attachments_written = 0
     skipped_no_frames = 0
+    attachments_failed = 0
     if multimodal_provider is not None:
-        attachments_written, skipped_no_frames = _embed_multimodal(conn, multimodal_provider)
+        attachments_written, skipped_no_frames, attachments_failed = _embed_multimodal(
+            conn, multimodal_provider
+        )
 
     return EmbedRunReport(
         segments_embedded=segments_written,
         chunks_embedded=chunks_written,
         attachments_embedded=attachments_written,
         attachments_skipped_no_frames=skipped_no_frames,
+        attachments_failed=attachments_failed,
     )
 
 

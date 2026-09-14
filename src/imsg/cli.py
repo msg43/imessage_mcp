@@ -1042,7 +1042,8 @@ def embed(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
     typer.echo(
         f"embed: segments_embedded={report.segments_embedded} "
         f"chunks_embedded={report.chunks_embedded} "
-        f"attachments_embedded={report.attachments_embedded}"
+        f"attachments_embedded={report.attachments_embedded} "
+        f"attachments_failed={report.attachments_failed}"
     )
     if dry_run:
         typer.echo(DRY_RUN_MARKER)

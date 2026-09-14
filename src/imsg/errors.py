@@ -13,6 +13,11 @@ so the CLI's top-level handler can format them consistently.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
 
 class ImsgError(Exception):
     """Base class for all imsg errors."""
@@ -117,6 +122,29 @@ class EmbeddingError(ImsgError):
     """S6 embedding failed outside its normal per-batch-transaction
     handling (SPEC §8 S6) — e.g. the provider returned a vector of the
     wrong dimension."""
+
+
+class ImageEmbeddingError(EmbeddingError):
+    """Exactly one image could not be embedded by the multimodal provider
+    (S6, D3a). `path` names it so `imsg.embed.pipeline` can record that
+    attachment as failed and carry on with the run — the only member of
+    the `EmbeddingError` family that is a property of one input rather
+    than of the model/runtime, which is why the pipeline catches it and
+    lets everything else abort. A provider raises it per item (a batch
+    failure is retried item by item first) and never for a runtime,
+    device or weights problem."""
+
+    def __init__(self, path: Path, reason: str) -> None:
+        self.path = path
+        self.reason = reason
+        super().__init__(f"image {path} could not be embedded: {reason}")
+
+
+class UnreadableImageError(ImageEmbeddingError):
+    """The image file could not be opened or decoded: missing,
+    truncated, not a format PIL recognises (a HEIC without
+    `pillow-heif`), or a decompression bomb. Detected per item, before
+    any batch is formed."""
 
 
 class FtsSidecarError(ImsgError):

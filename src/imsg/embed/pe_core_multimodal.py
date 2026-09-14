@@ -91,7 +91,7 @@ from typing import Any
 
 import structlog
 
-from imsg.errors import EmbeddingError
+from imsg.errors import EmbeddingError, ImageEmbeddingError, UnreadableImageError
 
 logger = structlog.get_logger(__name__)
 
@@ -128,22 +128,9 @@ class PeCoreRuntimeError(EmbeddingError):
     failure -> abort run, nothing partial")."""
 
 
-class ImageEmbeddingError(EmbeddingError):
-    """Exactly one image could not be embedded; `path` names it so the
-    caller can mark that attachment failed and carry on. The other
-    images in the same `embed_images` call are unaffected — a batch
-    failure is retried item by item before this is raised."""
-
-    def __init__(self, path: Path, reason: str) -> None:
-        self.path = path
-        self.reason = reason
-        super().__init__(f"image {path} could not be embedded: {reason}")
-
-
-class UnreadableImageError(ImageEmbeddingError):
-    """The image file could not be opened or decoded: missing,
-    truncated, not a format PIL recognises, or a decompression bomb.
-    Detected per item, before any batch is formed."""
+# `ImageEmbeddingError` / `UnreadableImageError` — the per-item failures
+# this provider raises — are defined in `imsg.errors` (so the pipeline can
+# catch them without importing this module) and re-exported here.
 
 
 def resolve_weights_repo(model_repo: str) -> str:
