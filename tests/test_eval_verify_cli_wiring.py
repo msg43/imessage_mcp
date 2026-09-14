@@ -37,7 +37,7 @@ def test_reconcile_attachments_is_registered() -> None:
 def test_verify_seed_requires_exactly_one_of_export_or_reference() -> None:
     result = runner.invoke(app, ["verify-seed"])
     assert result.exit_code == 2
-    assert "exactly one of --export or --reference" in result.output
+    assert "exactly one of --export, --reference or --reference-db" in result.output
 
 
 def test_verify_seed_rejects_both_export_and_reference(tmp_path: object) -> None:
@@ -45,7 +45,7 @@ def test_verify_seed_rejects_both_export_and_reference(tmp_path: object) -> None
         app, ["verify-seed", "--export", "/tmp/x.json", "--reference", "/tmp/y.json"]
     )
     assert result.exit_code == 2
-    assert "exactly one of --export or --reference" in result.output
+    assert "exactly one of --export, --reference or --reference-db" in result.output
 
 
 def test_eval_run_rejects_non_local_target() -> None:
