@@ -14,11 +14,14 @@ explicitly allowlist it.
 
 ## ⚠️ Read this before you clone
 
-**This code has never run against a real corpus.** 836 tests pass (639
-without a database, plus 197 integration tests that need a live
-PostgreSQL and skip cleanly without one), the CLI works, migrations
-apply against real PostgreSQL + pgvector — and no message has ever been
-indexed by it.
+**No model has been executed end to end yet.** 1,188 tests (990 run
+without a database; 198 integration tests need a live PostgreSQL and
+skip cleanly without one — measured 2026-09-14), the CLI works,
+migrations apply against real PostgreSQL + pgvector, and the snapshot →
+extract → identity stages have run against a real corpus. Segmentation,
+embedding, enrichment and retrieval have only ever run on the fake
+providers or on tiny stand-in models (see
+[what is still unverified](#replacing-the-model-providers)).
 
 **It ships deterministic *fake* model providers alongside the real
 wiring.** The embedding, reranking, captioning, OCR, transcription, and
@@ -48,8 +51,8 @@ already made and documented the non-obvious decisions, read on.
 | Public MCP surface (StreamableHTTP + OAuth) | Implemented; never exposed |
 | Export gate (default-deny, plan/approve/push) | Implemented; transport never wired to a live API |
 | Eval harness (nDCG@k, recall@k, MRR) | Implemented; metrics verified against hand-computed fixtures |
-| Real model providers | **Not implemented** |
-| Any run against real data | **Never happened** |
+| Real model providers (MLX text/reranker/boundary LLM, Apple Vision OCR, mlx-whisper, mlx-vlm captions, PE-Core) | Implemented behind `models.backend: real` (the default); **pinned weights never downloaded, never executed end to end** |
+| Runs against real data | Snapshot → extract → identity: yes. Segment / embed / enrich with the pinned models: **never** |
 
 ---
 
@@ -108,13 +111,17 @@ Four choices that shaped everything else:
 
 ```bash
 git clone https://github.com/msg43/imessage_mcp.git imessage-index
-cd imessage-index && uv sync
+cd imessage-index && uv sync --extra models --extra dev
 ```
+The `models` extra installs the real model runtimes (mlx, mlx-lm,
+mlx-whisper, mlx-vlm, torch, open_clip, pyobjc's Vision bridge,
+pillow-heif); plain `uv sync` is enough for the `fake` backend and the
+test suite.
 ```bash
 cargo build --release --manifest-path tools/imsg-dump/Cargo.toml
 ```
 ```bash
-uv run pytest        # 639 passed, 197 skipped (integration tests need a live DB)
+uv run pytest        # 990 passed, 198 skipped (integration tests need a live DB) — 2026-09-14
 ```
 
 Copy `config.example.yaml`, fill it in, and point the CLI at it:
@@ -142,17 +149,41 @@ Then `uv run imsg --help`. Every stage supports `--dry-run`.
 ## Replacing the model providers
 
 This is the work between "tests pass" and "it does something." The
-interfaces already exist and are correctly dimensioned. `imsg.providers.
-factory` is the only place providers are constructed: with
-`models.backend: real` it imports the implementation classes it names
-in `REAL_PROVIDERS` (lazily, by dotted path) and builds them from the
-repo ids and immutable revisions in `config.yaml`; those pins are
-recorded in `models/manifest.lock.yaml` (repo, commit sha, license,
-dimension, quantization, runtime floors) and `imsg models verify`
-reports any drift against the Hugging Face API without ever rewriting
-the lock unless asked. The runtime packages live behind the `models`
-extra (`uv sync --extra models`); a missing package fails as one clear
-`imsg: ...` line, not a traceback.
+real implementations exist; what is missing is any run of them against
+the pinned weights. `imsg.providers.factory` is the only place providers
+are constructed. `models.backend` in `config.yaml` selects `real` (the
+default — MLX text embedding, reranker and boundary LLM; Apple Vision
+OCR; mlx-whisper transcription; mlx-vlm captioning; PE-Core multimodal
+embedding) or `fake` (the deterministic stand-ins, explicit opt-in);
+every command that builds providers prints `models: backend=<...>`
+first. The factory imports the real classes lazily, by dotted path, and
+builds them from the repo ids and immutable revisions in `config.yaml`,
+whose defaults mirror `models/manifest.lock.yaml` — repo, commit sha,
+license, expected dimension, quantization, runtime floors and a
+smoke-test record per model. `uv run imsg models verify` (also
+`scripts/verify_model_manifest.py`) re-resolves each repo against the
+Hugging Face API and checks the installed packages against the floors;
+it reports drift and never rewrites the lock unless given `--write`.
+The runtime packages live behind the `models` extra; a missing package
+fails as one clear `imsg: ...` line, not a traceback. The two fixed
+prompts (`prompts/segment_boundaries.txt`, `prompts/caption.txt`) ship
+in the repo and are used unless `paths.data_root` holds a copy at the
+same relative path; each run prints which file it used, because those
+bytes are hashed into `seg_config_hash` and the caption provenance.
+
+**What is still unverified (2026-09-14).** No pinned model has been
+downloaded or executed end to end: every hosted entry in the manifest
+carries `smoke_test: not_run`. What *has* been checked: every runtime
+API name the providers call exists with the assumed signature in the
+installed packages; the pinned Qwen3.5 chat template honours
+`enable_thinking=False`; the Apple Vision OCR provider ran on this
+machine's framework and read a generated image back verbatim (recorded
+in the manifest); the transcription chain (ffmpeg → mlx-whisper) returned
+an exact transcript of synthesised speech on a 50 MB `whisper-tiny`
+stand-in; and the three mlx-lm providers loaded a 79 MB stand-in model
+and produced correctly shaped, padding-invariant output. None of that
+says anything about retrieval quality with the pinned 8B / 35B weights —
+establishing that is the first real task.
 
 | Interface | What it needs |
 |---|---|
