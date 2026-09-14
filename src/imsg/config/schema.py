@@ -191,7 +191,13 @@ class SegmentationConfig(StrictModel):
     topical_min_messages: int = Field(default=10, ge=1)
     max_messages: int = Field(default=50, ge=1)
     max_tokens: int = Field(default=2000, ge=1)
-    boundary_model: str = "qwen3.5-35b-a3b-4bit"
+    # Hugging Face repo id of the boundary-detection LLM (SPEC §4.1) and
+    # the immutable commit it is pinned to. Both default to the pins in
+    # models/manifest.lock.yaml (mirrored in imsg.constants). NOTE:
+    # `boundary_model` is folded into `seg_config_hash` (D4), so changing
+    # it forces re-segmentation of every chat.
+    boundary_model: str = Field(default=constants.BOUNDARY_MODEL_REPO, min_length=1)
+    boundary_revision: str = Field(default=constants.BOUNDARY_MODEL_REVISION, min_length=1)
     boundary_prompt: Path = Field(default=Path("prompts/segment_boundaries.txt"))
 
     @model_validator(mode="after")
@@ -235,6 +241,29 @@ class EnrichmentConfig(StrictModel):
     pdf_scanned_threshold_chars_per_page: int = Field(default=50, ge=0)
     limits: EnrichmentLimits = Field(default_factory=EnrichmentLimits)
 
+    # --- model providers (SPEC §4.1; built by imsg.providers.factory) ---
+    # Repo ids + immutable revisions default to models/manifest.lock.yaml's
+    # pins (mirrored in imsg.constants).
+    transcription_model: str = Field(default=constants.TRANSCRIPTION_MODEL_REPO, min_length=1)
+    transcription_revision: str = Field(
+        default=constants.TRANSCRIPTION_MODEL_REVISION, min_length=1
+    )
+    transcription_language: str | None = None
+    """BCP-47-ish language hint for Whisper (e.g. 'en'); `null` lets the
+    model auto-detect per file."""
+    caption_model: str = Field(default=constants.CAPTION_MODEL_REPO, min_length=1)
+    caption_revision: str = Field(default=constants.CAPTION_MODEL_REVISION, min_length=1)
+    caption_prompt: Path = Field(default=Path("prompts/caption.txt"))
+    """Fixed captioning prompt (SPEC §4.1) — relative to `paths.data_root`,
+    same convention as `segmentation.boundary_prompt`; must resolve
+    under data_root (checked at the root level)."""
+    ocr_languages: list[str] | None = None
+    """Apple Vision recognition languages (e.g. ['en-US']); `null` lets
+    Vision detect the language automatically (macOS 13+)."""
+    ocr_minimum_text_height: float | None = Field(default=None, gt=0, le=1)
+    """Vision's `minimumTextHeight` as a fraction of image height;
+    `null` keeps the framework default."""
+
     @field_validator("window", mode="after")
     @classmethod
     def _window_must_be_hh_mm_range(cls, v: str) -> str:
@@ -243,6 +272,31 @@ class EnrichmentConfig(StrictModel):
                 f"enrichment.window must look like 'HH:MM-HH:MM', got '{v}'"
             )
         return v
+
+    @field_validator("ocr_languages", mode="after")
+    @classmethod
+    def _ocr_languages_non_empty_tags(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return v
+        if not v:
+            raise ValueError(
+                "enrichment.ocr_languages must be null (automatic detection) or a "
+                "non-empty list of language tags such as ['en-US']"
+            )
+        cleaned = [tag.strip() for tag in v]
+        if any(not tag for tag in cleaned):
+            raise ValueError("enrichment.ocr_languages entries must be non-empty language tags")
+        return cleaned
+
+    @field_validator("transcription_language", mode="after")
+    @classmethod
+    def _transcription_language_non_empty(cls, v: str | None) -> str | None:
+        if v is not None and not v.strip():
+            raise ValueError(
+                "enrichment.transcription_language must be null (auto-detect) or a "
+                "non-empty language code such as 'en'"
+            )
+        return v.strip() if v is not None else None
 
 
 # --------------------------------------------------------------------------
@@ -254,9 +308,10 @@ class MultimodalEmbeddingConfig(StrictModel):
     enabled: bool = True
     provider: Literal["local"] = "local"
     scope: Literal["full"] = "full"
-    model: str = "facebook/PE-Core-G14-448"
+    model: str = Field(default=constants.MULTIMODAL_EMBEDDING_MODEL_REPO, min_length=1)
     revision: str = Field(min_length=1)
     dim: int = constants.MULTIMODAL_EMBEDDING_DIM
+    batch_size: int = Field(default=16, ge=1)
 
     @field_validator("dim", mode="after")
     @classmethod
@@ -272,9 +327,13 @@ class MultimodalEmbeddingConfig(StrictModel):
 
 
 class EmbeddingConfig(StrictModel):
-    model: str = "Qwen/Qwen3-Embedding-8B"
+    model: str = Field(default=constants.TEXT_EMBEDDING_MODEL_REPO, min_length=1)
     revision: str = Field(min_length=1)
-    quantization: str = "8bit"
+    quantization: str = "mxfp8"
+    """Informational: the quantization of the artifact `model`@`revision`
+    names (the MLX conversion fixes it; nothing re-quantizes at load
+    time). Kept in config so the run log and models/manifest.lock.yaml
+    describe the same weights."""
     dim: int = constants.PRIMARY_EMBEDDING_DIM
     batch_size: int = Field(default=32, ge=1)
     query_instruction: str = Field(min_length=1)
@@ -310,9 +369,30 @@ class RetrievalConfig(StrictModel):
     k_vector: int = Field(default=100, ge=1)
     rrf_k: int = Field(default=60, ge=1)
     rerank_top: int = Field(default=50, ge=1)
-    reranker_model: str = "Qwen/Qwen3-Reranker-8B"
+    reranker_model: str = Field(default=constants.RERANKER_MODEL_REPO, min_length=1)
     reranker_revision: str = Field(min_length=1)
     default_limit: int = Field(default=10, ge=1)
+
+
+# --------------------------------------------------------------------------
+# models
+# --------------------------------------------------------------------------
+
+
+class ModelsConfig(StrictModel):
+    """Which provider backend every model-backed stage constructs
+    (`imsg.providers.factory`).
+
+    `real` — the default — loads the pinned MLX / Apple Vision / PE-Core
+    models named by the `embedding.*`, `retrieval.reranker_*`,
+    `segmentation.boundary_*` and `enrichment.*` fields (runtime
+    packages: the `models` extra in pyproject.toml). `fake` substitutes
+    the deterministic test stand-ins and is explicit opt-in only: every
+    command that builds providers prints `models: backend=fake` so such
+    a run can never be mistaken for a real one.
+    """
+
+    backend: Literal["real", "fake"] = "real"
 
 
 # --------------------------------------------------------------------------
@@ -461,6 +541,7 @@ class Config(StrictModel):
     enrichment: EnrichmentConfig = Field(default_factory=EnrichmentConfig)
     embedding: EmbeddingConfig
     retrieval: RetrievalConfig
+    models: ModelsConfig = Field(default_factory=ModelsConfig)
     render: RenderConfig = Field(default_factory=RenderConfig)
     mcp: McpConfig
     export: ExportConfig
@@ -520,6 +601,7 @@ class Config(StrictModel):
         derived: list[tuple[str, Path]] = [
             ("database.cluster_fingerprint_file", self.database.cluster_fingerprint_file),
             ("segmentation.boundary_prompt", self.segmentation.boundary_prompt),
+            ("enrichment.caption_prompt", self.enrichment.caption_prompt),
             ("eval.seed_queries", self.eval.seed_queries),
             ("eval.runs_dir", self.eval.runs_dir),
         ]
@@ -558,6 +640,7 @@ __all__ = [
     "McpLocalConfig",
     "McpPublicConfig",
     "McpPublicOauthConfig",
+    "ModelsConfig",
     "MultimodalEmbeddingConfig",
     "PathsConfig",
     "PolicyConfig",

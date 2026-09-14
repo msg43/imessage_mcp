@@ -2,24 +2,25 @@
 
 Wired up for real: `migrate`, `check-permissions`, `status`,
 `guard-mount`, `snapshot`, `extract`, `identity`, `segment`, `embed`,
-`sync`, `enrich`, `backfill-attachments`, `mcp local`. `export` and
-`install-agents` remain `StageNotImplementedError` stubs — `export` is
-a parallel agent's scope this wave (SPEC §11, `src/imsg/export/`,
-untouched here), and `install-agents` (SPEC §5.5) is not yet built by
-anyone.
+`sync`, `enrich`, `backfill-attachments`, `mcp local`, `mcp public`,
+`models verify`, `install-agents`. `export` remains a
+`StageNotImplementedError` stub — it is a parallel agent's scope
+(SPEC §11, `src/imsg/export/`, untouched here).
 
-**Placeholder model providers (flagged prominently)**: `segment`,
-`embed`, `sync`, and `mcp local` construct `Fake*EmbeddingProvider` /
-`FakeBoundaryProvider` / `FakeRerankerProvider` — no MLX-backed
-provider loader exists anywhere in this codebase yet (SPEC §4.1's real
-models are explicitly Phase 3/5 work), so there is nothing else to
-wire these CLI commands to. This makes every stage genuinely runnable
-end-to-end today, but retrieval/segmentation *quality* from these
-commands is not representative of the real system. A follow-up build
-should add a real provider-loader module (reading `embedding.model` /
-`revision` / `quantization` etc. from config) and swap it in exactly
-where `_text_provider`/`_multimodal_provider`/`FakeBoundaryProvider()`/
-`FakeRerankerProvider()` are constructed below.
+**Model providers** come from `imsg.providers.factory` — the only place
+a model-backed command (`segment`, `embed`, `sync`, `enrich`, `mcp
+local`, `mcp public`, and `eval run`/`eval pool` in `imsg.eval.cli`)
+obtains its embedding / boundary / reranker / OCR / caption /
+transcription providers. `models.backend` in config selects between the
+real implementations (`real`, the default: MLX, Apple Vision and
+PE-Core, pinned by repo + revision in config and in
+`models/manifest.lock.yaml`) and the deterministic `Fake*` stand-ins
+(`fake`, explicit opt-in only). Every command that builds providers
+prints `models: backend=<real|fake>` first, so a fake run — which
+reports success while its search results are meaningless — can never
+be mistaken for a real one. A real provider whose module or runtime
+packages are missing fails as one clean `imsg: ...` line telling the
+operator to install the `models` extra, never as a traceback.
 
 Pattern for downstream agents: every real command loads config via
 `imsg.config.loader.load_config` exactly once near the top, then runs
@@ -35,6 +36,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -60,9 +62,7 @@ from imsg.diagnostics import (
 from imsg.embed.fts.schema import assert_schema_current, create_schema
 from imsg.embed.fts.sync import sync_fts
 from imsg.embed.pipeline import run_embed
-from imsg.embed.provider import FakeMultimodalEmbeddingProvider, FakeTextEmbeddingProvider
-from imsg.enrich.pipeline import EnrichmentProviders, process_one_task
-from imsg.enrich.provider import FakeCaptionProvider, FakeOcrProvider, FakeTranscriptionProvider
+from imsg.enrich.pipeline import process_one_task
 from imsg.enrich.queue import claim_tasks, preview_claimable_tasks
 from imsg.errors import AgentInstallError, ImsgError, StageNotImplementedError
 from imsg.eval.cli import eval_app
@@ -71,9 +71,16 @@ from imsg.mcp.auth import build_public_gate
 from imsg.mcp.tools.local_server import LocalMcpServer, run_local_server
 from imsg.mcp.tools.public_server import PublicMcpServer, build_public_asgi_app, parse_bind_address
 from imsg.mount.guard import run_guard_mount_or_exit
-from imsg.retrieval.reranker import FakeRerankerProvider
+from imsg.providers.factory import (
+    backend_status_line,
+    build_boundary_provider,
+    build_enrichment_providers,
+    build_multimodal_provider,
+    build_reranker,
+    build_text_provider,
+)
+from imsg.providers.manifest import verify_manifest
 from imsg.retrieval.service import RetrievalService
-from imsg.segment.boundaries import FakeBoundaryProvider
 from imsg.segment.pipeline import REBUILD_ALL_SENTINEL, run_segment, run_segment_for_chat
 from imsg.stages.extract import run_extract
 from imsg.stages.identity import (
@@ -103,6 +110,12 @@ app = typer.Typer(
 
 mcp_app = typer.Typer(name="mcp", help="MCP surfaces (SPEC §10).", no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp")
+models_app = typer.Typer(
+    name="models",
+    help="Model pins: models/manifest.lock.yaml (SPEC model-manifest requirement).",
+    no_args_is_help=True,
+)
+app.add_typer(models_app, name="models")
 app.add_typer(eval_app, name="eval")
 app.command("verify-seed")(verify_seed)
 app.command("reconcile-attachments")(reconcile_attachments)
@@ -219,16 +232,29 @@ def _boundary_prompt_bytes_or_die(cfg: Config) -> bytes:
         raise typer.Exit(code=1) from exc
 
 
-def _text_provider(cfg: Config) -> FakeTextEmbeddingProvider:
-    # PLACEHOLDER — see module docstring: no real provider loader exists yet.
-    return FakeTextEmbeddingProvider(dim=cfg.embedding.dim)
+def _echo_backend_line(cfg: Config, *, err: bool = False) -> None:
+    """`models: backend=<real|fake>` — every command that builds
+    providers prints this before doing anything else (to stderr for the
+    stdio MCP server, whose stdout is the JSON-RPC channel)."""
+    typer.echo(backend_status_line(cfg), err=err)
 
 
-def _multimodal_provider(cfg: Config) -> FakeMultimodalEmbeddingProvider | None:
-    # PLACEHOLDER — see module docstring.
-    if not cfg.embedding.multimodal.enabled:
-        return None
-    return FakeMultimodalEmbeddingProvider(dim=cfg.embedding.multimodal.dim)
+def _build_or_die[T](build: Callable[[], T]) -> T:
+    """Construct providers at the command boundary: a missing provider
+    module, missing runtime package, missing prompt file, or failed
+    model load is one clean `imsg: ...` line and exit 1, never a
+    traceback (see `imsg.providers.factory`)."""
+    try:
+        return build()
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+def _decode_prompt(prompt_bytes: bytes) -> str:
+    # Same decode the segmentation config hash applies to these bytes
+    # (imsg.segment.hashing), so the model sees exactly what was hashed.
+    return prompt_bytes.decode("utf-8", "replace")
 
 
 @app.callback()
@@ -375,6 +401,7 @@ def status(
     free_bytes = disk_free_bytes(cfg.paths.data_root)
 
     report = {
+        "models_backend": cfg.models.backend,
         "mount_ok": mount.ok,
         "mount_reason": mount.reason,
         "postgres_reachable": pg.reachable,
@@ -404,8 +431,45 @@ def status(
         typer.echo(json.dumps(report, indent=2))
         return
 
+    _echo_backend_line(cfg)
     for key, value in report.items():
+        if key == "models_backend":
+            continue  # already printed in its canonical `models: backend=...` form
         typer.echo(f"{key}: {value}")
+
+
+@models_app.command("verify")
+def models_verify(
+    lock: Annotated[
+        Path | None,
+        typer.Option(
+            "--lock",
+            help="Path to manifest.lock.yaml (defaults to the repo's models/manifest.lock.yaml).",
+        ),
+    ] = None,
+    write: Annotated[
+        bool,
+        typer.Option(
+            "--write", help="Accept drift: rewrite drifted entries' revision/license in the lock."
+        ),
+    ] = False,
+    skip_remote: Annotated[
+        bool, typer.Option("--skip-remote", help="Do not contact the Hugging Face API.")
+    ] = False,
+    skip_runtime: Annotated[
+        bool, typer.Option("--skip-runtime", help="Do not check installed runtime packages.")
+    ] = False,
+) -> None:
+    """Re-resolve every pinned model's current revision and license from
+    the Hugging Face API and report drift versus models/manifest.lock.yaml;
+    check installed runtime packages against its `min_runtime` floors.
+    Never modifies the lock without --write (SPEC: a build must not
+    silently advance a model because 'latest' changed)."""
+    code = verify_manifest(
+        lock, write=write, skip_remote=skip_remote, skip_runtime=skip_runtime, out=sys.stdout
+    )
+    if code != 0:
+        raise typer.Exit(code=code)
 
 
 @app.command()
@@ -901,7 +965,8 @@ def segment(
     run_guard_mount_or_exit(cfg.paths.data_root)
 
     prompt_bytes = _boundary_prompt_bytes_or_die(cfg)
-    provider = FakeBoundaryProvider()  # PLACEHOLDER — see module docstring.
+    _echo_backend_line(cfg)
+    provider = _build_or_die(lambda: build_boundary_provider(cfg, _decode_prompt(prompt_bytes)))
 
     conn = _connect_and_verify_or_die(cfg)
     try:
@@ -943,6 +1008,11 @@ def embed(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
     """S6 — embed segments/attachment chunks and update the FTS sidecar (SPEC §8 S6)."""
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
+    _echo_backend_line(cfg)
+    # Providers first, connection second: a missing model runtime fails
+    # fast, before anything is opened.
+    text_provider = _build_or_die(lambda: build_text_provider(cfg))
+    multimodal_provider = _build_or_die(lambda: build_multimodal_provider(cfg))
 
     conn = _connect_and_verify_or_die(cfg)
     # `_open_fts_conn` creates `fts/` and the sqlite sidecar file on disk
@@ -953,8 +1023,8 @@ def embed(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
     try:
         report = run_embed(
             conn,
-            _text_provider(cfg),
-            multimodal_provider=_multimodal_provider(cfg),
+            text_provider,
+            multimodal_provider=multimodal_provider,
             batch_size=cfg.embedding.batch_size,
             dry_run=dry_run,
         )
@@ -985,7 +1055,7 @@ def embed(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
 
 def _make_segment_fn(cfg: Config) -> SegmentFn:
     prompt_bytes = _boundary_prompt_bytes_or_die(cfg)
-    provider = FakeBoundaryProvider()  # PLACEHOLDER — see module docstring.
+    provider = _build_or_die(lambda: build_boundary_provider(cfg, _decode_prompt(prompt_bytes)))
 
     def _segment_fn(conn: psycopg.Connection, config: Config, *, dry_run: bool = False) -> object:
         return run_segment(conn, config, provider, prompt_bytes, dry_run=dry_run)
@@ -994,13 +1064,16 @@ def _make_segment_fn(cfg: Config) -> SegmentFn:
 
 
 def _make_embed_fn(cfg: Config) -> EmbedFn:
-    del cfg  # unused: each invocation reads whatever `config` `run_sync` hands it
+    # Built once per `sync` process, up front: a real embedder loads model
+    # weights, and `run_sync_all_sources` invokes this once per source.
+    text_provider = _build_or_die(lambda: build_text_provider(cfg))
+    multimodal_provider = _build_or_die(lambda: build_multimodal_provider(cfg))
 
     def _embed_fn(conn: psycopg.Connection, config: Config, *, dry_run: bool = False) -> object:
         report = run_embed(
             conn,
-            _text_provider(config),
-            multimodal_provider=_multimodal_provider(config),
+            text_provider,
+            multimodal_provider=multimodal_provider,
             batch_size=config.embedding.batch_size,
             dry_run=dry_run,
         )
@@ -1044,6 +1117,7 @@ def sync(
     """
     cfg = _load_config_or_die(config)
     _validate_seed_or_die(cfg, snapshot, source)
+    _echo_backend_line(cfg)
     segment_fn = _make_segment_fn(cfg)  # validates the boundary prompt exists up front
     embed_fn = _make_embed_fn(cfg)
 
@@ -1105,6 +1179,10 @@ def enrich(
     """S5b — OCR/caption/transcribe/pdftotext enrichment queue worker (SPEC §8 S5b)."""
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
+    _echo_backend_line(cfg)
+    # Providers before the DB connection so a missing model runtime fails
+    # fast; a dry run claims and dispatches nothing, so it builds none.
+    providers = None if dry_run else _build_or_die(lambda: build_enrichment_providers(cfg))
 
     conn = _connect_and_verify_or_die(cfg)
 
@@ -1124,9 +1202,7 @@ def enrich(
         typer.echo(DRY_RUN_MARKER)
         return
 
-    providers = EnrichmentProviders(  # PLACEHOLDER — see module docstring.
-        ocr=FakeOcrProvider(), caption=FakeCaptionProvider(), transcription=FakeTranscriptionProvider()
-    )
+    assert providers is not None  # built above for every non-dry run
     try:
         if retry_failed:
             with conn.transaction(), conn.cursor() as cur:
@@ -1208,6 +1284,11 @@ def mcp_local(config: ConfigOption = None) -> None:
         typer.echo("imsg: mcp.local.enabled is false in config", err=True)
         raise typer.Exit(code=1)
     run_guard_mount_or_exit(cfg.paths.data_root)
+    # stderr: this server's stdout IS the stdio JSON-RPC channel.
+    _echo_backend_line(cfg, err=True)
+    text_provider = _build_or_die(lambda: build_text_provider(cfg))
+    reranker = _build_or_die(lambda: build_reranker(cfg))
+    multimodal_provider = _build_or_die(lambda: build_multimodal_provider(cfg))
 
     conn = _connect_and_verify_or_die(cfg)
     fts_conn = _open_fts_conn(cfg)
@@ -1223,9 +1304,9 @@ def mcp_local(config: ConfigOption = None) -> None:
         pg_conn=conn,
         fts_conn=fts_conn,
         config=cfg,
-        text_provider=_text_provider(cfg),  # PLACEHOLDER — see module docstring.
-        reranker=FakeRerankerProvider(),  # PLACEHOLDER — see module docstring.
-        multimodal_provider=_multimodal_provider(cfg),
+        text_provider=text_provider,
+        reranker=reranker,
+        multimodal_provider=multimodal_provider,
     )
     audit = PostgresAuditSink(lambda: connect(cfg.database, autocommit=True))
     local = LocalMcpServer(service=service, audit=audit, config=cfg, conn=conn)
@@ -1253,6 +1334,10 @@ def mcp_public(config: ConfigOption = None) -> None:
         typer.echo("imsg: mcp.public.enabled is false in config", err=True)
         raise typer.Exit(code=1)
     run_guard_mount_or_exit(cfg.paths.data_root)
+    _echo_backend_line(cfg, err=True)
+    text_provider = _build_or_die(lambda: build_text_provider(cfg))
+    reranker = _build_or_die(lambda: build_reranker(cfg))
+    multimodal_provider = _build_or_die(lambda: build_multimodal_provider(cfg))
 
     conn = _connect_and_verify_or_die(cfg)
     fts_conn = _open_fts_conn(cfg)
@@ -1276,9 +1361,9 @@ def mcp_public(config: ConfigOption = None) -> None:
         pg_conn=conn,
         fts_conn=fts_conn,
         config=cfg,
-        text_provider=_text_provider(cfg),  # PLACEHOLDER — see module docstring.
-        reranker=FakeRerankerProvider(),  # PLACEHOLDER — see module docstring.
-        multimodal_provider=_multimodal_provider(cfg),
+        text_provider=text_provider,
+        reranker=reranker,
+        multimodal_provider=multimodal_provider,
     )
     audit = PostgresAuditSink(lambda: connect(cfg.database, autocommit=True))
     try:
