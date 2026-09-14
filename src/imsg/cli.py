@@ -71,6 +71,7 @@ from imsg.mcp.auth import build_public_gate
 from imsg.mcp.tools.local_server import LocalMcpServer, run_local_server
 from imsg.mcp.tools.public_server import PublicMcpServer, build_public_asgi_app, parse_bind_address
 from imsg.mount.guard import run_guard_mount_or_exit
+from imsg.paths import is_contained_in, resolve_path
 from imsg.providers.factory import (
     ResolvedPrompt,
     backend_status_line,
@@ -527,14 +528,17 @@ def _validate_seed_or_die(cfg: Config, snapshot: Path | None, source: str | None
     """Gate the one-shot seed path (SPEC §8 S7): `--snapshot` feeds a prepared
     database straight to S2, bypassing S1.
 
-    Two rules, both fail-closed, because the failure they prevent is silent
-    and permanent. A seed advances the **ROWID watermark of whatever source
-    it is ingested under**, and a ROWID means something only inside one
-    database file. Seed a file whose ROWIDs run past the live source's and
-    the watermark jumps past real messages that were never looked at — they
-    are then below the watermark forever, and nothing reports rows it never
-    read. So a seed must carry its own `--source`, and that source must not
-    be one the pipeline is actively snapshotting.
+    Three rules, all fail-closed, because the failures they prevent are
+    silent and permanent. A seed advances the **ROWID watermark of whatever
+    source it is ingested under**, and a ROWID means something only inside
+    one database file. Seed a file whose ROWIDs run past the live source's
+    and the watermark jumps past real messages that were never looked at —
+    they are then below the watermark forever, and nothing reports rows it
+    never read. So a seed must carry its own `--source`, and that source
+    must not be one the pipeline is actively snapshotting. And the file
+    must not be the live `chat.db` (or anything beside it): the pipeline
+    reads the live database exactly once, through S1's SQLite `.backup`,
+    and nothing else may ever open it (CLAUDE.md non-negotiable #1).
     """
     if snapshot is None:
         return
@@ -553,6 +557,35 @@ def _validate_seed_or_die(cfg: Config, snapshot: Path | None, source: str | None
             f"chat.db. Seeding it would advance that source's ROWID watermark to this "
             f"file's row count; every live message below the new watermark is then "
             f"skipped forever, with no error. Use a fresh source name for the seed.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    # Compared by *resolved* path, so a symlink or `..` cannot dodge the
+    # check (SPEC §5.4: never infer containment from a string prefix).
+    seed_resolved = resolve_path(snapshot)
+    live_databases = [("paths.live_chat_db", resolve_path(cfg.paths.live_chat_db))]
+    live_databases += [
+        (f"sync.sources[{i}] ({s.name}).chat_db", resolve_path(s.chat_db))
+        for i, s in enumerate(cfg.sync.sources)
+    ]
+    for label, live in live_databases:
+        if seed_resolved == live:
+            typer.echo(
+                f"imsg: --snapshot '{snapshot}' is the live Messages database ({label}). "
+                f"A seed must be a snapshot or a prepared copy — the pipeline never opens "
+                f"chat.db directly; S1's SQLite backup is its only reader (CLAUDE.md "
+                f"non-negotiable #1: never write to the live chat.db). Run 'imsg snapshot', "
+                f"or copy the file under data_root, and seed from that.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+    live_dir = resolve_path(cfg.paths.live_chat_db).parent
+    if is_contained_in(seed_resolved, live_dir):
+        typer.echo(
+            f"imsg: --snapshot '{snapshot}' resolves inside the live Messages directory "
+            f"'{live_dir}' (the live chat.db, its -wal/-shm sidecars and the attachment "
+            f"tree live there). Nothing in this pipeline may open a database there "
+            f"directly (CLAUDE.md non-negotiable #1) — copy the file under data_root first.",
             err=True,
         )
         raise typer.Exit(code=1)
