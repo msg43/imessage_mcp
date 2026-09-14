@@ -10,6 +10,106 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-14 — real model providers behind `models.backend`, and the QA pass that read them together
+
+Four agents built the real providers in parallel against a contract and the
+branches were merged unread; this entry covers everything since `7c71097`,
+including the review that followed. The `extraction_run.finished_at` fix from
+the same day has its own entry below.
+
+**Landed (the build):**
+
+- `ffmpeg`: `-fps_mode` replaces the removed `-vsync` option (keyframe sampling
+  failed on current ffmpeg).
+- `imsg verify-seed --reference-db <chat.db>` builds the AT-2 reference straight
+  from a chat.db-shaped file, applying the extractor's three inclusion filters
+  in SQL — a recovered/merged corpus has no host to run `--export` on, which
+  had left AT-2 unrunnable for exactly the seed it exists to check.
+- Real providers, each importing its runtime lazily so `imsg` imports without
+  the `models` extra: `imsg.mlx_runtime` (shared mlx-lm loading with revision
+  pinning, right-padded batching, last-token gather); `embed.mlx_text`
+  (Qwen3-Embedding: EOS suffix from the tokenizer's own post-processor,
+  last-token pooling, Matryoshka truncation + L2); `retrieval.mlx_reranker`
+  (Qwen3-Reranker: the model card's yes/no logit recipe);
+  `segment.mlx_boundaries` (Qwen3.5 boundary LLM: chat template with thinking
+  off, greedy decoding, between-token deadline, tolerant JSON parse);
+  `enrich.vision_ocr` (VNRecognizeTextRequest, accurate, reading-order sort);
+  `enrich.mlx_whisper_transcription`; `enrich.mlx_vlm_caption` (fixed prompt,
+  `prompt_sha256`); `embed.pe_core_multimodal` (PE-Core via open_clip on MPS,
+  per-item image failures, revision-pinned snapshot).
+- Wiring: `imsg.providers.factory` is the only place providers are built;
+  `models.backend` (`real` default, `fake` opt-in) with a `models: backend=…`
+  line on every model-backed command; `models/manifest.lock.yaml` +
+  `imsg models verify` / `scripts/verify_model_manifest.py` (drift against the
+  HF API, runtime floors, `--write` only on request); config fields for every
+  repo/revision and the enrichment knobs; the `models` extra in
+  `pyproject.toml`; README rewritten around the above.
+
+**Found by reading the merged result (each fixed, with a test):**
+
+- The PE-Core pin could never load: manifest/constants/config pinned
+  `facebook/PE-Core-G14-448 @ a604668…`, but the provider fetches from the
+  `timm/PE-Core-bigG-14-448` mirror, which has no such commit. Pinned the
+  mirror at its own sha (`17aa0c25…`); a test asserts the pin names the repo
+  `resolve_weights_repo()` would fetch from.
+- A missing MLX runtime silently degraded segmentation: `MlxBoundaryProvider`
+  wrapped load failures as `BoundaryDetectionError`, which the caller answers
+  with the session-as-segment fallback — every session, run reports success.
+  Environment failures now propagate as `MlxRuntimeError` (abort), consistent
+  with `ModelRuntimeUnavailableError` on the enrichment side.
+- One unembeddable image aborted the whole multimodal pass: the provider's
+  per-item `ImageEmbeddingError` was never caught. The two classes moved to
+  `imsg.errors`; the pass logs, counts (`EmbedRunReport.attachments_failed`)
+  and continues; every other `EmbeddingError` still aborts.
+- `enrichment.ocr_languages: null` promised automatic language detection but
+  the provider never enabled it (Vision's default is a fixed en-US list with
+  detection off, read back from a live request). Switched on for the null case.
+- HEIC — the iPhone default — could not be decoded: `pillow_heif`'s opener is
+  registered on load when the package is importable.
+- Caption provenance: `prompt_sha256` was computed and never stored; it now
+  lands in `enrichment.detail`. The mlx-vlm call passes
+  `enable_thinking=False` explicitly (rendered against the pinned Qwen3.5 chat
+  template) instead of relying on the library's per-model default.
+- `segmentation.boundary_revision` was not part of `seg_config_hash` (D4). It
+  is now (payload `v2`); **existing installs re-segment every chat on their
+  next run.**
+- No `prompts/segment_boundaries.txt` was ever shipped although config
+  defaulted to it. It is now, stating the parser's exact contract; both prompt
+  lookups fall back from `data_root` to the repo copy and print which file was
+  used; a non-UTF-8 prompt is one clear error instead of a traceback.
+- `--snapshot` never compared its path with `paths.live_chat_db`: a seed could
+  open the live database directly. Refused by resolved path — the live db, any
+  configured source db, anything inside the live Messages directory
+  (non-negotiable #1). Found by today's real seed run.
+
+**Verified against the installed runtimes, not from memory** (mlx 0.32.2,
+mlx-lm 0.31.3, mlx-whisper 0.4.3, mlx-vlm 0.7.1, open_clip_torch 3.3.0,
+huggingface_hub 1.31.0, pyobjc Vision 12.2.2): every API name the providers
+call exists with the assumed signature — `mlx_lm.load(revision=)`,
+`stream_generate(sampler=)`, `make_sampler(temp=)`, `mx.take_along_axis`
+broadcasting, `mlx_whisper.transcribe(path_or_hf_repo=, temperature=)`,
+`mlx_vlm.load`/`generate`/`prompt_utils.apply_chat_template` (kwargs reach the
+template), open_clip's `local-dir:` schema and `require_pretrained`
+forwarding, the Vision selectors including `setAutomaticallyDetectsLanguage_`.
+mlx-lm ships `models/qwen3_5_moe.py` and its `sanitize` drops the vision tower;
+the pinned Qwen3.5 `chat_template.jinja` honours `enable_thinking`; the
+Qwen3-Embedding tokenizer's post-processor appends exactly `<|endoftext|>`
+(151643). Absent in mlx-lm 0.31.3: `mlx_lm.utils.get_model_path` — harmless,
+`load()` takes `revision` and the fallback chain handles its absence.
+
+**Executed, on stand-ins where the pinned weights were not downloaded:** Apple
+Vision OCR read a generated image back verbatim on macOS 26.6.2 (recorded in
+the manifest — the one entry not `not_run`); the transcription chain (speech
+synthesis → ffmpeg → `MlxWhisperTranscriptionProvider`) returned an exact
+transcript on the 50 MB `whisper-tiny-mlx-q4`; the three mlx-lm providers
+loaded the 79 MB `SmolLM-135M-Instruct-4bit` and produced unit-norm
+embeddings, yes/no probabilities and a parsed-or-rejected boundary answer,
+bit-identical across pad-token choices (right padding cannot leak). **No
+pinned model has been executed end to end; retrieval quality with the 8B / 35B
+weights is unknown.**
+
+Suite: 990 passed, 198 skipped (no database here); ruff and mypy strict clean.
+
 ## 2026-08-17 — first real corpus run: the write-loss class, and identity curation
 
 Recorded late (2026-09-03). This work landed across 2026-08-14→17 with no
