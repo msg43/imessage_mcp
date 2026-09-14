@@ -15,8 +15,10 @@
 # -> `sha` (current main commit) and `cardData.license` / `license:*` tag;
 # quantization read from each repo's config.json; runtime floors are the
 # PyPI versions verified to exist on the same date (pyproject.toml
-# `models` extra). Nothing below has been downloaded or executed yet —
-# every artifact_sha256 is null and every smoke_test is not_run.
+# `models` extra). No hosted model below has been downloaded or executed
+# yet — every artifact_sha256 is null and every resolved entry's
+# smoke_test is not_run. The Apple Vision entry ships with the OS and has
+# been exercised through the real provider (see its smoke_test).
 schema_version: 1
 resolved_at: '2026-09-14'
 models:
@@ -96,12 +98,24 @@ models:
     quantization: none
     artifact_sha256: null
     min_runtime: {macos: '13.0', pyobjc-framework-Vision: '12.2.2', pyobjc-framework-Quartz: '12.2.2'}
-    smoke_test: {status: not_run}
+    smoke_test:
+      status: passed
+      date: '2026-09-14'
+      macos: '26.6.2'
+      method: >-
+        imsg.enrich.vision_ocr.AppleVisionOcrProvider().recognize_text() on a generated
+        900x260 PNG carrying two lines of 56px Helvetica ("Receipt total 42.50" /
+        "Second line of text"); both lines came back verbatim, in reading order, with
+        automatic language detection (ocr_languages null) and again with an explicit
+        en-US list plus minimum_text_height 0.05. model_id apple/vision-recognize-text@26.6.2.
     notes: >-
-      VNRecognizeTextRequest in accurate mode with VNRecognizeTextRequestRevision3
-      and automaticallyDetectsLanguage — both introduced in macOS 13.0 (Apple developer
-      documentation, checked 2026-09-14). The model ships with the OS, so there is no
-      repo or revision to pin; the OS version IS the pin. Not re-resolved remotely.
+      VNRecognizeTextRequest in accurate mode with language correction; the request
+      revision is left at the running OS's default (VNRecognizeTextRequestRevision3 is
+      the macOS 13.0 floor) and automaticallyDetectsLanguage is switched on whenever
+      enrichment.ocr_languages is null (Vision's own default is a fixed en-US list with
+      detection off — read back from a live request, 2026-09-14). The model ships with
+      the OS, so there is no repo or revision to pin; the OS version IS the pin. Not
+      re-resolved remotely.
   pe-core-g14-448:
     role: [multimodal_embedding]
     status: resolved

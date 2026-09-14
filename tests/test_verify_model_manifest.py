@@ -379,7 +379,17 @@ def test_repo_lock_is_well_formed() -> None:
             assert entry.repo and "/" in entry.repo, entry.name
             assert entry.revision and re.fullmatch(r"[0-9a-f]{40}", entry.revision), entry.name
             assert entry.license, entry.name
-        assert entry.raw["smoke_test"] == {"status": "not_run"}, entry.name
+        # No hosted model has been downloaded or executed: every resolved
+        # entry stays not_run with no artifact checksum. The one `system`
+        # entry (Apple Vision) can be exercised without a download; when it
+        # records a run, the record must say when, on which OS, and how.
+        smoke = entry.raw["smoke_test"]
+        if entry.status == "resolved":
+            assert smoke == {"status": "not_run"}, entry.name
+        else:
+            assert smoke["status"] in {"not_run", "passed"}, entry.name
+            if smoke["status"] == "passed":
+                assert {"date", "macos", "method"} <= set(smoke), entry.name
         assert entry.raw["artifact_sha256"] is None, entry.name
     assert not [e.name for e in lock.entries if e.status == "unresolved"]
 
