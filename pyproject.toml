@@ -24,6 +24,27 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6", "mypy>=1.11", "types-PyYAML", "types-jsonschema"]
+# Real model backends (`models.backend: real`, the default — see
+# imsg.providers.factory). Floors are the PyPI versions verified to exist
+# on 2026-09-14 (https://pypi.org/pypi/<name>/json); they mirror the
+# `min_runtime` floors in models/manifest.lock.yaml, and uv.lock pins the
+# exact resolved versions. Install with `uv sync --extra models`.
+models = [
+    "mlx>=0.32.2",                    # verified: 0.32.2 (2026-08-25); mlx-vlm 0.7.1 requires >=0.32.2
+    "mlx-lm>=0.31.3",                 # verified: 0.31.3 (2026-04-22)
+    "mlx-whisper>=0.4.3",             # verified: 0.4.3 (2025-08-29)
+    "mlx-vlm>=0.7.1",                 # verified: 0.7.1 (2026-09-14)
+    "pyobjc-framework-Vision>=12.2.2", # verified: 12.2.2 (2026-08-11)
+    "pyobjc-framework-Quartz>=12.2.2", # verified: 12.2.2 (2026-08-11)
+    "huggingface_hub>=1.31.0",        # verified: 1.31.0 (2026-09-10)
+    "pillow>=12.3.0",                 # verified: 12.3.0 (2026-07-01)
+    "torch>=2.14.0",                  # verified: 2.14.0 (2026-09-02); PE-Core (MPS) + mlx-whisper dependency
+    # PE-CORE BACKEND — INTEGRATOR FILLS IN from the multimodal agent's report:
+    # the package that loads facebook/PE-Core-G14-448 (imsg.embed.pe_core_multimodal).
+    # Verify its floor exists on PyPI, then add the same floor to
+    # models/manifest.lock.yaml `pe-core-g14-448.min_runtime`.
+    # "<pe-core-backend-package>>=<version>",
+]
 
 [project.scripts]
 imsg = "imsg.cli:app"

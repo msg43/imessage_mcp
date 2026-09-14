@@ -1,0 +1,122 @@
+# models/manifest.lock.yaml — the model pin lock (SPEC model-manifest
+# requirement): for every model, the exact repository, the immutable
+# revision (commit sha), the license observed at that revision, the
+# expected output dimension, the quantization, the artifact checksum,
+# the minimum runtime versions, and the smoke-test result.
+#
+# A build MUST NOT silently advance a model or MLX package because
+# "latest" changed: `imsg models verify` (scripts/verify_model_manifest.py)
+# re-resolves each repo against the Hugging Face API and reports drift;
+# it rewrites this file only with --write. The config-schema defaults
+# in src/imsg/constants.py mirror the pins below and a unit test keeps
+# the two equal.
+#
+# Resolution method (2026-09-14): GET https://huggingface.co/api/models/<repo>
+# -> `sha` (current main commit) and `cardData.license` / `license:*` tag;
+# quantization read from each repo's config.json; runtime floors are the
+# PyPI versions verified to exist on the same date (pyproject.toml
+# `models` extra). Nothing below has been downloaded or executed yet —
+# every artifact_sha256 is null and every smoke_test is not_run.
+schema_version: 1
+resolved_at: '2026-09-14'
+models:
+  qwen3-embedding-8b:
+    role: [text_embedding]
+    status: resolved
+    repo: mlx-community/Qwen3-Embedding-8B-mxfp8
+    revision: 51c773b7464b630a6c67b4f75dbd796b658d6236
+    license: apache-2.0
+    expected_dim: 2048
+    quantization: {mode: mxfp8, bits: 8, group_size: 32}
+    artifact_sha256: null
+    min_runtime: {mlx: '0.32.2', mlx-lm: '0.31.3', huggingface_hub: '1.31.0'}
+    smoke_test: {status: not_run}
+    notes: >-
+      mlx-community's 8-bit conversion of Qwen/Qwen3-Embedding-8B (converted with
+      mlx-embeddings 0.0.3, per its model card; model_type qwen3, hidden_size 4096).
+      expected_dim 2048 is the MRL truncation of the model's native 4096-dim output
+      (SPEC §4.1; migration 0001's halfvec(2048) CHECK constraint). Alternative
+      considered: mlx-community/Qwen3-Embedding-8B-4bit-DWQ (affine 4-bit, sha
+      885642d6b98742ea03b77a1673579c92ca961efd) — rejected because the spec pins 8-bit.
+      Upstream: Qwen/Qwen3-Embedding-8B @ 1d8ad4ca9b3dd8059ad90a75d4983776a23d44af (apache-2.0).
+  qwen3-reranker-8b:
+    role: [reranker]
+    status: resolved
+    repo: mlx-community/Qwen3-Reranker-8B-mxfp8
+    revision: a8947a5fe4c62cc1feb8dffa89d49502c8c80923
+    license: apache-2.0
+    expected_dim: null
+    quantization: {mode: mxfp8, bits: 8, group_size: 32}
+    artifact_sha256: null
+    min_runtime: {mlx: '0.32.2', mlx-lm: '0.31.3', huggingface_hub: '1.31.0'}
+    smoke_test: {status: not_run}
+    notes: >-
+      mlx-community's 8-bit conversion of Qwen/Qwen3-Reranker-8B (converted with
+      mlx-embeddings 0.0.3, per its model card). Scores (query, rendered_text) pairs
+      for SPEC §9.4 step 7; no output dimension applies. Upstream:
+      Qwen/Qwen3-Reranker-8B @ 77d193c791ed757ca307ee72715aa132723da912 (apache-2.0).
+  qwen3.5-35b-a3b:
+    role: [segment_boundaries, image_caption]
+    status: resolved
+    repo: mlx-community/Qwen3.5-35B-A3B-4bit
+    revision: 1e20fd8d42056f870933bf98ca6211024744f7ec
+    license: apache-2.0
+    expected_dim: null
+    quantization: {mode: affine, bits: 4, group_size: 64}
+    artifact_sha256: null
+    min_runtime: {mlx: '0.32.2', mlx-lm: '0.31.3', mlx-vlm: '0.7.1', pillow: '12.3.0', huggingface_hub: '1.31.0'}
+    smoke_test: {status: not_run}
+    notes: >-
+      One set of weights serves both S4 topical-boundary detection (text, via mlx-lm)
+      and S5b image captioning (vision, via mlx-vlm) — SPEC §4.1/D4. model_type
+      qwen3_5_moe (Qwen3_5MoeForConditionalGeneration), converted with mlx-vlm 0.3.12
+      per its model card; 4-bit affine, group_size 64.
+  whisper-large-v3:
+    role: [transcription]
+    status: resolved
+    repo: mlx-community/whisper-large-v3-mlx
+    revision: 49e6aa286ad60c14352c404340ded53710378a11
+    license: mit
+    expected_dim: null
+    quantization: none
+    artifact_sha256: null
+    min_runtime: {mlx: '0.32.2', mlx-whisper: '0.4.3', torch: '2.14.0', huggingface_hub: '1.31.0'}
+    smoke_test: {status: not_run}
+    notes: >-
+      mlx-whisper's own conversion of openai/whisper-large-v3 (weights.npz +
+      config.json; unquantized — the repo does not state the stored dtype, confirm
+      at download). torch is a declared dependency of mlx-whisper itself.
+  apple-vision-ocr:
+    role: [ocr]
+    status: system
+    repo: null
+    revision: null
+    license: Apple macOS SDK (system framework; not redistributed by this project)
+    expected_dim: null
+    quantization: none
+    artifact_sha256: null
+    min_runtime: {macos: '13.0', pyobjc-framework-Vision: '12.2.2', pyobjc-framework-Quartz: '12.2.2'}
+    smoke_test: {status: not_run}
+    notes: >-
+      VNRecognizeTextRequest in accurate mode with VNRecognizeTextRequestRevision3
+      and automaticallyDetectsLanguage — both introduced in macOS 13.0 (Apple developer
+      documentation, checked 2026-09-14). The model ships with the OS, so there is no
+      repo or revision to pin; the OS version IS the pin. Not re-resolved remotely.
+  pe-core-g14-448:
+    role: [multimodal_embedding]
+    status: resolved
+    repo: facebook/PE-Core-G14-448
+    revision: a6046680086f67d1f24d4b465a240de0578dfc0b
+    license: apache-2.0
+    expected_dim: 1280
+    quantization: none
+    artifact_sha256: null
+    min_runtime: {torch: '2.14.0', pillow: '12.3.0', huggingface_hub: '1.31.0'}
+    smoke_test: {status: not_run}
+    notes: >-
+      Perception Encoder Core G/14 at 448px (D3a): 1.88B-param vision tower + 0.47B
+      text tower, both projecting to 1280 dims (model-card table; migration 0002's
+      halfvec(1280) CHECK constraint). Artifact is PE-Core-G14-448.pt + config.yaml
+      (fp32 checkpoint, not an MLX conversion; runs on torch/MPS). INTEGRATOR: add the
+      PE-Core loader package and its floor to min_runtime and to pyproject's `models`
+      extra once the multimodal agent reports it.

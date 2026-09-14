@@ -20,12 +20,16 @@ PostgreSQL and skip cleanly without one), the CLI works, migrations
 apply against real PostgreSQL + pgvector — and no message has ever been
 indexed by it.
 
-**It ships deterministic *fake* model providers.** The embedding,
-captioning, OCR, transcription, and segmentation providers are
-correctly-dimensioned stubs (marked `PLACEHOLDER` in `cli.py`) that let
-the pipeline run end to end in tests. **Run the pipeline as-is and every
-stage will report success while your search results are meaningless.**
-Replacing them is the first real task — see
+**It ships deterministic *fake* model providers alongside the real
+wiring.** The embedding, reranking, captioning, OCR, transcription, and
+segmentation providers each have a correctly-dimensioned stub that lets
+the pipeline run end to end in tests. `imsg.providers.factory` selects
+between the real implementations and those stubs with one config field,
+`models.backend` (`real` is the default; `fake` is explicit opt-in), and
+every command that builds providers prints `models: backend=<real|fake>`
+first. **Run the pipeline with `fake` and every stage will report success
+while your search results are meaningless.** The real implementations
+and their pins are described in
 [Replacing the model providers](#replacing-the-model-providers).
 
 Treat this as a **thoroughly tested skeleton with a complete design
@@ -138,9 +142,17 @@ Then `uv run imsg --help`. Every stage supports `--dry-run`.
 ## Replacing the model providers
 
 This is the work between "tests pass" and "it does something." The
-interfaces already exist and are correctly dimensioned — implement them
-and inject your implementations where `cli.py` currently constructs the
-fakes.
+interfaces already exist and are correctly dimensioned. `imsg.providers.
+factory` is the only place providers are constructed: with
+`models.backend: real` it imports the implementation classes it names
+in `REAL_PROVIDERS` (lazily, by dotted path) and builds them from the
+repo ids and immutable revisions in `config.yaml`; those pins are
+recorded in `models/manifest.lock.yaml` (repo, commit sha, license,
+dimension, quantization, runtime floors) and `imsg models verify`
+reports any drift against the Hugging Face API without ever rewriting
+the lock unless asked. The runtime packages live behind the `models`
+extra (`uv sync --extra models`); a missing package fails as one clear
+`imsg: ...` line, not a traceback.
 
 | Interface | What it needs |
 |---|---|
