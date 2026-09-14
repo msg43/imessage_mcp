@@ -105,8 +105,8 @@ models:
   pe-core-g14-448:
     role: [multimodal_embedding]
     status: resolved
-    repo: facebook/PE-Core-G14-448
-    revision: a6046680086f67d1f24d4b465a240de0578dfc0b
+    repo: timm/PE-Core-bigG-14-448
+    revision: 17aa0c25addfa14198fa2ff73d845a22d433432e
     license: apache-2.0
     expected_dim: 1280
     quantization: none
@@ -115,8 +115,15 @@ models:
     smoke_test: {status: not_run}
     notes: >-
       Perception Encoder Core G/14 at 448px (D3a): 1.88B-param vision tower + 0.47B
-      text tower, both projecting to 1280 dims (model-card table; migration 0002's
-      halfvec(1280) CHECK constraint). Artifact is PE-Core-G14-448.pt + config.yaml
-      (fp32 checkpoint, not an MLX conversion; runs on torch/MPS). INTEGRATOR: add the
-      PE-Core loader package and its floor to min_runtime and to pyproject's `models`
-      extra once the multimodal agent reports it.
+      text tower, both projecting to 1280 dims (migration 0002's halfvec(1280) CHECK
+      constraint). Pinned as timm's open_clip-layout remap of Meta's canonical
+      facebook/PE-Core-G14-448 (a6046680086f67d1f24d4b465a240de0578dfc0b, apache-2.0),
+      because that canonical repo holds a single PE-Core-G14-448.pt in Meta's own
+      layout, loadable only by the GitHub-only perception_models package (see
+      imsg.embed.pe_core_multimodal). The provider reads open_clip_config.json +
+      open_clip_model.safetensors from this repo through open_clip's local-dir schema,
+      and a revision is a commit of the repo the bytes come from — the earlier pin
+      named the canonical repo's sha, which this mirror cannot resolve (2026-09-14).
+      Resolved via GET https://huggingface.co/api/models/timm/PE-Core-bigG-14-448 on
+      2026-09-14: sha 17aa0c25addfa14198fa2ff73d845a22d433432e, license apache-2.0,
+      open_clip_config.json declares embed_dim 1280. Runs on torch/MPS (fp32 weights).

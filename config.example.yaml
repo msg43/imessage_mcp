@@ -86,8 +86,8 @@ embedding:
     enabled: true
     provider: local               # only 'local' is implemented — D3a
     scope: full                   # only 'full' is implemented — D3a
-    model: facebook/PE-Core-G14-448
-    revision: a6046680086f67d1f24d4b465a240de0578dfc0b   # immutable commit sha (manifest pin)
+    model: timm/PE-Core-bigG-14-448   # open_clip-layout remap of facebook/PE-Core-G14-448 (manifest pin)
+    revision: 17aa0c25addfa14198fa2ff73d845a22d433432e   # immutable commit sha OF THIS REPO (manifest pin)
     dim: 1280                     # must match migration 0002's DDL
     batch_size: 16
 

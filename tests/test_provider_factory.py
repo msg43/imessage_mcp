@@ -23,6 +23,7 @@ import pytest
 from imsg import constants
 from imsg.config.loader import load_config_dict
 from imsg.config.schema import Config
+from imsg.embed.pe_core_multimodal import resolve_weights_repo
 from imsg.embed.provider import FakeMultimodalEmbeddingProvider, FakeTextEmbeddingProvider
 from imsg.enrich.pipeline import EnrichmentProviders
 from imsg.enrich.provider import FakeCaptionProvider, FakeOcrProvider, FakeTranscriptionProvider
@@ -426,6 +427,15 @@ def test_config_defaults_mirror_the_manifest_lock(config_dict_factory: Any) -> N
         multimodal.expected_dim
         == cfg.embedding.multimodal.dim
         == constants.MULTIMODAL_EMBEDDING_DIM
+    )
+    # A revision is a commit of exactly one repo. The PE-Core provider
+    # downloads from `resolve_weights_repo(model)` — the open_clip-layout
+    # mirror when given Meta's canonical id — so the lock must pin THAT
+    # repo and one of its commits. Pinned as the canonical id, the mirror
+    # was asked for a sha it does not have (2026-09-14).
+    assert resolve_weights_repo(multimodal.repo) == multimodal.repo, (
+        f"the multimodal pin names {multimodal.repo!r}, but weights are fetched from "
+        f"{resolve_weights_repo(multimodal.repo)!r} — pin the repo the bytes come from"
     )
 
     assert by_role["ocr"].status == "system"

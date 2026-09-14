@@ -74,8 +74,16 @@ CAPTION_MODEL_REVISION = BOUNDARY_MODEL_REVISION
 TRANSCRIPTION_MODEL_REPO = "mlx-community/whisper-large-v3-mlx"
 TRANSCRIPTION_MODEL_REVISION = "49e6aa286ad60c14352c404340ded53710378a11"
 
-MULTIMODAL_EMBEDDING_MODEL_REPO = "facebook/PE-Core-G14-448"
-MULTIMODAL_EMBEDDING_MODEL_REVISION = "a6046680086f67d1f24d4b465a240de0578dfc0b"
+MULTIMODAL_EMBEDDING_MODEL_REPO = "timm/PE-Core-bigG-14-448"
+MULTIMODAL_EMBEDDING_MODEL_REVISION = "17aa0c25addfa14198fa2ff73d845a22d433432e"
+"""timm's open_clip-layout remap of Meta's ``facebook/PE-Core-G14-448``
+(``a6046680086f67d1f24d4b465a240de0578dfc0b``, Apache-2.0) — the repo
+``imsg.embed.pe_core_multimodal`` actually downloads from. A revision is
+a commit of exactly one repo, so the pin names the mirror: the provider
+maps the canonical id to this mirror, and pinned the other way round it
+asked the mirror for the canonical repo's sha, which the mirror cannot
+resolve (found 2026-09-14 by resolving both ids against the Hugging
+Face API; the canonical repo holds only Meta's own ``.pt`` layout)."""
 
 __all__ = [
     "BOUNDARY_MODEL_REPO",
