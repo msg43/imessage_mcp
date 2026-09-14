@@ -1,0 +1,5 @@
+Describe this image for a private search index. Write exactly one plain-text paragraph of no more than 120 words.
+
+Cover only what is actually visible: the kind of image (photograph, screenshot, scanned document, drawing, map, chart, meme); the setting and main subject; any readable text, quoted exactly as written; the number of people present and what they are doing, described without guessing who they are; and notable objects, colours, or logos.
+
+Do not guess names, identities, relationships, emotions, locations, dates, or purposes that are not shown. Do not add commentary, opinions, or a title. If the image is blank, unreadable, or too small to interpret, say so in one sentence instead.
