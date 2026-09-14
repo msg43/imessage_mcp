@@ -15,9 +15,10 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 [`msg43/imessage_mcp`](https://github.com/msg43/imessage_mcp) (MIT).
 Every buildable component of the governing spec is implemented: 8
 pipeline stages, hybrid retrieval, both MCP surfaces, the export gate,
-the eval harness, 32 CLI commands (counting subcommands), migrations
-0001–0003. 858 tests (661 without a database, 197 integration tests
-that skip without one); ruff and mypy strict clean; DDL lint clean.
+the eval harness, 33 CLI commands (counting subcommands), migrations
+0001–0003. 1,188 tests (990 without a database, 198 integration tests
+that skip without one — measured 2026-09-14); ruff and mypy strict
+clean; DDL lint clean.
 
 **This status previously read "code complete, unrun" and stayed that way
 for three weeks after it stopped being true** — see `CHANGELOG.md`
@@ -27,12 +28,18 @@ defect no test could see: stages that printed success, exited 0, and
 persisted nothing. Identity resolution and Contacts curation have run
 against real address books.
 
-Still true, and the thing most likely to be mistaken for success: the
-pipeline runs end to end on **deterministic fake model providers**
-(marked `PLACEHOLDER`), so segmentation, embedding, and retrieval
-complete successfully and return meaningless results until real loaders
-replace them. Phase 1's exit criteria — seed completeness (AT-2) and a
-hand-verified `person` table — are **not** met. (2026-09-03)
+The real model providers exist as of 2026-09-14 — `imsg.providers.factory`
+builds them behind `models.backend: real` (the default; `fake` is explicit
+opt-in and every command prints which), pinned in `models/manifest.lock.yaml`
+— but **no pinned model has been downloaded or executed end to end**: every
+hosted manifest entry is `smoke_test: not_run`. Only the OS-supplied Apple
+Vision OCR has run against its pinned "model"; the whisper and mlx-lm code
+paths were exercised on tiny stand-in models, and every runtime API the
+providers call was checked against the installed packages. Segmentation,
+embedding and retrieval quality with the real 8B / 35B weights is unknown,
+and a `fake` run still reports success with meaningless results. Phase 1's
+exit criteria — seed completeness (AT-2) and a hand-verified `person` table —
+are **not** met. (2026-09-14)
 
 ## Gate ladder
 
@@ -55,11 +62,18 @@ Deployment is a human-gated sequence; the step-by-step guide lives in
 the private design-record repo, not here (it names real hosts and
 accounts).
 
-- **Replace the fake model providers** before trusting Phase 3. The
-  interfaces exist and are correctly dimensioned — the loaders do not.
-  Vector dimensions are load-bearing: pgvector's HNSW index caps below
-  what the models natively emit, so changing them requires a migration
-  and a full re-embed.
+- **Run the real model providers end to end** before trusting Phase 3.
+  The providers exist behind `models.backend: real` (2026-09-14) and every
+  runtime API they call was verified against the installed packages, but
+  the pinned weights (Qwen3-Embedding-8B, Qwen3-Reranker-8B, Qwen3.5-35B-A3B,
+  whisper-large-v3, PE-Core-G14-448) have never been downloaded or run:
+  `uv sync --extra models`, `imsg models verify`, download, then `segment`
+  / `embed` / `enrich` on one real chat, and record each `smoke_test` in the
+  manifest (only the Apple Vision entry has one). Note the `seg_config_hash`
+  v2 bump: the first real `segment` run re-segments every chat. Vector
+  dimensions are load-bearing: pgvector's HNSW index caps below what the
+  models natively emit, so changing them requires a migration and a full
+  re-embed.
 - Confirm the host's unified memory before Phase 0 — it selects the
   model ladder.
 - Populate the `unsupported` materialization state in the backfill
