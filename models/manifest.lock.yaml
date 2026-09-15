@@ -4,12 +4,32 @@
 # expected output dimension, the quantization, the artifact checksum,
 # the minimum runtime versions, and the smoke-test result.
 #
+# Two kinds of entry, told apart by `source`:
+#   hub (the default) — a Hugging Face repo pinned at a commit sha:
+#     `repo`, `revision`, `license`.
+#   local_conversion — a directory under paths.data_root produced from
+#     an upstream Hub repo by a recorded, reproducible command:
+#     `upstream_repo`, `upstream_revision` (sha), `upstream_license`,
+#     `tool` (`<package>==<exact version>` that ran it), `command` (the
+#     exact invocation; `$DATA_ROOT` stands for paths.data_root),
+#     `output_dir` (data-root-relative). `repo`/`revision`/`license` stay
+#     null: a local directory has no Hub revision — its provenance is the
+#     upstream pin plus `artifact_sha256`, computed over the OUTPUT
+#     directory. The config carries `<output_dir>` as the model and the
+#     UPSTREAM sha as the revision; the provider records `model_id` as
+#     `<output_dir>@<upstream sha>`.
+#
 # A build MUST NOT silently advance a model or MLX package because
 # "latest" changed: `imsg models verify` (scripts/verify_model_manifest.py)
-# re-resolves each repo against the Hugging Face API and reports drift;
-# it rewrites this file only with --write. The config-schema defaults
-# in src/imsg/constants.py mirror the pins below and a unit test keeps
-# the two equal.
+# re-resolves each repo — a local conversion's upstream repo — against
+# the Hugging Face API and reports drift; checks every local
+# conversion's directory under data_root (`--data-root`) against its
+# artifact_sha256; and checks the installed runtimes against
+# `min_runtime`. It rewrites this file only with --write, and only Hub
+# entries' revision/license — an upstream pin is never advanced (the
+# directory on disk was converted from the pinned sha; re-convert and
+# re-pin by hand). The config-schema defaults in src/imsg/constants.py
+# mirror the pins below and a unit test keeps the two equal.
 #
 # Resolution method (2026-09-14): GET https://huggingface.co/api/models/<repo>
 # -> `sha` (current main commit) and `cardData.license` / `license:*` tag;
@@ -26,14 +46,16 @@
 #   artifact_sha256 — the hex SHA-256 of the UTF-8 text made of the lines
 #     "<relative POSIX path>  <hex sha256 of the file bytes>\n" (two
 #     spaces, like sha256sum), one per regular file in the pinned snapshot
-#     whose name matches *.safetensors, *.npz, *.json, *.txt, *.model,
-#     *.tiktoken, *.jinja, *.py or *.jsonl (hidden entries skipped), sorted
-#     by relative path. README.md, .gitattributes and *.bin/*.pt duplicates
-#     of safetensors weights are outside the definition, so a partial and
-#     a full snapshot of the same commit give the same digest
-#     (imsg.providers.model_smoke.artifact_digest is the reference
-#     implementation). Null until an entry has been downloaded; null for
-#     the system entry, which has no artifact.
+#     — for a local conversion, in its output_dir — whose name matches
+#     *.safetensors, *.npz, *.json, *.txt, *.model, *.tiktoken, *.jinja,
+#     *.py or *.jsonl (hidden entries skipped), sorted by relative path.
+#     README.md, .gitattributes and *.bin/*.pt duplicates of safetensors
+#     weights are outside the definition, so a partial and a full snapshot
+#     of the same commit give the same digest
+#     (imsg.providers.manifest.artifact_digest is the reference
+#     implementation). Null until an entry has been downloaded (or, for a
+#     local conversion, converted and smoke-run); null for the system
+#     entry, which has no artifact.
 #   smoke_test — status (passed | failed | not_run), date, host_class
 #     (chip family and memory size, never a hostname), load_seconds,
 #     inference_seconds, peak_memory_gb (GiB; mlx.core.get_peak_memory for
@@ -77,50 +99,64 @@ models:
   qwen3-reranker-8b:
     role: [reranker]
     status: resolved
-    repo: mlx-community/Qwen3-Reranker-8B-mxfp8
-    revision: a8947a5fe4c62cc1feb8dffa89d49502c8c80923
-    license: apache-2.0
+    source: local_conversion
+    upstream_repo: Qwen/Qwen3-Reranker-8B
+    upstream_revision: 77d193c791ed757ca307ee72715aa132723da912
+    upstream_license: apache-2.0
+    tool: mlx-lm==0.31.3
+    command: >-
+      python -c "from huggingface_hub import snapshot_download; from mlx_lm.convert import
+      convert; src = snapshot_download('Qwen/Qwen3-Reranker-8B',
+      revision='77d193c791ed757ca307ee72715aa132723da912'); convert(hf_path=src,
+      mlx_path='$DATA_ROOT/models/qwen3-reranker-8b-mxfp8-77d193c7', quantize=True,
+      q_mode='mxfp8', q_bits=8, q_group_size=32)"
+    output_dir: models/qwen3-reranker-8b-mxfp8-77d193c7
     expected_dim: null
     quantization: {mode: mxfp8, bits: 8, group_size: 32}
-    artifact_sha256: '1dbdeb35eea637bd9702a6555f80712f5660100a1a3dff4125c6906bfa994b67'
+    artifact_sha256: '29e4a1aecc6956b0ee401bbecaf058b2af75be7df3f9eb055d3fb13f014ee3d7'
     min_runtime: {mlx: '0.32.2', mlx-lm: '0.31.3', huggingface_hub: '1.31.0'}
     smoke_test:
-      status: failed
-      date: '2026-09-14'
+      status: passed
+      date: '2026-09-15'
       host_class: Apple M2 Ultra, 128 GB unified memory
-      peak_memory_gb: 0.0
+      load_seconds: 3.71
+      inference_seconds: 1.19
+      peak_memory_gb: 8.09
       peak_memory_source: mlx.core.get_peak_memory
-      result: 'failed: MlxRuntimeError: could not load mlx-community/Qwen3-Reranker-8B-mxfp8@a8947a5fe4c62cc1feb8dffa89d49502c8c80923
-        via mlx_lm: ValueError: Missing 1 parameters: lm_head.weight.. mlx_lm needs an MLX-layou…'
-      error: 'MlxRuntimeError: could not load mlx-community/Qwen3-Reranker-8B-mxfp8@a8947a5fe4c62cc1feb8dffa89d49502c8c80923
-        via mlx_lm: ValueError: Missing 1 parameters: lm_head.weight.. mlx_lm needs an MLX-layout checkpoint
-        (e.g. an `mlx-community/*` conversion or the output of `mlx_lm.convert`); a repo published only in the
-        raw transformers layout will not load'
+      result: 'P(yes): relevant=0.9707 > irrelevant=0.0000, both in [0, 1]'
     notes: >-
-      mlx-community's 8-bit conversion of Qwen/Qwen3-Reranker-8B (converted with
-      mlx-embeddings 0.0.3, per its model card). Scores (query, rendered_text) pairs
-      for SPEC §9.4 step 7; no output dimension applies. Upstream:
-      Qwen/Qwen3-Reranker-8B @ 77d193c791ed757ca307ee72715aa132723da912 (apache-2.0).
-      UNUSABLE AS PINNED (smoke run 2026-09-14): the checkpoint's two safetensors shards
-      hold 651 tensors and no lm_head.* at all (its model.safetensors.index.json lists
-      an lm_head.weight and a fifth shard that do not exist at this revision), while
-      upstream ships a distinct, untied lm_head.weight (399 tensors,
-      tie_word_embeddings false). The reranker's P(yes) is read from lm_head logits,
-      so no loader change on our side can make this artifact score; mlx-lm's strict
-      load fails first with "Missing 1 parameters: lm_head.weight". local_conversion —
-      the one fix evaluated, same day, same host: mlx_lm.convert of the upstream repo at
-      its pinned sha, i.e. `python -c "from mlx_lm.convert import convert;
-      convert(hf_path='Qwen/Qwen3-Reranker-8B',
-      revision='77d193c791ed757ca307ee72715aa132723da912', mlx_path='<dir>',
-      quantize=True, q_mode='mxfp8', q_bits=8, q_group_size=32)"` (the CLI has no
-      --revision flag; mlx-lm 0.31.3's save() needs the source snapshot complete —
-      snapshot_download(repo, revision=<sha>) first, or huggingface_hub 1.31 refuses).
-      The output (653 tensors, lm_head.weight + lm_head.scales, 8.46 GB) loaded through
-      the same factory path and passed the same check: P(yes) relevant 0.9707 vs
-      irrelevant 0.0000, load 3.6 s, inference 0.69 s, peak 8.09 GiB (mlx). Not pinned:
-      the lock pins Hub revisions, and a local directory has none — publishing that
-      conversion under a repo this project controls (or an mlx-lm-made mlx-community
-      conversion appearing) is the owner's re-pin decision.
+      Pinned as a LOCAL CONVERSION (owner decision 2026-09-15): mlx-lm's own 8-bit
+      mxfp8 conversion (group size 32) of upstream Qwen/Qwen3-Reranker-8B at the sha
+      above, written to output_dir under paths.data_root by the recorded command.
+      `python` is the project venv with the `models` extra (mlx-lm 0.31.3, mlx 0.32.2,
+      huggingface_hub 1.31.0); $DATA_ROOT is paths.data_root. The command fetches the
+      pinned upstream snapshot first and hands its DIRECTORY to convert() rather than
+      the repo id: mlx-lm 0.31.3's save() copies generation_config.json from
+      `snapshot_download(repo, local_files_only=True)` — the cache's `main` ref, with
+      no revision parameter — so converting by repo id would depend on refs/main
+      existing and equalling the pin; from the directory every input file is the
+      pinned one and the model card is generic (README.md is outside the digest
+      either way). Output: 653 tensors including lm_head.weight + lm_head.scales
+      (8,188,548,096 parameters, 8.44 GB), tie_word_embeddings false, config.json
+      quantization {group_size: 32, bits: 8, mode: mxfp8}; conversion took 16 s on an
+      M2 Ultra. Scores (query, rendered_text) pairs for SPEC §9.4 step 7; no output
+      dimension applies. The reranker's P(yes) is read from lm_head logits.
+      WHY NOT THE HUB CONVERSION (evidence from the 2026-09-14 smoke run, kept
+      here because it is the reason this entry is a local conversion):
+      mlx-community/Qwen3-Reranker-8B-mxfp8 @ a8947a5fe4c62cc1feb8dffa89d49502c8c80923
+      (apache-2.0; converted with mlx-embeddings 0.0.3 per its model card) holds 651
+      tensors across two safetensors shards and no lm_head.* at all — its
+      model.safetensors.index.json lists an lm_head.weight and a fifth shard that do
+      not exist at that revision — while upstream ships a distinct, untied
+      lm_head.weight (399 tensors, tie_word_embeddings false). No loader change on
+      our side can make that artifact score; mlx-lm's strict load fails first with
+      "Missing 1 parameters: lm_head.weight" (recorded as smoke_test failed, host
+      Apple M2 Ultra 128 GB, 2026-09-14). The same-day evaluation of this exact
+      conversion recipe through the factory path gave P(yes) relevant 0.9707 vs
+      irrelevant 0.0000, load 3.6 s, inference 0.69 s, peak 8.09 GiB (mlx). The
+      alternative — publishing the conversion under a repo this project controls —
+      was declined: the artifact is reproducible from the recorded command, and
+      `imsg models verify` checks the directory's digest against artifact_sha256.
   qwen3.5-35b-a3b:
     role: [segment_boundaries, image_caption]
     status: resolved

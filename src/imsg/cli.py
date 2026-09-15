@@ -485,20 +485,44 @@ def models_verify(
             "--write", help="Accept drift: rewrite drifted entries' revision/license in the lock."
         ),
     ] = False,
+    data_root: Annotated[
+        Path | None,
+        typer.Option(
+            "--data-root",
+            help="paths.data_root, under which local conversions' output_dir live "
+            "(default: the config schema's default data root).",
+        ),
+    ] = None,
     skip_remote: Annotated[
         bool, typer.Option("--skip-remote", help="Do not contact the Hugging Face API.")
+    ] = False,
+    skip_artifacts: Annotated[
+        bool,
+        typer.Option(
+            "--skip-artifacts",
+            help="Do not check local conversions' directories under data_root.",
+        ),
     ] = False,
     skip_runtime: Annotated[
         bool, typer.Option("--skip-runtime", help="Do not check installed runtime packages.")
     ] = False,
 ) -> None:
     """Re-resolve every pinned model's current revision and license from
-    the Hugging Face API and report drift versus models/manifest.lock.yaml;
-    check installed runtime packages against its `min_runtime` floors.
-    Never modifies the lock without --write (SPEC: a build must not
-    silently advance a model because 'latest' changed)."""
+    the Hugging Face API (a local conversion's upstream repo) and report
+    drift versus models/manifest.lock.yaml; check every local conversion's
+    directory under data_root against its recorded artifact_sha256; check
+    installed runtime packages against its `min_runtime` floors. Never
+    modifies the lock without --write (SPEC: a build must not silently
+    advance a model because 'latest' changed), and never advances a local
+    conversion's upstream pin."""
     code = verify_manifest(
-        lock, write=write, skip_remote=skip_remote, skip_runtime=skip_runtime, out=sys.stdout
+        lock,
+        data_root=data_root,
+        write=write,
+        skip_remote=skip_remote,
+        skip_artifacts=skip_artifacts,
+        skip_runtime=skip_runtime,
+        out=sys.stdout,
     )
     if code != 0:
         raise typer.Exit(code=code)

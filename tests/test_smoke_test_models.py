@@ -16,6 +16,7 @@ import io
 import json
 import platform
 import re
+import shutil
 import subprocess
 import sys
 from itertools import pairwise
@@ -25,9 +26,14 @@ from typing import Any
 import pytest
 import yaml
 
-from imsg.errors import ImsgError
+from imsg.errors import ImsgError, ModelManifestError
 from imsg.providers import model_smoke as smoke
-from imsg.providers.manifest import ManifestEntry, default_manifest_path, load_manifest
+from imsg.providers.manifest import (
+    ManifestEntry,
+    default_data_root,
+    default_manifest_path,
+    load_manifest,
+)
 from imsg.providers.model_smoke import (
     BOUNDARY_DESIGNED_SPLIT,
     EMBED_DOCUMENTS,
@@ -281,10 +287,12 @@ def test_artifact_digest_is_content_sensitive_and_layout_insensitive(tmp_path: P
 
 
 def test_artifact_digest_rejects_missing_or_empty_snapshots(tmp_path: Path) -> None:
-    with pytest.raises(SmokeError, match="does not exist"):
+    # The digest lives in imsg.providers.manifest (the verifier checks
+    # local conversions with it); its errors are ModelManifestErrors.
+    with pytest.raises(ModelManifestError, match="does not exist"):
         artifact_digest(tmp_path / "nope")
     empty = _write_snapshot(tmp_path / "empty", {"README.md": b"only prose"})
-    with pytest.raises(SmokeError, match="no weight or config files"):
+    with pytest.raises(ModelManifestError, match="no weight or config files"):
         artifact_digest(empty)
 
 
@@ -1075,6 +1083,8 @@ class Recorder:
         self.built: list[str] = []
         self.checked: list[str] = []
         self.failing: set[str] = set()
+        self.data_roots: list[Path] = []
+        self.reranker_pins: list[tuple[str, str]] = []
 
 
 def _stub_specs(recorder: Recorder) -> dict[str, RoleSpec]:
@@ -1083,6 +1093,10 @@ def _stub_specs(recorder: Recorder) -> dict[str, RoleSpec]:
 
         def build(cfg: Any, wd: Path, _role: str = role) -> Any:
             recorder.built.append(_role)
+            recorder.data_roots.append(cfg.paths.data_root)
+            recorder.reranker_pins.append(
+                (cfg.retrieval.reranker_model, cfg.retrieval.reranker_revision)
+            )
             provider = LoadingProvider()
             provider.model_id = f"stub/{_role}@rev"
             return provider
@@ -1351,7 +1365,7 @@ def test_config_from_manifest_against_the_real_lock_matches_the_config_defaults(
         constants.TEXT_EMBEDDING_MODEL_REVISION,
     )
     assert (cfg.retrieval.reranker_model, cfg.retrieval.reranker_revision) == (
-        constants.RERANKER_MODEL_REPO,
+        constants.RERANKER_MODEL,
         constants.RERANKER_MODEL_REVISION,
     )
     assert (cfg.segmentation.boundary_model, cfg.segmentation.boundary_revision) == (
@@ -1486,10 +1500,315 @@ def test_script_wrapper_help_runs(tmp_path: Path) -> None:
         [sys.executable, str(script), "--help"], capture_output=True, text=True, check=False
     )
     assert result.returncode == 0, result.stderr
-    for flag in ["--only", "--role", "--skip-download", "--write", "--work-dir", "--in-process"]:
+    for flag in [
+        "--only",
+        "--role",
+        "--skip-download",
+        "--write",
+        "--work-dir",
+        "--in-process",
+        "--data-root",
+    ]:
         assert flag in result.stdout
     assert "--child" not in result.stdout  # internal
 
 
 def test_smoke_errors_are_imsg_errors() -> None:
     assert issubclass(SmokeError, ImsgError) and issubclass(SmokeCheckFailed, ImsgError)
+
+
+# --------------------------------------------------------------------------
+# source: local_conversion — located under --data-root, never downloaded
+# --------------------------------------------------------------------------
+
+LOCAL_SHA = "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c"
+LOCAL_OUTPUT_DIR = "models/example-reranker-mxfp8-3c3c3c3c"
+LOCAL_RERANKER_TEXT = f"""  reranker:
+    role: [reranker]
+    status: resolved
+    source: local_conversion
+    upstream_repo: example-org/Upstream-Reranker
+    upstream_revision: {LOCAL_SHA}
+    upstream_license: apache-2.0
+    tool: mlx-lm==0.31.3
+    command: >-
+      python -c "convert('example-org/Upstream-Reranker', '$DATA_ROOT/{LOCAL_OUTPUT_DIR}')"
+    output_dir: {LOCAL_OUTPUT_DIR}
+    expected_dim: null
+    quantization: {{mode: mxfp8, bits: 8, group_size: 32}}
+    artifact_sha256: null
+    min_runtime: {{mlx: '0.32.2', mlx-lm: '0.31.3'}}
+    smoke_test: {{status: not_run}}
+"""
+LOCAL_LOCK_TEXT = (
+    LOCK_TEXT[: LOCK_TEXT.index("  reranker:\n")]
+    + LOCAL_RERANKER_TEXT
+    + LOCK_TEXT[LOCK_TEXT.index("  dual-role-llm:\n") :]
+)
+LOCAL_FILES: dict[str, bytes] = {
+    "config.json": b'{"quantization": {"bits": 8, "mode": "mxfp8"}}',
+    "model.safetensors": b"converted" * 50,
+    "README.md": b"# generic card, outside the digest",
+}
+
+
+@pytest.fixture
+def local_lock(tmp_path: Path) -> tuple[Path, Path]:
+    """The fixture lock with its reranker re-pinned as a local conversion,
+    plus a data_root holding the converted directory."""
+    path = tmp_path / "manifest-local.lock.yaml"
+    path.write_text(LOCAL_LOCK_TEXT, encoding="utf-8")
+    data_root = tmp_path / "data_root"
+    _write_snapshot(data_root / LOCAL_OUTPUT_DIR, LOCAL_FILES)
+    return path, data_root
+
+
+def _reranker_entry(lock_path: Path) -> ManifestEntry:
+    return next(e for e in load_manifest(lock_path).entries if e.name == "reranker")
+
+
+def _never_download(**kwargs: Any) -> str:
+    raise AssertionError(f"a local conversion is never downloaded, got {kwargs}")
+
+
+def test_run_entry_locates_and_hashes_a_local_conversion_without_downloading(
+    local_lock: tuple[Path, Path],
+) -> None:
+    lock_path, data_root = local_lock
+    directory = data_root / LOCAL_OUTPUT_DIR
+    out = io.StringIO()
+    result = run_entry(
+        _reranker_entry(lock_path),
+        ["reranker"],
+        downloader=_never_download,
+        skip_download=False,
+        runner=_passing_runner,
+        out=out,
+        data_root=data_root,
+    )
+    digest = artifact_digest(directory)
+    assert result.status == "passed"
+    assert [r.role for r in result.roles] == ["reranker"]
+    assert result.artifact_sha256 == digest.sha256
+    assert [f.relative_path for f in digest.files] == ["config.json", "model.safetensors"]
+    assert result.artifact_bytes == digest.total_bytes
+    assert result.download_bytes is None and result.download_seconds is None
+    assert result.snapshot_path == scrub_private(str(directory.resolve()))
+    text = out.getvalue()
+    assert "reranker: local conversion" in text and "nothing downloaded" in text
+    assert f"artifact_sha256 {digest.sha256}" in text
+    assert result.to_json()["artifact_bytes"] == digest.total_bytes
+
+
+def test_run_entry_local_conversion_missing_directory_fails_before_any_role(
+    local_lock: tuple[Path, Path],
+) -> None:
+    lock_path, data_root = local_lock
+    shutil.rmtree(data_root / LOCAL_OUTPUT_DIR)
+    ran: list[str] = []
+
+    def runner(entry: ManifestEntry, role: str) -> RoleResult:
+        ran.append(role)
+        return _passing_runner(entry, role)
+
+    out = io.StringIO()
+    result = run_entry(
+        _reranker_entry(lock_path),
+        ["reranker"],
+        downloader=_never_download,
+        skip_download=False,
+        runner=runner,
+        out=out,
+        data_root=data_root,
+    )
+    assert result.status == "failed" and ran == [] and result.artifact_sha256 is None
+    assert result.error is not None
+    assert f"local conversion '{LOCAL_OUTPUT_DIR}' is not a directory under data_root" in result.error
+    assert "mlx-lm==0.31.3" in result.error and "never converts" in result.error
+    assert "FAILED before any model ran" in out.getvalue()
+
+    result = run_entry(
+        _reranker_entry(lock_path),
+        ["reranker"],
+        downloader=_never_download,
+        skip_download=False,
+        runner=runner,
+        out=io.StringIO(),
+        data_root=None,
+    )
+    assert result.status == "failed" and ran == []
+    assert result.error is not None and "pass --data-root" in result.error
+
+
+def test_run_entry_local_conversion_symlink_escaping_data_root_fails(
+    local_lock: tuple[Path, Path], tmp_path: Path
+) -> None:
+    lock_path, data_root = local_lock
+    directory = data_root / LOCAL_OUTPUT_DIR
+    outside = tmp_path / "outside"
+    shutil.move(str(directory), str(outside))
+    directory.symlink_to(outside)
+    result = run_entry(
+        _reranker_entry(lock_path),
+        ["reranker"],
+        downloader=_never_download,
+        skip_download=False,
+        runner=_passing_runner,
+        out=io.StringIO(),
+        data_root=data_root,
+    )
+    assert result.status == "failed"
+    assert result.error is not None and "outside data_root" in result.error
+
+
+def test_config_from_manifest_carries_a_local_conversion_as_output_dir_and_upstream_sha(
+    local_lock: tuple[Path, Path],
+) -> None:
+    lock_path, data_root = local_lock
+    cfg = config_from_manifest(load_manifest(lock_path), data_root=data_root)
+    assert (cfg.retrieval.reranker_model, cfg.retrieval.reranker_revision) == (
+        LOCAL_OUTPUT_DIR,
+        LOCAL_SHA,
+    )
+    assert cfg.paths.data_root == data_root
+    assert (cfg.embedding.model, cfg.embedding.revision) == (
+        "example-org/Example-Embedder-8bit",
+        PIN_A,
+    )
+
+
+def test_main_with_data_root_smoke_tests_a_local_conversion_and_writes_its_digest(
+    local_lock: tuple[Path, Path], tmp_path: Path
+) -> None:
+    lock_path, data_root = local_lock
+    recorder = Recorder()
+    download, calls = _snapshot_downloader(tmp_path)
+    out = io.StringIO()
+    before = lock_path.read_text(encoding="utf-8")
+    code = main(
+        [
+            "--lock",
+            str(lock_path),
+            "--in-process",
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--data-root",
+            str(data_root),
+            "--only",
+            "reranker",
+            "--write",
+        ],
+        deps=_main_deps(recorder),
+        downloader=download,
+        out=out,
+    )
+    text = out.getvalue()
+    assert code == 0, text
+    assert calls == []  # nothing downloaded
+    assert recorder.checked == ["reranker"]
+    assert recorder.data_roots == [data_root]
+    assert recorder.reranker_pins == [(LOCAL_OUTPUT_DIR, LOCAL_SHA)]
+    assert f"data_root: {scrub_private(str(data_root))}" in text
+    assert "total downloaded: 0.00 GiB" in text
+    assert re.search(r"passed\s+reranker\s+0\.00 GiB\s+[0-9a-f]{64}", text)
+
+    lock = load_manifest(lock_path)
+    entry = next(e for e in lock.entries if e.name == "reranker")
+    assert entry.artifact_sha256 == artifact_digest(data_root / LOCAL_OUTPUT_DIR).sha256
+    assert entry.raw["smoke_test"]["status"] == "passed"
+    assert entry.raw["smoke_test"]["result"] == "reranker ok"
+    # Only the two recorded keys changed; the provenance survived byte for byte.
+    changed = _changed_lines(before, lock_path.read_text(encoding="utf-8"))
+    assert all(
+        re.match(r"^[+-]    (artifact_sha256:|smoke_test:)|^[+-]      |^-        ", line)
+        for line in changed
+    ), changed
+    assert LOCAL_RERANKER_TEXT.split("    artifact_sha256")[0] in lock_path.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_main_data_root_defaults_to_the_config_schemas(lock_path: Path, tmp_path: Path) -> None:
+    recorder = Recorder()
+    download, _ = _snapshot_downloader(tmp_path)
+    code = main(
+        [
+            "--lock",
+            str(lock_path),
+            "--in-process",
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--only",
+            "text-embedder",
+        ],
+        deps=_main_deps(recorder),
+        downloader=download,
+        out=io.StringIO(),
+    )
+    assert code == 0
+    assert recorder.data_roots == [default_data_root()]
+
+
+def test_run_child_uses_the_given_data_root(local_lock: tuple[Path, Path], tmp_path: Path) -> None:
+    lock_path, data_root = local_lock
+    recorder = Recorder()
+    result_json = tmp_path / "work" / "reranker.reranker.result.json"
+    code = smoke.run_child(
+        lock_path,
+        "reranker",
+        "reranker",
+        tmp_path / "work",
+        result_json,
+        _main_deps(recorder),
+        data_root=data_root,
+    )
+    assert code == 0
+    assert recorder.data_roots == [data_root]
+    assert json.loads(result_json.read_text(encoding="utf-8"))["status"] == "passed"
+
+
+def test_spawn_role_hands_the_data_root_to_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands: list[list[str]] = []
+
+    class FakePopen:
+        def __init__(self, command: list[str], **kwargs: Any) -> None:
+            commands.append(list(command))
+            self.stdout = iter(["child says hello\n"])
+
+        def __enter__(self) -> FakePopen:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def wait(self) -> int:
+            return 0
+
+    monkeypatch.setattr(smoke.subprocess, "Popen", FakePopen)
+    out = io.StringIO()
+    result = spawn_role(
+        tmp_path / "lock.yaml",
+        _entry(),
+        "text_embedding",
+        tmp_path / "work",
+        data_root=tmp_path / "dr",
+        python="python-stub",
+        out=out,
+    )
+    assert commands[0][:4] == ["python-stub", "-m", smoke.CHILD_MODULE, "--child"]
+    assert commands[0][-2:] == ["--data-root", str(tmp_path / "dr")]
+    assert "    | child says hello" in out.getvalue()
+    assert result.status == "failed"
+    assert result.error is not None and "exited with code 0 before writing a result" in result.error
+
+    spawn_role(
+        tmp_path / "lock.yaml",
+        _entry(),
+        "text_embedding",
+        tmp_path / "work",
+        python="python-stub",
+        out=io.StringIO(),
+    )
+    assert "--data-root" not in commands[1]

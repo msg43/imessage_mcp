@@ -364,14 +364,49 @@ class EmbeddingConfig(StrictModel):
 # --------------------------------------------------------------------------
 
 
+RERANKER_MODEL_FORMS = (
+    "a Hugging Face repo id ('owner/name') or a directory relative to paths.data_root "
+    "holding a local MLX conversion (e.g. 'models/<conversion>', the lock's output_dir)"
+)
+
+
 class RetrievalConfig(StrictModel):
     k_fts: int = Field(default=100, ge=1)
     k_vector: int = Field(default=100, ge=1)
     rrf_k: int = Field(default=60, ge=1)
     rerank_top: int = Field(default=50, ge=1)
-    reranker_model: str = Field(default=constants.RERANKER_MODEL_REPO, min_length=1)
+    reranker_model: str = Field(default=constants.RERANKER_MODEL, min_length=1)
+    """Either form named by `RERANKER_MODEL_FORMS`. `imsg.providers.factory`
+    reads the value as a local directory when `<paths.data_root>/<value>`
+    exists (then `revision=None` is passed to the provider) and as a repo
+    id otherwise. Containment under `paths.data_root` is enforced: no
+    absolute path, no `~`, no `..`, and — at the root level, symlinks
+    resolved — nothing that escapes the data root."""
     reranker_revision: str = Field(min_length=1)
+    """The pinned commit sha: the repo's own for a Hub id; for a local
+    conversion, the UPSTREAM repo's commit the conversion was made from
+    (the lock's `upstream_revision`). The provider records
+    `<reranker_model>@<reranker_revision>` as its `model_id` either way."""
     default_limit: int = Field(default=10, ge=1)
+
+    @field_validator("reranker_model", mode="after")
+    @classmethod
+    def _reranker_model_is_a_repo_id_or_a_data_root_relative_dir(cls, v: str) -> str:
+        value = v.strip()
+        if not value:
+            raise ValueError(f"retrieval.reranker_model must be {RERANKER_MODEL_FORMS}, got ''")
+        path = Path(value)
+        if path.is_absolute() or value.startswith("~"):
+            raise ValueError(
+                f"retrieval.reranker_model must be {RERANKER_MODEL_FORMS} — not an absolute "
+                f"or home-relative path, got '{v}'"
+            )
+        if ".." in path.parts:
+            raise ValueError(
+                f"retrieval.reranker_model must be {RERANKER_MODEL_FORMS} — a directory may "
+                f"not contain '..' segments (it must stay under paths.data_root), got '{v}'"
+            )
+        return value
 
 
 # --------------------------------------------------------------------------
@@ -622,12 +657,33 @@ class Config(StrictModel):
                 )
         return self
 
+    @model_validator(mode="after")
+    def _reranker_model_dir_stays_under_data_root(self) -> Config:
+        """`retrieval.reranker_model` may name a directory under
+        `paths.data_root` (a local conversion). The field validator has
+        already rejected absolute, `~` and `..` forms; this resolves the
+        candidate against the real filesystem so a symlink planted under
+        data_root cannot point the provider at a directory outside it. A
+        Hub repo id (`owner/name`) joins under data_root trivially and
+        passes — the factory decides which form it is by existence."""
+        root = self.paths.data_root
+        value = self.retrieval.reranker_model
+        resolved = resolve_path(join_under_root(root, value))
+        if not is_contained_in(resolved, root) or is_contained_in(resolved, MESSAGES_DIR):
+            raise ValueError(
+                f"retrieval.reranker_model ('{value}') must be {RERANKER_MODEL_FORMS}; as a "
+                f"directory it must resolve under paths.data_root ('{root}') and never under "
+                f"{MESSAGES_DIR} — resolved path was '{resolved}'"
+            )
+        return self
+
 
 # Re-exported so `from imsg.config.schema import ...` covers everything
 # the rest of the codebase needs without reaching into submodules.
 PathLike = Annotated[Path, "resolved via imsg.paths helpers before use"]
 
 __all__ = [
+    "RERANKER_MODEL_FORMS",
     "Config",
     "DatabaseConfig",
     "EmbeddingConfig",

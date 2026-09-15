@@ -14,9 +14,9 @@ explicitly allowlist it.
 
 ## ⚠️ Read this before you clone
 
-**No model has been executed end to end yet.** 1,188 tests (990 run
-without a database; 198 integration tests need a live PostgreSQL and
-skip cleanly without one — measured 2026-09-14), the CLI works,
+**No model has run on the pipeline end to end yet.** 1,315 tests (1,116
+run without a database; 199 integration tests need a scratch PostgreSQL
+and skip cleanly without one — measured 2026-09-15), the CLI works,
 migrations apply against real PostgreSQL + pgvector, and the snapshot →
 extract → identity stages have run against a real corpus. Segmentation,
 embedding, enrichment and retrieval have only ever run on the fake
@@ -51,7 +51,7 @@ already made and documented the non-obvious decisions, read on.
 | Public MCP surface (StreamableHTTP + OAuth) | Implemented; never exposed |
 | Export gate (default-deny, plan/approve/push) | Implemented; transport never wired to a live API |
 | Eval harness (nDCG@k, recall@k, MRR) | Implemented; metrics verified against hand-computed fixtures |
-| Real model providers (MLX text/reranker/boundary LLM, Apple Vision OCR, mlx-whisper, mlx-vlm captions, PE-Core) | Implemented behind `models.backend: real` (the default); **pinned weights never downloaded, never executed end to end** |
+| Real model providers (MLX text/reranker/boundary LLM, Apple Vision OCR, mlx-whisper, mlx-vlm captions, PE-Core) | Implemented behind `models.backend: real` (the default); every pinned model smoke-run once on a synthetic input (2026-09-14/15, results in the lock); **never run on the pipeline end to end** |
 | Runs against real data | Snapshot → extract → identity: yes. Segment / embed / enrich with the pinned models: **never** |
 
 ---
@@ -171,21 +171,40 @@ in the repo and are used unless `paths.data_root` holds a copy at the
 same relative path; each run prints which file it used, because those
 bytes are hashed into `seg_config_hash` and the caption provenance.
 
-**What has been run, and what is still unverified (2026-09-14).**
+**What has been run, and what is still unverified (2026-09-15).**
 `uv run python scripts/smoke_test_models.py` (also
 `imsg.providers.model_smoke`) downloads every pinned model at its sha,
 checksums it (`artifact_sha256`, defined in the lock header), builds the
 real provider through the factory and runs one fictional input per role,
 recording load time, inference time and peak memory per model into the
-lock with `--write`. On an M2 Ultra with 128 GB every entry passed except
-the pinned reranker: the mlx-embeddings conversion of Qwen3-Reranker-8B
-ships no `lm_head` tensor, so the model card's yes/no logits cannot be
-computed from it — the lock records the exact error, and the fix is a
-re-pin, not code (a local `mlx_lm.convert` of the upstream repo passes the
-same check; see the entry's notes). Still unverified: `segment` / `embed` / `enrich` on a
-real chat, batched throughput and memory (the recorded peaks are
-single-input), the deployment host's memory, and retrieval quality with
-the pinned weights — establishing that is the first real task.
+lock with `--write`. On an M2 Ultra with 128 GB every entry passes. Still
+unverified: `segment` / `embed` / `enrich` on a real chat, batched
+throughput and memory (the recorded peaks are single-input), the
+deployment host's memory, and retrieval quality with the pinned weights —
+establishing that is the first real task.
+
+**The reranker is a local conversion, not a Hub download.** The only
+8-bit MLX conversion of Qwen3-Reranker-8B on the Hub ships no `lm_head`
+tensor, so the model card's yes/no logits cannot be computed from it (the
+2026-09-14 smoke run found this; the evidence is kept in the lock entry's
+notes). The lock therefore pins the reranker as `source: local_conversion`:
+the upstream repo and commit sha, the license, the converter
+(`mlx-lm==0.31.3`), the exact `command` that produces it, its
+`output_dir` relative to `paths.data_root`, and the `artifact_sha256` of
+that directory. To reproduce it, run the recorded command with
+`$DATA_ROOT` set to your data root and the `models` extra installed
+(about 16 seconds on an M2 Ultra; 7.9 GiB on disk), then
+`scripts/smoke_test_models.py --only qwen3-reranker-8b --data-root
+$DATA_ROOT` to confirm the digest. In `config.yaml`,
+`retrieval.reranker_model` names that directory (data-root-relative) and
+`retrieval.reranker_revision` the *upstream* commit; the factory reads
+the value as a local directory when it exists under the data root and as
+a Hugging Face repo id otherwise, and the provider records `model_id` as
+`<dir>@<upstream sha>`. `uv run imsg models verify --data-root
+$DATA_ROOT` re-resolves the upstream repo for drift, recomputes the
+directory's digest against the lock, and checks the runtimes; `--write`
+never advances an upstream pin (the directory was converted from the
+pinned commit — re-convert and re-pin by hand to move it).
 
 | Interface | What it needs |
 |---|---|
