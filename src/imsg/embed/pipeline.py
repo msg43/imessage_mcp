@@ -22,11 +22,25 @@ FTS sidecar sync is a separate concern
 (`imsg.embed.fts.sync.sync_fts`) — segment/attachment_chunk content
 already carries its own `search_index_event` rows from S4/S5b at the
 point it's created or changed; this module only computes vectors.
+
+Batching (2026-09-15): pending rows are embedded longest-first in
+length-sorted, token-budgeted batches (`imsg.embed.batching.
+plan_batches` over `imsg.tokens.estimate_tokens` of the normalized
+text) rather than in id order in fixed groups of `batch_size`. A
+right-padded batch costs `rows x longest row`, so id-order batching
+paid for the longest segment in every arbitrary group of 32 — on the
+real corpus a 3.9x inflation of the tokens computed, and the model's
+padded throughput does not rise with batch size (see
+`imsg.embed.batching.DEFAULT_MAX_BATCH_TOKENS`), so that inflation
+was a straight 3.9x on wall-clock time. Every result is keyed by its
+id and each batch is still its own transaction, so the order of
+embedding changes nothing that is observable — only how long it takes.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,11 +48,13 @@ from typing import TYPE_CHECKING
 import structlog
 
 from imsg import constants
+from imsg.embed.batching import DEFAULT_MAX_BATCH_TOKENS, padded_tokens, plan_batches
 from imsg.embed.provider import MultimodalEmbeddingProvider, TextEmbeddingProvider
 from imsg.embed.vector_codec import vector_literal
 from imsg.errors import EmbeddingError, ImageEmbeddingError
 from imsg.hashing import sha256_text
 from imsg.textnorm import normalize_text
+from imsg.tokens import estimate_tokens
 
 if TYPE_CHECKING:
     import psycopg
@@ -110,70 +126,129 @@ def _pending_chunks(conn: psycopg.Connection) -> list[tuple[int, str, str]]:
     return pending
 
 
-def _embed_segments(
-    conn: psycopg.Connection, provider: TextEmbeddingProvider, pending: list[tuple[int, str, str]], batch_size: int
+PendingRow = tuple[int, str, str]
+"""`(id, text, text_sha256)` — what `_pending_segments` / `_pending_chunks`
+return: the raw text and the hash the embedding row will record."""
+
+SEGMENT_UPSERT_SQL = """
+    INSERT INTO segment_embedding (segment_id, model, dim, text_sha256, vec)
+    VALUES (%s, %s, %s, %s, %s::halfvec)
+    ON CONFLICT (segment_id) DO UPDATE SET
+        model = EXCLUDED.model, dim = EXCLUDED.dim,
+        text_sha256 = EXCLUDED.text_sha256, vec = EXCLUDED.vec,
+        embedded_at = now()
+"""
+
+CHUNK_UPSERT_SQL = """
+    INSERT INTO attachment_chunk_embedding (chunk_id, model, dim, text_sha256, vec)
+    VALUES (%s, %s, %s, %s, %s::halfvec)
+    ON CONFLICT (chunk_id) DO UPDATE SET
+        model = EXCLUDED.model, dim = EXCLUDED.dim,
+        text_sha256 = EXCLUDED.text_sha256, vec = EXCLUDED.vec,
+        embedded_at = now()
+"""
+
+
+def plan_pending_batches(
+    pending: list[PendingRow], *, batch_size: int, max_batch_tokens: int
+) -> list[list[PendingRow]]:
+    """Group pending rows into the batches the provider will see — one
+    `embed_documents` call and one transaction each — longest first,
+    each bounded by `batch_size` rows and `max_batch_tokens` padded
+    tokens (`rows x longest row`, `imsg.embed.batching.plan_batches`).
+    The text in every returned row is already `normalize_text`-ed (the
+    provider's input); the id and `text_sha256` are the caller's. Row
+    lengths are `imsg.tokens.estimate_tokens` of that text — the same
+    estimate `segment.token_count` / `attachment_chunk.token_count`
+    carry — which is what the budget is denominated in; the provider
+    re-packs on its own tokenizer's counts if its budget is tighter.
+    A row longer than the budget by itself is embedded alone.
+    """
+    normalized = [normalize_text(text) for _, text, _ in pending]
+    lengths = [max(1, estimate_tokens(text)) for text in normalized]
+    groups = plan_batches(lengths, max_batch_size=batch_size, max_batch_tokens=max_batch_tokens)
+    return [
+        [(pending[i][0], normalized[i], pending[i][2]) for i in group] for group in groups
+    ]
+
+
+def _embed_rows(
+    conn: psycopg.Connection,
+    provider: TextEmbeddingProvider,
+    batches: list[list[PendingRow]],
+    *,
+    upsert_sql: str,
+    kind: str,
 ) -> int:
+    """Embed and commit `batches` one at a time: a batch's rows land in
+    one transaction, and a failure mid-run leaves every earlier batch
+    committed and the failing one absent (SPEC §8 S6)."""
     written = 0
-    for i in range(0, len(pending), batch_size):
-        batch = pending[i : i + batch_size]
-        vectors = provider.embed_documents([normalize_text(text) for _, text, _ in batch])
+    total_rows = sum(len(batch) for batch in batches)
+    total_tokens = sum(estimate_tokens(text) for batch in batches for _, text, _ in batch)
+    done_tokens = 0
+    for index, batch in enumerate(batches, start=1):
+        started = time.perf_counter()
+        vectors = provider.embed_documents([text for _, text, _ in batch])
         if len(vectors) != len(batch):
             raise EmbeddingError(
-                f"provider returned {len(vectors)} vectors for a batch of {len(batch)} segments"
+                f"provider returned {len(vectors)} vectors for a batch of {len(batch)} {kind}s"
             )
         with conn.transaction(), conn.cursor() as cur:
-            for (segment_id, _, text_hash), vec in zip(batch, vectors, strict=True):
+            for (row_id, _, text_hash), vec in zip(batch, vectors, strict=True):
                 if len(vec) != provider.dim:
                     raise EmbeddingError(
                         f"provider {provider.model_id!r} returned a {len(vec)}-dim vector "
-                        f"for segment {segment_id}, expected {provider.dim}"
+                        f"for {kind} {row_id}, expected {provider.dim}"
                     )
                 cur.execute(
-                    """
-                        INSERT INTO segment_embedding (segment_id, model, dim, text_sha256, vec)
-                        VALUES (%s, %s, %s, %s, %s::halfvec)
-                        ON CONFLICT (segment_id) DO UPDATE SET
-                            model = EXCLUDED.model, dim = EXCLUDED.dim,
-                            text_sha256 = EXCLUDED.text_sha256, vec = EXCLUDED.vec,
-                            embedded_at = now()
-                        """,
-                    (segment_id, provider.model_id, provider.dim, text_hash, vector_literal(vec)),
+                    upsert_sql,
+                    (row_id, provider.model_id, provider.dim, text_hash, vector_literal(vec)),
                 )
                 written += 1
+        lengths = [estimate_tokens(text) for _, text, _ in batch]
+        done_tokens += sum(lengths)
+        logger.info(
+            "embed.batch",
+            kind=kind,
+            batch=index,
+            batches=len(batches),
+            rows=len(batch),
+            longest_est_tokens=max(lengths),
+            padded_est_tokens=padded_tokens(lengths, [list(range(len(batch)))]),
+            seconds=round(time.perf_counter() - started, 2),
+            rows_done=written,
+            rows_total=total_rows,
+            est_tokens_done=done_tokens,
+            est_tokens_total=total_tokens,
+        )
     return written
+
+
+def _embed_segments(
+    conn: psycopg.Connection,
+    provider: TextEmbeddingProvider,
+    pending: list[PendingRow],
+    batch_size: int,
+    max_batch_tokens: int = DEFAULT_MAX_BATCH_TOKENS,
+) -> int:
+    batches = plan_pending_batches(
+        pending, batch_size=batch_size, max_batch_tokens=max_batch_tokens
+    )
+    return _embed_rows(conn, provider, batches, upsert_sql=SEGMENT_UPSERT_SQL, kind="segment")
 
 
 def _embed_chunks(
-    conn: psycopg.Connection, provider: TextEmbeddingProvider, pending: list[tuple[int, str, str]], batch_size: int
+    conn: psycopg.Connection,
+    provider: TextEmbeddingProvider,
+    pending: list[PendingRow],
+    batch_size: int,
+    max_batch_tokens: int = DEFAULT_MAX_BATCH_TOKENS,
 ) -> int:
-    written = 0
-    for i in range(0, len(pending), batch_size):
-        batch = pending[i : i + batch_size]
-        vectors = provider.embed_documents([normalize_text(text) for _, text, _ in batch])
-        if len(vectors) != len(batch):
-            raise EmbeddingError(
-                f"provider returned {len(vectors)} vectors for a batch of {len(batch)} chunks"
-            )
-        with conn.transaction(), conn.cursor() as cur:
-            for (chunk_id, _, text_hash), vec in zip(batch, vectors, strict=True):
-                if len(vec) != provider.dim:
-                    raise EmbeddingError(
-                        f"provider {provider.model_id!r} returned a {len(vec)}-dim vector "
-                        f"for chunk {chunk_id}, expected {provider.dim}"
-                    )
-                cur.execute(
-                    """
-                    INSERT INTO attachment_chunk_embedding (chunk_id, model, dim, text_sha256, vec)
-                    VALUES (%s, %s, %s, %s, %s::halfvec)
-                    ON CONFLICT (chunk_id) DO UPDATE SET
-                        model = EXCLUDED.model, dim = EXCLUDED.dim,
-                        text_sha256 = EXCLUDED.text_sha256, vec = EXCLUDED.vec,
-                        embedded_at = now()
-                    """,
-                    (chunk_id, provider.model_id, provider.dim, text_hash, vector_literal(vec)),
-                )
-                written += 1
-    return written
+    batches = plan_pending_batches(
+        pending, batch_size=batch_size, max_batch_tokens=max_batch_tokens
+    )
+    return _embed_rows(conn, provider, batches, upsert_sql=CHUNK_UPSERT_SQL, kind="chunk")
 
 
 # --------------------------------------------------------------------------
@@ -358,12 +433,15 @@ def run_embed(
     *,
     multimodal_provider: MultimodalEmbeddingProvider | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    max_batch_tokens: int = DEFAULT_MAX_BATCH_TOKENS,
     dry_run: bool = False,
 ) -> EmbedRunReport:
     """One full embedding pass: every segment/chunk lacking an
     up-to-date embedding, then (if `multimodal_provider` is given)
     every image/video attachment lacking an up-to-date
-    `attachment_mm_embedding` (D3a).
+    `attachment_mm_embedding` (D3a). `batch_size` and
+    `max_batch_tokens` bound each text batch — rows and padded tokens
+    (`plan_pending_batches`).
 
     `dry_run=True` (SPEC §8: "takes --dry-run where writes leave the
     machine") never calls `text_provider`/`multimodal_provider` at all
@@ -399,8 +477,12 @@ def run_embed(
             dry_run=True,
         )
 
-    segments_written = _embed_segments(conn, text_provider, _pending_segments(conn), batch_size)
-    chunks_written = _embed_chunks(conn, text_provider, _pending_chunks(conn), batch_size)
+    segments_written = _embed_segments(
+        conn, text_provider, _pending_segments(conn), batch_size, max_batch_tokens
+    )
+    chunks_written = _embed_chunks(
+        conn, text_provider, _pending_chunks(conn), batch_size, max_batch_tokens
+    )
 
     attachments_written = 0
     skipped_no_frames = 0
@@ -419,4 +501,11 @@ def run_embed(
     )
 
 
-__all__ = ["DEFAULT_BATCH_SIZE", "EmbedRunReport", "run_embed"]
+__all__ = [
+    "DEFAULT_BATCH_SIZE",
+    "DEFAULT_MAX_BATCH_TOKENS",
+    "EmbedRunReport",
+    "PendingRow",
+    "plan_pending_batches",
+    "run_embed",
+]

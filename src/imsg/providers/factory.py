@@ -109,7 +109,8 @@ REAL_PROVIDERS: dict[str, RealProviderSpec] = {
 """One entry per provider role. The constructor signatures the builders
 below rely on (positional required args, keyword-only options):
 
-- text_embedding:       (model_repo, revision, dim, *, batch_size=32, max_length=8192)
+- text_embedding:       (model_repo, revision, dim, *, batch_size=32, max_length=8192,
+                         max_batch_tokens=2048, cache_limit_bytes=8 GiB, model_id=None)
 - multimodal_embedding: (model_repo, revision, dim, *, device="mps", batch_size=16,
                          allow_cpu_fallback=False)
 - boundary:             (model_repo, revision, prompt_template: str, *, max_tokens=512,
@@ -333,17 +334,40 @@ def resolve_caption_prompt(cfg: Config) -> ResolvedPrompt:
 
 def build_text_provider(cfg: Config) -> TextEmbeddingProvider:
     """S6's primary text embedder / the retrieval service's query
-    embedder (SPEC §4.1: Qwen3-Embedding-8B, 2048-dim MRL)."""
+    embedder (SPEC §4.1: Qwen3-Embedding-8B, 2048-dim MRL). `embedding.
+    model` is a local conversion when `<paths.data_root>/<value>` is an
+    existing directory — built with `revision=None` and `model_id`
+    `<value>@<embedding.revision>`, the upstream sha (the reranker's
+    rule, `build_reranker`) — and a Hub repo id pinned at
+    `embedding.revision` otherwise."""
     if cfg.models.backend == "fake":
         return FakeTextEmbeddingProvider(dim=cfg.embedding.dim)
     spec = REAL_PROVIDERS["text_embedding"]
-    provider = _construct(
-        spec,
-        cfg.embedding.model,
-        cfg.embedding.revision,
-        cfg.embedding.dim,
-        batch_size=cfg.embedding.batch_size,
-    )
+    model, revision = cfg.embedding.model, cfg.embedding.revision
+    options: dict[str, object] = {
+        "batch_size": cfg.embedding.batch_size,
+        "max_batch_tokens": cfg.embedding.max_batch_tokens,
+    }
+    local_dir = resolve_local_model_dir(cfg.paths.data_root, model)
+    if local_dir is not None:
+        provider = _construct(
+            spec,
+            str(local_dir),
+            None,
+            cfg.embedding.dim,
+            model_id=local_model_id(model, revision),
+            **options,
+        )
+    elif _looks_like_local_model_dir(model):
+        raise ProviderUnavailableError(
+            f"embedding.model '{model}' names a directory under paths.data_root "
+            f"('{cfg.paths.data_root}') that does not exist. A value under "
+            f"'{LOCAL_MODEL_DIR_PREFIX}/' is a local conversion (models/manifest.lock.yaml "
+            f"`output_dir`): produce it with the `command` recorded there, or set a Hugging "
+            f"Face repo id ('owner/name') instead"
+        )
+    else:
+        provider = _construct(spec, model, revision, cfg.embedding.dim, **options)
     _check_dim(spec, provider, cfg.embedding.dim)
     return cast("TextEmbeddingProvider", provider)
 

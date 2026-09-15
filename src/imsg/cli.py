@@ -1247,6 +1247,7 @@ def embed(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
             text_provider,
             multimodal_provider=multimodal_provider,
             batch_size=cfg.embedding.batch_size,
+            max_batch_tokens=cfg.embedding.max_batch_tokens,
             dry_run=dry_run,
         )
         if not dry_run:
@@ -1297,6 +1298,7 @@ def _make_embed_fn(cfg: Config) -> EmbedFn:
             text_provider,
             multimodal_provider=multimodal_provider,
             batch_size=config.embedding.batch_size,
+            max_batch_tokens=config.embedding.max_batch_tokens,
             dry_run=dry_run,
         )
         if dry_run:

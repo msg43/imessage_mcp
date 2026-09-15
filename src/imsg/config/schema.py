@@ -36,6 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from imsg import constants
 from imsg.config.secrets import SecretRef
+from imsg.embed.batching import DEFAULT_MAX_BATCH_TOKENS
 from imsg.paths import is_contained_in, join_under_root, resolve_path
 
 MESSAGES_DIR = Path("~/Library/Messages").expanduser()
@@ -336,6 +337,13 @@ class EmbeddingConfig(StrictModel):
     describe the same weights."""
     dim: int = constants.PRIMARY_EMBEDDING_DIM
     batch_size: int = Field(default=32, ge=1)
+    """Most rows in one text batch (one forward pass, one transaction)."""
+    max_batch_tokens: int = Field(default=DEFAULT_MAX_BATCH_TOKENS, ge=1)
+    """Most *padded* tokens in one text batch — `rows x longest row`,
+    the cost of a right-padded forward pass — in `imsg.tokens.
+    estimate_tokens` units. Batches are length-sorted so this bounds
+    activation memory without wasting compute on padding
+    (`imsg.embed.batching`)."""
     query_instruction: str = Field(min_length=1)
     multimodal: MultimodalEmbeddingConfig
 

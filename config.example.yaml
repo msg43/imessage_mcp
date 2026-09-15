@@ -82,7 +82,8 @@ embedding:
   revision: 51c773b7464b630a6c67b4f75dbd796b658d6236   # immutable commit sha (manifest pin)
   quantization: mxfp8            # informational — fixed by the artifact `model`@`revision` names
   dim: 2048                      # must match migration 0001's DDL; <= 4000 (halfvec HNSW cap)
-  batch_size: 32
+  batch_size: 32                 # most rows per text batch (one forward pass, one transaction)
+  max_batch_tokens: 2048         # most padded tokens per batch (rows x longest row); batches are length-sorted
   query_instruction: "Given a personal message search query, retrieve relevant conversation segments"
   multimodal:
     enabled: true
