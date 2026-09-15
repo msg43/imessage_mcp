@@ -88,7 +88,7 @@ accounts).
   Qwen3-Embedding-8B mxfp8 7.4 GiB; whisper-large-v3 3.7 GiB. These are
   single-input peaks — batched embedding and long windows will sit above
   them — and they were not measured on the mini.
-- Populate the `unsupported` materialization state in the backfill
+- ~~Populate the `unsupported` materialization state in the backfill~~ — **DONE 2026-09-15:** the backfill sets `unsupported` by reason class and AT-3 sub-counts it (CHANGELOG 2026-09-15).
   stage at Phase 2; the reconciliation bucket reads zero until then.
 - Arrange the second account needed for the Phase 6 isolation test.
 
