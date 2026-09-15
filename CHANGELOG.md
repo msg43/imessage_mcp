@@ -10,6 +10,44 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-14 — first real execution of every pinned model (`scripts/smoke_test_models.py`)
+
+- `scripts/smoke_test_models.py` / `imsg.providers.model_smoke`: per lock entry,
+  download the pinned sha into the Hugging Face cache, compute `artifact_sha256`
+  (definition in the lock header; `artifact_digest` is the reference), build the
+  real provider through `imsg.providers.factory` from a config carrying exactly
+  the pins, run one fictional input per role (two documents + a query; a
+  relevant/irrelevant pair; a 12-message two-topic window; a rendered PNG; a
+  `say`-synthesised sentence via ffmpeg; a drawn shape + two texts), and record
+  load time, inference time and peak memory (`mlx.core.get_peak_memory`, or max
+  RSS for torch/Vision). Every (entry, role) runs in its own child process so the
+  numbers are per model and two large models are never resident together;
+  `--write` rewrites only `smoke_test`/`artifact_sha256`, byte-preserving the
+  rest. Stubbed tests in `tests/test_smoke_test_models.py`.
+- Ran on an Apple M2 Ultra with 128 GB (not the deployment mini). Passed:
+  Qwen3-Embedding-8B mxfp8 (peak 7.41 GiB), whisper-large-v3 (3.66 GiB), PE-Core
+  G14-448 on MPS (9.43 GiB RSS, 107 s to build), Apple Vision, and
+  Qwen3.5-35B-A3B 4-bit for both roles — boundary via mlx-lm (19.07 GiB) and
+  caption via mlx-vlm (19.90 GiB), which settles the open question: mlx-lm 0.31.3
+  loads the mlx-vlm-converted checkpoint (`qwen3_5_moe` reads `text_config`).
+- Found by running, not reading: neither mxfp8 Qwen3 conversion ships an
+  `lm_head` tensor (their `model.safetensors.index.json` files do not describe
+  the shards), so mlx-lm's strict load failed on both with `Missing 1
+  parameters: lm_head.weight`. The embedder never uses the head — upstream
+  `Qwen/Qwen3-Embedding-8B` has none either — so `embed.mlx_text` now declares
+  `tie_word_embeddings: true` through a new `model_config` pass-through in
+  `mlx_runtime.load_model_and_tokenizer`, and loads. The reranker *needs* the
+  head (its P(yes) comes from `lm_head` logits) and upstream
+  `Qwen/Qwen3-Reranker-8B` ships a distinct one that the mlx-embeddings
+  conversion dropped: the pinned `mlx-community/Qwen3-Reranker-8B-mxfp8` is
+  recorded `failed` with the exact error and cannot be made to work from our
+  side. The one fix evaluated — a local `mlx_lm.convert` of the upstream repo at
+  its pinned sha, 8-bit mxfp8, which keeps the head — loads through the same
+  factory path and scores P(yes) 0.97 vs 0.00 at 8.1 GiB peak; command and
+  numbers in the entry's notes. Re-pinning is the owner's call (the lock pins
+  Hub revisions; a local directory has none).
+- `tests/test_verify_model_manifest.py` now checks the shape of a recorded
+  smoke run instead of asserting nothing has run.
 ## 2026-09-14 — two identity integration tests still encoded the pre-August Contacts rules
 
 Found by running the suite against a scratch Postgres for the

@@ -379,18 +379,41 @@ def test_repo_lock_is_well_formed() -> None:
             assert entry.repo and "/" in entry.repo, entry.name
             assert entry.revision and re.fullmatch(r"[0-9a-f]{40}", entry.revision), entry.name
             assert entry.license, entry.name
-        # No hosted model has been downloaded or executed: every resolved
-        # entry stays not_run with no artifact checksum. The one `system`
-        # entry (Apple Vision) can be exercised without a download; when it
-        # records a run, the record must say when, on which OS, and how.
+        # A smoke_test record is either the untouched `{status: not_run}` or
+        # what scripts/smoke_test_models.py --write records
+        # (imsg.providers.model_smoke.smoke_record): when, on which host
+        # class, how long the load and the inference took, the peak memory,
+        # and a one-line result — plus the OS version for the `system`
+        # entry, whose model ships with the OS. artifact_sha256 is the
+        # smoke run's snapshot digest (64 hex) once a hosted entry has been
+        # downloaded, and stays null for the system entry.
         smoke = entry.raw["smoke_test"]
-        if entry.status == "resolved":
+        digest = entry.raw["artifact_sha256"]
+        assert smoke["status"] in {"not_run", "passed", "failed"}, entry.name
+        if smoke["status"] == "not_run":
             assert smoke == {"status": "not_run"}, entry.name
         else:
-            assert smoke["status"] in {"not_run", "passed"}, entry.name
+            assert {"date", "host_class", "result"} <= set(smoke), entry.name
+            assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(smoke["date"])), entry.name
+            if entry.status == "system":
+                assert "macos" in smoke, entry.name
             if smoke["status"] == "passed":
-                assert {"date", "macos", "method"} <= set(smoke), entry.name
-        assert entry.raw["artifact_sha256"] is None, entry.name
+                assert {"load_seconds", "peak_memory_gb"} <= set(smoke), entry.name
+            for key in ("load_seconds", "inference_seconds", "peak_memory_gb"):
+                if key in smoke:
+                    assert isinstance(smoke[key], int | float) and smoke[key] >= 0, entry.name
+            if "roles" in smoke:
+                assert set(smoke["roles"]) == set(entry.roles), entry.name
+                for role_record in smoke["roles"].values():
+                    assert role_record["status"] in {"passed", "failed"}, entry.name
+        if entry.status == "system":
+            assert digest is None, entry.name
+        else:
+            assert digest is None or re.fullmatch(r"[0-9a-f]{64}", digest), entry.name
+            if smoke["status"] == "passed":
+                assert digest is not None, (
+                    f"{entry.name}: a passed smoke run must record its digest"
+                )
     assert not [e.name for e in lock.entries if e.status == "unresolved"]
 
 

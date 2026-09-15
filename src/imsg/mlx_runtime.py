@@ -132,11 +132,16 @@ def load_model_and_tokenizer(
     revision: str | None,
     *,
     tokenizer_config: dict[str, Any] | None = None,
+    model_config: dict[str, Any] | None = None,
 ) -> tuple[Any, Any]:
     """``mlx_lm.load`` with revision pinning on every ``mlx_lm`` version
     (see the module docstring). Returns ``(model, tokenizer)``; the
     tokenizer is ``mlx_lm``'s ``TokenizerWrapper``, which forwards
     attribute access to the underlying Hugging Face tokenizer.
+    ``model_config`` entries override the checkpoint's ``config.json``
+    before the model class is instantiated (``mlx_lm.load``'s own
+    ``model_config``); see ``imsg.embed.mlx_text`` for the one case that
+    needs it.
 
     Raises :class:`MlxRuntimeUnavailableError` when the runtime is
     missing and :class:`MlxRuntimeError` for any load failure.
@@ -145,6 +150,8 @@ def load_model_and_tokenizer(
     kwargs: dict[str, Any] = {}
     if tokenizer_config:
         kwargs["tokenizer_config"] = dict(tokenizer_config)
+    if model_config:
+        kwargs["model_config"] = dict(model_config)
     try:
         if revision is None:
             loaded = mlx_lm.load(model_repo, **kwargs)

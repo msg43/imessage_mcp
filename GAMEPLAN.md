@@ -63,19 +63,26 @@ the private design-record repo, not here (it names real hosts and
 accounts).
 
 - **Run the real model providers end to end** before trusting Phase 3.
-  The providers exist behind `models.backend: real` (2026-09-14) and every
-  runtime API they call was verified against the installed packages, but
-  the pinned weights (Qwen3-Embedding-8B, Qwen3-Reranker-8B, Qwen3.5-35B-A3B,
-  whisper-large-v3, PE-Core-G14-448) have never been downloaded or run:
-  `uv sync --extra models`, `imsg models verify`, download, then `segment`
-  / `embed` / `enrich` on one real chat, and record each `smoke_test` in the
-  manifest (only the Apple Vision entry has one). Note the `seg_config_hash`
-  v2 bump: the first real `segment` run re-segments every chat. Vector
+  Done as of 2026-09-14 for the single-input smoke level
+  (`scripts/smoke_test_models.py`, results in `models/manifest.lock.yaml`):
+  every pinned model was downloaded, checksummed and run through the
+  factory on an M2 Ultra / 128 GB — five entries pass; the pinned
+  Qwen3-Reranker-8B conversion **cannot work** (its LM head was dropped by
+  the converter; see the entry's `smoke_test` and notes) and needs a
+  re-pin decision by the owner — a local mlx-lm 8-bit conversion of the
+  upstream repo passes the same check (notes). Still open: `segment` / `embed` / `enrich`
+  on one real chat with the real backend. Note the `seg_config_hash` v2
+  bump: the first real `segment` run re-segments every chat. Vector
   dimensions are load-bearing: pgvector's HNSW index caps below what the
   models natively emit, so changing them requires a migration and a full
   re-embed.
 - Confirm the host's unified memory before Phase 0 — it selects the
-  model ladder.
+  model ladder. First real inputs (2026-09-14, M2 Ultra 128 GB, one model
+  resident at a time, peak per `models/manifest.lock.yaml`): Qwen3.5-35B-A3B
+  4-bit 19.9 GiB (mlx-vlm) / 19.1 GiB (mlx-lm); PE-Core G14-448 9.4 GiB RSS;
+  Qwen3-Embedding-8B mxfp8 7.4 GiB; whisper-large-v3 3.7 GiB. These are
+  single-input peaks — batched embedding and long windows will sit above
+  them — and they were not measured on the mini.
 - Populate the `unsupported` materialization state in the backfill
   stage at Phase 2; the reconciliation bucket reads zero until then.
 - Arrange the second account needed for the Phase 6 isolation test.
