@@ -12,7 +12,13 @@ backend selection is a single config field:
 `real` constructs the MLX / Apple Vision / PE-Core implementations named
 in `REAL_PROVIDERS`, from the repo ids and immutable revisions in
 `embedding.*`, `retrieval.reranker_*`, `segmentation.boundary_*` and
-`enrichment.*` (defaults mirror `models/manifest.lock.yaml`). `fake`
+`enrichment.*` (defaults mirror `models/manifest.lock.yaml`). A model
+field may also name a directory relative to `paths.data_root` holding a
+local conversion (the lock's `source: local_conversion` entries, their
+`output_dir`): `resolve_local_model_dir` reads the value as that
+directory when it exists under the data root, and the provider is built
+from the directory with `revision=None` and a `model_id` of
+`<data-root-relative dir>@<upstream sha>`. `fake`
 constructs the `Fake*` classes every test uses; because a fake run
 reports success while producing meaningless search results, every
 command prints `backend_status_line(cfg)` — one line,
@@ -52,6 +58,7 @@ from imsg.enrich.provider import (
     TranscriptionProvider,
 )
 from imsg.errors import ImsgError, ProviderUnavailableError
+from imsg.paths import is_contained_in, join_under_root, resolve_path
 from imsg.retrieval.reranker import FakeRerankerProvider, RerankerProvider
 from imsg.segment.boundaries import BoundaryProvider, FakeBoundaryProvider
 
@@ -108,7 +115,7 @@ below rely on (positional required args, keyword-only options):
 - boundary:             (model_repo, revision, prompt_template: str, *, max_tokens=512,
                          timeout_seconds=120.0)
 - reranker:             (model_repo, revision, *, instruction=None, batch_size=8,
-                         max_length=8192)
+                         max_length=8192, model_id=None)
 - ocr:                  (*, recognition_languages=None, minimum_text_height=None)
 - transcription:        (model_repo, revision, *, language=None)
 - caption:              (model_repo, revision, prompt: str, *, max_tokens=256)
@@ -200,6 +207,48 @@ def _check_dim(spec: RealProviderSpec, provider: object, expected: int) -> None:
             f"the real '{spec.role}' provider ({spec.dotted_path}) reports dim={actual}, "
             f"but config requires {expected} (the migration DDL's CHECK constraint)"
         )
+
+
+# --------------------------------------------------------------------------
+# local conversions: a model field naming a directory under data_root
+# --------------------------------------------------------------------------
+
+LOCAL_MODEL_DIR_PREFIX = "models"
+"""First path segment of every local conversion's `output_dir` in
+`models/manifest.lock.yaml`. A config value under it that does not exist
+on disk is reported as a missing conversion rather than handed to the
+Hub as a repo id (which would fail later with an unrelated 401)."""
+
+
+def resolve_local_model_dir(data_root: Path, value: str) -> Path | None:
+    """`data_root/<value>` when it is an existing directory that still
+    resolves under `data_root` with symlinks followed (SPEC §5.4) — the
+    rule by which a `*_model` config value is read as a local conversion
+    rather than a Hugging Face repo id. `None` for any value that is not
+    such a directory (a repo id, or a directory not present)."""
+    candidate = resolve_path(join_under_root(data_root, value))
+    if not candidate.is_dir():
+        return None
+    if not is_contained_in(candidate, data_root):
+        raise ProviderUnavailableError(
+            f"model directory '{value}' resolves to '{candidate}', outside paths.data_root "
+            f"('{data_root}') — CLAUDE.md non-negotiable #2: every model directory a provider "
+            f"opens must live on the encrypted volume"
+        )
+    return candidate
+
+
+def local_model_id(value: str, revision: str) -> str:
+    """`<data-root-relative dir>@<upstream sha>` — the `model_id` recorded
+    for a provider built from a local conversion: the config's relative
+    directory (normalised), never the absolute path, plus the upstream
+    commit the conversion derives from."""
+    return f"{Path(value).as_posix()}@{revision}"
+
+
+def _looks_like_local_model_dir(value: str) -> bool:
+    parts = Path(value).parts
+    return len(parts) > 1 and parts[0] == LOCAL_MODEL_DIR_PREFIX
 
 
 # --------------------------------------------------------------------------
@@ -329,11 +378,28 @@ def build_boundary_provider(cfg: Config, prompt_template: str) -> BoundaryProvid
 
 
 def build_reranker(cfg: Config) -> RerankerProvider:
-    """SPEC §9.4 step 7's reranker (Qwen3-Reranker-8B)."""
+    """SPEC §9.4 step 7's reranker (Qwen3-Reranker-8B). `retrieval.
+    reranker_model` is a local conversion when `<paths.data_root>/<value>`
+    is an existing directory — built with `revision=None` and `model_id`
+    `<value>@<retrieval.reranker_revision>`, the upstream sha — and a Hub
+    repo id pinned at `reranker_revision` otherwise."""
     if cfg.models.backend == "fake":
         return FakeRerankerProvider()
     spec = REAL_PROVIDERS["reranker"]
-    provider = _construct(spec, cfg.retrieval.reranker_model, cfg.retrieval.reranker_revision)
+    model, revision = cfg.retrieval.reranker_model, cfg.retrieval.reranker_revision
+    local_dir = resolve_local_model_dir(cfg.paths.data_root, model)
+    if local_dir is not None:
+        provider = _construct(spec, str(local_dir), None, model_id=local_model_id(model, revision))
+        return cast("RerankerProvider", provider)
+    if _looks_like_local_model_dir(model):
+        raise ProviderUnavailableError(
+            f"retrieval.reranker_model '{model}' names a directory under paths.data_root "
+            f"('{cfg.paths.data_root}') that does not exist. A value under "
+            f"'{LOCAL_MODEL_DIR_PREFIX}/' is a local conversion (models/manifest.lock.yaml "
+            f"`output_dir`): produce it with the `command` recorded there, or set a Hugging "
+            f"Face repo id ('owner/name') instead"
+        )
+    provider = _construct(spec, model, revision)
     return cast("RerankerProvider", provider)
 
 
@@ -385,6 +451,7 @@ def build_enrichment_providers(
 
 __all__ = [
     "INSTALL_HINT",
+    "LOCAL_MODEL_DIR_PREFIX",
     "MODELS_EXTRA",
     "REAL_PROVIDERS",
     "RealProviderSpec",
@@ -396,8 +463,10 @@ __all__ = [
     "build_reranker",
     "build_text_provider",
     "default_prompt_root",
+    "local_model_id",
     "read_caption_prompt",
     "read_prompt_text",
     "resolve_caption_prompt",
+    "resolve_local_model_dir",
     "resolve_prompt_path",
 ]

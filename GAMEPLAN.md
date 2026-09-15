@@ -16,9 +16,9 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 Every buildable component of the governing spec is implemented: 8
 pipeline stages, hybrid retrieval, both MCP surfaces, the export gate,
 the eval harness, 33 CLI commands (counting subcommands), migrations
-0001–0003. 1,188 tests (990 without a database, 198 integration tests
-that skip without one — measured 2026-09-14); ruff and mypy strict
-clean; DDL lint clean.
+0001–0003. 1,315 tests (1,116 without a database, 199 integration tests
+that skip without a scratch Postgres — measured 2026-09-15); ruff and
+mypy strict clean; DDL lint clean.
 
 **This status previously read "code complete, unrun" and stayed that way
 for three weeks after it stopped being true** — see `CHANGELOG.md`
@@ -31,15 +31,17 @@ against real address books.
 The real model providers exist as of 2026-09-14 — `imsg.providers.factory`
 builds them behind `models.backend: real` (the default; `fake` is explicit
 opt-in and every command prints which), pinned in `models/manifest.lock.yaml`
-— but **no pinned model has been downloaded or executed end to end**: every
-hosted manifest entry is `smoke_test: not_run`. Only the OS-supplied Apple
-Vision OCR has run against its pinned "model"; the whisper and mlx-lm code
-paths were exercised on tiny stand-in models, and every runtime API the
-providers call was checked against the installed packages. Segmentation,
+— and every pinned model has now been downloaded (or, for the reranker,
+converted locally), checksummed and run once on a synthetic input through
+the factory (`scripts/smoke_test_models.py`, 2026-09-14/15; results in the
+lock). The reranker is pinned as a reproducible local `mlx_lm.convert` of
+the upstream repo since 2026-09-15, because the Hub conversion ships no
+LM head. **No model has run on the pipeline end to end**: segmentation,
 embedding and retrieval quality with the real 8B / 35B weights is unknown,
-and a `fake` run still reports success with meaningless results. Phase 1's
-exit criteria — seed completeness (AT-2) and a hand-verified `person` table —
-are **not** met. (2026-09-14)
+batched throughput and memory are unmeasured, and a `fake` run still
+reports success with meaningless results. Phase 1's exit criteria — seed
+completeness (AT-2) and a hand-verified `person` table — are **not** met.
+(2026-09-15)
 
 ## Gate ladder
 
@@ -66,16 +68,19 @@ accounts).
   Done as of 2026-09-14 for the single-input smoke level
   (`scripts/smoke_test_models.py`, results in `models/manifest.lock.yaml`):
   every pinned model was downloaded, checksummed and run through the
-  factory on an M2 Ultra / 128 GB — five entries pass; the pinned
-  Qwen3-Reranker-8B conversion **cannot work** (its LM head was dropped by
-  the converter; see the entry's `smoke_test` and notes) and needs a
-  re-pin decision by the owner — a local mlx-lm 8-bit conversion of the
-  upstream repo passes the same check (notes). Still open: `segment` / `embed` / `enrich`
-  on one real chat with the real backend. Note the `seg_config_hash` v2
-  bump: the first real `segment` run re-segments every chat. Vector
-  dimensions are load-bearing: pgvector's HNSW index caps below what the
-  models natively emit, so changing them requires a migration and a full
-  re-embed.
+  factory on an M2 Ultra / 128 GB. **Reranker re-pin: resolved 2026-09-15**
+  — owner decision: the reranker stays local, pinned as a reproducible
+  local conversion (`source: local_conversion`) of upstream
+  Qwen/Qwen3-Reranker-8B @ 77d193c7 with mlx-lm 0.31.3 (mxfp8, 8-bit,
+  group 32), because the Hub conversion dropped the LM head; the converted
+  directory lives under `paths.data_root` (`models/…`), passes the same
+  smoke check (P(yes) 0.9707 vs 0.0000, peak 8.09 GiB), and `imsg models
+  verify --data-root` checks its digest. The Studio instance config points
+  at it. Still open: `segment` / `embed` / `enrich` on one real chat with
+  the real backend. Note the `seg_config_hash` v2 bump: the first real
+  `segment` run re-segments every chat. Vector dimensions are load-bearing:
+  pgvector's HNSW index caps below what the models natively emit, so
+  changing them requires a migration and a full re-embed.
 - Confirm the host's unified memory before Phase 0 — it selects the
   model ladder. First real inputs (2026-09-14, M2 Ultra 128 GB, one model
   resident at a time, peak per `models/manifest.lock.yaml`): Qwen3.5-35B-A3B

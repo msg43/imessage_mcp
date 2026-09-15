@@ -10,6 +10,61 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-15 — the reranker is pinned as a reproducible local conversion (`source: local_conversion`)
+
+- Owner decision: the reranker stays local. `models/manifest.lock.yaml` gains a
+  second entry kind, `source: local_conversion` — `upstream_repo`,
+  `upstream_revision` (sha), `upstream_license`, `tool` (`<package>==<exact
+  version>`), `command` (the exact, reproducible invocation; `$DATA_ROOT` stands
+  for `paths.data_root`), `output_dir` (data-root-relative) — with
+  `repo`/`revision`/`license` null: a local directory has no Hub revision, its
+  provenance is the upstream pin plus `artifact_sha256`, now computed over the
+  OUTPUT directory by the same definition the smoke harness uses (the digest
+  moved to `imsg.providers.manifest.artifact_digest`; `model_smoke` re-exports
+  it). `qwen3-reranker-8b` is re-pinned this way: mlx-lm 0.31.3's mxfp8 8-bit
+  (group 32) conversion of `Qwen/Qwen3-Reranker-8B` @ `77d193c7`, converted
+  from the pinned upstream snapshot's directory (not the repo id — mlx-lm's
+  `save()` copies `generation_config.json` from the cache's `main` ref, which
+  the recorded command therefore does not depend on). Output: 653 tensors with
+  `lm_head.weight` + `lm_head.scales`, 7.9 GiB on disk, 16 s to convert on an
+  M2 Ultra; the reasons the Hub pin could not work stay in the entry's notes.
+- Smoke-run through the factory path (`scripts/smoke_test_models.py --only
+  qwen3-reranker-8b --data-root … --write`, M2 Ultra 128 GB): P(yes) relevant
+  0.9707 vs irrelevant 0.0000, load 3.71 s, inference 1.19 s, peak 8.09 GiB;
+  `artifact_sha256` `29e4a1ae…`. Every pinned model now has a passed smoke
+  record. The harness locates a local conversion under `--data-root` (default:
+  the schema's data root; passed through to the child process) instead of
+  downloading, and reports artifact bytes separately from downloaded bytes.
+- `imsg models verify` / `scripts/verify_model_manifest.py` now (a)
+  re-resolves a local conversion's upstream repo for drift — reported, never
+  written: `--write` never advances an upstream pin, because the directory on
+  disk was converted from it; (b) checks each local conversion's directory
+  exists under `--data-root` (symlink-resolved containment) and that its
+  recomputed digest equals the lock (`--skip-artifacts` when the volume is not
+  mounted); (c) notes whether the recorded conversion tool version is what is
+  installed (informational — only re-running the command depends on it).
+  Verified clean against the live HF API, the real data root and the installed
+  runtimes on 2026-09-15.
+- Config: `retrieval.reranker_model` may be a directory relative to
+  `paths.data_root` as well as a Hub repo id; absolute, `~` and `..` forms are
+  rejected with a message naming both forms, and a root validator resolves
+  symlinks so the directory cannot escape the data root. The factory reads the
+  value as a local directory when `<data_root>/<value>` exists — building
+  `MlxRerankerProvider` with `revision=None` and `model_id`
+  `<dir>@<upstream sha>` (new `model_id` keyword) — and as a repo id otherwise;
+  a missing `models/…` directory is one clear error naming the recorded command,
+  not a doomed Hub download. `imsg.constants.RERANKER_MODEL` (renamed from
+  `RERANKER_MODEL_REPO`) and `RERANKER_MODEL_REVISION` now default to the
+  conversion's `output_dir` and the upstream sha; `config.example.yaml` and the
+  README describe the two forms. The Studio instance config (private, outside
+  every repo) points at the conversion; `imsg status` validates it and prints
+  `models: backend=real`.
+- Tests: the new entry kind's parsing and every rejection, upstream drift
+  versus `--write`, the artifact check (match, mismatch, unrecorded, missing
+  directory, unmounted data root, symlink escape), the tool note, the local-dir
+  config forms, the factory's revision/`model_id` handling, and the smoke
+  harness's locate-not-download path and `--data-root` plumbing.
+
 ## 2026-09-14 — first real execution of every pinned model (`scripts/smoke_test_models.py`)
 
 - `scripts/smoke_test_models.py` / `imsg.providers.model_smoke`: per lock entry,

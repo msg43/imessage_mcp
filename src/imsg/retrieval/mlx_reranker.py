@@ -87,7 +87,12 @@ class MlxRerankerProvider:
     Constructor arguments are plain values (the CLI reads
     ``retrieval.reranker_model`` / ``retrieval.reranker_revision`` and
     passes them here); weights load lazily on the first :meth:`score`
-    (or explicitly via :meth:`load`).
+    (or explicitly via :meth:`load`). ``model_repo`` may be a Hub repo id
+    or a local directory holding an MLX-layout checkpoint (``mlx_lm.load``
+    accepts both); for a local directory the factory passes
+    ``revision=None`` and a ``model_id`` of ``<data-root-relative
+    dir>@<upstream sha>`` so provenance is recorded without the absolute
+    path — by default ``model_id`` is ``<model_repo>@<revision or main>``.
     """
 
     def __init__(
@@ -98,6 +103,7 @@ class MlxRerankerProvider:
         instruction: str | None = None,
         batch_size: int = 8,
         max_length: int = 8192,
+        model_id: str | None = None,
     ) -> None:
         if not model_repo:
             raise ValueError("model_repo must be a non-empty repo id or local path")
@@ -105,7 +111,9 @@ class MlxRerankerProvider:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         if max_length < 1:
             raise ValueError(f"max_length must be >= 1, got {max_length}")
-        self.model_id = format_model_id(model_repo, revision)
+        if model_id is not None and not model_id.strip():
+            raise ValueError("model_id, when given, must be a non-empty string")
+        self.model_id = model_id or format_model_id(model_repo, revision)
         self.instruction = instruction or DEFAULT_RERANK_INSTRUCTION
         self._model_repo = model_repo
         self._revision = revision

@@ -1,14 +1,18 @@
 """`imsg.providers.manifest` / `scripts/verify_model_manifest.py` /
 `imsg models verify`: drift detection against a stubbed Hugging Face
 API, runtime-floor checks against a stubbed `importlib.metadata`, the
-never-write-without-`--write` rule, and structural checks of the real
-`models/manifest.lock.yaml` (every resolved entry carries a full commit
-sha; runtime floors equal pyproject's `models` extra). No network."""
+never-write-without-`--write` rule, the `source: local_conversion` entry
+kind (its provenance fields, upstream drift that `--write` never
+accepts, and the on-disk artifact check against `artifact_sha256`), and
+structural checks of the real `models/manifest.lock.yaml` (every
+resolved entry carries a full commit sha; runtime floors equal
+pyproject's `models` extra). No network."""
 
 from __future__ import annotations
 
 import io
 import re
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -24,6 +28,10 @@ from imsg.cli import app
 from imsg.errors import ModelManifestError
 from imsg.providers.manifest import (
     MACOS_PSEUDO_PACKAGE,
+    SOURCE_HUB,
+    SOURCE_LOCAL_CONVERSION,
+    artifact_digest,
+    default_data_root,
     default_manifest_path,
     entries_by_role,
     hf_model_url,
@@ -31,6 +39,8 @@ from imsg.providers.manifest import (
     load_manifest,
     main,
     meets_minimum,
+    normalize_output_dir,
+    verify_local_artifacts,
     verify_manifest,
     version_key,
 )
@@ -332,7 +342,14 @@ def test_cli_models_verify_is_registered_and_wired(lock_path: Path, tmp_path: Pa
     runner = CliRunner()
     result = runner.invoke(app, ["models", "verify", "--help"])
     assert result.exit_code == 0
-    for flag in ["--lock", "--write", "--skip-remote", "--skip-runtime"]:
+    for flag in [
+        "--lock",
+        "--data-root",
+        "--write",
+        "--skip-remote",
+        "--skip-artifacts",
+        "--skip-runtime",
+    ]:
         assert flag in result.output
 
     result = runner.invoke(
@@ -374,8 +391,32 @@ EXPECTED_ROLES = {
 def test_repo_lock_is_well_formed() -> None:
     lock = load_manifest(default_manifest_path())
     assert set(entries_by_role(lock)) == EXPECTED_ROLES
+    # The lock is public: no home directory, no hostname-bearing path.
+    assert "/Users/" not in default_manifest_path().read_text(encoding="utf-8")
     for entry in lock.entries:
-        if entry.status == "resolved":
+        if entry.local_conversion:
+            # Provenance is the upstream pin plus the recorded, reproducible
+            # command; the directory itself has no Hub repo/revision.
+            assert entry.status == "resolved", entry.name
+            assert (entry.repo, entry.revision, entry.license) == (None, None, None), entry.name
+            assert entry.upstream_repo and "/" in entry.upstream_repo, entry.name
+            assert entry.upstream_revision and re.fullmatch(
+                r"[0-9a-f]{40}", entry.upstream_revision
+            ), entry.name
+            assert entry.upstream_license, entry.name
+            tool = entry.tool_package_and_version
+            assert tool is not None, entry.name
+            package, version = tool
+            assert package in entry.min_runtime and meets_minimum(
+                version, entry.min_runtime[package]
+            ), f"{entry.name}: the conversion tool must satisfy its own min_runtime floor"
+            assert entry.output_dir and entry.output_dir.startswith("models/"), entry.name
+            assert entry.output_dir == normalize_output_dir(entry.name, entry.output_dir)
+            assert entry.command and f"$DATA_ROOT/{entry.output_dir}" in entry.command, (
+                f"{entry.name}: the command must write to $DATA_ROOT/<output_dir>"
+            )
+            assert "/Volumes/" not in entry.command, entry.name
+        elif entry.status == "resolved":
             assert entry.repo and "/" in entry.repo, entry.name
             assert entry.revision and re.fullmatch(r"[0-9a-f]{40}", entry.revision), entry.name
             assert entry.license, entry.name
@@ -448,3 +489,399 @@ def test_repo_lock_runtime_floors_equal_pyprojects_models_extra() -> None:
         assert floors == {extra_floors[pkg]}, (
             f"{pkg}: lock floors {floors} != pyproject {extra_floors[pkg]}"
         )
+
+
+# --------------------------------------------------------------------------
+# source: local_conversion — provenance, upstream drift, the artifact check
+# --------------------------------------------------------------------------
+
+UPSTREAM = "example-org/Upstream-Reranker"
+UPSTREAM_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+UPSTREAM_MOVED = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+OUTPUT_DIR = "models/upstream-reranker-mxfp8-aaaaaaaa"
+COMMAND = (
+    f"python -c \"from mlx_lm.convert import convert; convert(hf_path='{UPSTREAM}', "
+    f"revision='{UPSTREAM_SHA}', mlx_path='$DATA_ROOT/{OUTPUT_DIR}', quantize=True, "
+    f"q_mode='mxfp8', q_bits=8, q_group_size=32)\""
+)
+LOCAL_ENTRY_TEXT = f"""  converted-reranker:
+    role: [reranker]
+    status: resolved
+    source: local_conversion
+    upstream_repo: {UPSTREAM}
+    upstream_revision: {UPSTREAM_SHA}
+    upstream_license: apache-2.0
+    tool: mlx-lm==0.31.3
+    command: >-
+      {COMMAND}
+    output_dir: {OUTPUT_DIR}
+    expected_dim: null
+    quantization: {{mode: mxfp8, bits: 8, group_size: 32}}
+    artifact_sha256: null
+    min_runtime: {{mlx: '0.32.2', mlx-lm: '0.31.3'}}
+    smoke_test: {{status: not_run}}
+    notes: why it is local
+"""
+
+LOCAL_OK = _installed(
+    {
+        "mlx": "0.32.2",
+        "mlx-lm": "0.31.3",
+        "huggingface_hub": "1.31.0",
+        MACOS_PSEUDO_PACKAGE: "26.6.2",
+    }
+)
+
+
+@pytest.fixture
+def local_lock(tmp_path: Path) -> tuple[Path, Path]:
+    """The fixture lock plus one local conversion, and a data_root that
+    holds its converted directory; `artifact_sha256` is left null."""
+    path = tmp_path / "manifest.lock.yaml"
+    path.write_text(LOCK_TEXT + LOCAL_ENTRY_TEXT, encoding="utf-8")
+    data_root = tmp_path / "data_root"
+    directory = data_root / OUTPUT_DIR
+    directory.mkdir(parents=True)
+    (directory / "config.json").write_text('{"model_type": "example"}', encoding="utf-8")
+    (directory / "model.safetensors").write_bytes(b"converted-weights" * 64)
+    (directory / "README.md").write_text("# outside the digest", encoding="utf-8")
+    return path, data_root
+
+
+def _record_digest(lock_path: Path, digest: str) -> None:
+    text = lock_path.read_text(encoding="utf-8")
+    entry = LOCAL_ENTRY_TEXT.replace("artifact_sha256: null", f"artifact_sha256: '{digest}'")
+    assert LOCAL_ENTRY_TEXT in text
+    lock_path.write_text(text.replace(LOCAL_ENTRY_TEXT, entry), encoding="utf-8")
+
+
+def _both_unchanged() -> Any:
+    return _stub_fetch({hf_model_url(REPO): _info(PINNED), hf_model_url(UPSTREAM): _info(UPSTREAM_SHA)})
+
+
+def _run_local(lock_path: Path, **kwargs: Any) -> tuple[int, str]:
+    kwargs.setdefault("installed", LOCAL_OK)
+    kwargs.setdefault("fetch", _both_unchanged())
+    return _run(lock_path, **kwargs)
+
+
+def test_local_conversion_entry_parses_with_its_provenance(local_lock: tuple[Path, Path]) -> None:
+    lock_path, _ = local_lock
+    by_name = {e.name: e for e in load_manifest(lock_path).entries}
+    entry = by_name["converted-reranker"]
+    assert entry.source == SOURCE_LOCAL_CONVERSION
+    assert entry.local_conversion and not entry.hosted
+    assert (entry.repo, entry.revision, entry.license) == (None, None, None)
+    assert (entry.upstream_repo, entry.upstream_revision, entry.upstream_license) == (
+        UPSTREAM,
+        UPSTREAM_SHA,
+        "apache-2.0",
+    )
+    assert entry.hub_pin == (UPSTREAM, UPSTREAM_SHA, "apache-2.0")
+    assert (entry.config_model, entry.config_revision) == (OUTPUT_DIR, UPSTREAM_SHA)
+    assert entry.tool == "mlx-lm==0.31.3"
+    assert entry.tool_package_and_version == ("mlx-lm", "0.31.3")
+    assert entry.command == COMMAND  # the folded scalar round-trips as one line
+    assert entry.output_dir == OUTPUT_DIR
+    assert entry.artifact_sha256 is None
+    assert entries_by_role(load_manifest(lock_path))["reranker"] is not None
+
+    hub = by_name["text-embedder"]
+    assert hub.source == SOURCE_HUB and hub.hosted and not hub.local_conversion
+    assert hub.hub_pin == (REPO, PINNED, "apache-2.0")
+    assert (hub.config_model, hub.config_revision) == (REPO, PINNED)
+    assert hub.tool_package_and_version is None and hub.output_dir is None
+    assert by_name["system-ocr"].hub_pin is None and by_name["unresolved-thing"].hub_pin is None
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        (
+            "    source: local_conversion\n",
+            "    source: local_conversion\n    repo: example-org/Nope\n",
+            "no Hub repo/revision/license of its own",
+        ),
+        (
+            "    source: local_conversion\n",
+            f"    source: local_conversion\n    revision: {PINNED}\n",
+            "no Hub repo/revision/license of its own",
+        ),
+        ("    tool: mlx-lm==0.31.3\n", "    tool: mlx-lm 0.31.3\n", "'<package>==<exact version>'"),
+        ("    tool: mlx-lm==0.31.3\n", "", "non-empty 'tool'"),
+        ("    command: >-\n", "    command: ''\n    unused: >-\n", "non-empty 'command'"),
+        (f"    upstream_revision: {UPSTREAM_SHA}\n", "    upstream_revision: main\n", "40-hex"),
+        (f"    upstream_repo: {UPSTREAM}\n", "    upstream_repo: Upstream-Reranker\n", "'owner/name'"),
+        (f"    output_dir: {OUTPUT_DIR}\n", "    output_dir: /abs/models/x\n", "relative to paths.data_root"),
+        (f"    output_dir: {OUTPUT_DIR}\n", "    output_dir: ~/models/x\n", "relative to paths.data_root"),
+        (f"    output_dir: {OUTPUT_DIR}\n", "    output_dir: models/../../x\n", "'..'"),
+        (f"    output_dir: {OUTPUT_DIR}\n", "    output_dir: .\n", "may not be empty"),
+        ("    source: local_conversion\n", "    source: mirror\n", "source must be one of"),
+        (
+            "    status: resolved\n    source: local_conversion\n",
+            "    status: system\n    source: local_conversion\n",
+            "always 'resolved'",
+        ),
+        ("    artifact_sha256: null\n", "    artifact_sha256: not-a-digest\n", "64-hex sha256"),
+    ],
+)
+def test_local_conversion_entries_are_validated(
+    tmp_path: Path, old: str, new: str, message: str
+) -> None:
+    assert LOCAL_ENTRY_TEXT.count(old) == 1, old
+    path = tmp_path / "lock.yaml"
+    path.write_text(LOCK_TEXT + LOCAL_ENTRY_TEXT.replace(old, new), encoding="utf-8")
+    with pytest.raises(ModelManifestError, match=re.escape(message)):
+        load_manifest(path)
+
+
+def test_hub_entries_may_not_carry_local_conversion_keys(tmp_path: Path) -> None:
+    path = tmp_path / "lock.yaml"
+    path.write_text(
+        LOCK_TEXT.replace("    notes: keep me\n", "    notes: keep me\n    output_dir: models/x\n"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ModelManifestError, match=r"belong only to 'source: local_conversion'"):
+        load_manifest(path)
+
+
+def test_normalize_output_dir_strips_redundant_segments() -> None:
+    assert normalize_output_dir("e", "models//x/./y/") == "models/x/y"
+    with pytest.raises(ModelManifestError):
+        normalize_output_dir("e", "/models/x")
+
+
+def test_local_conversion_re_resolves_its_upstream_repo(local_lock: tuple[Path, Path]) -> None:
+    lock_path, _ = local_lock
+    code, out = _run_local(lock_path, skip_artifacts=True)
+    assert code == 0, out
+    assert re.search(
+        rf"ok\s+converted-reranker\s+upstream {re.escape(UPSTREAM)} @ {UPSTREAM_SHA[:12]} "
+        rf"\(apache-2.0\) -> {re.escape(OUTPUT_DIR)}",
+        out,
+    )
+    assert "local artifacts: skipped (--skip-artifacts)" in out
+    assert "models verify: clean" in out
+
+
+def test_upstream_drift_is_reported_but_never_written(local_lock: tuple[Path, Path]) -> None:
+    lock_path, _ = local_lock
+    before = lock_path.read_text(encoding="utf-8")
+    fetch = _stub_fetch(
+        {
+            hf_model_url(REPO): _info(PINNED),
+            hf_model_url(UPSTREAM): _info(UPSTREAM_MOVED, "mit"),
+            hf_model_url(UPSTREAM, UPSTREAM_SHA): _info(UPSTREAM_SHA),
+        }
+    )
+    code, out = _run_local(lock_path, fetch=fetch, write=True, skip_artifacts=True)
+    assert code == 1
+    assert "DRIFT    converted-reranker" in out
+    assert f"upstream revision {UPSTREAM_SHA} -> {UPSTREAM_MOVED} (repo's main moved)" in out
+    assert "upstream license 'apache-2.0' -> 'mit'" in out
+    assert "NO LONGER resolvable" not in out
+    assert f"'{OUTPUT_DIR}' still derives from {UPSTREAM_SHA}" in out
+    assert "--write never advances an upstream pin" in out
+    assert "1 local conversion(s) whose upstream moved" in out
+    assert "wrote" not in out
+    assert lock_path.read_text(encoding="utf-8") == before
+
+
+def test_write_accepts_hub_drift_while_leaving_the_local_conversion_alone(
+    local_lock: tuple[Path, Path],
+) -> None:
+    lock_path, _ = local_lock
+    fetch = _stub_fetch(
+        {
+            hf_model_url(REPO): _info(MOVED, "mit"),
+            hf_model_url(REPO, PINNED): _info(PINNED),
+            hf_model_url(UPSTREAM): _info(UPSTREAM_MOVED),
+            hf_model_url(UPSTREAM, UPSTREAM_SHA): _info(UPSTREAM_SHA),
+        }
+    )
+    code, out = _run_local(lock_path, fetch=fetch, write=True, skip_artifacts=True)
+    assert code == 1  # the upstream drift remains
+    assert "wrote 1 drifted entr" in out
+    data = yaml.safe_load(lock_path.read_text(encoding="utf-8"))
+    assert data["models"]["text-embedder"]["revision"] == MOVED
+    local = data["models"]["converted-reranker"]
+    assert local["upstream_revision"] == UPSTREAM_SHA and local["upstream_license"] == "apache-2.0"
+    assert local["command"] == COMMAND and local["notes"] == "why it is local"
+
+
+def test_vanished_upstream_pin_is_called_out(local_lock: tuple[Path, Path]) -> None:
+    lock_path, _ = local_lock
+    fetch = _stub_fetch({hf_model_url(REPO): _info(PINNED), hf_model_url(UPSTREAM): _info(UPSTREAM_MOVED)})
+    code, out = _run_local(lock_path, fetch=fetch, skip_artifacts=True)
+    assert code == 1
+    assert f"pinned upstream revision {UPSTREAM_SHA} is NO LONGER resolvable" in out
+
+
+def test_local_artifact_with_a_matching_digest_is_clean(local_lock: tuple[Path, Path]) -> None:
+    lock_path, data_root = local_lock
+    directory = data_root / OUTPUT_DIR
+    expected = artifact_digest(directory)
+    assert [f.relative_path for f in expected.files] == ["config.json", "model.safetensors"]
+    _record_digest(lock_path, expected.sha256)
+
+    reports = verify_local_artifacts(load_manifest(lock_path), data_root)
+    assert [(r.name, r.level, r.computed_sha256) for r in reports] == [
+        ("converted-reranker", "ok", expected.sha256)
+    ]
+    assert reports[0].directory == directory.resolve()
+
+    code, out = _run_local(lock_path, data_root=data_root)
+    assert code == 0, out
+    assert f"local artifacts (data_root {data_root}):" in out
+    assert re.search(
+        rf"ok\s+converted-reranker\s+'{re.escape(OUTPUT_DIR)}' — 2 files, 0\.00 GiB; "
+        rf"artifact_sha256 matches",
+        out,
+    )
+    assert "models verify: clean" in out
+
+
+def test_local_artifact_without_a_recorded_digest_is_a_problem(
+    local_lock: tuple[Path, Path],
+) -> None:
+    lock_path, data_root = local_lock
+    code, out = _run_local(lock_path, data_root=data_root)
+    assert code == 1
+    assert "ERROR    converted-reranker" in out
+    assert "the lock records no artifact_sha256" in out
+    assert "scripts/smoke_test_models.py --only converted-reranker --write" in out
+    assert "models verify: 1 problem(s)" in out
+
+
+def test_local_artifact_digest_mismatch_is_a_problem(local_lock: tuple[Path, Path]) -> None:
+    lock_path, data_root = local_lock
+    _record_digest(lock_path, "ab" * 32)
+    code, out = _run_local(lock_path, data_root=data_root)
+    assert code == 1
+    assert f"artifact_sha256 MISMATCH for '{OUTPUT_DIR}': lock {'ab' * 32}, directory" in out
+    assert "not the pinned conversion" in out
+
+
+def test_missing_local_artifact_names_the_recorded_command(local_lock: tuple[Path, Path]) -> None:
+    lock_path, data_root = local_lock
+    _record_digest(lock_path, "ab" * 32)
+    shutil.rmtree(data_root / OUTPUT_DIR)
+    code, out = _run_local(lock_path, data_root=data_root)
+    assert code == 1
+    assert f"'{OUTPUT_DIR}' is not a directory under data_root '{data_root}'" in out
+    assert "produce it with the recorded command (mlx-lm==0.31.3):" in out
+    assert COMMAND in out
+
+
+def test_unmounted_data_root_is_a_problem_not_a_traceback(
+    local_lock: tuple[Path, Path], tmp_path: Path
+) -> None:
+    lock_path, _ = local_lock
+    _record_digest(lock_path, "ab" * 32)
+    code, out = _run_local(lock_path, data_root=tmp_path / "not-mounted")
+    assert code == 1
+    assert "is not a directory (volume not mounted? pass --data-root)" in out
+
+
+def test_local_artifact_symlink_escaping_data_root_is_rejected(
+    local_lock: tuple[Path, Path], tmp_path: Path
+) -> None:
+    lock_path, data_root = local_lock
+    directory = data_root / OUTPUT_DIR
+    outside = tmp_path / "outside"
+    shutil.move(str(directory), str(outside))
+    directory.symlink_to(outside)
+    _record_digest(lock_path, artifact_digest(outside).sha256)
+    code, out = _run_local(lock_path, data_root=data_root)
+    assert code == 1
+    assert "outside data_root" in out
+
+
+def test_lock_without_local_conversions_prints_no_artifact_section(lock_path: Path) -> None:
+    code, out = _run(lock_path, skip_remote=True, data_root=Path("/nonexistent/data-root"))
+    assert code == 0, out
+    assert "local artifacts" not in out
+
+
+def test_conversion_tool_version_is_noted_never_enforced(local_lock: tuple[Path, Path]) -> None:
+    lock_path, data_root = local_lock
+    _record_digest(lock_path, artifact_digest(data_root / OUTPUT_DIR).sha256)
+
+    code, out = _run_local(lock_path, data_root=data_root)
+    assert code == 0, out
+    assert re.search(
+        r"ok\s+mlx-lm\s+== 0\.31\.3\s+installed 0\.31\.3 \(as recorded\) "
+        r"\(conversion tool for converted-reranker\)",
+        out,
+    )
+
+    newer = _installed(
+        {"mlx": "0.32.2", "mlx-lm": "0.32.0", "huggingface_hub": "1.31.0", MACOS_PSEUDO_PACKAGE: "26.6.2"}
+    )
+    code, out = _run_local(lock_path, data_root=data_root, installed=newer)
+    assert code == 0, out  # the floor is met and the digest matches; only reproduction is affected
+    assert re.search(
+        r"NOTE\s+mlx-lm\s+== 0\.31\.3\s+installed 0\.32\.0 — re-running the recorded command "
+        r"may not reproduce converted-reranker's artifact_sha256",
+        out,
+    )
+    assert "models verify: clean" in out
+
+
+def test_default_data_root_is_the_config_schemas() -> None:
+    from imsg.config.schema import PathsConfig
+
+    assert default_data_root() == PathsConfig().data_root
+
+
+def test_main_and_cli_accept_data_root_and_skip_artifacts(local_lock: tuple[Path, Path]) -> None:
+    lock_path, data_root = local_lock
+    _record_digest(lock_path, artifact_digest(data_root / OUTPUT_DIR).sha256)
+    out = io.StringIO()
+    code = verify_manifest(
+        lock_path,
+        data_root=data_root,
+        skip_remote=True,
+        skip_runtime=True,
+        out=out,
+    )
+    assert code == 0, out.getvalue()
+    assert "artifact_sha256 matches" in out.getvalue()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "models",
+            "verify",
+            "--lock",
+            str(lock_path),
+            "--data-root",
+            str(data_root),
+            "--skip-remote",
+            "--skip-runtime",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "artifact_sha256 matches" in result.output
+
+    result = runner.invoke(
+        app,
+        ["models", "verify", "--lock", str(lock_path), "--skip-remote", "--skip-runtime", "--skip-artifacts"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "local artifacts: skipped" in result.output
+
+    assert (
+        main(
+            [
+                "--lock",
+                str(lock_path),
+                "--data-root",
+                str(data_root),
+                "--skip-remote",
+                "--skip-runtime",
+            ]
+        )
+        == 0
+    )

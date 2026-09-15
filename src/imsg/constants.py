@@ -60,8 +60,19 @@ HALFVEC_INDEX_MAX_DIM = 4_000
 TEXT_EMBEDDING_MODEL_REPO = "mlx-community/Qwen3-Embedding-8B-mxfp8"
 TEXT_EMBEDDING_MODEL_REVISION = "51c773b7464b630a6c67b4f75dbd796b658d6236"
 
-RERANKER_MODEL_REPO = "mlx-community/Qwen3-Reranker-8B-mxfp8"
-RERANKER_MODEL_REVISION = "a8947a5fe4c62cc1feb8dffa89d49502c8c80923"
+RERANKER_MODEL = "models/qwen3-reranker-8b-mxfp8-77d193c7"
+"""The reranker is pinned as a LOCAL CONVERSION (``models/manifest.lock.yaml``
+entry ``qwen3-reranker-8b``, ``source: local_conversion``): this is its
+``output_dir``, a directory relative to ``paths.data_root`` that the
+recorded ``mlx_lm.convert`` command produces from the upstream repo.
+``imsg.providers.factory`` reads a ``retrieval.reranker_model`` value as a
+local directory when ``<data_root>/<value>`` exists and as a Hugging Face
+repo id (``owner/name``) otherwise. The mlx-community conversion pinned
+before 2026-09-15 ships no ``lm_head`` and cannot score (entry notes)."""
+RERANKER_MODEL_REVISION = "77d193c791ed757ca307ee72715aa132723da912"
+"""For a local conversion, the UPSTREAM commit it was converted from
+(``Qwen/Qwen3-Reranker-8B``); recorded in the provider's ``model_id`` as
+``<output_dir>@<sha>`` so provenance survives the move off the Hub."""
 
 BOUNDARY_MODEL_REPO = "mlx-community/Qwen3.5-35B-A3B-4bit"
 BOUNDARY_MODEL_REVISION = "1e20fd8d42056f870933bf98ca6211024744f7ec"
@@ -96,7 +107,7 @@ __all__ = [
     "MULTIMODAL_EMBEDDING_MODEL_REPO",
     "MULTIMODAL_EMBEDDING_MODEL_REVISION",
     "PRIMARY_EMBEDDING_DIM",
-    "RERANKER_MODEL_REPO",
+    "RERANKER_MODEL",
     "RERANKER_MODEL_REVISION",
     "TEXT_EMBEDDING_MODEL_REPO",
     "TEXT_EMBEDDING_MODEL_REVISION",

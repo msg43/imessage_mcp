@@ -566,3 +566,70 @@ def test_multimodal_batch_size_must_be_positive(config_dict_factory: object) -> 
     raw["embedding"]["multimodal"]["batch_size"] = 0
     with pytest.raises(ConfigError, match=r"embedding\.multimodal\.batch_size"):
         load_config_dict(raw)
+
+
+# --------------------------------------------------------------------------
+# retrieval.reranker_model: a Hub repo id, or a directory under data_root
+# --------------------------------------------------------------------------
+
+
+def test_reranker_model_defaults_to_the_lock_pin(config_dict_factory: object) -> None:
+    from imsg import constants
+
+    raw = config_dict_factory()  # type: ignore[operator]
+    del raw["retrieval"]["reranker_model"]
+    cfg = load_config_dict(raw)
+    assert cfg.retrieval.reranker_model == constants.RERANKER_MODEL
+    assert cfg.retrieval.reranker_model.startswith("models/")  # the local conversion's output_dir
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Qwen/Qwen3-Reranker-8B",
+        "models/qwen3-reranker-8b-mxfp8-77d193c7",
+        " models/nested/dir/ ",
+    ],
+)
+def test_reranker_model_accepts_a_repo_id_or_a_data_root_relative_dir(
+    config_dict_factory: object, value: str
+) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["retrieval"]["reranker_model"] = value
+    assert load_config_dict(raw).retrieval.reranker_model == value.strip()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/Volumes/elsewhere/models/x",
+        "~/models/x",
+        "../models/x",
+        "models/../../x",
+        " ",
+    ],
+)
+def test_reranker_model_rejects_forms_that_could_leave_data_root(
+    config_dict_factory: object, value: str
+) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["retrieval"]["reranker_model"] = value
+    with pytest.raises(ConfigError) as excinfo:
+        load_config_dict(raw)
+    message = str(excinfo.value)
+    assert "retrieval.reranker_model" in message
+    # The message says which two forms are accepted.
+    assert "Hugging Face repo id ('owner/name')" in message
+    assert "directory relative to paths.data_root" in message
+
+
+def test_reranker_model_symlink_escape_rejected(config_dict_factory: object) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    data_root = Path(raw["paths"]["data_root"])
+    (data_root / "models").mkdir(parents=True, exist_ok=True)
+    outside = data_root.parent / "outside-models"
+    outside.mkdir(exist_ok=True)
+    (data_root / "models" / "escaped").symlink_to(outside)
+    raw["retrieval"]["reranker_model"] = "models/escaped"
+    with pytest.raises(ConfigError, match=r"retrieval\.reranker_model.*resolve under paths\.data_root"):
+        load_config_dict(raw)

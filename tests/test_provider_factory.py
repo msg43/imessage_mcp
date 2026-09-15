@@ -38,6 +38,8 @@ from imsg.providers.factory import (
     build_multimodal_provider,
     build_reranker,
     build_text_provider,
+    local_model_id,
+    resolve_local_model_dir,
 )
 from imsg.providers.manifest import default_manifest_path, entries_by_role, load_manifest
 from imsg.retrieval.reranker import FakeRerankerProvider
@@ -458,9 +460,16 @@ def test_config_defaults_mirror_the_manifest_lock(config_dict_factory: Any) -> N
 
     reranker = by_role["reranker"]
     assert (cfg.retrieval.reranker_model, constants.RERANKER_MODEL_REVISION) == (
-        reranker.repo,
-        reranker.revision,
+        reranker.config_model,
+        reranker.config_revision,
     )
+    # The reranker is pinned as a local conversion (owner decision
+    # 2026-09-15): the config names its data-root-relative output_dir and
+    # the UPSTREAM commit the conversion derives from, never a Hub repo.
+    assert reranker.local_conversion, "the reranker pin is expected to be a local conversion"
+    assert reranker.output_dir == constants.RERANKER_MODEL
+    assert reranker.upstream_revision == constants.RERANKER_MODEL_REVISION
+    assert constants.RERANKER_MODEL.startswith("models/")
 
     boundary = by_role["segment_boundaries"]
     assert (cfg.segmentation.boundary_model, cfg.segmentation.boundary_revision) == (
@@ -511,3 +520,83 @@ def test_config_defaults_mirror_the_manifest_lock(config_dict_factory: Any) -> N
         "transcription",
         "caption",
     }
+
+
+# --------------------------------------------------------------------------
+# the reranker as a local conversion: a directory under paths.data_root
+# --------------------------------------------------------------------------
+
+UPSTREAM_SHA = "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c"
+LOCAL_DIR = "models/example-reranker-mxfp8-3c3c3c3c"
+
+
+def _local_reranker_config(config_dict_factory: Any, value: str) -> Config:
+    raw = config_dict_factory()
+    del raw["models"]  # real backend
+    raw["retrieval"]["reranker_model"] = value
+    raw["retrieval"]["reranker_revision"] = UPSTREAM_SHA
+    return load_config_dict(raw)
+
+
+def test_reranker_directory_under_data_root_builds_with_revision_none_and_a_relative_model_id(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _install_stub_modules(monkeypatch)
+    cfg = _local_reranker_config(config_dict_factory, LOCAL_DIR + "/")
+    directory = cfg.paths.data_root / LOCAL_DIR
+    directory.mkdir(parents=True)
+
+    provider = build_reranker(cfg)
+    assert type(provider).__name__ == REAL_PROVIDERS["reranker"].class_name
+    # The provider gets the resolved directory and no revision; the id it
+    # records is the config's relative path plus the upstream sha — never
+    # the absolute path.
+    assert calls["reranker"] == [
+        ((str(directory.resolve()), None), {"model_id": f"{LOCAL_DIR}@{UPSTREAM_SHA}"})
+    ]
+
+
+def test_reranker_repo_id_stays_a_hub_pin_when_no_such_directory_exists(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _install_stub_modules(monkeypatch)
+    cfg = _local_reranker_config(config_dict_factory, "example-org/Example-Reranker-8bit")
+    assert not (cfg.paths.data_root / "example-org").exists()
+    build_reranker(cfg)
+    assert calls["reranker"] == [(("example-org/Example-Reranker-8bit", UPSTREAM_SHA), {})]
+
+
+def test_reranker_missing_models_directory_is_one_clear_error_not_a_hub_lookup(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _install_stub_modules(monkeypatch)
+    cfg = _local_reranker_config(config_dict_factory, "models/not-converted-yet")
+    with pytest.raises(ProviderUnavailableError) as excinfo:
+        build_reranker(cfg)
+    message = str(excinfo.value)
+    assert "'models/not-converted-yet' names a directory under paths.data_root" in message
+    assert "does not exist" in message
+    assert "models/manifest.lock.yaml" in message and "command" in message
+    assert "Hugging Face repo id" in message
+    assert calls["reranker"] == []  # never handed to the Hub
+
+
+def test_resolve_local_model_dir_follows_the_containment_rule(tmp_path: Path) -> None:
+    data_root = tmp_path / "root"
+    (data_root / "models" / "present").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (data_root / "models" / "escape").symlink_to(outside)
+
+    assert resolve_local_model_dir(data_root, "models/present") == (
+        data_root / "models" / "present"
+    ).resolve()
+    assert resolve_local_model_dir(data_root, "models/absent") is None
+    assert resolve_local_model_dir(data_root, "example-org/repo") is None
+    with pytest.raises(ProviderUnavailableError, match=r"outside paths\.data_root"):
+        resolve_local_model_dir(data_root, "models/escape")
+
+
+def test_local_model_id_is_the_normalised_relative_dir_at_the_upstream_sha() -> None:
+    assert local_model_id("models/x/", UPSTREAM_SHA) == f"models/x@{UPSTREAM_SHA}"
+    assert local_model_id("models//y", UPSTREAM_SHA) == f"models/y@{UPSTREAM_SHA}"

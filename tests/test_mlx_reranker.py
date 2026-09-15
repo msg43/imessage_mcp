@@ -6,6 +6,7 @@ path."""
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import pytest
 
@@ -240,3 +241,23 @@ def test_load_failure_surfaces_as_mlx_runtime_error(monkeypatch: pytest.MonkeyPa
     with pytest.raises(MlxRuntimeError) as excinfo:
         _provider().score("q", ["d"])
     assert "org/rerank@rev2" in str(excinfo.value)
+
+
+# --- a local conversion: directory, no revision, relative model_id ---------
+
+
+def test_model_id_override_records_the_relative_dir_not_the_absolute_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime = FakeRuntime(model=_model()).install(monkeypatch)
+    directory = tmp_path / "models" / "example-reranker-mxfp8"
+    directory.mkdir(parents=True)
+    provider = MlxRerankerProvider(str(directory), None, model_id="models/example-reranker-mxfp8@rev9")
+    assert provider.model_id == "models/example-reranker-mxfp8@rev9"
+    provider.score("q", ["d"])
+    # Loaded from the directory, with no revision to pin.
+    assert runtime.load_calls == [
+        {"path": str(directory), "tokenizer_config": None, "model_config": None, "revision": None}
+    ]
+    with pytest.raises(ValueError, match="model_id"):
+        MlxRerankerProvider("org/rerank", None, model_id="   ")

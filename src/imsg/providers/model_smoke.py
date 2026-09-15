@@ -6,7 +6,7 @@ This module is the other half of the SPEC's model-manifest requirement —
 the "short smoke-test result" per model. For each entry of
 `models/manifest.lock.yaml`, in this order:
 
-1. **Download** the pinned snapshot:
+1. **Download** a Hub-pinned entry's snapshot:
    `huggingface_hub.snapshot_download(repo, revision=<pinned sha>,
    ignore_patterns=DOWNLOAD_IGNORE_PATTERNS)` into the default Hugging
    Face cache (public artifacts, not corpus-derived state — the
@@ -16,20 +16,15 @@ the "short smoke-test result" per model. For each entry of
    uses the snapshot directory already in the cache instead
    (`cached_snapshot_dir`; `huggingface_hub` would refuse a
    `local_files_only` download for any snapshot missing a file, and
-   never contacts the Hub).
-2. **Checksum** the snapshot as `artifact_sha256` — exact definition:
-   take every regular file in the snapshot directory whose *name* matches
-   one of `ARTIFACT_FILE_PATTERNS` (weights: `*.safetensors`, `*.npz`;
-   config/tokenizer: `*.json`, `*.txt`, `*.model`, `*.tiktoken`,
-   `*.jinja`, `*.py`, `*.jsonl`), skipping hidden files and directories;
-   for each, one line `"<relative POSIX path>  <hex sha256 of the file
-   bytes>\\n"` (two spaces, like `sha256sum`); sort the lines by relative
-   path (plain string order); `artifact_sha256` is the hex SHA-256 of the
-   UTF-8 bytes of those lines concatenated. `README.md`,
-   `.gitattributes` and the `*.bin`/`*.pt` duplicates of safetensors
-   weights (PE-Core's mirror ships both) are deliberately outside the
-   definition, so the digest is the same whether or not a full snapshot
-   was fetched. `artifact_digest()` is the reference implementation.
+   never contacts the Hub). A `source: local_conversion` entry is
+   **located** instead: `<data_root>/<output_dir>` must already exist —
+   the smoke test never converts anything; the recorded `command` in the
+   lock does (`--data-root`, default the config schema's data root).
+2. **Checksum** that directory as `artifact_sha256` —
+   `imsg.providers.manifest.artifact_digest`, the one definition the
+   lock header states, applied to a Hub snapshot and to a converted
+   directory alike (weights and config/tokenizer files by name pattern;
+   `README.md`, `.gitattributes` and `*.bin`/`*.pt` duplicates excluded).
 3. **Build the real provider through `imsg.providers.factory`** — the
    same builders every CLI command uses — from a `Config` whose model
    fields are exactly the manifest pins (`config_from_manifest`), and run
@@ -54,15 +49,16 @@ sentence, a drawn shape); nothing here reads the corpus, and no path
 under `~/Library/Messages` is touched — which is why the `Config` is
 assembled with `model_construct` (its root validators stat the live
 `chat.db` path to prove containment, a check that has no meaning for a
-tool that never opens any of those paths). Text that lands in the lock
-or the report passes through `scrub_private` (home directory and
+tool that never opens any of those paths). Its `paths.data_root` is
+`--data-root`: where a local conversion's `output_dir` lives, and where
+an operator's prompt overrides are looked for. Text that lands in the
+lock or the report passes through `scrub_private` (home directory and
 hostname removed) because the lock is public.
 """
 
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import importlib
 import json
 import math
@@ -100,7 +96,6 @@ from imsg.config.schema import (
 )
 from imsg.enrich.audio import convert_to_whisper_wav
 from imsg.errors import ImsgError
-from imsg.hashing import sha256_file, sha256_text
 from imsg.providers.factory import (
     build_boundary_provider,
     build_enrichment_providers,
@@ -111,31 +106,22 @@ from imsg.providers.factory import (
     resolve_prompt_path,
 )
 from imsg.providers.manifest import (
+    ARTIFACT_FILE_PATTERNS,
+    GIB,
     STATUS_SYSTEM,
+    ArtifactDigest,
+    ArtifactFile,
     ManifestEntry,
     ManifestLock,
+    artifact_digest,
+    default_data_root,
     default_manifest_path,
     entries_by_role,
+    iter_artifact_files,
     load_manifest,
+    local_conversion_dir,
 )
 from imsg.segment.models import MessageForSegmentation
-
-GIB = float(2**30)
-
-ARTIFACT_FILE_PATTERNS: tuple[str, ...] = (
-    "*.safetensors",
-    "*.npz",
-    "*.json",
-    "*.txt",
-    "*.model",
-    "*.tiktoken",
-    "*.jinja",
-    "*.py",
-    "*.jsonl",
-)
-"""The files `artifact_sha256` covers (module docstring, step 2): a
-superset of what `mlx_lm.load` fetches for a repo and of what
-`imsg.embed.pe_core_multimodal` fetches."""
 
 DOWNLOAD_IGNORE_PATTERNS: tuple[str, ...] = ("*.bin", "*.pt", "*.pth")
 """What step 1 leaves out: duplicate weight formats next to safetensors
@@ -356,68 +342,6 @@ def _shorten(text: str, limit: int) -> str:
 
 
 # --------------------------------------------------------------------------
-# artifact checksum
-# --------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class ArtifactFile:
-    relative_path: str
-    sha256: str
-    size_bytes: int
-
-
-@dataclass(frozen=True, slots=True)
-class ArtifactDigest:
-    sha256: str
-    files: tuple[ArtifactFile, ...]
-
-    @property
-    def total_bytes(self) -> int:
-        return sum(f.size_bytes for f in self.files)
-
-
-def iter_artifact_files(
-    snapshot: Path, patterns: Sequence[str] = ARTIFACT_FILE_PATTERNS
-) -> list[Path]:
-    """The regular files under `snapshot` (symlinks into the Hub cache's
-    blob store followed) whose name matches `patterns`, hidden entries
-    skipped, in relative-path order."""
-    matched: list[tuple[str, Path]] = []
-    for path in snapshot.rglob("*"):
-        relative = path.relative_to(snapshot)
-        if any(part.startswith(".") for part in relative.parts):
-            continue
-        if not path.is_file():
-            continue
-        if not any(fnmatch.fnmatch(path.name, pattern) for pattern in patterns):
-            continue
-        matched.append((relative.as_posix(), path))
-    matched.sort(key=lambda item: item[0])
-    return [path for _, path in matched]
-
-
-def artifact_digest(
-    snapshot: Path, patterns: Sequence[str] = ARTIFACT_FILE_PATTERNS
-) -> ArtifactDigest:
-    """`artifact_sha256` exactly as the module docstring defines it, plus
-    the per-file lines it was computed from."""
-    if not snapshot.is_dir():
-        raise SmokeError(f"snapshot directory does not exist: '{snapshot}'")
-    files: list[ArtifactFile] = []
-    for path in iter_artifact_files(snapshot, patterns):
-        relative = path.relative_to(snapshot).as_posix()
-        files.append(ArtifactFile(relative, sha256_file(path), path.stat().st_size))
-    if not files:
-        raise SmokeError(
-            f"snapshot '{snapshot}' holds no weight or config files matching {list(patterns)}"
-        )
-    files.sort(key=lambda item: item.relative_path)
-    listing = "".join(f"{item.relative_path}  {item.sha256}\n" for item in files)
-    return ArtifactDigest(sha256=sha256_text(listing), files=tuple(files))
-
-
-# --------------------------------------------------------------------------
 # download
 # --------------------------------------------------------------------------
 
@@ -484,6 +408,24 @@ def fetch_snapshot(
             ignore_patterns=list(DOWNLOAD_IGNORE_PATTERNS),
         )
     )
+
+
+def locate_local_conversion(entry: ManifestEntry, data_root: Path | None) -> Path:
+    """Step 1 for a `source: local_conversion` entry: its `output_dir`
+    under `data_root`, which must already exist — the smoke test never
+    runs the conversion itself."""
+    if data_root is None:
+        raise SmokeError(
+            f"entry '{entry.name}' is a local conversion under paths.data_root; pass --data-root"
+        )
+    directory = local_conversion_dir(entry, data_root)
+    if not directory.is_dir():
+        raise SmokeError(
+            f"local conversion '{entry.output_dir}' is not a directory under data_root "
+            f"'{scrub_private(str(data_root))}' — produce it with the command recorded in the "
+            f"lock ({entry.tool}); the smoke test never converts"
+        )
+    return directory
 
 
 # --------------------------------------------------------------------------
@@ -790,12 +732,19 @@ def check_multimodal(provider: Any, image_path: Path, *, dim: int) -> str:
 
 
 def _pin(by_role: Mapping[str, ManifestEntry], role: str) -> tuple[str, str]:
+    """What the config carries for `role`: `(repo, sha)` for a Hub pin,
+    `(output_dir, upstream sha)` for a local conversion — the factory
+    resolves the latter under `paths.data_root`."""
     entry = by_role.get(role)
     if entry is None:
         raise SmokeError(f"the lock has no entry for role '{role}'")
-    if not entry.repo or not entry.revision:
-        raise SmokeError(f"lock entry '{entry.name}' (role '{role}') has no repo/revision pin")
-    return entry.repo, entry.revision
+    model, revision = entry.config_model, entry.config_revision
+    if not model or not revision:
+        raise SmokeError(
+            f"lock entry '{entry.name}' (role '{role}') has no repo/revision pin and is not a "
+            f"local conversion"
+        )
+    return model, revision
 
 
 def config_from_manifest(lock: ManifestLock, *, data_root: Path) -> Config:
@@ -803,8 +752,9 @@ def config_from_manifest(lock: ManifestLock, *, data_root: Path) -> Config:
     backend is `real`, for `imsg.providers.factory`. The sections are
     validated individually; the root is assembled with `model_construct`
     so the root path-containment validators — which resolve the live
-    `chat.db` path — never run (module docstring). `data_root` only
-    decides where prompt overrides would be looked for."""
+    `chat.db` path — never run (module docstring). `data_root` is where
+    a local conversion's `output_dir` is resolved and where prompt
+    overrides would be looked for."""
     by_role = entries_by_role(lock)
     text_repo, text_revision = _pin(by_role, "text_embedding")
     mm_repo, mm_revision = _pin(by_role, "multimodal_embedding")
@@ -1009,17 +959,22 @@ class EntryResult:
     """`passed` | `failed` | `skipped`."""
     roles: list[RoleResult] = field(default_factory=list)
     artifact_sha256: str | None = None
+    artifact_bytes: int | None = None
+    """Bytes covered by `artifact_sha256` (downloaded or already local)."""
     download_seconds: float | None = None
     download_bytes: int | None = None
+    """`artifact_bytes` for a Hub entry; `None` for a local conversion,
+    which downloads nothing."""
     snapshot_path: str | None = None
     error: str | None = None
-    """A failure before any role ran (download, checksum)."""
+    """A failure before any role ran (download, locate, checksum)."""
 
     def to_json(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "status": self.status,
             "artifact_sha256": self.artifact_sha256,
+            "artifact_bytes": self.artifact_bytes,
             "download_seconds": self.download_seconds,
             "download_bytes": self.download_bytes,
             "snapshot_path": self.snapshot_path,
@@ -1126,10 +1081,12 @@ def run_entry(
     clock: Callable[[], float] = time.perf_counter,
     out: TextIO | None = None,
     cache_dir: Path | None = None,
+    data_root: Path | None = None,
 ) -> EntryResult:
-    """Steps 1 and 2 (download + checksum) for a hosted entry, then every
-    requested role through `runner`. A download or checksum failure ends
-    the entry: nothing that did not download can be smoke-tested."""
+    """Steps 1 and 2 (download or locate, then checksum) for a hosted
+    entry or a local conversion, then every requested role through
+    `runner`. A download, locate or checksum failure ends the entry:
+    nothing that is not on disk can be smoke-tested."""
     stream = out or sys.stdout
     result = EntryResult(name=entry.name, status="failed")
     if entry.hosted:
@@ -1141,12 +1098,30 @@ def run_entry(
             result.download_seconds = clock() - started
             digest = artifact_digest(snapshot)
             result.artifact_sha256 = digest.sha256
+            result.artifact_bytes = digest.total_bytes
             result.download_bytes = digest.total_bytes
             result.snapshot_path = scrub_private(str(snapshot))
             print(
                 f"  {entry.name}: snapshot {result.snapshot_path} — {len(digest.files)} files, "
                 f"{digest.total_bytes / GIB:.2f} GiB, {result.download_seconds:.1f}s; "
                 f"artifact_sha256 {digest.sha256}",
+                file=stream,
+            )
+        except Exception as exc:
+            result.error = scrub_private(f"{type(exc).__name__}: {exc}")
+            print(f"  {entry.name}: FAILED before any model ran — {result.error}", file=stream)
+            return result
+    elif entry.local_conversion:
+        try:
+            directory = locate_local_conversion(entry, data_root)
+            digest = artifact_digest(directory)
+            result.artifact_sha256 = digest.sha256
+            result.artifact_bytes = digest.total_bytes
+            result.snapshot_path = scrub_private(str(directory))
+            print(
+                f"  {entry.name}: local conversion {result.snapshot_path} — "
+                f"{len(digest.files)} files, {digest.total_bytes / GIB:.2f} GiB (nothing "
+                f"downloaded); artifact_sha256 {digest.sha256}",
                 file=stream,
             )
         except Exception as exc:
@@ -1192,8 +1167,10 @@ def _print_role_result(role_result: RoleResult, stream: TextIO) -> None:
 # --------------------------------------------------------------------------
 
 
-def in_process_runner(lock: ManifestLock, work_dir: Path, deps: SmokeDeps) -> RoleRunner:
-    cfg = config_from_manifest(lock, data_root=work_dir)
+def in_process_runner(
+    lock: ManifestLock, work_dir: Path, deps: SmokeDeps, *, data_root: Path
+) -> RoleRunner:
+    cfg = config_from_manifest(lock, data_root=data_root)
 
     def _run(entry: ManifestEntry, role: str) -> RoleResult:
         return run_role(entry, role, cfg, work_dir / entry.name, deps)
@@ -1202,7 +1179,14 @@ def in_process_runner(lock: ManifestLock, work_dir: Path, deps: SmokeDeps) -> Ro
 
 
 def run_child(
-    lock_path: Path, entry_name: str, role: str, work_dir: Path, result_json: Path, deps: SmokeDeps
+    lock_path: Path,
+    entry_name: str,
+    role: str,
+    work_dir: Path,
+    result_json: Path,
+    deps: SmokeDeps,
+    *,
+    data_root: Path,
 ) -> int:
     """`--child`: one (entry, role) in this process, result written as JSON
     for the parent. Exit 0 when the check passed, 1 when it failed, 2
@@ -1212,7 +1196,7 @@ def run_child(
         entry = next((e for e in lock.entries if e.name == entry_name), None)
         if entry is None:
             raise SmokeError(f"no entry '{entry_name}' in {lock_path}")
-        cfg = config_from_manifest(lock, data_root=work_dir)
+        cfg = config_from_manifest(lock, data_root=data_root)
     except ImsgError as exc:
         print(f"smoke child: {exc}", file=sys.stderr)
         return 2
@@ -1228,6 +1212,7 @@ def spawn_role(
     role: str,
     work_dir: Path,
     *,
+    data_root: Path | None = None,
     python: str = sys.executable,
     out: TextIO | None = None,
     tail_lines: int = 40,
@@ -1257,6 +1242,8 @@ def spawn_role(
         "--result-json",
         str(result_json),
     ]
+    if data_root is not None:
+        command += ["--data-root", str(data_root)]
     tail: deque[str] = deque(maxlen=tail_lines)
     with subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
@@ -1286,10 +1273,17 @@ def spawn_role(
 
 
 def subprocess_runner(
-    lock_path: Path, work_dir: Path, *, python: str = sys.executable, out: TextIO | None = None
+    lock_path: Path,
+    work_dir: Path,
+    *,
+    data_root: Path,
+    python: str = sys.executable,
+    out: TextIO | None = None,
 ) -> RoleRunner:
     def _run(entry: ManifestEntry, role: str) -> RoleResult:
-        return spawn_role(lock_path, entry, role, work_dir, python=python, out=out)
+        return spawn_role(
+            lock_path, entry, role, work_dir, data_root=data_root, python=python, out=out
+        )
 
     return _run
 
@@ -1558,6 +1552,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Hugging Face cache root for --skip-download (default: huggingface_hub's own).",
     )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=None,
+        help="paths.data_root: where a local conversion's output_dir lives and where prompt "
+        "overrides are looked for (default: the config schema's default data root).",
+    )
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--result-json", type=Path, default=None, help=argparse.SUPPRESS)
     return parser
@@ -1583,6 +1584,7 @@ def main(
     lock_path = args.lock or default_manifest_path()
     active_deps = deps or default_deps()
     work_dir = (args.work_dir or _default_work_dir()).resolve()
+    data_root = args.data_root or default_data_root()
 
     if args.child:
         if len(args.only) != 1 or len(args.role) != 1 or args.result_json is None:
@@ -1592,7 +1594,13 @@ def main(
             )
             return 2
         return run_child(
-            lock_path, args.only[0], args.role[0], work_dir, args.result_json, active_deps
+            lock_path,
+            args.only[0],
+            args.role[0],
+            work_dir,
+            args.result_json,
+            active_deps,
+            data_root=data_root,
         )
 
     try:
@@ -1604,13 +1612,14 @@ def main(
     role_filter = set(args.role)
     print(
         f"manifest: {lock_path} ({len(entries)} of {len(lock.entries)} entries selected); "
-        f"host: {active_deps.host_class}; work dir: {scrub_private(str(work_dir))}",
+        f"host: {active_deps.host_class}; work dir: {scrub_private(str(work_dir))}; "
+        f"data_root: {scrub_private(str(data_root))}",
         file=stream,
     )
     runner = (
-        in_process_runner(lock, work_dir, active_deps)
+        in_process_runner(lock, work_dir, active_deps, data_root=data_root)
         if args.in_process
-        else subprocess_runner(lock_path, work_dir, out=stream)
+        else subprocess_runner(lock_path, work_dir, data_root=data_root, out=stream)
     )
 
     results: list[EntryResult] = []
@@ -1636,6 +1645,7 @@ def main(
                 clock=active_deps.clock,
                 out=stream,
                 cache_dir=args.hub_cache,
+                data_root=data_root,
             )
         )
 
@@ -1655,7 +1665,7 @@ def main(
     print("\nsummary:", file=stream)
     for result in results:
         size = (
-            f"{result.download_bytes / GIB:.2f} GiB" if result.download_bytes is not None else "-"
+            f"{result.artifact_bytes / GIB:.2f} GiB" if result.artifact_bytes is not None else "-"
         )
         sha = result.artifact_sha256 or "-"
         print(f"  {result.status:8} {result.name:22} {size:>10}  {sha}", file=stream)
@@ -1740,6 +1750,7 @@ __all__ = [
     "fetch_snapshot",
     "in_process_runner",
     "iter_artifact_files",
+    "locate_local_conversion",
     "main",
     "ordered_entries",
     "parse_vm_stat",

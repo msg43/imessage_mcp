@@ -36,7 +36,9 @@ policy:
 # `models`, `embedding`, `retrieval`, `segmentation` and `enrichment`
 # sections below. Every repo id + revision here is pinned in
 # models/manifest.lock.yaml (the source of truth; `imsg models verify`
-# reports drift). Real backends need the `models` extra:
+# reports drift, and checks local conversions' directories under
+# data_root against their recorded digest). Real backends need the
+# `models` extra:
 #   uv sync --extra models
 models:
   backend: real                  # real | fake. `fake` = deterministic test stand-ins, explicit
@@ -96,8 +98,18 @@ retrieval:
   k_vector: 100
   rrf_k: 60
   rerank_top: 50
-  reranker_model: mlx-community/Qwen3-Reranker-8B-mxfp8
-  reranker_revision: a8947a5fe4c62cc1feb8dffa89d49502c8c80923   # immutable commit sha (manifest pin)
+  # The reranker is pinned as a LOCAL CONVERSION (models/manifest.lock.yaml,
+  # `source: local_conversion`): reranker_model is that entry's output_dir, a
+  # directory relative to data_root that the lock's recorded `command`
+  # produces from the upstream repo (the mlx-community conversion ships no
+  # lm_head and cannot score). The other accepted form is a Hugging Face repo
+  # id (owner/name); the factory reads the value as a directory when
+  # <data_root>/<value> exists and as a repo id otherwise. Absolute paths,
+  # `~` and `..` are rejected — a directory must stay under data_root.
+  reranker_model: models/qwen3-reranker-8b-mxfp8-77d193c7
+  reranker_revision: 77d193c791ed757ca307ee72715aa132723da912   # the UPSTREAM commit the conversion was made from
+                                                                # (Qwen/Qwen3-Reranker-8B; manifest upstream_revision).
+                                                                # For a repo id: that repo's immutable commit sha.
   default_limit: 10
 
 render:
