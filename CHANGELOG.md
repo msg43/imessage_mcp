@@ -10,6 +10,42 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-15 — backfill names its residue: `unsupported` populated, NULL-path rows are `missing`, long-name bug fixed
+
+The first AT-3 run against a real corpus reported `unsupported: 0`,
+`dataless_retrying: 1,362` and `error: 211` — three misdescriptions of
+the same residue. Read from the live rows rather than the report:
+
+- **Out-of-root source paths are `unsupported`, not `error`.** The
+  containment check is unchanged and still refuses; the outcome is now a
+  terminal `unsupported[<class>]: …` with no retry schedule, classed by
+  path shape only (`temp-directory-path`, `sticker-cache-path`,
+  `out-of-root-path`) — the deterministic OSErrors `EISDIR`/`ENAMETOOLONG`
+  join it (`is-a-directory`, `file-name-too-long`); everything else stays
+  transient with backoff. A pre-pass reclassifies existing rows without
+  reading anything.
+- **A row with no source path is `missing` from the start** (extract), and
+  a pre-pass heals existing `dataless` NULL-path rows; there is no
+  placeholder to read, so "retrying" was false. Re-extraction leaves the
+  state alone except `missing` → `dataless` when a path arrives.
+- **`--retry-failed`** on `backfill-attachments` mirrors enrich's flag:
+  `error` and `missing` rows with a path become eligible now;
+  `unsupported` and NULL-path rows are never reset.
+- **Two "file name too long" failures were ours:** the `.partial` temp
+  name was built from the full basename (251 and 238 chars) and crossed
+  NAME_MAX. Bounded to 64 chars; both files then materialized.
+- **The printed report now equals `GROUP BY state`** for every terminal
+  outcome (the containment branch used to count rows that became
+  `missing` as `errored`); a test runs one pass producing every outcome
+  and asserts report == database.
+- AT-3 buckets `unsupported` and sub-counts it by reason class in the text
+  report and the CSV; the rendered reason never carries the offending path.
+
+Measured on the real index after one pass: materialized 99,121 / missing
+1,362 / unsupported 443 (362 temp-directory, 73 sticker-cache, 8
+directory) / error 0 of 100,926 rows; AT-3 PASS at 98.21 % present.
+Suite: 1,385 passed with a scratch database.
+
 ## 2026-09-15 — the reranker is pinned as a reproducible local conversion (`source: local_conversion`)
 
 - Owner decision: the reranker stays local. `models/manifest.lock.yaml` gains a
