@@ -10,6 +10,42 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-15 — identity changes now mark their chats for re-segmentation
+
+Rendered segments carry people's names — the chat header lists
+participants and every line is `[HH:MM] <short_name>: …` — but
+`find_dirty_chats` keys on `message.updated_at`, and `rename_person` /
+`merge_persons` / `assign_handle` bumped only `person.updated_at`. So a
+rename after segmentation never re-rendered anything and the index kept
+the old name silently. Non-negotiable #3 makes that a correctness bug.
+
+- `_mark_chats_dirty_for_persons` runs inside each mutation's existing
+  transaction, so every caller (interactive commands, `apply-overrides`,
+  `rematch-stubs`) inherits it and a dry-run rollback undoes it. It
+  collects chats by the three paths the renderer actually reads —
+  non-owner participants, non-`is_from_me` message senders, non-`is_from_me`
+  tapback senders — then does one set-based `UPDATE message SET updated_at
+  = now() … WHERE updated_at < now()`. The guard deduplicates within a
+  transaction (probed: a second rename in the same transaction rewrites 0
+  rows), which at full `rematch-stubs` scale is 95,516 rewrites instead of
+  135,821. A merge marks only the kept person, which by then holds both
+  sides' rows; an assign marks the old and the new person.
+- End-to-end DB-gated test: segment a chat, embed it, rename a
+  participant, assert the chat is dirty from its first message, re-segment,
+  assert the rendered text carries the new name and `rendered_sha256`
+  changed — which is exactly what makes `imsg embed` re-embed it.
+- Owner guard: renaming the owner now needs `--yes-owner`. Belt-and-braces
+  by measurement — an owner rename marks 0 chats and re-rendering
+  reproduces the stored text byte for byte, because nothing rendered names
+  the owner.
+- Every curation command prints `chats marked for re-segmentation: N` and,
+  when non-zero, says to run `imsg segment` then `imsg embed`.
+- Known follow-up: `tapback.sender_person_id` is unindexed, so that branch
+  sequentially scans (~5–18 ms per call); irrelevant for a handful of
+  renames, roughly 1–3 minutes inside a full-scale rematch.
+
+Suite: 1,442 passed with a scratch database.
+
 ## 2026-09-15 — embedding was 3.9× slower than it had to be: padding and an unbounded MLX cache
 
 Measured on the first full-corpus `imsg embed` run (benchmark
