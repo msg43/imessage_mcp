@@ -42,7 +42,11 @@ def materialize_attachment(source_path: Path, data_root: Path) -> MaterializeRes
     resolved_source = resolve_path(source_path)
     tmp_root = data_root / "attachments" / ".tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
-    tmp_path = tmp_root / f"{resolved_source.name}.{id(resolved_source)}.partial"
+    # The source's own name is kept (truncated) only as a debugging aid
+    # for a stray partial; it must never make the temp path itself
+    # over-long, or the cleanup in `finally` raises ENAMETOOLONG and
+    # masks the real error from the read that failed first.
+    tmp_path = tmp_root / f"{resolved_source.name[:64]}.{id(resolved_source)}.partial"
 
     byte_size = 0
     try:

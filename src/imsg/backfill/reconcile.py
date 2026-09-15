@@ -12,16 +12,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from imsg.backfill.classify import parse_unsupported_reason
+
 if TYPE_CHECKING:
     import psycopg
 
 _GAP_REASONS = {
-    "missing": "iCloud never materialized this file after repeated attempts",
+    "missing": "nothing to materialize: no source path, or iCloud never delivered the file "
+    "after repeated attempts",
     "error": "last materialization attempt errored",
     "dataless": "not yet materialized",
     "materializing": "materialization was in progress and never completed "
     "(likely an interrupted run)",
 }
+
+UNSPECIFIED_UNSUPPORTED_REASON = "unspecified"
+"""`unsupported_reason` for an `unsupported` row whose
+`materialization_last_error` does not carry the `unsupported[...]`
+prefix `imsg.backfill.classify` writes — reported as such rather than
+guessed at."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +39,10 @@ class ReconciliationGap:
     attachment_key: str
     state: str
     reason: str
+    unsupported_reason: str | None = None
+    """For `state == 'unsupported'`, the reason class parsed from
+    `materialization_last_error` (an `UnsupportedReason` value, or
+    `UNSPECIFIED_UNSUPPORTED_REASON`); `None` for every other state."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +58,25 @@ class ReconciliationReport:
         return self.materialized_and_present / self.total
 
 
+def _describe_gap(state: str, last_error: str | None) -> tuple[str, str | None]:
+    """`(reason, unsupported_reason)` for a non-present row. Only the
+    reason *class* is surfaced for `unsupported` rows — the stored
+    `materialization_last_error` also carries the offending path, which
+    belongs in the database, not in every rendering of the report."""
+    if state == "materialized":
+        return "row says materialized but the cache file is missing on disk", None
+    if state == "unsupported":
+        parsed = parse_unsupported_reason(last_error)
+        if parsed is None:
+            return (
+                f"unsupported ({UNSPECIFIED_UNSUPPORTED_REASON}): can never be materialized; "
+                "no reason class recorded",
+                UNSPECIFIED_UNSUPPORTED_REASON,
+            )
+        return f"unsupported ({parsed.value}): {parsed.description}", parsed.value
+    return _GAP_REASONS.get(state, f"unrecognized state {state!r}"), None
+
+
 def build_reconciliation_report(conn: psycopg.Connection) -> ReconciliationReport:
     """Cross-checks every attachment row's `state`/`cache_path` against
     the real filesystem. Takes no `data_root` — `cache_path` is stored
@@ -54,27 +86,36 @@ def build_reconciliation_report(conn: psycopg.Connection) -> ReconciliationRepor
     reports a gap if that trust turns out to be misplaced.
     """
     with conn.cursor() as cur:
-        cur.execute("SELECT attachment_id, attachment_key, state, cache_path FROM attachment")
+        cur.execute(
+            "SELECT attachment_id, attachment_key, state, cache_path, materialization_last_error "
+            "FROM attachment"
+        )
         rows = cur.fetchall()
 
     present = 0
     gaps: list[ReconciliationGap] = []
-    for attachment_id, attachment_key, state, cache_path in rows:
+    for attachment_id, attachment_key, state, cache_path, last_error in rows:
         on_disk = bool(cache_path) and Path(cache_path).is_file()
         if state == "materialized" and on_disk:
             present += 1
             continue
-        if state == "materialized" and not on_disk:
-            reason = "row says materialized but the cache file is missing on disk"
-        else:
-            reason = _GAP_REASONS.get(state, f"unrecognized state {state!r}")
+        reason, unsupported_reason = _describe_gap(state, last_error)
         gaps.append(
             ReconciliationGap(
-                attachment_id=attachment_id, attachment_key=attachment_key, state=state, reason=reason
+                attachment_id=attachment_id,
+                attachment_key=attachment_key,
+                state=state,
+                reason=reason,
+                unsupported_reason=unsupported_reason,
             )
         )
 
     return ReconciliationReport(total=len(rows), materialized_and_present=present, gaps=tuple(gaps))
 
 
-__all__ = ["ReconciliationGap", "ReconciliationReport", "build_reconciliation_report"]
+__all__ = [
+    "UNSPECIFIED_UNSUPPORTED_REASON",
+    "ReconciliationGap",
+    "ReconciliationReport",
+    "build_reconciliation_report",
+]

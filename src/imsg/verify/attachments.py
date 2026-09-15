@@ -25,7 +25,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from imsg.backfill.reconcile import ReconciliationGap, build_reconciliation_report
+from imsg.backfill.reconcile import (
+    UNSPECIFIED_UNSUPPORTED_REASON,
+    ReconciliationGap,
+    build_reconciliation_report,
+)
 from imsg.hashing import sha256_file
 
 if TYPE_CHECKING:
@@ -37,22 +41,23 @@ _STATE_TO_CATEGORY = {
     "dataless": "dataless_retrying",
     "materializing": "dataless_retrying",  # interrupted run — a re-run naturally retries it
     "missing": "remote_missing",
+    "unsupported": "unsupported",
     "error": "error",
     # 'materialized' rows never appear as a *gap* under a matching state — see
     # `_classify` below for the "state says materialized but the file is
     # absent/mismatched" case, which is a data-integrity error, not a
     # not-yet-materialized state.
 }
-"""SPEC §12 AT-3 names an `unsupported` exception category (a MIME/UTI
-S5a will never be able to materialize), but `materialization_state`
-(migration 0001) has no such state — S5a's router has no "this type
-cannot ever be fetched" outcome, only the backoff/retry states listed
-above. `_classify` below never produces `unsupported` as a result
-today; the category is kept in `EXCEPTION_CATEGORIES` so the manifest
-shape matches the spec exactly and the bucket is ready the day such a
-state exists, but its count will always be 0 against the current
-schema — flagged in the build report as a spec/schema gap, not
-silently worked around."""
+"""One category per non-present state. `unsupported` is a real state
+since migration 0003 and S5a populates it (`imsg.backfill.classify`)
+for a row that can never be materialized — a source path outside the
+attachments root (temp directory, sticker cache, other), a path that
+names a directory, a path component too long for the filesystem. The
+report sub-counts those reason classes (`AT3Report.unsupported_by_reason`)
+so the owner signing off on the exception manifest sees *why*, not
+just how many. `missing` covers both a NULL source path (nothing on
+disk to read — S2 inserts those as `missing` directly) and a placeholder
+iCloud never delivered after repeated attempts."""
 
 
 def _classify(gap: ReconciliationGap) -> str:
@@ -72,6 +77,9 @@ class ExceptionEntry:
     state: str
     category: str
     reason: str
+    reason_class: str | None = None
+    """For `category == 'unsupported'`, the reason class
+    (`ReconciliationGap.unsupported_reason`); `None` otherwise."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +105,9 @@ class AT3Report:
     exceptions: tuple[ExceptionEntry, ...]
     """Every non-materialized-and-present row, classified — the
     exception manifest SPEC §12 AT-3 requires."""
+    unsupported_by_reason: dict[str, int]
+    """reason class -> count, over the `unsupported` exceptions (sorted
+    by class). Empty when there are none."""
     integrity_sample: tuple[IntegritySampleResult, ...]
     integrity_sample_ok_count: int
     passed: bool
@@ -219,9 +230,15 @@ def build_at3_report(
             state=gap.state,
             category=_classify(gap),
             reason=gap.reason,
+            reason_class=gap.unsupported_reason,
         )
         for gap in base.gaps
     )
+    unsupported_by_reason: dict[str, int] = {}
+    for entry in exceptions:
+        if entry.category == "unsupported":
+            key = entry.reason_class or UNSPECIFIED_UNSUPPORTED_REASON
+            unsupported_by_reason[key] = unsupported_by_reason.get(key, 0) + 1
 
     rng = random.Random(seed)
     sample_ids = (
@@ -252,6 +269,7 @@ def build_at3_report(
         by_year={k: (v[0], v[1]) for k, v in sorted(by_year.items())},
         by_mime_type={k: (v[0], v[1]) for k, v in sorted(by_mime.items())},
         exceptions=exceptions,
+        unsupported_by_reason=dict(sorted(unsupported_by_reason.items())),
         integrity_sample=integrity_sample,
         integrity_sample_ok_count=ok_count,
         passed=not reasons,
@@ -282,10 +300,19 @@ def report_to_csv(report: AT3Report) -> str:
             ["by_mime_type", mime, present, total, f"{(present / total) if total else 1.0:.4f}"]
         )
 
+    for reason_class, count in report.unsupported_by_reason.items():
+        # Sub-counts of the `unsupported` category; a count, not a rate,
+        # so the `materialized_present`/`ratio` columns stay blank.
+        writer.writerow(["unsupported_by_reason", reason_class, "", count, ""])
+
     writer.writerow([])
-    writer.writerow(["attachment_id", "attachment_key", "state", "category", "reason"])
+    writer.writerow(
+        ["attachment_id", "attachment_key", "state", "category", "reason_class", "reason"]
+    )
     for e in report.exceptions:
-        writer.writerow([e.attachment_id, e.attachment_key, e.state, e.category, e.reason])
+        writer.writerow(
+            [e.attachment_id, e.attachment_key, e.state, e.category, e.reason_class or "", e.reason]
+        )
 
     writer.writerow([])
     writer.writerow(["sample_attachment_id", "sample_attachment_key", "cache_path", "ok", "detail"])
@@ -316,6 +343,9 @@ def format_report_text(report: AT3Report) -> str:
     lines.append("  exception categories:")
     for cat in EXCEPTION_CATEGORIES:
         lines.append(f"    {cat}: {category_counts.get(cat, 0)}")
+        if cat == "unsupported":
+            for reason_class, count in report.unsupported_by_reason.items():
+                lines.append(f"      {reason_class}: {count}")
     lines.append(f"  VERDICT: {'PASS' if report.passed else 'FAIL'}")
     for reason in report.reasons:
         lines.append(f"    - {reason}")

@@ -1463,6 +1463,14 @@ def backfill_attachments(
             "--yes-full-run", help="Skip the first-run 12-file trial gate (SPEC §8 S5a)."
         ),
     ] = False,
+    retry_failed: Annotated[
+        bool,
+        typer.Option(
+            "--retry-failed",
+            help="Put failed rows (state error or missing, with a source path) back on the "
+            "retry ladder first — attempts 0, eligible now — so they are re-examined this run.",
+        ),
+    ] = False,
     dry_run: DryRunOption = False,
 ) -> None:
     """S5a — materialize iCloud-optimized attachments locally (SPEC §8 S5a)."""
@@ -1479,6 +1487,7 @@ def backfill_attachments(
             rate_per_minute=rate,
             yes_full_run=yes_full_run,
             dry_run=dry_run,
+            retry_failed=retry_failed,
         )
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
@@ -1486,10 +1495,20 @@ def backfill_attachments(
     finally:
         conn.close()
 
+    # Two lines, two kinds of write: what this run attempted, and what it
+    # reclassified without reading (see `imsg.backfill.pipeline`'s
+    # docstring). Every count here is a row the database now holds in
+    # that state.
     typer.echo(
         f"backfill-attachments: considered={report.considered} "
-        f"materialized={report.materialized} errored={report.errored} "
-        f"marked_missing={report.marked_missing}"
+        f"materialized={report.materialized} unsupported={report.marked_unsupported} "
+        f"errored={report.errored} marked_missing={report.marked_missing}"
+    )
+    typer.echo(
+        f"backfill-attachments: reclassified without reading — "
+        f"unsupported={report.reclassified_unsupported} "
+        f"missing_no_source_path={report.reclassified_missing_no_source}; "
+        f"retry_failed_reset={report.retry_reset}"
     )
     if report.trial_gate_capped:
         typer.echo(

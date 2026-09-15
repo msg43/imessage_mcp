@@ -24,6 +24,7 @@ from imsg.hashing import sha256_text
 from imsg.verify.attachments import (
     EXCEPTION_CATEGORIES,
     build_at3_report,
+    format_report_text,
     report_to_csv,
 )
 
@@ -117,15 +118,17 @@ def _insert_attachment(
     cache_path: str | None = None,
     sha256: str | None = None,
     mime_type: str | None = "image/png",
+    last_error: str | None = None,
 ) -> int:
     guid = f"att-{uuid.uuid4()}"
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO attachment (source_guid, attachment_key, state, cache_path, sha256, mime_type)
-            VALUES (%s, %s, %s, %s, %s, %s) RETURNING attachment_id
+            INSERT INTO attachment (source_guid, attachment_key, state, cache_path, sha256,
+                                    mime_type, materialization_last_error)
+            VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING attachment_id
             """,
-            (guid, f"akey-{guid}", state, cache_path, sha256, mime_type),
+            (guid, f"akey-{guid}", state, cache_path, sha256, mime_type, last_error),
         )
         attachment_id = int(cur.fetchone()[0])  # type: ignore[index]
         cur.execute(
@@ -142,24 +145,73 @@ def test_at3_report_classifies_every_gap_into_a_known_category(
     m2 = _insert_chat_and_message(scratch_db, sent_at=datetime(2023, 6, 2, tzinfo=UTC))
     m3 = _insert_chat_and_message(scratch_db, sent_at=datetime(2024, 1, 1, tzinfo=UTC))
     m4 = _insert_chat_and_message(scratch_db, sent_at=datetime(2024, 1, 2, tzinfo=UTC))
+    m5 = _insert_chat_and_message(scratch_db, sent_at=datetime(2024, 1, 3, tzinfo=UTC))
 
     _insert_attachment(scratch_db, message_id=m1, state="dataless")
     _insert_attachment(scratch_db, message_id=m2, state="missing")
     _insert_attachment(scratch_db, message_id=m3, state="error")
     _insert_attachment(scratch_db, message_id=m4, state="materializing")
+    _insert_attachment(
+        scratch_db, message_id=m5, state="unsupported",
+        last_error="unsupported[is-a-directory]: [Errno 21] Is a directory",
+    )
 
     report = build_at3_report(scratch_db, integrity_sample_size=10)
 
-    assert report.total == 4
+    assert report.total == 5
     assert report.materialized_and_present == 0
     categories = {e.category for e in report.exceptions}
-    assert categories == {"dataless_retrying", "remote_missing", "error"}
+    assert categories == {"dataless_retrying", "remote_missing", "error", "unsupported"}
     assert all(e.category in EXCEPTION_CATEGORIES for e in report.exceptions)
     assert report.by_year["2023"] == (0, 2)
-    assert report.by_year["2024"] == (0, 2)
+    assert report.by_year["2024"] == (0, 3)
+    assert report.unsupported_by_reason == {"is-a-directory": 1}
     # No materialized files -> nothing to sample -> integrity sample trivially clean.
     assert report.integrity_sample == ()
     assert report.passed is True
+
+
+def test_at3_report_sub_counts_unsupported_reasons(scratch_db: psycopg.Connection) -> None:
+    m = _insert_chat_and_message(scratch_db, sent_at=datetime(2024, 1, 1, tzinfo=UTC))
+    for last_error in (
+        "unsupported[temp-directory-path]: source_path '/private/var/folders/x/y/T/a' ...",
+        "unsupported[temp-directory-path]: source_path '/private/var/folders/x/y/T/b' ...",
+        "unsupported[sticker-cache-path]: source_path '.../StickerCache/s.heic' ...",
+        None,  # an `unsupported` row nothing recorded a reason for
+    ):
+        _insert_attachment(scratch_db, message_id=m, state="unsupported", last_error=last_error)
+    _insert_attachment(scratch_db, message_id=m, state="error", last_error="[Errno 5] I/O error")
+
+    report = build_at3_report(scratch_db, integrity_sample_size=10)
+
+    assert report.unsupported_by_reason == {
+        "sticker-cache-path": 1,
+        "temp-directory-path": 2,
+        "unspecified": 1,
+    }
+    unsupported = [e for e in report.exceptions if e.category == "unsupported"]
+    assert len(unsupported) == 4
+    assert {e.reason_class for e in unsupported} == {
+        "temp-directory-path", "sticker-cache-path", "unspecified"
+    }
+    assert all("/private/var/folders" not in e.reason for e in unsupported)  # paths stay in the DB
+    error_entries = [e for e in report.exceptions if e.category == "error"]
+    assert [e.reason_class for e in error_entries] == [None]
+
+    text = format_report_text(report)
+    assert "    unsupported: 4\n" in text
+    assert "      temp-directory-path: 2\n" in text
+    assert "      sticker-cache-path: 1\n" in text
+    assert "      unspecified: 1\n" in text
+    assert "    error: 1\n" in text
+
+    rows = list(csv.reader(io.StringIO(report_to_csv(report))))
+    assert ["unsupported_by_reason", "temp-directory-path", "", "2", ""] in rows
+    assert ["unsupported_by_reason", "sticker-cache-path", "", "1", ""] in rows
+    manifest = [r for r in rows if len(r) == 6 and r[3] == "unsupported"]
+    assert sorted(r[4] for r in manifest) == sorted(
+        ["temp-directory-path", "temp-directory-path", "sticker-cache-path", "unspecified"]
+    )
 
 
 def test_at3_report_flags_materialized_but_missing_file_as_error(
@@ -230,7 +282,10 @@ def test_report_to_csv_contains_all_sections(scratch_db: psycopg.Connection, tmp
     rows = list(csv.reader(io.StringIO(csv_text)))
     header_rows = [r for r in rows if r and r[0] == "section"]
     assert header_rows  # overall/by_year/by_mime_type summary section present
-    attachment_header = [r for r in rows if r == ["attachment_id", "attachment_key", "state", "category", "reason"]]
+    attachment_header = [
+        r for r in rows
+        if r == ["attachment_id", "attachment_key", "state", "category", "reason_class", "reason"]
+    ]
     assert attachment_header
     sample_header = [
         r for r in rows

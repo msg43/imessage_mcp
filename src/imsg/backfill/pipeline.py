@@ -2,9 +2,22 @@
 candidate `attachment` rows, applies the first-run trial gate, throttles
 materialization, checks free space periodically, and drives the
 `materialization_state` state machine (`dataless` -> `materializing` ->
-`materialized` / `missing` / `error`).
+`materialized` / `missing` / `error` / `unsupported`).
 
 Takes an already-open `psycopg.Connection`, never owns its lifecycle.
+
+Two kinds of write happen in a run, and the report keeps them apart:
+
+- **attempts** — a candidate row is read and copied (`materialized`),
+  or the read fails: transiently (`error`, then `missing` once the
+  retry budget is spent) or deterministically (`unsupported`, no retry
+  schedule — see `imsg.backfill.classify`);
+- **reclassifications** — rows whose *current* state is provably wrong
+  without reading anything: a NULL `source_path` can only ever be
+  `missing`, and an `error`/`missing` row whose path fails the
+  containment check can only ever be `unsupported`. Both are applied
+  at the start of every run so an index built before those states
+  existed heals on its next pass, with no manual UPDATE.
 """
 
 from __future__ import annotations
@@ -16,6 +29,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from imsg.backfill.classify import (
+    NO_SOURCE_PATH_ERROR,
+    UnsupportedReason,
+    classify_os_error,
+    classify_out_of_root,
+    format_unsupported_error,
+)
 from imsg.backfill.dataless import is_dataless
 from imsg.backfill.materialize import materialize_attachment
 from imsg.backfill.throttle import RateThrottle
@@ -70,6 +90,19 @@ class BackfillRunReport:
     materialized: int = 0
     errored: int = 0
     marked_missing: int = 0
+    marked_unsupported: int = 0
+    """Candidates whose attempt ended in `unsupported`: refused by the
+    containment check before any read, or read and failed with a
+    deterministic errno (`imsg.backfill.classify`)."""
+    reclassified_unsupported: int = 0
+    """`error`/`missing` rows moved to `unsupported` by the pre-pass,
+    without being read — their `source_path` fails containment."""
+    reclassified_missing_no_source: int = 0
+    """Not-yet-materialized rows with a NULL `source_path` moved to
+    `missing` by the pre-pass — there is nothing on disk to retry."""
+    retry_reset: int = 0
+    """Rows `retry_failed=True` put back on the ladder (attempts 0,
+    eligible now) before candidates were selected."""
     detected_dataless: int = 0
     detected_already_local: int = 0
     trial_gate_capped: bool = False
@@ -79,38 +112,44 @@ class BackfillRunReport:
     """True when this report came from `run_backfill(dry_run=True)`
     (SPEC §8: "takes --dry-run where writes leave the machine").
     `considered`/`detected_dataless`/`detected_already_local`/
-    `trial_gate_capped` are accurate (the same read-only candidate
-    selection and dataless classification ran); `materialized`/
-    `errored`/`marked_missing` are always 0 — see `notes` — because
-    materialization outcome (success/failure) can only be known by
-    attempting it, which a dry run never does."""
+    `trial_gate_capped`, the two `reclassified_*` counts, `retry_reset`
+    and `marked_unsupported` are accurate as "would happen" numbers —
+    every one of them is decided by the database row and the path
+    alone, never by attempting a read; `materialized`/`errored`/
+    `marked_missing` are always 0 — see `notes` — because a read's
+    outcome can only be known by attempting it, which a dry run never
+    does."""
 
 
-def _count_pending(conn: psycopg.Connection) -> int:
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT count(*) FROM attachment WHERE state IN ('dataless', 'materializing', 'error') "
+def _fetch_candidates(
+    conn: psycopg.Connection, *, include_failed_for_retry: bool = False
+) -> list[BackfillCandidate]:
+    """Every row a run would attempt, in `attachment_id` order.
+
+    `include_failed_for_retry` exists for the dry run only: it selects
+    what the candidate set *would be* after `_reset_failed_for_retry`
+    has run (backed-off `error` rows and given-up `missing` rows become
+    eligible immediately) without applying that reset. A real run
+    applies the reset first and then uses the plain query — the two
+    agree by construction, because the reset leaves no `missing` row
+    with a source path and no row with a future next-attempt time."""
+    if include_failed_for_retry:
+        where = (
+            "state IN ('dataless', 'materializing', 'error', 'missing') "
+            "AND source_path IS NOT NULL"
+        )
+    else:
+        where = (
+            "state IN ('dataless', 'materializing', 'error') "
             "AND source_path IS NOT NULL AND materialization_next_attempt_at <= now()"
         )
-        row = cur.fetchone()
-        return int(row[0]) if row else 0
-
-
-def _fetch_candidates(conn: psycopg.Connection, *, limit: int | None) -> list[BackfillCandidate]:
     with conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT attachment_id, attachment_key, source_path
-            FROM attachment
-            WHERE state IN ('dataless', 'materializing', 'error')
-              AND source_path IS NOT NULL
-              AND materialization_next_attempt_at <= now()
-            ORDER BY attachment_id
-            """
+            f"SELECT attachment_id, attachment_key, source_path FROM attachment "
+            f"WHERE {where} ORDER BY attachment_id"
         )
         rows = cur.fetchall()
-    candidates = [BackfillCandidate(*row) for row in rows]
-    return candidates[:limit] if limit is not None else candidates
+    return [BackfillCandidate(*row) for row in rows]
 
 
 def _has_ever_materialized_anything(conn: psycopg.Connection) -> bool:
@@ -151,7 +190,9 @@ def _mark_materialized(
 
 
 def _mark_failure(conn: psycopg.Connection, attachment_id: int, error: str) -> bool:
-    """Returns True if this attempt pushed the row to `missing`."""
+    """A *transient* failure: one more rung on the retry ladder. Returns
+    True if this attempt pushed the row to `missing`. Deterministic
+    failures never come here — see `_mark_unsupported`."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT materialization_attempts FROM attachment WHERE attachment_id = %s",
@@ -176,6 +217,135 @@ def _mark_failure(conn: psycopg.Connection, attachment_id: int, error: str) -> b
     return became_missing
 
 
+def _mark_unsupported(
+    conn: psycopg.Connection, attachment_id: int, reason: UnsupportedReason, detail: str
+) -> None:
+    """Terminal, and deliberately off the retry ladder: no backoff is
+    scheduled (`materialization_next_attempt_at` is left at "now" so
+    nothing ever shows as "retrying"), and `materialization_attempts`
+    is not touched — the counter measures rungs on a ladder this row is
+    not on. Only a manual UPDATE moves a row out of `unsupported`;
+    `_reset_failed_for_retry` deliberately skips it, because the reason
+    is a property of the row and would recur on retry."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE attachment
+            SET state = 'unsupported', materialization_next_attempt_at = now(),
+                materialization_last_error = %s, updated_at = now()
+            WHERE attachment_id = %s
+            """,
+            (format_unsupported_error(reason, detail)[:2000], attachment_id),
+        )
+    conn.commit()
+
+
+def _refusal_reason(
+    source_path: str, resolved_attachments_root: Path
+) -> tuple[Path, UnsupportedReason | None]:
+    """The one containment code path for both the pre-pass and the
+    candidate loop. Returns the resolved path and, when it does NOT lie
+    under the attachments root, the reason class — the caller must then
+    refuse to read it. `None` means contained."""
+    resolved = resolve_path(source_path)
+    if is_contained_in(resolved, resolved_attachments_root):
+        return resolved, None
+    return resolved, classify_out_of_root(resolved)
+
+
+def _out_of_root_detail(
+    source_path: str, resolved: Path, resolved_attachments_root: Path, reason: UnsupportedReason
+) -> str:
+    return (
+        f"source_path '{source_path}' resolves to '{resolved}', which does not resolve under "
+        f"the Messages attachments root ('{resolved_attachments_root}') — refusing to read it "
+        f"({reason.description})"
+    )
+
+
+def _reset_failed_for_retry(conn: psycopg.Connection, *, dry_run: bool) -> int:
+    """`imsg backfill-attachments --retry-failed`, the S5a counterpart of
+    `imsg enrich --retry-failed`: put every failed row that still has
+    something to read back at the bottom of the ladder, eligible now.
+
+    Covers both failure outcomes of an attempt — `error` (backed off)
+    and `missing` (given up after `MAX_MATERIALIZATION_ATTEMPTS`) — so a
+    corrected classifier can be applied to all of them in one run
+    rather than waiting out backoffs or hand-editing `missing` rows.
+    `missing` rows go to `error` so the ordinary candidate query sees
+    them; `materialization_last_error` is kept until the retry
+    overwrites it (a run that halts before reaching the row still
+    shows why it failed last time). `unsupported` and NULL-path rows
+    are never reset: nothing about them changes on retry."""
+    where = "state IN ('error', 'missing') AND source_path IS NOT NULL"
+    with conn.cursor() as cur:
+        if dry_run:
+            cur.execute(f"SELECT count(*) FROM attachment WHERE {where}")
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+        cur.execute(
+            f"UPDATE attachment SET state = 'error', materialization_attempts = 0, "
+            f"materialization_next_attempt_at = now(), updated_at = now() WHERE {where}"
+        )
+        reset = cur.rowcount
+    conn.commit()
+    return reset
+
+
+def _reclassify_no_source_path(conn: psycopg.Connection, *, dry_run: bool) -> tuple[int, set[int]]:
+    """A row with no `source_path` has no placeholder to read, so
+    `dataless` ("not yet materialized, will retry") is false for it: it
+    is `missing`. S2 now inserts such rows as `missing` directly
+    (`imsg.stages.extract`); this heals rows inserted before it did.
+    Returns `(count, attachment_ids)`."""
+    where = "source_path IS NULL AND state IN ('dataless', 'materializing', 'error')"
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT attachment_id FROM attachment WHERE {where}")
+        ids = {int(row[0]) for row in cur.fetchall()}
+        if ids and not dry_run:
+            cur.execute(
+                f"UPDATE attachment SET state = 'missing', materialization_last_error = %s, "
+                f"materialization_next_attempt_at = now(), updated_at = now() WHERE {where}",
+                (NO_SOURCE_PATH_ERROR,),
+            )
+    if not dry_run:
+        conn.commit()
+    return len(ids), ids
+
+
+def _reclassify_out_of_root(
+    conn: psycopg.Connection, resolved_attachments_root: Path, *, dry_run: bool
+) -> tuple[int, set[int]]:
+    """`error`/`missing` rows whose `source_path` fails the containment
+    check were never going to succeed on retry — the refusal is a
+    property of the path. Move them to `unsupported` with the reason
+    class, without reading anything (nothing outside the root is ever
+    read, in this pass or any other). Rows still `dataless` are left to
+    the candidate loop, which refuses them the same way when their turn
+    comes. Returns `(count, attachment_ids)`."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT attachment_id, source_path FROM attachment "
+            "WHERE state IN ('error', 'missing') AND source_path IS NOT NULL "
+            "ORDER BY attachment_id"
+        )
+        rows = cur.fetchall()
+    reclassified: set[int] = set()
+    for attachment_id, source_path in rows:
+        resolved, reason = _refusal_reason(source_path, resolved_attachments_root)
+        if reason is None:
+            continue
+        reclassified.add(int(attachment_id))
+        if not dry_run:
+            _mark_unsupported(
+                conn,
+                int(attachment_id),
+                reason,
+                _out_of_root_detail(source_path, resolved, resolved_attachments_root, reason),
+            )
+    return len(reclassified), reclassified
+
+
 def run_backfill(
     conn: psycopg.Connection,
     data_root: Path,
@@ -189,6 +359,7 @@ def run_backfill(
     throttle: RateThrottle | None = None,
     disk_free_fn: DiskFreeFn | None = None,
     dry_run: bool = False,
+    retry_failed: bool = False,
 ) -> BackfillRunReport:
     """Run one backfill pass. `attachments_root` is the live
     `~/Library/Messages/Attachments` directory — every candidate's
@@ -197,35 +368,59 @@ def run_backfill(
     containment goes through `imsg.paths` everywhere per convention,
     never a trusted-by-construction shortcut).
 
+    Order of operations, so the printed report and the database agree
+    row for row: (1) `retry_failed` reset, (2) the two reclassification
+    pre-passes (module docstring), (3) candidate selection + trial
+    gate, (4) the attempt loop.
+
     `dry_run=True` (SPEC §8: "takes --dry-run where writes leave the
-    machine") still does the read-only candidate selection
-    (`_fetch_candidates`), trial-gate accounting, and `is_dataless`
-    classification, but never calls `throttle.wait()`,
-    `_mark_materializing`, `materialize_attachment`, or
-    `_mark_materialized`/`_mark_failure` — no filesystem copy and no
-    Postgres write happens. See `BackfillRunReport.dry_run`'s docstring
-    for why `materialized`/`errored`/`marked_missing` stay 0.
+    machine") performs steps 1-3 as read-only counts (the pre-passes
+    report what they *would* reclassify, and candidates are selected as
+    they would be after those writes) and, in step 4, still classifies
+    each candidate (`is_dataless`, containment) but never calls
+    `throttle.wait()`, `_mark_materializing`, `materialize_attachment`,
+    `_mark_materialized`/`_mark_failure`/`_mark_unsupported` — no
+    filesystem copy and no Postgres write happens. See
+    `BackfillRunReport.dry_run`'s docstring for which counts stay 0.
     """
     disk_free_fn = disk_free_fn or _default_disk_free
     throttle = throttle or RateThrottle(rate_per_minute)
 
-    is_first_run = not _has_ever_materialized_anything(conn)
-    trial_gate_active = is_first_run and not yes_full_run
-    limit = trial_limit if trial_gate_active else None
-
-    total_pending = _count_pending(conn)
-    candidates = _fetch_candidates(conn, limit=limit)
-
-    report = BackfillRunReport(considered=len(candidates), dry_run=dry_run)
-    if trial_gate_active and total_pending > trial_limit:
-        report.trial_gate_capped = True
-        report.notes.append(
-            f"first run: capped at {trial_limit} of {total_pending} pending "
-            f"attachments — pass yes_full_run=True to process the rest"
-        )
-
+    report = BackfillRunReport(dry_run=dry_run)
     resolved_attachments_root = resolve_path(attachments_root)
     resolved_data_root = resolve_path(data_root)
+
+    if retry_failed:
+        report.retry_reset = _reset_failed_for_retry(conn, dry_run=dry_run)
+
+    report.reclassified_missing_no_source, healed_no_source = _reclassify_no_source_path(
+        conn, dry_run=dry_run
+    )
+    report.reclassified_unsupported, healed_out_of_root = _reclassify_out_of_root(
+        conn, resolved_attachments_root, dry_run=dry_run
+    )
+    # In a real run the pre-passes have already been written, so the
+    # candidate query cannot return those rows; in a dry run it can,
+    # and they are excluded here so `considered` means the same thing
+    # in both modes.
+    already_reclassified = (healed_no_source | healed_out_of_root) if dry_run else set()
+
+    is_first_run = not _has_ever_materialized_anything(conn)
+    trial_gate_active = is_first_run and not yes_full_run
+
+    all_candidates = [
+        c
+        for c in _fetch_candidates(conn, include_failed_for_retry=dry_run and retry_failed)
+        if c.attachment_id not in already_reclassified
+    ]
+    candidates = all_candidates[:trial_limit] if trial_gate_active else all_candidates
+    report.considered = len(candidates)
+    if trial_gate_active and len(all_candidates) > trial_limit:
+        report.trial_gate_capped = True
+        report.notes.append(
+            f"first run: capped at {trial_limit} of {len(all_candidates)} pending "
+            f"attachments — pass yes_full_run=True to process the rest"
+        )
 
     if dry_run:
         for i, candidate in enumerate(candidates, start=1):
@@ -239,12 +434,14 @@ def run_backfill(
                     )
                     break
 
-            source_path = resolve_path(candidate.source_path)
-            if not is_contained_in(source_path, resolved_attachments_root):
+            source_path, refusal = _refusal_reason(candidate.source_path, resolved_attachments_root)
+            if refusal is not None:
                 # Never stat/read a path outside the trusted attachments
                 # root, even for read-only classification — the same
                 # defense-in-depth boundary the real path enforces
-                # before ever calling is_dataless() on it.
+                # before ever calling is_dataless() on it. The outcome
+                # IS known without reading, so it is counted.
+                report.marked_unsupported += 1
                 continue
 
             if is_dataless(source_path):
@@ -270,15 +467,17 @@ def run_backfill(
                 )
                 break
 
-        source_path = resolve_path(candidate.source_path)
-        if not is_contained_in(source_path, resolved_attachments_root):
-            _mark_failure(
+        source_path, refusal = _refusal_reason(candidate.source_path, resolved_attachments_root)
+        if refusal is not None:
+            _mark_unsupported(
                 conn,
                 candidate.attachment_id,
-                f"source_path '{candidate.source_path}' does not resolve under the "
-                f"Messages attachments root ('{resolved_attachments_root}') — refusing to read it",
+                refusal,
+                _out_of_root_detail(
+                    candidate.source_path, source_path, resolved_attachments_root, refusal
+                ),
             )
-            report.errored += 1
+            report.marked_unsupported += 1
             continue
 
         if is_dataless(source_path):
@@ -291,8 +490,11 @@ def run_backfill(
         try:
             result = materialize_attachment(source_path, resolved_data_root)
         except OSError as exc:
-            became_missing = _mark_failure(conn, candidate.attachment_id, str(exc))
-            if became_missing:
+            deterministic = classify_os_error(exc)
+            if deterministic is not None:
+                _mark_unsupported(conn, candidate.attachment_id, deterministic, str(exc))
+                report.marked_unsupported += 1
+            elif _mark_failure(conn, candidate.attachment_id, str(exc)):
                 report.marked_missing += 1
             else:
                 report.errored += 1
