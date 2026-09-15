@@ -10,6 +10,25 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-14 — two identity integration tests still encoded the pre-August Contacts rules
+
+Found by running the suite against a scratch Postgres for the
+`finished_at` fix. `tests/test_identity.py` last changed on 2026-07-30;
+`identity.py` changed three times on 2026-08-15; and the two end-to-end
+tests covering those changes only run with a database, none of which was
+reachable when the rules landed — so they failed silently for a month.
+Test-only: the code was right both times.
+
+- The "multiple contact matches fall back to a stub" fixture was
+  "Alice" / "Also Alice", which the 2026-08-15 subset rule treats as one
+  person at two levels of completeness. It is now a genuine conflict (two
+  different people on one household number), and a sibling test pins the
+  subset rule end to end through the real S2→S3 handoff: the most
+  complete name wins and the person stays off the review worklist.
+- `assign_handle` has checked the target person before the handle since
+  9fa85ce; the test asserted the handle error against an empty `person`
+  table and got the person error instead. It now asserts both, in order.
+
 ## 2026-09-14 — read-only means the directory is untouched: no sidecars beside chat.db-shaped files
 
 - **`SQLITE_OPEN_READONLY` was leaving `-wal`/`-shm` files next to databases
