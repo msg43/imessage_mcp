@@ -10,6 +10,34 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-15 — embedding was 3.9× slower than it had to be: padding and an unbounded MLX cache
+
+Measured on the first full-corpus `imsg embed` run (benchmark
+`scripts/bench_text_embedding.py`, synthetic texts drawn from the real
+segment-length distribution): the model's padded throughput is flat at
+~920 tokens/s regardless of batch shape, so fixed batches of 32 in
+`segment_id` order — padded to the longest row — wasted 3.9× of it
+(17.3M real → 68.3M padded tokens). Independently, MLX's buffer cache
+defaults to the memory limit; it grew ~1.3 GiB per batch to a 103 GB GPU
+footprint with swap full, and the GPU stalled on paging.
+
+- `imsg.embed.batching.plan_batches`: longest-first, greedy, bounded by
+  rows and by rows × longest row (`embedding.max_batch_tokens`, default
+  2,048 — the measured optimum); an oversize row goes alone. Results are
+  keyed by id, one transaction per batch, so order changes nothing.
+- The MLX text provider packs every call the same way on real token
+  counts and sets an explicit 8 GiB cache limit at load (D10.2's
+  "bound the cache" recommendation, now measured: same throughput,
+  footprint 17 GB instead of 103).
+- `max_length` was not the problem: the provider already padded to the
+  batch's longest row (2048 vs 8192 byte-identical).
+- Affine 8-bit local conversion of the embedder was benchmarked against
+  the pinned mxfp8: ~10 % slower and not the same vectors (cosine mean
+  0.978), so the pin stands. `scripts/convert_qwen3_embedding_mlx.py`
+  documents the upstream-layout rename the converter needs.
+- Real tokens/s: 174 before → 687 after on the longest rows, 845 on the
+  typical distribution. Suite: 1,414 passed with a scratch database.
+
 ## 2026-09-15 — backfill names its residue: `unsupported` populated, NULL-path rows are `missing`, long-name bug fixed
 
 The first AT-3 run against a real corpus reported `unsupported: 0`,
