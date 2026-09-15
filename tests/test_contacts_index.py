@@ -134,3 +134,57 @@ def test_a_real_number_containing_parens_is_not_corrupted() -> None:
 
     assert strip_ios_filter_suffix("(800) 555-0199") == "(800) 555-0199"
     assert strip_ios_filter_suffix("+1 (800) 555-0199") == "+1 (800) 555-0199"
+
+
+# --------------------------------------------------------------------------
+# 2026-09-15 — `lookup` / `lookup_all`: the same rules, with "nobody has
+# this identifier" told apart from "two people do", for the stub rematch.
+# --------------------------------------------------------------------------
+
+
+def test_lookup_tells_absence_from_ambiguity() -> None:
+    from imsg.stages.identity import ContactRecord, ContactsIndex
+
+    shared = ("+15559998888", "phone")
+    a = ContactRecord(identifier="a", display_name="Dave Carter", organization=None,
+                      normalized_identifiers=(shared,))
+    b = ContactRecord(identifier="b", display_name="Alice Bell Carter", organization=None,
+                      normalized_identifiers=(shared,))
+    index = ContactsIndex([a, b])
+    assert index.lookup(*shared).status == "ambiguous"
+    assert index.lookup(*shared).contact is None
+    assert index.lookup("+15550000000", "phone").status == "unmatched"
+    assert index.find_unique(*shared) is None  # unchanged: both cases are still None here
+
+    only = ("+15551234567", "phone")
+    jane = ContactRecord(identifier="c", display_name="Jane Doe", organization=None,
+                         normalized_identifiers=(only,))
+    found = ContactsIndex([jane]).lookup(*only)
+    assert found.status == "matched" and found.contact is jane
+
+
+def test_lookup_all_needs_every_identifier_to_name_one_person() -> None:
+    from imsg.stages.identity import ContactRecord, ContactsIndex
+
+    phone, email = ("+15551110000", "phone"), ("erin@example.com", "email")
+    short = ContactRecord(identifier="a", display_name="Erin", organization=None,
+                          normalized_identifiers=(phone,))
+    full = ContactRecord(identifier="b", display_name="Erin Delgado", organization=None,
+                         normalized_identifiers=(email,))
+    index = ContactsIndex([short, full])
+
+    agreed = index.lookup_all([phone, email])
+    assert agreed.status == "matched" and agreed.contact is full  # the most complete name
+
+    # An identifier no card carries: the whole person is unmatched.
+    assert index.lookup_all([phone, ("nobody@example.com", "email")]).status == "unmatched"
+    # Two handles naming two different people: ambiguous, nothing guessed.
+    other = ContactRecord(identifier="c", display_name="Bob Feldman", organization=None,
+                          normalized_identifiers=(email,))
+    assert ContactsIndex([short, other]).lookup_all([phone, email]).status == "ambiguous"
+    # A handle whose own cards disagree outranks one no card carries.
+    conflicted = ContactsIndex([short, ContactRecord(identifier="d", display_name="Bob Feldman",
+                                                     organization=None,
+                                                     normalized_identifiers=(phone,))])
+    assert conflicted.lookup_all([phone, ("nobody@example.com", "email")]).status == "ambiguous"
+    assert index.lookup_all([]).status == "unmatched"
