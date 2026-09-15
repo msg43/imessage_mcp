@@ -101,6 +101,7 @@ from imsg.stages.identity_overrides import (
     load_overrides,
     write_overrides,
 )
+from imsg.stages.identity_rematch import run_rematch_stubs
 from imsg.stages.imsg_dump import default_binary_path
 from imsg.stages.snapshot import SNAPSHOT_FILENAME, SNAPSHOT_SUBDIR, run_snapshot
 from imsg.stages.sync import EmbedFn, SegmentFn, run_sync, run_sync_all_sources
@@ -777,6 +778,43 @@ def identity(
 def identity_import(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
     """Resolve every source handle to a person_id (Contacts + review stubs)."""
     _identity_import(_load_config_or_die(config), dry_run)
+
+
+@identity_app.command("rematch-stubs")
+def identity_rematch_stubs(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
+    """Name the review stubs an import that ran without Contacts access left behind.
+
+    Contacts access is granted per application, so an import run over SSH
+    or by an agent creates stubs named after their raw handle that a later
+    import never revisits. Run this from a terminal that HAS the grant:
+    every stub still named after its own handle is looked up in Contacts
+    under the import's own rules (unique match only) and, on a match, named
+    exactly as the import would have named it. Reviewed persons, the owner,
+    ambiguous handles and handles no card carries are never touched. Fails
+    outright, rather than degrading, when Contacts is unavailable.
+    """
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        result = run_rematch_stubs(conn=conn, config=cfg, dry_run=dry_run)
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    typer.echo(f"identity: contacts loaded={result.contacts_loaded}")
+    if not dry_run:
+        for outcome in result.outcomes:
+            if outcome.status == "matched":
+                typer.echo(
+                    f"identity: rematched person {outcome.person_id} "
+                    f"{outcome.display_name!r} -> {outcome.new_display_name!r}"
+                )
+    typer.echo(f"rematch: {result.summary}")
+    if dry_run:
+        typer.echo(DRY_RUN_MARKER)
 
 
 @identity_app.command("review-report")

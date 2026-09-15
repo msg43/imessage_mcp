@@ -494,6 +494,73 @@ def test_identity_wires_run_identity_and_warns_on_degraded_contacts(
     assert "no TCC grant" in result.output
 
 
+def test_identity_rematch_stubs_wires_the_stage_and_prints_counts(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.stages.identity_rematch import RematchStubsResult, StubOutcome
+
+    captured: dict[str, Any] = {}
+
+    def fake_rematch(*, conn: Any, config: Any, dry_run: bool = False, **kw: Any) -> RematchStubsResult:
+        captured.update(dry_run=dry_run, region=config.identity.default_region)
+        return RematchStubsResult(
+            outcomes=(
+                StubOutcome(
+                    7, "+14155552671", (("+14155552671", "phone"),), "matched",
+                    new_display_name="Alice Example", new_short_name="alice-example",
+                ),
+                StubOutcome(8, "+14155552672", (("+14155552672", "phone"),), "ambiguous"),
+                StubOutcome(9, "24273", (("24273", "unknown"),), "unmatched"),
+            ),
+            contacts_loaded=2,
+            dry_run=dry_run,
+        )
+
+    monkeypatch.setattr(cli_module, "run_rematch_stubs", fake_rematch)
+
+    result = runner.invoke(app, ["identity", "rematch-stubs", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert captured["dry_run"] is False
+    assert captured["region"] == "US"
+    assert "identity: contacts loaded=2" in result.output
+    assert "identity: rematched person 7 '+14155552671' -> 'Alice Example'" in result.output
+    assert "rematch: stubs=3 matched=1 ambiguous=1 unmatched=1" in result.output
+    assert "DRY RUN" not in result.output
+
+    result = runner.invoke(
+        app, ["identity", "rematch-stubs", "--config", str(mocked_pg_env), "--dry-run"]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["dry_run"] is True
+    assert "rematch: stubs=3 matched=1 ambiguous=1 unmatched=1" in result.output
+    assert "rematched person" not in result.output  # a dry run prints counts only
+    assert "DRY RUN — nothing was written" in result.output
+
+
+def test_identity_rematch_stubs_fails_loudly_without_contacts(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Contacts is the whole point: no grant means a clean error and exit 1,
+    never a counts line that reads as "looked, matched nothing"."""
+    from imsg.stages.identity import ContactsAccessDeniedError
+
+    def denied(**kw: Any) -> Any:
+        raise ContactsAccessDeniedError(
+            "rematch-stubs needs Contacts and could not use it; nothing was changed. "
+            "Contacts access is not authorized (CNAuthorizationStatus=0)"
+        )
+
+    monkeypatch.setattr(cli_module, "run_rematch_stubs", denied)
+    result = runner.invoke(
+        app, ["identity", "rematch-stubs", "--config", str(mocked_pg_env), "--dry-run"]
+    )
+    assert result.exit_code == 1
+    assert "imsg: " in result.output and "Contacts access is not authorized" in result.output
+    assert "rematch:" not in result.output
+    assert "DRY RUN" not in result.output
+    assert "Traceback" not in result.output
+
+
 def _write_overrides_fixture(path: Path) -> None:
     """A tiny, fictional decisions file (schema: imsg.stages.identity_overrides)."""
     path.parent.mkdir(parents=True, exist_ok=True)
