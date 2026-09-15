@@ -338,30 +338,78 @@ def test_run_identity_unique_contact_match_names_the_person(
         assert cur.fetchone() == ("Alice Example", "Acme Construction")
 
 
-def test_run_identity_multiple_contact_matches_falls_back_to_stub(
+def test_run_identity_conflicting_contact_matches_fall_back_to_stub(
     pg_conn: psycopg.Connection, tmp_path: Path, config_dict_factory: ConfigDictFactory
 ) -> None:
+    """A shared household number saved under two different people is a
+    genuine conflict: neither name's words contain the other's, so S3 must
+    not guess — it creates a review stub named after the handle.
+
+    Until 2026-09-14 this test used "Alice" / "Also Alice", which the
+    2026-08-15 subset rule rightly treats as one person at two levels of
+    completeness; the test only runs with a database, so nobody saw it
+    start failing."""
     _seed_extraction(pg_conn, tmp_path)
     config = _identity_config(config_dict_factory, contacts_import=True)
 
     shared = ("+14155552671", "phone")
-    alice = ContactRecord(identifier="c1", display_name="Alice", organization=None, normalized_identifiers=(shared,))
-    also_alice = ContactRecord(identifier="c2", display_name="Also Alice", organization=None, normalized_identifiers=(shared,))
+    alice = ContactRecord(
+        identifier="c1", display_name="Alice Example", organization=None,
+        normalized_identifiers=(shared,),
+    )
+    carol = ContactRecord(
+        identifier="c2", display_name="Carol Example", organization=None,
+        normalized_identifiers=(shared,),
+    )
 
     def fake_importer(region: str) -> list[ContactRecord]:
-        return [alice, also_alice]
+        return [alice, carol]
 
     run_identity(conn=pg_conn, config=config, contacts_importer=fake_importer)
 
     with pg_conn.cursor() as cur:
         cur.execute(
-            "SELECT p.display_name, p.notes FROM message m "
+            "SELECT p.display_name, p.notes, p.needs_review FROM message m "
             "JOIN person p ON p.person_id = m.sender_person_id WHERE m.source_guid = 'msg-in-1'"
         )
         row = cur.fetchone()
         assert row is not None
         assert row[0] == "+14155552671"  # stub, not either contact's name
         assert row[1] is not None and "review stub" in row[1]
+        assert row[2] is True
+
+
+def test_run_identity_subset_contact_names_resolve_to_the_most_complete(
+    pg_conn: psycopg.Connection, tmp_path: Path, config_dict_factory: ConfigDictFactory
+) -> None:
+    """The same person saved twice at two levels of completeness ("Alice"
+    in one account, "Alice Example" in another) is not a conflict: S3 takes
+    the most complete name and keeps the person off the review worklist
+    (the 2026-08-15 rule, end to end through the real S2->S3 handoff)."""
+    _seed_extraction(pg_conn, tmp_path)
+    config = _identity_config(config_dict_factory, contacts_import=True)
+
+    shared = ("+14155552671", "phone")
+    short = ContactRecord(
+        identifier="c1", display_name="Alice", organization=None,
+        normalized_identifiers=(shared,),
+    )
+    full = ContactRecord(
+        identifier="c2", display_name="Alice Example", organization=None,
+        normalized_identifiers=(shared,),
+    )
+
+    def fake_importer(region: str) -> list[ContactRecord]:
+        return [short, full]
+
+    run_identity(conn=pg_conn, config=config, contacts_importer=fake_importer)
+
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "SELECT p.display_name, p.notes, p.needs_review FROM message m "
+            "JOIN person p ON p.person_id = m.sender_person_id WHERE m.source_guid = 'msg-in-1'"
+        )
+        assert cur.fetchone() == ("Alice Example", None, False)
 
 
 def test_run_identity_cross_references_same_contacts_two_handles(
@@ -580,5 +628,20 @@ def test_assign_handle_repoints_to_new_person(
 
 
 def test_assign_handle_missing_raises(pg_conn: psycopg.Connection) -> None:
+    """Both preconditions are checked before anything is written: the
+    target person first (there is nothing to repoint onto without one),
+    then the handle. The person check has come first since 2026-08-15, so
+    the handle error is only reachable with a real person_id."""
+    with pytest.raises(IdentityError, match="person_id 999999 not found"):
+        assign_handle(pg_conn, normalized_value="+10000000000", kind="phone", person_id=999999)
+
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO person (display_name, short_name) VALUES ('Alice Example', 'alice-example') "
+            "RETURNING person_id"
+        )
+        person_id = _scalar_int(cur)
+    pg_conn.commit()
+
     with pytest.raises(IdentityError, match="no handle found"):
-        assign_handle(pg_conn, normalized_value="+10000000000", kind="phone", person_id=1)
+        assign_handle(pg_conn, normalized_value="+10000000000", kind="phone", person_id=person_id)
