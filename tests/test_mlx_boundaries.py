@@ -226,7 +226,7 @@ def test_loads_once_with_pinned_revision(monkeypatch: pytest.MonkeyPatch) -> Non
     provider.detect_boundaries(_window(4))
     provider.detect_boundaries(_window(4))
     assert runtime.load_calls == [
-        {"path": "org/boundary", "tokenizer_config": None, "revision": "rev3"}
+        {"path": "org/boundary", "tokenizer_config": None, "model_config": None, "revision": "rev3"}
     ]
 
 

@@ -55,6 +55,22 @@ from imsg.mlx_runtime import (
 QUERY_TEMPLATE = "Instruct: {instruction}\nQuery: {text}"
 """Qwen3-Embedding's instruction-aware query format."""
 
+EMBEDDING_MODEL_CONFIG: dict[str, Any] = {"tie_word_embeddings": True}
+"""Config override handed to ``mlx_lm.load``. The pinned mlx-embeddings
+conversion (``mlx-community/Qwen3-Embedding-8B-mxfp8``) ships no
+``lm_head.*`` tensor at all — read from its safetensors headers on
+2026-09-14 (651 tensors; its ``model.safetensors.index.json`` does not
+describe the shards) — while its ``config.json`` says
+``tie_word_embeddings: false``. ``mlx_lm``'s Qwen3 ``Model`` allocates an
+``lm_head`` whenever the config says untied, and its strict weight load
+then fails with ``Missing 1 parameters: lm_head.weight``. This provider
+never calls the head (it reads the base transformer's hidden states), so
+it declares the head tied: ``mlx_lm`` then allocates none and every
+tensor the checkpoint does ship is loaded. A conversion that *does* ship
+a head still loads — ``mlx_lm``'s ``sanitize`` drops ``lm_head.weight``
+for a tied model — and the reranker, which needs the head, does not use
+this override."""
+
 
 def format_query_text(instruction: str, text: str) -> str:
     """Render a query the way Qwen3-Embedding expects at query time only
@@ -168,7 +184,9 @@ class MlxTextEmbeddingProvider:
         any load error — at startup rather than mid-pipeline."""
         if self._model is not None:
             return
-        model, tokenizer = load_model_and_tokenizer(self._model_repo, self._revision)
+        model, tokenizer = load_model_and_tokenizer(
+            self._model_repo, self._revision, model_config=EMBEDDING_MODEL_CONFIG
+        )
         hidden = hidden_size_of(model)
         if hidden < self.dim:
             raise EmbeddingError(

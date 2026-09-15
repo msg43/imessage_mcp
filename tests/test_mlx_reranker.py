@@ -214,7 +214,7 @@ def test_loads_once_with_pinned_revision(monkeypatch: pytest.MonkeyPatch) -> Non
     provider.score("q", ["e"])
     provider.load()
     assert runtime.load_calls == [
-        {"path": "org/rerank", "tokenizer_config": None, "revision": "rev2"}
+        {"path": "org/rerank", "tokenizer_config": None, "model_config": None, "revision": "rev2"}
     ]
     assert provider.is_loaded is True
 
