@@ -383,8 +383,10 @@ def push_export(
         row = cur.fetchone()
         remaining = int(row[0]) if row else 0
         final_status = "ok" if remaining == 0 else "failed"
+        # clock_timestamp(), not now(): now() is frozen at transaction start
+        # (see tests/test_finished_at_uses_clock_timestamp.py).
         cur.execute(
-            "UPDATE export_run SET status = %s, finished_at = now() "
+            "UPDATE export_run SET status = %s, finished_at = clock_timestamp() "
             "WHERE export_run_id = %s",
             (final_status, run_id),
         )

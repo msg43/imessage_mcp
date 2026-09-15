@@ -14,8 +14,9 @@ from __future__ import annotations
 import os
 import plistlib
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import psycopg
 import pytest
@@ -757,11 +758,111 @@ def test_run_extract_failed_run_is_recorded(pg_conn: psycopg.Connection, tmp_pat
         )
 
     with pg_conn.cursor() as cur:
-        cur.execute("SELECT status FROM extraction_run WHERE source_name = 'mini'")
-        assert cur.fetchall() == [("failed",)]
+        cur.execute(
+            "SELECT status, started_at, finished_at FROM extraction_run WHERE source_name = 'mini'"
+        )
+        rows = cur.fetchall()
+        assert len(rows) == 1
+        status, started_at, finished_at = rows[0]
+        assert status == "failed"
+        # Same invariant as the success path: a wall-clock completion
+        # stamp, never null, never before the start.
+        assert finished_at is not None
+        assert finished_at >= started_at
         # Watermark must not have advanced on a failed run.
         cur.execute("SELECT count(*) FROM sync_state WHERE key = 'watermark.rowid.mini'")
         assert cur.fetchone() == (0,)
+
+
+def test_run_extract_finished_at_is_wall_clock_not_transaction_start(
+    pg_conn: psycopg.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (2026-09-14): `finished_at` was written with `now()` from
+    inside the single transaction that wraps the whole upsert loop.
+    Postgres `now()` is frozen at transaction start, so the column
+    recorded when the write transaction OPENED, and every duration
+    computed from `extraction_run` silently excluded the entire write
+    phase — a real seed run that worked for about 2m35s recorded 11.9s.
+
+    The delay has to be injected *inside* the write transaction: work
+    done before it opens (the snapshot reads, the `imsg-dump` call) was
+    already inside the recorded window, so a slow `run_imsg_dump_fn`
+    would not reproduce the bug. `_backfill_tapback_targets` is the last
+    call the loop makes before the run row is stamped, so it is the seam.
+
+    Runs on an autocommit connection, as production does (`connect()`
+    defaults to autocommit=True): the run row is inserted in its own
+    short transaction and the write transaction opens later.
+    """
+    work_seconds = 0.25
+    builder = ChatDbBuilder()
+    chat = builder.add_chat(FixtureChat(guid="chat-1", style=45))
+    handle = builder.add_handle(FixtureHandle(raw_value="+15551234567"))
+    builder.link_participant(chat.guid, handle.raw_value)
+    builder.add_message(
+        FixtureMessage(guid="msg-1", chat_guid=chat.guid, handle_raw_value=handle.raw_value)
+    )
+    snapshot_path = builder.build(tmp_path / "snapshot.db")
+
+    def fake_run(binary_path: Path, snap: Path, since_rowid: int) -> ImsgDumpRun:
+        return ImsgDumpRun(messages=(_dump_message(guid="msg-1", rowid=1),), stderr_lines=())
+
+    import imsg.stages.extract as extract_module
+
+    original_backfill = extract_module._backfill_tapback_targets
+    observed: dict[str, datetime] = {}
+
+    def backfill_then_work_inside_write_transaction(cur: psycopg.Cursor[Any]) -> None:
+        original_backfill(cur)
+        # Prove the seam really is inside the write transaction — otherwise
+        # the assertions below would be measuring nothing.
+        assert cur.connection.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+        cur.execute("SELECT pg_sleep(%s)", (work_seconds,))
+        cur.execute("SELECT clock_timestamp()")
+        row = cur.fetchone()
+        assert row is not None
+        observed["after_work"] = row[0]
+
+    monkeypatch.setattr(
+        extract_module, "_backfill_tapback_targets", backfill_then_work_inside_write_transaction
+    )
+
+    pg_conn.commit()
+    pg_conn.autocommit = True
+    result = run_extract(
+        conn=pg_conn,
+        source_name="mini",
+        snapshot_path=snapshot_path,
+        imsg_dump_binary=_fake_binary(tmp_path),
+        run_imsg_dump_fn=fake_run,
+    )
+
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, started_at, finished_at FROM extraction_run WHERE run_id = %s",
+            (result.run_id,),
+        )
+        row = cur.fetchone()
+    assert row is not None
+    status, started_at, finished_at = row
+    assert status == "ok"
+    assert "after_work" in observed
+
+    # The exact invariant: the stamp is not earlier than a wall-clock reading
+    # taken after work that happened inside the same transaction.
+    assert finished_at >= observed["after_work"], (
+        f"finished_at {finished_at} predates work done inside the write transaction "
+        f"at {observed['after_work']} — written with now() instead of clock_timestamp()?"
+    )
+    # And the consequence the bug was found by: the recorded window covers
+    # the work. (`started_at` precedes the write transaction by the whole
+    # pre-transaction phase, so this needs no tolerance for pg_sleep's
+    # sub-microsecond rounding.)
+    recorded = finished_at - started_at
+    assert recorded >= timedelta(seconds=work_seconds), (
+        f"recorded duration {recorded} is shorter than the {work_seconds}s of work done "
+        "inside the write transaction"
+    )
 
 
 # --------------------------------------------------------------------------

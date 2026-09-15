@@ -697,8 +697,10 @@ def plan_export(
                 """,
                 (run_id, delete.document_id),
             )
+        # clock_timestamp(), not now(): now() is frozen at transaction start
+        # (see tests/test_finished_at_uses_clock_timestamp.py).
         cur.execute(
-            "UPDATE export_run SET status = 'planned', finished_at = now() "
+            "UPDATE export_run SET status = 'planned', finished_at = clock_timestamp() "
             "WHERE export_run_id = %s",
             (run_id,),
         )

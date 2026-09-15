@@ -770,9 +770,13 @@ def _begin_extraction_run(
 
 
 def _fail_extraction_run(conn: psycopg.Connection, run_id: int) -> None:
+    # clock_timestamp() for the same reason as the success path in
+    # _do_extract: this helper opens its own short transaction today, but the
+    # stamp must mean "wall clock at failure" whatever transaction it lands in.
     with conn.transaction(), conn.cursor() as cur:
         cur.execute(
-            "UPDATE extraction_run SET status = 'failed', finished_at = now() WHERE run_id = %s",
+            "UPDATE extraction_run SET status = 'failed', finished_at = clock_timestamp() "
+            "WHERE run_id = %s",
             (run_id,),
         )
 
@@ -897,10 +901,18 @@ def _do_extract(
             (_watermark_key(source_name), str(snapshot_max_rowid)),
         )
 
+        # clock_timestamp(), not now(): now() is frozen at transaction start,
+        # and this UPDATE runs inside the transaction opened above, before the
+        # whole upsert loop. With now() the row recorded when the loop *began*
+        # writing, so every duration read from extraction_run excluded the
+        # write phase entirely (2026-09-14: a seed run that worked for about
+        # 2m35s recorded 11.9s). started_at is unaffected — its DEFAULT fires
+        # in _begin_extraction_run's own short transaction.
         cur.execute(
             """
             UPDATE extraction_run
-            SET status = 'ok', finished_at = now(), rowid_after = %s, messages_upserted = %s
+            SET status = 'ok', finished_at = clock_timestamp(), rowid_after = %s,
+                messages_upserted = %s
             WHERE run_id = %s
             """,
             (snapshot_max_rowid, messages_upserted, run_id),

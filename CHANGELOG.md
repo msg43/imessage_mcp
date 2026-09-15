@@ -149,6 +149,42 @@ weights is unknown.**
 
 Suite: 990 passed, 198 skipped (no database here); ruff and mypy strict clean.
 
+## 2026-09-14 — `extraction_run.finished_at` recorded when the write transaction opened, not when the run finished
+
+Postgres `now()` is frozen at transaction start, and S2 stamped
+`finished_at = now()` from inside the single transaction that wraps the
+whole upsert loop. So the column recorded the moment the loop *began*
+writing, and every duration computed from the table excluded the write
+phase entirely — always in the flattering direction. Probed on the live
+instance: `now()` did not move across a `pg_sleep(2)` inside one
+transaction; the seed run of the merged corpus (run 7) was still logging
+work at 19:08:22 but its row says it finished at 19:06:01, 11.9s after it
+started, for roughly 2m35s of real wall time; the earlier 655,494-message
+studio run (run 5) shows 7.3s. The MCP freshness check reads
+`max(finished_at)`, so it was early by the same amount.
+
+- **`finished_at = clock_timestamp()`** in `_do_extract` and
+  `_fail_extraction_run`, and at the `export_run` ledger's two stamps
+  (`plan_export`, `push_export`). The export sites were statement-scoped
+  under autocommit and so correct by accident; they change so the stamp's
+  meaning no longer depends on whatever transaction a caller wraps them
+  in. `started_at` is untouched — its DEFAULT fires in the run row's own
+  short transaction.
+- **`updated_at = now()` deliberately left alone** (`sync_state` and every
+  trigger-backed table): migration 0003's trigger overwrites it with
+  `now()` regardless of the statement, and "the transaction that set
+  this" is the intended meaning there.
+- **Regression test** injects a `pg_sleep` inside the write transaction
+  through the `_backfill_tapback_targets` seam and asserts the recorded
+  window covers it. It fails on the old code by exactly the injected
+  delay; a slow `imsg-dump` would *not* have reproduced the bug, because
+  work done before the transaction opens was already inside the window.
+  A no-database scan (`tests/test_finished_at_uses_clock_timestamp.py`)
+  fails on any completion column written with `now()` under `src/imsg`,
+  so the class cannot return quietly.
+- Historical rows (runs 5 and 7) keep their wrong `finished_at`; the real
+  finish times survive only in the run logs.
+
 ## 2026-08-17 — first real corpus run: the write-loss class, and identity curation
 
 Recorded late (2026-09-03). This work landed across 2026-08-14→17 with no
