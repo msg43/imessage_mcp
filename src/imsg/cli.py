@@ -780,6 +780,20 @@ def identity_import(config: ConfigOption = None, dry_run: DryRunOption = False) 
     _identity_import(_load_config_or_die(config), dry_run)
 
 
+def _echo_chats_marked_dirty(count: int) -> None:
+    """Every curation command ends with this: the chats whose rendered
+    segments named the persons involved are marked so `imsg segment`
+    re-renders them and `imsg embed` re-embeds the result (the rendered
+    hash changes, which is what S6 treats as pending). Printed on dry
+    runs too, as the count the real run would mark."""
+    typer.echo(f"identity: chats marked for re-segmentation: {count}")
+    if count:
+        typer.echo(
+            "identity: run `imsg segment` and then `imsg embed` — until then the index "
+            "keeps the old names in those chats' segments, embeddings and FTS rows"
+        )
+
+
 @identity_app.command("rematch-stubs")
 def identity_rematch_stubs(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
     """Name the review stubs an import that ran without Contacts access left behind.
@@ -792,6 +806,12 @@ def identity_rematch_stubs(config: ConfigOption = None, dry_run: DryRunOption = 
     exactly as the import would have named it. Reviewed persons, the owner,
     ambiguous handles and handles no card carries are never touched. Fails
     outright, rather than degrading, when Contacts is unavailable.
+
+    Every rename marks the chats whose segments carry the stub's old name
+    for re-segmentation — on a Contacts-less index that is most chats —
+    and the last line reports how many. Run `imsg segment` and then
+    `imsg embed` afterwards; until then the index keeps the raw-handle
+    names in those chats' segments, embeddings and FTS rows.
     """
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
@@ -813,6 +833,7 @@ def identity_rematch_stubs(config: ConfigOption = None, dry_run: DryRunOption = 
                     f"{outcome.display_name!r} -> {outcome.new_display_name!r}"
                 )
     typer.echo(f"rematch: {result.summary}")
+    _echo_chats_marked_dirty(result.chats_marked_dirty)
     if dry_run:
         typer.echo(DRY_RUN_MARKER)
 
@@ -1022,12 +1043,17 @@ def identity_merge(
     absorb: Annotated[int, typer.Option(help="person_id to absorb and delete.")],
     config: ConfigOption = None,
 ) -> None:
-    """Fold `absorb` into `keep` — handles, messages, tapbacks, participants."""
+    """Fold `absorb` into `keep` — handles, messages, tapbacks, participants.
+
+    The absorbed person's chats (and the kept person's) are marked for
+    re-segmentation, since their segments now render the kept person's
+    names; run `imsg segment` and then `imsg embed` afterwards.
+    """
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
     conn = _connect_and_verify_or_die(cfg)
     try:
-        merge_persons(conn, keep_person_id=keep, absorb_person_id=absorb)
+        dirty = merge_persons(conn, keep_person_id=keep, absorb_person_id=absorb)
         conn.commit()
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
@@ -1035,6 +1061,7 @@ def identity_merge(
     finally:
         conn.close()
     typer.echo(f"identity: merged person {absorb} into {keep}")
+    _echo_chats_marked_dirty(len(dirty))
 
 
 @identity_app.command("rename")
@@ -1043,13 +1070,35 @@ def identity_rename(
     name: Annotated[str, typer.Option(help="New display_name.")],
     short: Annotated[str | None, typer.Option(help="Optional new short_name.")] = None,
     config: ConfigOption = None,
+    yes_owner: Annotated[
+        bool,
+        typer.Option(
+            "--yes-owner",
+            help="Required to rename the owner person — the one identity merge, "
+            "apply-overrides and rematch-stubs never touch. Without it, renaming the "
+            "owner is refused.",
+        ),
+    ] = False,
 ) -> None:
-    """Set a person's display name (and optionally short name)."""
+    """Set a person's display name (and optionally short name).
+
+    Every chat whose segments carry the person's name is marked for
+    re-segmentation; run `imsg segment` and then `imsg embed` afterwards.
+    The owner person is refused unless --yes-owner is given.
+    """
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
+    if yes_owner:
+        typer.echo(
+            f"identity: WARNING --yes-owner: person {person} is renamed even if it is the "
+            "owner person, which every automated curation path leaves alone",
+            err=True,
+        )
     conn = _connect_and_verify_or_die(cfg)
     try:
-        rename_person(conn, person_id=person, display_name=name, short_name=short)
+        dirty = rename_person(
+            conn, person_id=person, display_name=name, short_name=short, allow_owner=yes_owner
+        )
         conn.commit()
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
@@ -1057,6 +1106,7 @@ def identity_rename(
     finally:
         conn.close()
     typer.echo(f"identity: renamed person {person} to {name!r}")
+    _echo_chats_marked_dirty(len(dirty))
 
 
 @identity_app.command("assign")
@@ -1066,12 +1116,16 @@ def identity_assign(
     person: Annotated[int, typer.Option(help="person_id to attach it to.")],
     config: ConfigOption = None,
 ) -> None:
-    """Repoint one canonical handle onto a different person."""
+    """Repoint one canonical handle onto a different person.
+
+    The chats of the handle's previous person and of its new one are marked
+    for re-segmentation; run `imsg segment` and then `imsg embed` afterwards.
+    """
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
     conn = _connect_and_verify_or_die(cfg)
     try:
-        assign_handle(conn, normalized_value=value, kind=kind, person_id=person)
+        dirty = assign_handle(conn, normalized_value=value, kind=kind, person_id=person)
         conn.commit()
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
@@ -1079,6 +1133,7 @@ def identity_assign(
     finally:
         conn.close()
     typer.echo(f"identity: assigned {kind} {value!r} to person {person}")
+    _echo_chats_marked_dirty(len(dirty))
 
 
 OverridesPathArgument = Annotated[
@@ -1112,6 +1167,12 @@ def identity_apply_overrides(
     are no-ops; identifiers absent from the index are reported as
     `unmatched`, never invented; conflicts are reported and skipped unless
     `--force`. Ends with the S3 invariant report and a one-line summary.
+
+    Every applied decision marks the chats whose segments carry the names
+    it replaced for re-segmentation, and the last line reports how many.
+    Run `imsg segment` and then `imsg embed` afterwards; until then the
+    index keeps the old names in those chats' segments, embeddings and
+    FTS rows.
     """
     cfg = _load_config_or_die(config)
     try:
@@ -1156,6 +1217,7 @@ def identity_apply_overrides(
             err=True,
         )
     typer.echo(f"identity: {result.summary}")
+    _echo_chats_marked_dirty(result.chats_marked_dirty)
     if dry_run:
         typer.echo(DRY_RUN_MARKER)
 

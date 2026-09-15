@@ -19,7 +19,12 @@ guessed), and on a unique match names the person exactly as the import
 names a fresh handle: the card's display name, a `short_name` slugged from
 it, the card's organization, the stub note cleared, `needs_review`
 cleared. The rename goes through `rename_person`, so `person.updated_at`
-moves the way a hand rename moves it.
+moves the way a hand rename moves it — and, like a hand rename, every
+chat whose rendered segments carry the stub's name is marked for
+re-segmentation (`RematchStubsResult.chats_marked_dirty`). On an index
+where most stubs sit in their own chats that is most chats; the run
+must be followed by `imsg segment` and then `imsg embed`, or the
+segments, embeddings and FTS rows keep the raw-handle names.
 
 What a stub is
 --------------
@@ -91,6 +96,12 @@ class RematchStubsResult:
     outcomes: tuple[StubOutcome, ...]
     contacts_loaded: int
     dry_run: bool = False
+    chats_marked_dirty: int = 0
+    """Distinct chats marked for re-segmentation by the renames (each
+    `rename_person` bumps the chats whose rendered segments name the
+    person; a chat shared by several renamed stubs is counted once).
+    `imsg segment` and then `imsg embed` must follow a run that reports
+    a non-zero count, or the index keeps the old names."""
 
     def count(self, status: MatchStatus) -> int:
         return sum(1 for outcome in self.outcomes if outcome.status == status)
@@ -165,6 +176,7 @@ def _rematch_body(
     conn: psycopg.Connection, index: ContactsIndex, *, contacts_loaded: int
 ) -> RematchStubsResult:
     outcomes: list[StubOutcome] = []
+    dirty_chat_ids: set[int] = set()
     with conn.transaction(), conn.cursor() as cur:
         for stub in _load_stubs(cur):
             found = index.lookup_all(stub.handles)
@@ -186,9 +198,9 @@ def _rematch_body(
             # Exactly what `_create_person` gives a Contacts-named person, applied
             # to the existing row: name, a fresh slug, organization, no stub note,
             # off the review worklist. `rename_person` is the same path a hand
-            # rename takes, `updated_at` bump included.
+            # rename takes, `updated_at` bump and dirty-chat marking included.
             short_name = _generate_unique_short_name(cur, contact.display_name)
-            rename_person(
+            dirty_chat_ids |= rename_person(
                 conn,
                 person_id=stub.person_id,
                 display_name=contact.display_name,
@@ -208,7 +220,11 @@ def _rematch_body(
                     new_short_name=short_name,
                 )
             )
-    return RematchStubsResult(outcomes=tuple(outcomes), contacts_loaded=contacts_loaded)
+    return RematchStubsResult(
+        outcomes=tuple(outcomes),
+        contacts_loaded=contacts_loaded,
+        chats_marked_dirty=len(dirty_chat_ids),
+    )
 
 
 def run_rematch_stubs(

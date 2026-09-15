@@ -9,14 +9,21 @@ lifecycle, per the foundation's DB convention. Honors D1's
 `policy.index_unsent` / `policy.index_edit_history` flags and stamps
 `seg_config_hash` (D4's freeze mechanism) on every segment it writes.
 
-**Cross-stage dependency (flagged for downstream agents):** dirty-chat
-detection below assumes S2 (edits/retractions) and S3 (identity merges)
-bump `message.updated_at` on any content-relevant change. Nothing in
-migration 0001 does this automatically (no trigger) — if a stage
-mutates `message` without setting `updated_at = now()`, the affected
-chat will not be picked up by `find_dirty_chats` until an explicit
-`--rebuild`. Worth confirming against S2/S3's actual UPDATE statements
-once they land.
+**Cross-stage dependency:** dirty-chat detection below assumes S2
+(edits/retractions) and S3 (identity curation) bump
+`message.updated_at` on any change to what a segment renders. Migration
+0003's trigger covers every UPDATE of a `message` row, so S2's upserts
+and S3's sender repoints are caught by construction. A name change is
+not an UPDATE of any message row, though — the rendered text carries
+`person.display_name` (header) and `person.short_name` (message lines,
+tapback suffixes) — so `rename_person` / `merge_persons` /
+`assign_handle` (`imsg.stages.identity._mark_chats_dirty_for_persons`)
+bump every message of every chat whose rendered segments name the
+persons involved, which makes `find_dirty_chats` report the chat from
+its first message and the incremental frontier rebuild it from the
+start. Before 2026-09-15 they bumped only `person.updated_at`, which
+nothing here watches, and a rename after segmentation was never
+re-rendered.
 """
 
 from __future__ import annotations

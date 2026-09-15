@@ -428,3 +428,58 @@ def test_rematch_keeps_a_stub_whose_only_card_has_no_name(
     )
     assert result.summary == "stubs=1 matched=0 ambiguous=0 unmatched=1"
     assert _state_snapshot(pg_conn) == before
+
+
+def _message_updated_ats(conn: psycopg.Connection) -> dict[int, Any]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT message_id, updated_at FROM message ORDER BY message_id")
+        return {int(message_id): updated_at for message_id, updated_at in cur.fetchall()}
+
+
+def test_rematch_marks_the_renamed_stubs_chats_for_resegmentation_once_each(
+    pg_conn: psycopg.Connection, tmp_path: Path, config_dict_factory: ConfigDictFactory
+) -> None:
+    """Both stubs share the one seeded chat, so two renames mark one chat:
+    the count is a union, not a sum. The mark is a bump of every message's
+    `updated_at` in that chat — the owner's own message included, since the
+    header on every segment changes — and a dry run rolls the bump back
+    along with the renames while still reporting the count."""
+    _seed_and_resolve(pg_conn, tmp_path, config_dict_factory, handles=[ALICE_PHONE, BOB_PHONE])
+    before = _message_updated_ats(pg_conn)
+    assert len(before) == 3  # one message per stub plus the owner's
+    cards = [
+        _card("c-alice", "Alice Example", _phone(ALICE_PHONE)),
+        _card("c-bob", "Bob Builder", _phone(BOB_PHONE)),
+    ]
+    config = _identity_config(config_dict_factory)
+
+    preview = run_rematch_stubs(
+        conn=pg_conn, config=config, contacts_importer=lambda region: cards, dry_run=True
+    )
+    assert preview.summary == "stubs=2 matched=2 ambiguous=0 unmatched=0"
+    assert preview.chats_marked_dirty == 1
+    assert _message_updated_ats(pg_conn) == before
+
+    real = run_rematch_stubs(conn=pg_conn, config=config, contacts_importer=lambda region: cards)
+    assert real.summary == preview.summary
+    assert real.chats_marked_dirty == 1
+    after = _message_updated_ats(pg_conn)
+    assert set(after) == set(before)
+    assert all(after[message_id] > before[message_id] for message_id in before)
+
+
+def test_rematch_that_names_nobody_marks_no_chat(
+    pg_conn: psycopg.Connection, tmp_path: Path, config_dict_factory: ConfigDictFactory
+) -> None:
+    _seed_and_resolve(pg_conn, tmp_path, config_dict_factory, handles=[ALICE_PHONE])
+    before = _message_updated_ats(pg_conn)
+
+    result = run_rematch_stubs(
+        conn=pg_conn,
+        config=_identity_config(config_dict_factory),
+        contacts_importer=lambda region: [_card("c-dana", "Dana Okafor", _phone(DANA_PHONE))],
+    )
+
+    assert result.summary == "stubs=1 matched=0 ambiguous=0 unmatched=1"
+    assert result.chats_marked_dirty == 0
+    assert _message_updated_ats(pg_conn) == before
