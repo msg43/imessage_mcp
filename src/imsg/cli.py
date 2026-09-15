@@ -71,6 +71,7 @@ from imsg.mcp.auth import build_public_gate
 from imsg.mcp.tools.local_server import LocalMcpServer, run_local_server
 from imsg.mcp.tools.public_server import PublicMcpServer, build_public_asgi_app, parse_bind_address
 from imsg.mount.guard import run_guard_mount_or_exit
+from imsg.paths import is_same_file
 from imsg.providers.factory import (
     backend_status_line,
     build_boundary_provider,
@@ -496,14 +497,21 @@ def _validate_seed_or_die(cfg: Config, snapshot: Path | None, source: str | None
     """Gate the one-shot seed path (SPEC §8 S7): `--snapshot` feeds a prepared
     database straight to S2, bypassing S1.
 
-    Two rules, both fail-closed, because the failure they prevent is silent
-    and permanent. A seed advances the **ROWID watermark of whatever source
+    Three rules, all fail-closed, because the failures they prevent are
+    silent and permanent. A seed advances the **ROWID watermark of whatever source
     it is ingested under**, and a ROWID means something only inside one
     database file. Seed a file whose ROWIDs run past the live source's and
     the watermark jumps past real messages that were never looked at — they
     are then below the watermark forever, and nothing reports rows it never
     read. So a seed must carry its own `--source`, and that source must not
     be one the pipeline is actively snapshotting.
+
+    Third, the seed must not *be* the live database — `paths.live_chat_db`
+    or any `sync.sources[].chat_db` — under any alias: symlink, hard link,
+    or the macOS `/System/Volumes/Data/…` firmlink, which is why the
+    comparison is by inode as well as by resolved path. Only S1 may open
+    the live file, and only through the online-backup API (hard
+    requirement 1); S2's seed open assumes a file nobody is writing to.
     """
     if snapshot is None:
         return
@@ -525,6 +533,23 @@ def _validate_seed_or_die(cfg: Config, snapshot: Path | None, source: str | None
             err=True,
         )
         raise typer.Exit(code=1)
+    protected: list[tuple[str, Path]] = [("paths.live_chat_db", cfg.paths.live_chat_db)]
+    protected += [
+        (f"sync.sources[{i}] ({s.name}).chat_db", s.chat_db)
+        for i, s in enumerate(cfg.sync.sources)
+    ]
+    for label, live_path in protected:
+        if is_same_file(snapshot, live_path):
+            typer.echo(
+                f"imsg: --snapshot may not be the live chat.db — '{snapshot}' is {label} "
+                f"('{live_path}'). Only S1 may open the live database, read-only through "
+                f"SQLite's online-backup API (hard requirement 1); S2's seed open assumes a "
+                f"file nobody is writing to and would read a live database inconsistently "
+                f"while Messages.app writes it. Run 'imsg snapshot' and extract from that "
+                f"snapshot, or seed from a copy you prepared elsewhere.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
     if not snapshot.is_file():
         typer.echo(f"imsg: --snapshot file not found: '{snapshot}'", err=True)
         raise typer.Exit(code=1)
