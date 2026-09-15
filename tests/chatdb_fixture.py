@@ -119,7 +119,7 @@ class FixtureMessage:
 class FixtureAttachment:
     guid: str
     filename: str = "IMG_0001.jpeg"  # transfer_name (display name)
-    source_path: str = "~/Library/Messages/Attachments/a/b/IMG_0001.jpeg"  # filename (disk path)
+    source_path: str | None = "~/Library/Messages/Attachments/a/b/IMG_0001.jpeg"  # filename (disk path); None = never landed on disk
     uti: str = "public.jpeg"
     mime_type: str = "image/jpeg"
     byte_size: int = 12345

@@ -28,6 +28,7 @@ from chatdb_fixture import (
     FixtureHandle,
     FixtureMessage,
 )
+from imsg.backfill.classify import NO_SOURCE_PATH_ERROR
 from imsg.db.migrations import PostgresMigrationRunner
 from imsg.stages.extract import (
     ExtractResult,
@@ -618,6 +619,140 @@ def test_run_extract_attachment_linked_to_message(pg_conn: psycopg.Connection, t
             "JOIN message m ON m.message_id = ma.message_id WHERE m.source_guid = 'msg-1'"
         )
         assert cur.fetchall() == [("att-1", 0)]
+
+        # A row with a source path starts on S5a's ladder as `dataless`.
+        cur.execute(
+            "SELECT state, materialization_last_error FROM attachment WHERE source_guid = 'att-1'"
+        )
+        assert cur.fetchall() == [("dataless", None)]
+
+
+def _attachment_state(conn: psycopg.Connection, guid: str) -> tuple[str, str | None, str | None]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT state, source_path, materialization_last_error FROM attachment "
+            "WHERE source_guid = %s",
+            (guid,),
+        )
+        row = cur.fetchone()
+        assert row is not None
+        return str(row[0]), row[1], row[2]
+
+
+def test_run_extract_attachment_without_a_source_path_starts_missing(
+    pg_conn: psycopg.Connection, tmp_path: Path
+) -> None:
+    """chat.db records no `filename` for an attachment that never landed
+    on disk. There is no placeholder to read, so S5a's `dataless`
+    ("pending, will retry") would be a promise nobody can keep: the row
+    is `missing` from the start, with the reason recorded. If a later
+    snapshot supplies a path (the transfer completed), the row goes
+    back to `dataless` so S5a gives it its first real attempt."""
+    builder = ChatDbBuilder()
+    chat = builder.add_chat(FixtureChat(guid="chat-1"))
+    handle = builder.add_handle(FixtureHandle(raw_value="+15551234567"))
+    builder.link_participant(chat.guid, handle.raw_value)
+    builder.add_message(
+        FixtureMessage(guid="msg-1", chat_guid=chat.guid, handle_raw_value=handle.raw_value, rowid=1)
+    )
+    builder.add_attachment(FixtureAttachment(guid="att-nopath", source_path=None))
+    builder.link_attachment("msg-1", "att-nopath")
+    snapshot_path = builder.build(tmp_path / "snapshot-1.db")
+
+    def fake_run_1(binary_path: Path, snap: Path, since_rowid: int) -> ImsgDumpRun:
+        return ImsgDumpRun(messages=(_dump_message(guid="msg-1", rowid=1),), stderr_lines=())
+
+    run_extract(
+        conn=pg_conn, source_name="mini", snapshot_path=snapshot_path,
+        imsg_dump_binary=_fake_binary(tmp_path), run_imsg_dump_fn=fake_run_1,
+    )
+    assert _attachment_state(pg_conn, "att-nopath") == ("missing", None, NO_SOURCE_PATH_ERROR)
+
+    # A later snapshot: the same attachment now has a path, referenced
+    # from a new message (only rows past the watermark are re-read).
+    builder2 = ChatDbBuilder()
+    chat2 = builder2.add_chat(FixtureChat(guid="chat-1"))
+    handle2 = builder2.add_handle(FixtureHandle(raw_value="+15551234567"))
+    builder2.link_participant(chat2.guid, handle2.raw_value)
+    builder2.add_message(
+        FixtureMessage(guid="msg-1", chat_guid=chat2.guid, handle_raw_value=handle2.raw_value, rowid=1)
+    )
+    builder2.add_message(
+        FixtureMessage(guid="msg-2", chat_guid=chat2.guid, handle_raw_value=handle2.raw_value, rowid=2)
+    )
+    builder2.add_attachment(
+        FixtureAttachment(
+            guid="att-nopath", source_path="~/Library/Messages/Attachments/c/d/IMG_0002.jpeg"
+        )
+    )
+    builder2.link_attachment("msg-1", "att-nopath")
+    builder2.link_attachment("msg-2", "att-nopath")
+    snapshot_path_2 = builder2.build(tmp_path / "snapshot-2.db")
+
+    def fake_run_2(binary_path: Path, snap: Path, since_rowid: int) -> ImsgDumpRun:
+        return ImsgDumpRun(messages=(_dump_message(guid="msg-2", rowid=2),), stderr_lines=())
+
+    run_extract(
+        conn=pg_conn, source_name="mini", snapshot_path=snapshot_path_2,
+        imsg_dump_binary=_fake_binary(tmp_path), run_imsg_dump_fn=fake_run_2,
+    )
+    assert _attachment_state(pg_conn, "att-nopath") == (
+        "dataless", "~/Library/Messages/Attachments/c/d/IMG_0002.jpeg", None
+    )
+
+
+def test_run_extract_re_extraction_leaves_materialization_state_alone(
+    pg_conn: psycopg.Connection, tmp_path: Path
+) -> None:
+    """S5a owns `state` once a row has a path: re-reading the same
+    attachment from a later snapshot must not knock a materialized (or
+    unsupported, or errored) row back to `dataless`."""
+    def build_snapshot(path: Path, *, message_rowids: tuple[int, ...]) -> Path:
+        builder = ChatDbBuilder()
+        chat = builder.add_chat(FixtureChat(guid="chat-1"))
+        handle = builder.add_handle(FixtureHandle(raw_value="+15551234567"))
+        builder.link_participant(chat.guid, handle.raw_value)
+        builder.add_attachment(FixtureAttachment(guid="att-1"))
+        for rowid in message_rowids:
+            builder.add_message(
+                FixtureMessage(
+                    guid=f"msg-{rowid}", chat_guid=chat.guid,
+                    handle_raw_value=handle.raw_value, rowid=rowid,
+                )
+            )
+            builder.link_attachment(f"msg-{rowid}", "att-1")
+        return builder.build(path)
+
+    def fake_run_for(rowid: int) -> Any:
+        def fake_run(binary_path: Path, snap: Path, since_rowid: int) -> ImsgDumpRun:
+            return ImsgDumpRun(
+                messages=(_dump_message(guid=f"msg-{rowid}", rowid=rowid),), stderr_lines=()
+            )
+
+        return fake_run
+
+    # First snapshot: msg-1 only. Then S5a "materializes" the row.
+    run_extract(
+        conn=pg_conn, source_name="mini",
+        snapshot_path=build_snapshot(tmp_path / "snapshot-1.db", message_rowids=(1,)),
+        imsg_dump_binary=_fake_binary(tmp_path), run_imsg_dump_fn=fake_run_for(1),
+    )
+    assert _attachment_state(pg_conn, "att-1")[0] == "dataless"
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE attachment SET state = 'materialized', materialization_last_error = NULL "
+            "WHERE source_guid = 'att-1'"
+        )
+    pg_conn.commit()
+
+    # Second snapshot adds msg-2, which references att-1 again: the row
+    # is re-upserted (past the watermark) and its state must survive.
+    run_extract(
+        conn=pg_conn, source_name="mini",
+        snapshot_path=build_snapshot(tmp_path / "snapshot-2.db", message_rowids=(1, 2)),
+        imsg_dump_binary=_fake_binary(tmp_path), run_imsg_dump_fn=fake_run_for(2),
+    )
+    assert _attachment_state(pg_conn, "att-1")[0] == "materialized"
 
 
 def test_run_extract_group_chat_classified_by_style(pg_conn: psycopg.Connection, tmp_path: Path) -> None:

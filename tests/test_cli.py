@@ -969,6 +969,34 @@ def test_backfill_attachments_wires_run_backfill(
     assert "materialized=4" in result.output
     assert captured["attachments_root"].name == "Attachments"
     assert captured["kw"]["yes_full_run"] is True
+    assert captured["kw"]["retry_failed"] is False
+
+
+def test_backfill_attachments_retry_failed_flag_and_reclassification_line(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.backfill.pipeline import BackfillRunReport
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_backfill(conn: Any, data_root: Path, attachments_root: Path, **kw: Any) -> BackfillRunReport:
+        captured["kw"] = kw
+        return BackfillRunReport(
+            considered=7, materialized=2, errored=1, marked_missing=1, marked_unsupported=3,
+            reclassified_unsupported=435, reclassified_missing_no_source=1362, retry_reset=445,
+        )
+
+    monkeypatch.setattr(cli_module, "run_backfill", fake_run_backfill)
+    result = runner.invoke(
+        app,
+        ["backfill-attachments", "--retry-failed", "--yes-full-run", "--config", str(mocked_pg_env)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["kw"]["retry_failed"] is True
+    # Every terminal state a run can produce is printed, from the same
+    # counters the database was written from.
+    assert "considered=7 materialized=2 unsupported=3 errored=1 marked_missing=1" in result.output
+    assert "unsupported=435 missing_no_source_path=1362; retry_failed_reset=445" in result.output
 
 
 # --------------------------------------------------------------------------

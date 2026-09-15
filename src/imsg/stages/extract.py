@@ -87,6 +87,7 @@ import apsw
 import psycopg
 import structlog
 
+from imsg.backfill.classify import NO_SOURCE_PATH_ERROR
 from imsg.errors import ExtractionError
 from imsg.hashing import sha256_file
 from imsg.keys import attachment_key, message_key, thread_key
@@ -984,15 +985,40 @@ def _upsert_source_handle(cur: psycopg.Cursor[Any], handle: HandleRow) -> int:
 
 
 def _upsert_attachment(cur: psycopg.Cursor[Any], att: AttachmentRow) -> int:
+    """`state` is decided here, once, from whether chat.db recorded a
+    path at all: with one the row starts `dataless` (S5a's "pending");
+    with none there is nothing on disk to read, so it starts `missing`
+    with `NO_SOURCE_PATH_ERROR` — calling it `dataless` would promise a
+    retry that can never happen. On re-extraction the state is left
+    alone (S5a owns it from then on), with one exception: a `missing`
+    row that had no path and now has one goes back to `dataless`, so
+    a transfer that completed since the last run gets its first
+    attempt without anyone hand-editing the row."""
+    initial_state = "dataless" if att.source_path is not None else "missing"
+    initial_error = None if att.source_path is not None else NO_SOURCE_PATH_ERROR
     cur.execute(
         """
         INSERT INTO attachment (
-            source_guid, attachment_key, filename, source_path, uti, mime_type, byte_size, is_sticker
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            source_guid, attachment_key, filename, source_path, uti, mime_type, byte_size,
+            is_sticker, state, materialization_last_error
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (source_guid) DO UPDATE SET
             filename = EXCLUDED.filename, source_path = EXCLUDED.source_path,
             uti = EXCLUDED.uti, mime_type = EXCLUDED.mime_type, byte_size = EXCLUDED.byte_size,
-            is_sticker = EXCLUDED.is_sticker, updated_at = now()
+            is_sticker = EXCLUDED.is_sticker,
+            state = CASE
+                WHEN attachment.state = 'missing' AND attachment.source_path IS NULL
+                     AND EXCLUDED.source_path IS NOT NULL
+                THEN 'dataless'::materialization_state
+                ELSE attachment.state
+            END,
+            materialization_last_error = CASE
+                WHEN attachment.state = 'missing' AND attachment.source_path IS NULL
+                     AND EXCLUDED.source_path IS NOT NULL
+                THEN NULL
+                ELSE attachment.materialization_last_error
+            END,
+            updated_at = now()
         RETURNING attachment_id
         """,
         (
@@ -1004,6 +1030,8 @@ def _upsert_attachment(cur: psycopg.Cursor[Any], att: AttachmentRow) -> int:
             att.mime_type,
             att.byte_size,
             att.is_sticker,
+            initial_state,
+            initial_error,
         ),
     )
     row = cur.fetchone()
