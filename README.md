@@ -171,19 +171,21 @@ in the repo and are used unless `paths.data_root` holds a copy at the
 same relative path; each run prints which file it used, because those
 bytes are hashed into `seg_config_hash` and the caption provenance.
 
-**What is still unverified (2026-09-14).** No pinned model has been
-downloaded or executed end to end: every hosted entry in the manifest
-carries `smoke_test: not_run`. What *has* been checked: every runtime
-API name the providers call exists with the assumed signature in the
-installed packages; the pinned Qwen3.5 chat template honours
-`enable_thinking=False`; the Apple Vision OCR provider ran on this
-machine's framework and read a generated image back verbatim (recorded
-in the manifest); the transcription chain (ffmpeg → mlx-whisper) returned
-an exact transcript of synthesised speech on a 50 MB `whisper-tiny`
-stand-in; and the three mlx-lm providers loaded a 79 MB stand-in model
-and produced correctly shaped, padding-invariant output. None of that
-says anything about retrieval quality with the pinned 8B / 35B weights —
-establishing that is the first real task.
+**What has been run, and what is still unverified (2026-09-14).**
+`uv run python scripts/smoke_test_models.py` (also
+`imsg.providers.model_smoke`) downloads every pinned model at its sha,
+checksums it (`artifact_sha256`, defined in the lock header), builds the
+real provider through the factory and runs one fictional input per role,
+recording load time, inference time and peak memory per model into the
+lock with `--write`. On an M2 Ultra with 128 GB every entry passed except
+the pinned reranker: the mlx-embeddings conversion of Qwen3-Reranker-8B
+ships no `lm_head` tensor, so the model card's yes/no logits cannot be
+computed from it — the lock records the exact error, and the fix is a
+re-pin, not code (a local `mlx_lm.convert` of the upstream repo passes the
+same check; see the entry's notes). Still unverified: `segment` / `embed` / `enrich` on a
+real chat, batched throughput and memory (the recorded peaks are
+single-input), the deployment host's memory, and retrieval quality with
+the pinned weights — establishing that is the first real task.
 
 | Interface | What it needs |
 |---|---|
