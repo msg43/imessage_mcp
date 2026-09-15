@@ -228,7 +228,12 @@ def test_loads_once_with_pinned_revision(monkeypatch: pytest.MonkeyPatch) -> Non
     provider.embed_query("b", instruction="x")
     provider.load()
     assert runtime.load_calls == [
-        {"path": "org/embed", "tokenizer_config": None, "revision": "rev1"}
+        {
+            "path": "org/embed",
+            "tokenizer_config": None,
+            "model_config": {"tie_word_embeddings": True},
+            "revision": "rev1",
+        }
     ]
     assert provider.is_loaded is True
 

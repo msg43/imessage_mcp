@@ -15,10 +15,35 @@
 # -> `sha` (current main commit) and `cardData.license` / `license:*` tag;
 # quantization read from each repo's config.json; runtime floors are the
 # PyPI versions verified to exist on the same date (pyproject.toml
-# `models` extra). No hosted model below has been downloaded or executed
-# yet — every artifact_sha256 is null and every resolved entry's
-# smoke_test is not_run. The Apple Vision entry ships with the OS and has
-# been exercised through the real provider (see its smoke_test).
+# `models` extra).
+#
+# Smoke runs (scripts/smoke_test_models.py, imsg.providers.model_smoke):
+# every hosted entry is downloaded at its pinned sha, checksummed, built
+# through imsg.providers.factory from a config carrying exactly these
+# pins, and run once on a fictional input, each (entry, role) in its own
+# process; `--write` then records, per entry, only these two keys:
+#
+#   artifact_sha256 — the hex SHA-256 of the UTF-8 text made of the lines
+#     "<relative POSIX path>  <hex sha256 of the file bytes>\n" (two
+#     spaces, like sha256sum), one per regular file in the pinned snapshot
+#     whose name matches *.safetensors, *.npz, *.json, *.txt, *.model,
+#     *.tiktoken, *.jinja, *.py or *.jsonl (hidden entries skipped), sorted
+#     by relative path. README.md, .gitattributes and *.bin/*.pt duplicates
+#     of safetensors weights are outside the definition, so a partial and
+#     a full snapshot of the same commit give the same digest
+#     (imsg.providers.model_smoke.artifact_digest is the reference
+#     implementation). Null until an entry has been downloaded; null for
+#     the system entry, which has no artifact.
+#   smoke_test — status (passed | failed | not_run), date, host_class
+#     (chip family and memory size, never a hostname), load_seconds,
+#     inference_seconds, peak_memory_gb (GiB; mlx.core.get_peak_memory for
+#     the MLX runtimes, the process's max RSS for torch and Apple Vision —
+#     see peak_memory_source), a one-line result, `error` when failed,
+#     `macos` for the system entry (the OS version is its pin), and a
+#     per-role `roles` map when one set of weights serves two roles (the
+#     top-level numbers are then the per-role maxima). The numbers are
+#     from the host_class named — the machine the run happened on, not
+#     necessarily the deployment host.
 schema_version: 1
 resolved_at: '2026-09-14'
 models:
@@ -30,9 +55,17 @@ models:
     license: apache-2.0
     expected_dim: 2048
     quantization: {mode: mxfp8, bits: 8, group_size: 32}
-    artifact_sha256: null
+    artifact_sha256: '5f1fbc90671290cef2f532a606ecb82eece11754e1694ec0643756f6f4b585c4'
     min_runtime: {mlx: '0.32.2', mlx-lm: '0.31.3', huggingface_hub: '1.31.0'}
-    smoke_test: {status: not_run}
+    smoke_test:
+      status: passed
+      date: '2026-09-14'
+      host_class: Apple M2 Ultra, 128 GB unified memory
+      load_seconds: 12.49
+      inference_seconds: 2.79
+      peak_memory_gb: 7.41
+      peak_memory_source: mlx.core.get_peak_memory
+      result: dim=2048, unit-norm; cos(query, relevant)=0.7272 > cos(query, unrelated)=0.2378
     notes: >-
       mlx-community's 8-bit conversion of Qwen/Qwen3-Embedding-8B (converted with
       mlx-embeddings 0.0.3, per its model card; model_type qwen3, hidden_size 4096).
@@ -49,14 +82,45 @@ models:
     license: apache-2.0
     expected_dim: null
     quantization: {mode: mxfp8, bits: 8, group_size: 32}
-    artifact_sha256: null
+    artifact_sha256: '1dbdeb35eea637bd9702a6555f80712f5660100a1a3dff4125c6906bfa994b67'
     min_runtime: {mlx: '0.32.2', mlx-lm: '0.31.3', huggingface_hub: '1.31.0'}
-    smoke_test: {status: not_run}
+    smoke_test:
+      status: failed
+      date: '2026-09-14'
+      host_class: Apple M2 Ultra, 128 GB unified memory
+      peak_memory_gb: 0.0
+      peak_memory_source: mlx.core.get_peak_memory
+      result: 'failed: MlxRuntimeError: could not load mlx-community/Qwen3-Reranker-8B-mxfp8@a8947a5fe4c62cc1feb8dffa89d49502c8c80923
+        via mlx_lm: ValueError: Missing 1 parameters: lm_head.weight.. mlx_lm needs an MLX-layou…'
+      error: 'MlxRuntimeError: could not load mlx-community/Qwen3-Reranker-8B-mxfp8@a8947a5fe4c62cc1feb8dffa89d49502c8c80923
+        via mlx_lm: ValueError: Missing 1 parameters: lm_head.weight.. mlx_lm needs an MLX-layout checkpoint
+        (e.g. an `mlx-community/*` conversion or the output of `mlx_lm.convert`); a repo published only in the
+        raw transformers layout will not load'
     notes: >-
       mlx-community's 8-bit conversion of Qwen/Qwen3-Reranker-8B (converted with
       mlx-embeddings 0.0.3, per its model card). Scores (query, rendered_text) pairs
       for SPEC §9.4 step 7; no output dimension applies. Upstream:
       Qwen/Qwen3-Reranker-8B @ 77d193c791ed757ca307ee72715aa132723da912 (apache-2.0).
+      UNUSABLE AS PINNED (smoke run 2026-09-14): the checkpoint's two safetensors shards
+      hold 651 tensors and no lm_head.* at all (its model.safetensors.index.json lists
+      an lm_head.weight and a fifth shard that do not exist at this revision), while
+      upstream ships a distinct, untied lm_head.weight (399 tensors,
+      tie_word_embeddings false). The reranker's P(yes) is read from lm_head logits,
+      so no loader change on our side can make this artifact score; mlx-lm's strict
+      load fails first with "Missing 1 parameters: lm_head.weight". local_conversion —
+      the one fix evaluated, same day, same host: mlx_lm.convert of the upstream repo at
+      its pinned sha, i.e. `python -c "from mlx_lm.convert import convert;
+      convert(hf_path='Qwen/Qwen3-Reranker-8B',
+      revision='77d193c791ed757ca307ee72715aa132723da912', mlx_path='<dir>',
+      quantize=True, q_mode='mxfp8', q_bits=8, q_group_size=32)"` (the CLI has no
+      --revision flag; mlx-lm 0.31.3's save() needs the source snapshot complete —
+      snapshot_download(repo, revision=<sha>) first, or huggingface_hub 1.31 refuses).
+      The output (653 tensors, lm_head.weight + lm_head.scales, 8.46 GB) loaded through
+      the same factory path and passed the same check: P(yes) relevant 0.9707 vs
+      irrelevant 0.0000, load 3.6 s, inference 0.69 s, peak 8.09 GiB (mlx). Not pinned:
+      the lock pins Hub revisions, and a local directory has none — publishing that
+      conversion under a repo this project controls (or an mlx-lm-made mlx-community
+      conversion appearing) is the owner's re-pin decision.
   qwen3.5-35b-a3b:
     role: [segment_boundaries, image_caption]
     status: resolved
@@ -65,9 +129,36 @@ models:
     license: apache-2.0
     expected_dim: null
     quantization: {mode: affine, bits: 4, group_size: 64}
-    artifact_sha256: null
+    artifact_sha256: '572ed2b997b9492e092a4a768e0f077f3f3bd171b936df7321850679d2c5b800'
     min_runtime: {mlx: '0.32.2', mlx-lm: '0.31.3', mlx-vlm: '0.7.1', pillow: '12.3.0', huggingface_hub: '1.31.0'}
-    smoke_test: {status: not_run}
+    smoke_test:
+      status: passed
+      date: '2026-09-14'
+      host_class: Apple M2 Ultra, 128 GB unified memory
+      load_seconds: 29.9
+      inference_seconds: 11.21
+      peak_memory_gb: 19.9
+      peak_memory_source: mlx.core.get_peak_memory
+      result: 'segment_boundaries: passed — boundaries=[6] for a 12-message two-topic window; matches the designed
+        split; image_caption: passed — caption mentions [''kite'', ''festival'', ''harbor'']: ''This image is
+        a simple digital graphic or screenshot with a white bac…'
+      roles:
+        segment_boundaries:
+          status: passed
+          load_seconds: 17.05
+          inference_seconds: 11.21
+          peak_memory_gb: 19.07
+          peak_memory_source: mlx.core.get_peak_memory
+          result: boundaries=[6] for a 12-message two-topic window; matches the designed split
+        image_caption:
+          status: passed
+          load_seconds: 29.9
+          inference_seconds: 4.98
+          peak_memory_gb: 19.9
+          peak_memory_source: mlx.core.get_peak_memory
+          result: 'caption mentions [''kite'', ''festival'', ''harbor'']: ''This image is a simple digital graphic
+            or screenshot with a white background. It contains two lines of black text in a sans-serif font:
+            "Harbor Kite Festival" …'''
     notes: >-
       One set of weights serves both S4 topical-boundary detection (text, via mlx-lm)
       and S5b image captioning (vision, via mlx-vlm) — SPEC §4.1/D4. model_type
@@ -81,9 +172,18 @@ models:
     license: mit
     expected_dim: null
     quantization: none
-    artifact_sha256: null
+    artifact_sha256: '77cd803bebe9915d9c01ef1a5c8fe8dc9cf8c29b16d8688b0adfa0ba9a4862b9'
     min_runtime: {mlx: '0.32.2', mlx-whisper: '0.4.3', torch: '2.14.0', huggingface_hub: '1.31.0'}
-    smoke_test: {status: not_run}
+    smoke_test:
+      status: passed
+      date: '2026-09-14'
+      host_class: Apple M2 Ultra, 128 GB unified memory
+      load_seconds: 7.73
+      inference_seconds: 1.04
+      peak_memory_gb: 3.66
+      peak_memory_source: mlx.core.get_peak_memory
+      result: 'transcript matched all 10 words of the synthesised sentence: ''The blue kite drifted over the
+        quiet harbor at dawn.'''
     notes: >-
       mlx-whisper's own conversion of openai/whisper-large-v3 (weights.npz +
       config.json; unquantized — the repo does not state the stored dtype, confirm
@@ -101,13 +201,13 @@ models:
     smoke_test:
       status: passed
       date: '2026-09-14'
-      macos: '26.6.2'
-      method: >-
-        imsg.enrich.vision_ocr.AppleVisionOcrProvider().recognize_text() on a generated
-        900x260 PNG carrying two lines of 56px Helvetica ("Receipt total 42.50" /
-        "Second line of text"); both lines came back verbatim, in reading order, with
-        automatic language detection (ocr_languages null) and again with an explicit
-        en-US list plus minimum_text_height 0.05. model_id apple/vision-recognize-text@26.6.2.
+      host_class: Apple M2 Ultra, 128 GB unified memory
+      macos: 26.6.2
+      load_seconds: 2.2
+      inference_seconds: 0.18
+      peak_memory_gb: 0.12
+      peak_memory_source: resource.getrusage(RUSAGE_SELF).ru_maxrss
+      result: 'recovered both rendered lines verbatim: Harbor Kite Festival / Gate opens at nine'
     notes: >-
       VNRecognizeTextRequest in accurate mode with language correction; the request
       revision is left at the running OS's default (VNRecognizeTextRequestRevision3 is
@@ -124,9 +224,17 @@ models:
     license: apache-2.0
     expected_dim: 1280
     quantization: none
-    artifact_sha256: null
+    artifact_sha256: 'b9ed20d5f156fd14e17c8fb70f4b59170a49603f22326c516532fdf196148337'
     min_runtime: {torch: '2.14.0', open_clip_torch: '3.0.0', timm: '1.0.17', pillow: '12.3.0', pillow-heif: '1.7.0', huggingface_hub: '1.31.0'}
-    smoke_test: {status: not_run}
+    smoke_test:
+      status: passed
+      date: '2026-09-14'
+      host_class: Apple M2 Ultra, 128 GB unified memory
+      load_seconds: 107.44
+      inference_seconds: 0.48
+      peak_memory_gb: 9.43
+      peak_memory_source: resource.getrusage(RUSAGE_SELF).ru_maxrss
+      result: dim=1280, unit-norm; cos(image, matching text)=0.2350 > cos(image, unrelated text)=0.0754
     notes: >-
       Perception Encoder Core G/14 at 448px (D3a): 1.88B-param vision tower + 0.47B
       text tower, both projecting to 1280 dims (migration 0002's halfvec(1280) CHECK

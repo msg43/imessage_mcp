@@ -61,7 +61,7 @@ def test_load_passes_revision_when_load_supports_it(monkeypatch: pytest.MonkeyPa
     assert model is runtime.model
     assert tokenizer is runtime.tokenizer
     assert runtime.load_calls == [
-        {"path": "org/model", "tokenizer_config": None, "revision": "abc123"}
+        {"path": "org/model", "tokenizer_config": None, "model_config": None, "revision": "abc123"}
     ]
     assert runtime.get_model_path_calls == []
     assert runtime.snapshot_calls == []
@@ -107,6 +107,14 @@ def test_load_forwards_tokenizer_config(monkeypatch: pytest.MonkeyPatch) -> None
     runtime = FakeRuntime().install(monkeypatch)
     load_model_and_tokenizer("org/model", None, tokenizer_config={"trust_remote_code": False})
     assert runtime.load_calls[0]["tokenizer_config"] == {"trust_remote_code": False}
+
+
+def test_load_forwards_model_config_only_when_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = FakeRuntime().install(monkeypatch)
+    load_model_and_tokenizer("org/model", None, model_config={"tie_word_embeddings": True})
+    assert runtime.load_calls[0]["model_config"] == {"tie_word_embeddings": True}
+    load_model_and_tokenizer("org/model", None, model_config={})
+    assert runtime.load_calls[1]["model_config"] is None
 
 
 def test_load_failure_is_wrapped_as_mlx_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:

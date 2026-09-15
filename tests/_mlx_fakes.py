@@ -263,24 +263,35 @@ class FakeRuntime:
         self,
         path_or_hf_repo: str,
         tokenizer_config: dict[str, Any] | None = None,
+        model_config: dict[str, Any] | None = None,
         revision: str | None = None,
         **kwargs: Any,
     ) -> tuple[FakeModel, FakeTokenizer]:
-        return self._record_load(path_or_hf_repo, tokenizer_config, revision)
+        return self._record_load(path_or_hf_repo, tokenizer_config, model_config, revision)
 
     def _load_legacy(
         self,
         path_or_hf_repo: str,
         tokenizer_config: dict[str, Any] | None = None,
+        model_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> tuple[FakeModel, FakeTokenizer]:
-        return self._record_load(path_or_hf_repo, tokenizer_config, None)
+        return self._record_load(path_or_hf_repo, tokenizer_config, model_config, None)
 
     def _record_load(
-        self, path: str, tokenizer_config: dict[str, Any] | None, revision: str | None
+        self,
+        path: str,
+        tokenizer_config: dict[str, Any] | None,
+        model_config: dict[str, Any] | None,
+        revision: str | None,
     ) -> tuple[FakeModel, FakeTokenizer]:
         self.load_calls.append(
-            {"path": path, "tokenizer_config": tokenizer_config, "revision": revision}
+            {
+                "path": path,
+                "tokenizer_config": tokenizer_config,
+                "model_config": model_config,
+                "revision": revision,
+            }
         )
         if self.load_error is not None:
             raise self.load_error
