@@ -39,10 +39,10 @@ import math
 from collections.abc import Sequence
 from typing import Any
 
+from imsg.embed.batching import DEFAULT_MAX_BATCH_TOKENS, plan_batches
 from imsg.errors import EmbeddingError
 from imsg.mlx_runtime import (
     base_transformer_hidden_states,
-    batched,
     float_rows,
     format_model_id,
     gather_last_token_states,
@@ -70,6 +70,22 @@ tensor the checkpoint does ship is loaded. A conversion that *does* ship
 a head still loads — ``mlx_lm``'s ``sanitize`` drops ``lm_head.weight``
 for a tied model — and the reranker, which needs the head, does not use
 this override."""
+
+DEFAULT_CACHE_LIMIT_BYTES = 8 * 2**30
+"""``mx.set_cache_limit`` applied when the weights load (D10.2: bound
+MLX's buffer cache explicitly at process start). MLX's default cache
+limit equals its memory limit — 121.6 GiB on a 128 GB M2 Ultra
+(``mx.device_info`` / ``set_cache_limit``, 2026-09-15) — so every
+freed activation buffer is retained and, because consecutive batches
+have different shapes, rarely reused: measured with
+`scripts/bench_text_embedding.py`, the cache grew by ~1.3 GiB per
+batch without bound (44-54 GiB after 8-64 batches; peak *active*
+memory never above 28 GiB), and the first production run reached a
+102 GB GPU footprint, filled the 30 GB swap and stalled the GPU on
+paging (`footprint`/`vm.swapusage`, 2026-09-15). 8 GiB is comfortably
+above the active working set of the batches the pipeline plans (peak
+9-11 GiB *including* the 8.4 GB of weights for 4k-16k padded
+tokens), so bounding it costs nothing and keeps the process resident."""
 
 
 def format_query_text(instruction: str, text: str) -> str:
@@ -154,7 +170,19 @@ class MlxTextEmbeddingProvider:
         *,
         batch_size: int = 32,
         max_length: int = 8192,
+        max_batch_tokens: int = DEFAULT_MAX_BATCH_TOKENS,
+        cache_limit_bytes: int | None = DEFAULT_CACHE_LIMIT_BYTES,
+        model_id: str | None = None,
     ) -> None:
+        """``batch_size`` caps the rows of one forward pass and
+        ``max_batch_tokens`` its padded tokens (``rows x longest row``);
+        :func:`imsg.embed.batching.plan_batches` packs every
+        ``embed_documents`` call under both, longest rows first, and the
+        results come back in input order. ``cache_limit_bytes`` bounds
+        MLX's buffer cache once the weights load (``None`` leaves the
+        runtime default). ``model_id`` overrides the recorded
+        ``'<repo>@<revision>'`` — a local conversion passes its
+        data-root-relative directory plus the upstream sha."""
         if not model_repo:
             raise ValueError("model_repo must be a non-empty repo id or local path")
         if dim < 1:
@@ -163,12 +191,18 @@ class MlxTextEmbeddingProvider:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         if max_length < 2:
             raise ValueError(f"max_length must be >= 2 (one text token plus EOS), got {max_length}")
-        self.model_id = format_model_id(model_repo, revision)
+        if max_batch_tokens < 1:
+            raise ValueError(f"max_batch_tokens must be >= 1, got {max_batch_tokens}")
+        if cache_limit_bytes is not None and cache_limit_bytes < 0:
+            raise ValueError(f"cache_limit_bytes must be >= 0 or None, got {cache_limit_bytes}")
+        self.model_id = model_id or format_model_id(model_repo, revision)
         self.dim = dim
         self._model_repo = model_repo
         self._revision = revision
         self._batch_size = batch_size
         self._max_length = max_length
+        self._max_batch_tokens = max_batch_tokens
+        self._cache_limit_bytes = cache_limit_bytes
         self._model: Any = None
         self._tokenizer: Any = None
         self._eos_suffix: list[int] = []
@@ -203,6 +237,31 @@ class MlxTextEmbeddingProvider:
         self._pad_id = pad_token_id_for(tokenizer, suffix[-1])
         self._model = model
         self._tokenizer = tokenizer
+        if self._cache_limit_bytes is not None:
+            set_cache_limit = getattr(import_mlx_core(), "set_cache_limit", None)
+            if set_cache_limit is not None:
+                set_cache_limit(self._cache_limit_bytes)
+
+    @property
+    def tokenizer(self) -> Any:
+        """The loaded model's tokenizer (loads the weights on first use)."""
+        self.load()
+        return self._tokenizer
+
+    @property
+    def max_length(self) -> int:
+        return self._max_length
+
+    @property
+    def max_batch_tokens(self) -> int:
+        return self._max_batch_tokens
+
+    def token_length(self, text: str) -> int:
+        """How many tokens ``text`` occupies in a batch row — after
+        truncation to ``max_length``, EOS suffix included — i.e. the
+        length :func:`imsg.embed.batching.plan_batches` budgets."""
+        self.load()
+        return len(self._tokenize(text))
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return self._embed(list(texts))
@@ -210,27 +269,36 @@ class MlxTextEmbeddingProvider:
     def embed_query(self, text: str, *, instruction: str) -> list[float]:
         return self._embed([format_query_text(instruction, text)])[0]
 
+    def _tokenize(self, text: str) -> list[int]:
+        return tokenize_for_embedding(
+            self._tokenizer, text, max_length=self._max_length, eos_suffix=self._eos_suffix
+        )
+
     def _embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
         self.load()
         mx = import_mlx_core()
-        vectors: list[list[float]] = []
-        for batch in batched(texts, self._batch_size):
-            vectors.extend(self._embed_batch(mx, batch))
-        if len(vectors) != len(texts):
+        rows = [self._tokenize(text) for text in texts]
+        plan = plan_batches(
+            [len(row) for row in rows],
+            max_batch_size=self._batch_size,
+            max_batch_tokens=self._max_batch_tokens,
+        )
+        vectors: list[list[float] | None] = [None] * len(texts)
+        for group in plan:
+            for index, vector in zip(
+                group, self._embed_rows(mx, [rows[i] for i in group]), strict=True
+            ):
+                vectors[index] = vector
+        out = [v for v in vectors if v is not None]
+        if len(out) != len(texts):
             raise EmbeddingError(
-                f"embedded {len(vectors)} vectors for {len(texts)} texts (internal batching bug)"
+                f"embedded {len(out)} vectors for {len(texts)} texts (internal batching bug)"
             )
-        return vectors
+        return out
 
-    def _embed_batch(self, mx: Any, texts: list[str]) -> list[list[float]]:
-        rows = [
-            tokenize_for_embedding(
-                self._tokenizer, text, max_length=self._max_length, eos_suffix=self._eos_suffix
-            )
-            for text in texts
-        ]
+    def _embed_rows(self, mx: Any, rows: list[list[int]]) -> list[list[float]]:
         padded, lengths = right_pad(rows, self._pad_id)
         hidden = base_transformer_hidden_states(self._model, mx.array(padded))
         pooled = float_rows(mx, gather_last_token_states(mx, hidden, lengths))
@@ -246,6 +314,8 @@ class MlxTextEmbeddingProvider:
 
 
 __all__ = [
+    "DEFAULT_CACHE_LIMIT_BYTES",
+    "DEFAULT_MAX_BATCH_TOKENS",
     "QUERY_TEMPLATE",
     "MlxTextEmbeddingProvider",
     "eos_suffix_for",

@@ -164,7 +164,12 @@ def test_real_backend_resolves_each_class_by_dotted_path(
 
     text = build_text_provider(cfg)
     assert type(text).__name__ == REAL_PROVIDERS["text_embedding"].class_name
-    assert calls["text_embedding"] == [((e.model, e.revision, e.dim), {"batch_size": e.batch_size})]
+    assert calls["text_embedding"] == [
+        (
+            (e.model, e.revision, e.dim),
+            {"batch_size": e.batch_size, "max_batch_tokens": e.max_batch_tokens},
+        )
+    ]
 
     multimodal = build_multimodal_provider(cfg)
     assert type(multimodal).__name__ == REAL_PROVIDERS["multimodal_embedding"].class_name
@@ -212,13 +217,14 @@ def test_real_backend_passes_operator_settings_through(
     raw["enrichment"]["ocr_minimum_text_height"] = 0.05
     raw["enrichment"]["transcription_language"] = "en"
     raw["embedding"]["batch_size"] = 8
+    raw["embedding"]["max_batch_tokens"] = 4096
     raw["embedding"]["multimodal"]["batch_size"] = 4
     cfg = load_config_dict(raw)
 
     build_text_provider(cfg)
     build_multimodal_provider(cfg)
     build_enrichment_providers(cfg, caption_prompt="p")
-    assert calls["text_embedding"][0][1] == {"batch_size": 8}
+    assert calls["text_embedding"][0][1] == {"batch_size": 8, "max_batch_tokens": 4096}
     assert calls["multimodal_embedding"][0][1] == {"batch_size": 4}
     assert calls["ocr"][0][1] == {
         "recognition_languages": ["en-US", "fr-FR"],
@@ -600,3 +606,69 @@ def test_resolve_local_model_dir_follows_the_containment_rule(tmp_path: Path) ->
 def test_local_model_id_is_the_normalised_relative_dir_at_the_upstream_sha() -> None:
     assert local_model_id("models/x/", UPSTREAM_SHA) == f"models/x@{UPSTREAM_SHA}"
     assert local_model_id("models//y", UPSTREAM_SHA) == f"models/y@{UPSTREAM_SHA}"
+
+
+# --------------------------------------------------------------------------
+# the text embedder as a local conversion: the reranker's rule, applied
+# to embedding.model (a directory under paths.data_root)
+# --------------------------------------------------------------------------
+
+EMBED_LOCAL_DIR = "models/example-embedding-8bit-3c3c3c3c"
+
+
+def _local_embedding_config(config_dict_factory: Any, value: str) -> Config:
+    raw = config_dict_factory()
+    del raw["models"]  # real backend
+    raw["embedding"]["model"] = value
+    raw["embedding"]["revision"] = UPSTREAM_SHA
+    return load_config_dict(raw)
+
+
+def test_embedding_directory_under_data_root_builds_with_revision_none_and_a_relative_model_id(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _install_stub_modules(monkeypatch)
+    cfg = _local_embedding_config(config_dict_factory, EMBED_LOCAL_DIR)
+    directory = cfg.paths.data_root / EMBED_LOCAL_DIR
+    directory.mkdir(parents=True)
+
+    provider = build_text_provider(cfg)
+    assert type(provider).__name__ == REAL_PROVIDERS["text_embedding"].class_name
+    assert calls["text_embedding"] == [
+        (
+            (str(directory.resolve()), None, cfg.embedding.dim),
+            {
+                "model_id": f"{EMBED_LOCAL_DIR}@{UPSTREAM_SHA}",
+                "batch_size": cfg.embedding.batch_size,
+                "max_batch_tokens": cfg.embedding.max_batch_tokens,
+            },
+        )
+    ]
+
+
+def test_embedding_repo_id_stays_a_hub_pin_when_no_such_directory_exists(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _install_stub_modules(monkeypatch)
+    cfg = _local_embedding_config(config_dict_factory, "example-org/Example-Embedding-8bit")
+    build_text_provider(cfg)
+    assert calls["text_embedding"] == [
+        (
+            ("example-org/Example-Embedding-8bit", UPSTREAM_SHA, cfg.embedding.dim),
+            {"batch_size": cfg.embedding.batch_size, "max_batch_tokens": cfg.embedding.max_batch_tokens},
+        )
+    ]
+
+
+def test_embedding_missing_models_directory_is_one_clear_error_not_a_hub_lookup(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _install_stub_modules(monkeypatch)
+    cfg = _local_embedding_config(config_dict_factory, "models/not-converted-yet")
+    with pytest.raises(ProviderUnavailableError) as excinfo:
+        build_text_provider(cfg)
+    message = str(excinfo.value)
+    assert "embedding.model 'models/not-converted-yet' names a directory under paths.data_root" in message
+    assert "does not exist" in message
+    assert "models/manifest.lock.yaml" in message and "command" in message
+    assert calls["text_embedding"] == []

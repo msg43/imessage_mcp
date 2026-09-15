@@ -18,6 +18,7 @@ from _mlx_fakes import (
     uninstall_runtime,
 )
 from imsg.embed.mlx_text import (
+    DEFAULT_CACHE_LIMIT_BYTES,
     QUERY_TEMPLATE,
     MlxTextEmbeddingProvider,
     eos_suffix_for,
@@ -277,3 +278,81 @@ def test_load_failure_surfaces_as_mlx_runtime_error(monkeypatch: pytest.MonkeyPa
     with pytest.raises(MlxRuntimeError) as excinfo:
         provider.embed_query("a", instruction="x")
     assert "org/embed@rev1" in str(excinfo.value)
+
+
+# --- length-sorted, token-budgeted packing; cache bound; accessors ---------
+
+
+def test_packs_by_padded_token_budget_longest_first_and_restores_input_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = FakeRuntime(tokenizer=_tokenizer()).install(monkeypatch)
+    # Rows (EOS included): "a b c d"=5, "a"=2, "a b"=3, "b"=2, "c d"=3.
+    provider = _provider(batch_size=32, max_batch_tokens=6)
+    texts = ["a b c d", "a", "a b", "b", "c d"]
+    vectors = provider.embed_documents(texts)
+    # 5 alone (2 x 5 > 6); then 3, 3 (2 x 3 = 6); then 2, 2 (2 x 2 = 4, a third would be 6 — fits).
+    assert runtime.model.model.calls == [
+        [[1, 2, 3, 4, EOS]],
+        [[1, 2, EOS], [3, 4, EOS]],
+        [[1, EOS], [2, EOS]],
+    ]
+    assert len(vectors) == 5
+    for text, vector in zip(texts, vectors, strict=True):
+        assert vector == pytest.approx(_expected_vector([*_tokenizer().encode(text, False), EOS], 3))
+
+
+def test_row_count_cap_still_applies_under_a_large_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = FakeRuntime(tokenizer=_tokenizer()).install(monkeypatch)
+    provider = _provider(batch_size=2, max_batch_tokens=1_000_000)
+    provider.embed_documents(["a", "b", "c", "d", "a b"])
+    assert [len(call) for call in runtime.model.model.calls] == [2, 2, 1]
+    assert runtime.model.model.calls[0] == [[1, 2, EOS], [1, EOS, PAD]]  # longest row leads
+
+
+def test_bounds_the_mlx_buffer_cache_when_the_weights_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = FakeRuntime(tokenizer=_tokenizer()).install(monkeypatch)
+    provider = _provider()
+    mx = __import__("sys").modules["mlx.core"]
+    assert mx.cache_limit_calls == []
+    provider.load()
+    assert mx.cache_limit_calls == [DEFAULT_CACHE_LIMIT_BYTES]
+    provider.load()  # idempotent: not applied twice
+    assert mx.cache_limit_calls == [DEFAULT_CACHE_LIMIT_BYTES]
+    assert runtime.load_calls and len(runtime.load_calls) == 1
+
+
+def test_cache_limit_none_leaves_the_runtime_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeRuntime(tokenizer=_tokenizer()).install(monkeypatch)
+    provider = _provider(cache_limit_bytes=None)
+    provider.load()
+    assert __import__("sys").modules["mlx.core"].cache_limit_calls == []
+
+
+def test_token_length_and_tokenizer_accessors(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = FakeRuntime(tokenizer=_tokenizer()).install(monkeypatch)
+    provider = _provider(max_length=4)
+    assert provider.tokenizer is runtime.tokenizer
+    assert provider.token_length("a b") == 3  # a, b, EOS
+    assert provider.token_length("a b c d e") == 4  # truncated to max_length, EOS kept
+    assert provider.max_length == 4
+    assert provider.max_batch_tokens > 0
+
+
+def test_model_id_override_for_a_local_conversion() -> None:
+    provider = MlxTextEmbeddingProvider(
+        "/data/models/example-8bit", None, 8, model_id="models/example-8bit@rev9"
+    )
+    assert provider.model_id == "models/example-8bit@rev9"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_batch_tokens": 0},
+        {"cache_limit_bytes": -1},
+    ],
+)
+def test_constructor_rejects_invalid_batching_arguments(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        MlxTextEmbeddingProvider("org/embed", None, 8, **kwargs)  # type: ignore[arg-type]

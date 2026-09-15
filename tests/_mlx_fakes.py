@@ -88,6 +88,16 @@ def make_mx_module() -> types.ModuleType:
     module.eval = lambda *args: None  # type: ignore[attr-defined]
     module.float32 = "float32"  # type: ignore[attr-defined]
     module.int32 = "int32"  # type: ignore[attr-defined]
+    # Buffer-cache bound (D10.2): records every ``set_cache_limit`` call
+    # and answers like the real one (the previous limit).
+    module.cache_limit_calls = []  # type: ignore[attr-defined]
+
+    def _set_cache_limit(limit: int) -> int:
+        previous = module.cache_limit_calls[-1] if module.cache_limit_calls else 0  # type: ignore[attr-defined]
+        module.cache_limit_calls.append(limit)  # type: ignore[attr-defined]
+        return previous
+
+    module.set_cache_limit = _set_cache_limit  # type: ignore[attr-defined]
     return module
 
 
