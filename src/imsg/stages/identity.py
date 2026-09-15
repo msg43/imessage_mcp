@@ -810,11 +810,98 @@ def _count_persons(cur: psycopg.Cursor[Any]) -> int:
 # --------------------------------------------------------------------------
 
 
-def merge_persons(conn: psycopg.Connection, *, keep_person_id: int, absorb_person_id: int) -> None:
+def _mark_chats_dirty_for_persons(
+    cur: psycopg.Cursor[Any], person_ids: Iterable[int]
+) -> frozenset[int]:
+    """Mark every chat whose rendered segments name any of `person_ids`
+    for re-segmentation, and return those chat ids.
+
+    A segment's `rendered_text` embeds people's names in two places
+    (`imsg.segment.render`, fed by `imsg.segment.pipeline`): the header
+    lists every non-owner participant's `display_name`, and each message
+    line and tapback suffix carries its sender's `short_name` — except
+    the owner's own rows, which render as the literal `owner`. S4 only
+    re-segments a chat when a message's `updated_at` has moved past its
+    segment (`find_dirty_chats`), so a rename, merge or assign that
+    changes a name but touches only `person`/`handle` rows would leave
+    every existing segment — and its embedding, its FTS row, its export
+    document — carrying the old name for good. That is what this bump
+    exists to prevent, and it is why the three curation functions call
+    it inside their own transaction: a dry run's rollback undoes the
+    marks along with the mutation.
+
+    The chat set mirrors the renderer exactly, so it is the set whose
+    rendered text can actually change: chats where a person is a
+    participant (header; the owner is never listed there), chats with a
+    message the person sent, and chats with a tapback the person left —
+    the last two excluding `is_from_me` rows, which render as `owner`
+    whoever they are attributed to. For every person but the owner that
+    is simply "sender or participant"; for the owner it is normally
+    nothing, which keeps a rename of the owner from re-segmenting and
+    re-embedding the entire corpus for text that does not change.
+
+    Every message in an affected chat is bumped, not just the person's
+    own: the header is on every segment, and a whole-chat bump makes
+    `find_dirty_chats` report the chat's first message as the earliest
+    change, so the incremental frontier rebuilds the chat from the
+    start. One set-based UPDATE, no per-message loop; rows already
+    bumped in this transaction (`updated_at = now()`, whether by an
+    earlier call or by migration 0003's trigger on a sender repoint) are
+    skipped, so a batch such as `rematch-stubs` rewrites each message
+    once however many of its chat's participants get renamed. The
+    returned set is computed before the UPDATE and is the full affected
+    set either way, so callers can union it across a batch and report a
+    count that does not double-count shared chats.
+    """
+    ids = sorted({int(person_id) for person_id in person_ids})
+    if not ids:
+        return frozenset()
+    cur.execute(
+        """
+        SELECT DISTINCT chat_id FROM (
+            SELECT cp.chat_id
+            FROM chat_participant cp
+            JOIN person p ON p.person_id = cp.person_id
+            WHERE cp.person_id = ANY(%(ids)s) AND NOT p.is_owner
+            UNION ALL
+            SELECT m.chat_id
+            FROM message m
+            WHERE m.sender_person_id = ANY(%(ids)s) AND NOT m.is_from_me
+            UNION ALL
+            SELECT m.chat_id
+            FROM tapback t
+            JOIN message m ON m.message_id = t.target_message_id
+            WHERE t.sender_person_id = ANY(%(ids)s) AND NOT t.is_from_me
+        ) named
+        ORDER BY chat_id
+        """,
+        {"ids": ids},
+    )
+    chat_ids = frozenset(int(row[0]) for row in cur.fetchall())
+    if chat_ids:
+        cur.execute(
+            "UPDATE message SET updated_at = now() "
+            "WHERE chat_id = ANY(%s) AND updated_at < now()",
+            (sorted(chat_ids),),
+        )
+    return chat_ids
+
+
+def merge_persons(
+    conn: psycopg.Connection, *, keep_person_id: int, absorb_person_id: int
+) -> frozenset[int]:
     """Repoint every handle/message/tapback/participant/allowlist row
     from `absorb_person_id` onto `keep_person_id` in one transaction,
     then delete the absorbed person (SPEC §8 S3: "merges repoint
-    handles/messages/participants in one transaction")."""
+    handles/messages/participants in one transaction").
+
+    Returns the chats marked for re-segmentation
+    (`_mark_chats_dirty_for_persons`): the absorbed person's chats, whose
+    headers and sender labels now carry the kept person's names, plus
+    the kept person's own. By the time the mark runs the kept person
+    holds every participation and message the absorbed one had, so
+    marking the kept person covers both sides.
+    """
     if keep_person_id == absorb_person_id:
         raise IdentityError("cannot merge a person into themselves")
     with conn.transaction(), conn.cursor() as cur:
@@ -857,6 +944,8 @@ def merge_persons(conn: psycopg.Connection, *, keep_person_id: int, absorb_perso
         cur.execute("DELETE FROM allowlist_person WHERE person_id = %s", (absorb_person_id,))
         cur.execute("DELETE FROM person WHERE person_id = %s", (absorb_person_id,))
 
+        return _mark_chats_dirty_for_persons(cur, (keep_person_id,))
+
 
 def rename_person(
     conn: psycopg.Connection,
@@ -865,7 +954,8 @@ def rename_person(
     display_name: str,
     short_name: str | None = None,
     mark_reviewed: bool = True,
-) -> None:
+    allow_owner: bool = False,
+) -> frozenset[int]:
     """Naming a person IS reviewing them, so this clears `needs_review`
     by default.
 
@@ -874,8 +964,31 @@ def rename_person(
     top 50 correspondents saw an unchanged pending count, and the only
     way off the list was `merge` (i.e. deletion). Pass
     `mark_reviewed=False` to rename without clearing the flag.
+
+    Returns the chats marked for re-segmentation — every chat whose
+    rendered segments carry this person's `display_name` (header) or
+    `short_name` (message lines, tapback suffixes); see
+    `_mark_chats_dirty_for_persons`. Before 2026-09-15 a rename bumped
+    only `person.updated_at`, which nothing downstream watches, so the
+    index kept the old name in every segment until an explicit
+    `--rebuild`.
+
+    The owner is refused unless `allow_owner=True`: it is the one person
+    every automated curation path (`merge_persons`, `apply_overrides`,
+    `rematch-stubs`) leaves alone, so renaming it is a deliberate act —
+    `imsg identity rename --yes-owner` is the CLI's spelling of the flag.
     """
     with conn.transaction(), conn.cursor() as cur:
+        cur.execute("SELECT is_owner FROM person WHERE person_id = %s", (person_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise IdentityError(f"person_id {person_id} not found")
+        if bool(row[0]) and not allow_owner:
+            raise IdentityError(
+                f"refusing to rename person {person_id}: it is the singleton owner person, "
+                f"which merge, apply-overrides and rematch-stubs never touch — pass "
+                f"--yes-owner (allow_owner=True) to rename it deliberately"
+            )
         if short_name is not None:
             cur.execute(
                 "UPDATE person SET display_name = %s, short_name = %s, "
@@ -893,8 +1006,12 @@ def rename_person(
         if cur.rowcount == 0:
             raise IdentityError(f"person_id {person_id} not found")
 
+        return _mark_chats_dirty_for_persons(cur, (person_id,))
 
-def assign_handle(conn: psycopg.Connection, *, normalized_value: str, kind: str, person_id: int) -> None:
+
+def assign_handle(
+    conn: psycopg.Connection, *, normalized_value: str, kind: str, person_id: int
+) -> frozenset[int]:
     """Manual override: repoint an already-canonical handle onto a
     different person (SPEC §8 S3 `identity assign`).
 
@@ -912,6 +1029,12 @@ def assign_handle(conn: psycopg.Connection, *, normalized_value: str, kind: str,
     The UPDATEs below deliberately omit the `IS NULL` guard the backfill
     uses: the whole point here is to *re*-attribute rows that already
     have a person.
+
+    Returns the chats marked for re-segmentation
+    (`_mark_chats_dirty_for_persons`) for the handle's previous person
+    and its new one: the repointed messages now render under the new
+    person's `short_name`, and the new person joins the header of every
+    chat the handle participates in.
     """
     with conn.transaction(), conn.cursor() as cur:
         cur.execute("SELECT 1 FROM person WHERE person_id = %s", (person_id,))
@@ -919,13 +1042,14 @@ def assign_handle(conn: psycopg.Connection, *, normalized_value: str, kind: str,
             raise IdentityError(f"person_id {person_id} not found")
 
         cur.execute(
-            "SELECT handle_id FROM handle WHERE normalized_value = %s AND kind = %s",
+            "SELECT handle_id, person_id FROM handle WHERE normalized_value = %s AND kind = %s",
             (normalized_value, kind),
         )
         row = cur.fetchone()
         if row is None:
             raise IdentityError(f"no handle found for ({normalized_value!r}, {kind!r})")
         handle_id = int(row[0])
+        previous_person_id = int(row[1])
 
         cur.execute("UPDATE handle SET person_id = %s WHERE handle_id = %s", (person_id, handle_id))
 
@@ -958,6 +1082,8 @@ def assign_handle(conn: psycopg.Connection, *, normalized_value: str, kind: str,
             """,
             (person_id, handle_id),
         )
+
+        return _mark_chats_dirty_for_persons(cur, (previous_person_id, person_id))
 
 
 __all__ = [

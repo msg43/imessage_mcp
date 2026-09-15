@@ -772,3 +772,68 @@ def test_export_moves_a_legacy_prior_to_the_clean_handle_only_once_the_legacy_ro
             why="kept",
         ),
     )
+
+
+def _message_updated_ats(conn: psycopg.Connection) -> dict[int, Any]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT message_id, updated_at FROM message ORDER BY message_id")
+        return {int(message_id): updated_at for message_id, updated_at in cur.fetchall()}
+
+
+def test_apply_marks_the_chats_its_renames_merges_and_assigns_touch_once_each(
+    pg_conn: psycopg.Connection, tmp_path: Path, config_dict_factory: ConfigDictFactory
+) -> None:
+    """Three decisions — a rename, a rename, and a merge — all land in the
+    one seeded chat, so the run marks one chat, not three. The mark bumps
+    every message's `updated_at` in that chat; a dry run reports the same
+    count and rolls the bump back with everything else."""
+    _seed_and_resolve(
+        pg_conn, tmp_path, config_dict_factory, handles=[ALICE_PHONE, BOB_PHONE, ALICE_EMAIL]
+    )
+    # Seeding and the replay must be separate transactions, as in production:
+    # the bump is `now()`, and so is the seeded rows' `updated_at` until this
+    # commits — see `_mark_chats_dirty_for_persons`.
+    pg_conn.commit()
+    before = _message_updated_ats(pg_conn)
+    assert len(before) == 4
+    decisions = [
+        IdentityOverride(value=ALICE_PHONE, kind="phone", name="Alice Example"),
+        IdentityOverride(value=BOB_PHONE, kind="phone", name="Bob Example"),
+        IdentityOverride(value=ALICE_EMAIL, kind="email", name="Alice Example"),
+    ]
+
+    preview = apply_overrides(pg_conn, overrides=decisions, default_region="US", dry_run=True)
+    assert preview.summary == "applied=3 already=0 unmatched=0 conflicts=0"
+    assert preview.chats_marked_dirty == 1
+    assert _message_updated_ats(pg_conn) == before
+
+    real = apply_overrides(pg_conn, overrides=decisions, default_region="US")
+    assert real.summary == preview.summary
+    assert real.chats_marked_dirty == 1
+    after = _message_updated_ats(pg_conn)
+    assert set(after) == set(before)
+    assert all(after[message_id] > before[message_id] for message_id in before)
+
+    # Nothing left to decide, nothing left to mark.
+    again = apply_overrides(pg_conn, overrides=decisions, default_region="US")
+    assert again.summary == "applied=0 already=3 unmatched=0 conflicts=0"
+    assert again.chats_marked_dirty == 0
+    assert _message_updated_ats(pg_conn) == after
+
+
+def test_apply_marks_nothing_when_no_decision_runs(
+    pg_conn: psycopg.Connection, tmp_path: Path, config_dict_factory: ConfigDictFactory
+) -> None:
+    _seed_and_resolve(pg_conn, tmp_path, config_dict_factory, handles=[ALICE_PHONE])
+    pg_conn.commit()
+    before = _message_updated_ats(pg_conn)
+
+    result = apply_overrides(
+        pg_conn,
+        overrides=[IdentityOverride(value=SHORT_CODE, kind="unknown", name="Acme Bank Alerts")],
+        default_region="US",
+    )
+
+    assert result.summary == "applied=0 already=0 unmatched=1 conflicts=0"
+    assert result.chats_marked_dirty == 0
+    assert _message_updated_ats(pg_conn) == before

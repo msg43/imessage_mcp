@@ -101,6 +101,14 @@ dry run rolls the whole transaction back after computing exactly what
 a real run would have done (the same savepoint-and-rollback pattern
 `run_identity(dry_run=True)` uses).
 
+Every applied decision goes through `rename_person` / `merge_persons` /
+`assign_handle`, each of which marks the chats whose rendered segments
+name the persons involved for re-segmentation;
+`ApplyOverridesResult.chats_marked_dirty` is the distinct count. A run
+that reports a non-zero count must be followed by `imsg segment` and
+then `imsg embed`, or the segments, embeddings and FTS rows keep the
+names the decisions replaced.
+
 Export
 ------
 `export_overrides` writes one decision per handle of every non-owner
@@ -410,6 +418,13 @@ class ApplyOverridesResult:
     outcomes: tuple[OverrideOutcome, ...]
     invariant: InvariantReport
     dry_run: bool = False
+    chats_marked_dirty: int = 0
+    """Distinct chats marked for re-segmentation by the applied
+    decisions (every rename/merge/assign bumps the chats whose rendered
+    segments name the persons involved; a chat touched by several
+    decisions is counted once). `imsg segment` and then `imsg embed`
+    must follow a run that reports a non-zero count, or the index keeps
+    the old names."""
 
     def count(self, status: OverrideStatus) -> int:
         return sum(1 for o in self.outcomes if o.status == status)
@@ -497,11 +512,13 @@ def _apply_to_handle(
     row: _HandleRow,
     override: IdentityOverride,
     group_forms: frozenset[tuple[str, str]],
+    dirty_chat_ids: set[int],
 ) -> str | None:
     """Run the one curation operation this handle needs, through the same
     function the interactive command calls. Returns a description of what
     ran, or `None` when an earlier operation of this run already put the
-    handle where the decision wants it."""
+    handle where the decision wants it. The chats the operation marked
+    for re-segmentation are added to `dirty_chat_ids`."""
     # Re-read: an earlier decision (or the legacy form of this one) may have
     # renamed or merged this handle's person since the plan was made.
     fresh = _lookup_handles(cur, ((row.normalized_value, row.kind),))
@@ -515,7 +532,7 @@ def _apply_to_handle(
         cur, name=override.name, exclude_person_id=row.person_id, group_forms=group_forms
     )
     if target is None:
-        rename_person(conn, person_id=row.person_id, display_name=override.name)
+        dirty_chat_ids |= rename_person(conn, person_id=row.person_id, display_name=override.name)
         return f"renamed person {row.person_id} {row.display_name!r} -> {override.name!r} ({row.label})"
 
     cur.execute(
@@ -524,12 +541,14 @@ def _apply_to_handle(
     )
     others = cur.fetchone()
     if others is None or int(others[0]) == 0:
-        merge_persons(conn, keep_person_id=target, absorb_person_id=row.person_id)
+        dirty_chat_ids |= merge_persons(conn, keep_person_id=target, absorb_person_id=row.person_id)
         return (
             f"merged person {row.person_id} {row.display_name!r} into person {target} "
             f"{override.name!r} ({row.label})"
         )
-    assign_handle(conn, normalized_value=row.normalized_value, kind=row.kind, person_id=target)
+    dirty_chat_ids |= assign_handle(
+        conn, normalized_value=row.normalized_value, kind=row.kind, person_id=target
+    )
     return (
         f"assigned {row.label} from person {row.person_id} {row.display_name!r} "
         f"to person {target} {override.name!r}"
@@ -544,6 +563,7 @@ def _apply_one(
     default_region: str,
     force: bool,
     group_forms: frozenset[tuple[str, str]],
+    dirty_chat_ids: set[int],
 ) -> OverrideOutcome:
     forms = identifier_forms(override, default_region)
     rows = _lookup_handles(cur, forms)
@@ -578,9 +598,15 @@ def _apply_one(
             override, "already", f"{rows[0].label} already on a person named {override.name!r}"
         )
 
+    # Chats marked by an operation that is then rolled back with the
+    # ambiguous-target savepoint below must not be counted either.
+    marked_here: set[int] = set()
     try:
         with conn.transaction():
-            details = [_apply_to_handle(conn, cur, row, override, group_forms) for row in pending]
+            details = [
+                _apply_to_handle(conn, cur, row, override, group_forms, marked_here)
+                for row in pending
+            ]
     except _AmbiguousTarget as exc:
         return OverrideOutcome(
             override,
@@ -589,6 +615,7 @@ def _apply_one(
             f"{override.kind} {override.value!r} cannot say which one it means — merge or "
             f"rename them by hand first (never forced)",
         )
+    dirty_chat_ids |= marked_here
     ran = [d for d in details if d is not None]
     if not ran:
         return OverrideOutcome(
@@ -610,6 +637,7 @@ def _apply_body(
             identifier_forms(override, default_region)
         )
     outcomes: list[OverrideOutcome] = []
+    dirty_chat_ids: set[int] = set()
     with conn.transaction(), conn.cursor() as cur:
         for override in overrides:
             outcomes.append(
@@ -620,10 +648,13 @@ def _apply_body(
                     default_region=default_region,
                     force=force,
                     group_forms=frozenset(groups[override.name.casefold()]),
+                    dirty_chat_ids=dirty_chat_ids,
                 )
             )
     invariant = compute_invariant_report(conn)
-    return ApplyOverridesResult(outcomes=tuple(outcomes), invariant=invariant)
+    return ApplyOverridesResult(
+        outcomes=tuple(outcomes), invariant=invariant, chats_marked_dirty=len(dirty_chat_ids)
+    )
 
 
 def apply_overrides(

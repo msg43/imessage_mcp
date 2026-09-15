@@ -514,6 +514,7 @@ def test_identity_rematch_stubs_wires_the_stage_and_prints_counts(
             ),
             contacts_loaded=2,
             dry_run=dry_run,
+            chats_marked_dirty=3,
         )
 
     monkeypatch.setattr(cli_module, "run_rematch_stubs", fake_rematch)
@@ -525,6 +526,8 @@ def test_identity_rematch_stubs_wires_the_stage_and_prints_counts(
     assert "identity: contacts loaded=2" in result.output
     assert "identity: rematched person 7 '+14155552671' -> 'Alice Example'" in result.output
     assert "rematch: stubs=3 matched=1 ambiguous=1 unmatched=1" in result.output
+    assert "identity: chats marked for re-segmentation: 3" in result.output
+    assert "run `imsg segment` and then `imsg embed`" in result.output
     assert "DRY RUN" not in result.output
 
     result = runner.invoke(
@@ -534,7 +537,143 @@ def test_identity_rematch_stubs_wires_the_stage_and_prints_counts(
     assert captured["dry_run"] is True
     assert "rematch: stubs=3 matched=1 ambiguous=1 unmatched=1" in result.output
     assert "rematched person" not in result.output  # a dry run prints counts only
+    assert "identity: chats marked for re-segmentation: 3" in result.output
     assert "DRY RUN — nothing was written" in result.output
+
+
+def test_identity_rematch_stubs_help_says_segment_and_embed_must_follow() -> None:
+    result = runner.invoke(app, ["identity", "rematch-stubs", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "imsg segment" in result.output and "imsg embed" in result.output
+
+    result = runner.invoke(app, ["identity", "apply-overrides", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "imsg segment" in result.output and "imsg embed" in result.output
+
+
+def _recording_connect(monkeypatch: pytest.MonkeyPatch) -> list[_FakePgConn]:
+    """Like `mocked_pg_env`'s `connect`, but keeps every connection it hands
+    out so a test can assert the command committed on it."""
+    conns: list[_FakePgConn] = []
+
+    def fake_connect(database: Any, **kw: Any) -> _FakePgConn:
+        conn = _FakePgConn()
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(cli_module, "connect", fake_connect)
+    return conns
+
+
+def test_identity_rename_wires_rename_person_and_prints_the_dirty_chat_count(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    conns = _recording_connect(monkeypatch)
+
+    def fake_rename(conn: Any, **kw: Any) -> frozenset[int]:
+        captured.update(kw)
+        return frozenset({11, 12})
+
+    monkeypatch.setattr(cli_module, "rename_person", fake_rename)
+
+    result = runner.invoke(
+        app,
+        ["identity", "rename", "--person", "7", "--name", "Alice Example", "--short", "alice",
+         "--config", str(mocked_pg_env)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured == {
+        "person_id": 7, "display_name": "Alice Example", "short_name": "alice", "allow_owner": False,
+    }
+    assert conns[-1].committed == 1
+    assert "identity: renamed person 7 to 'Alice Example'" in result.output
+    assert "identity: chats marked for re-segmentation: 2" in result.output
+    assert "run `imsg segment` and then `imsg embed`" in result.output
+    assert "WARNING" not in result.output
+
+
+def test_identity_rename_owner_needs_yes_owner(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the flag the library refuses the owner and the CLI relays
+    that (exit 1, the flag named); with it the CLI warns, threads
+    `allow_owner=True`, and reports what was marked."""
+    from imsg.stages.identity import IdentityError
+
+    captured: dict[str, Any] = {}
+
+    def fake_rename(conn: Any, **kw: Any) -> frozenset[int]:
+        captured.update(kw)
+        if not kw["allow_owner"]:
+            raise IdentityError(
+                "refusing to rename person 3: it is the singleton owner person, which merge, "
+                "apply-overrides and rematch-stubs never touch — pass --yes-owner "
+                "(allow_owner=True) to rename it deliberately"
+            )
+        return frozenset()
+
+    monkeypatch.setattr(cli_module, "rename_person", fake_rename)
+
+    result = runner.invoke(
+        app, ["identity", "rename", "--person", "3", "--name", "Jamie", "--config", str(mocked_pg_env)]
+    )
+    assert result.exit_code == 1
+    assert captured["allow_owner"] is False
+    assert "imsg: refusing to rename person 3" in result.output
+    assert "--yes-owner" in result.output
+    assert "renamed person" not in result.output
+
+    result = runner.invoke(
+        app,
+        ["identity", "rename", "--person", "3", "--name", "Jamie", "--yes-owner",
+         "--config", str(mocked_pg_env)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["allow_owner"] is True
+    assert "identity: WARNING --yes-owner" in result.output
+    assert "identity: renamed person 3 to 'Jamie'" in result.output
+    assert "identity: chats marked for re-segmentation: 0" in result.output
+    assert "run `imsg segment`" not in result.output  # nothing to re-segment, no nag
+
+
+def test_identity_merge_and_assign_print_the_dirty_chat_count(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    conns = _recording_connect(monkeypatch)
+
+    def fake_merge(conn: Any, **kw: Any) -> frozenset[int]:
+        captured["merge"] = kw
+        return frozenset({5})
+
+    def fake_assign(conn: Any, **kw: Any) -> frozenset[int]:
+        captured["assign"] = kw
+        return frozenset({5, 6, 7})
+
+    monkeypatch.setattr(cli_module, "merge_persons", fake_merge)
+    monkeypatch.setattr(cli_module, "assign_handle", fake_assign)
+
+    result = runner.invoke(
+        app, ["identity", "merge", "--keep", "7", "--absorb", "8", "--config", str(mocked_pg_env)]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["merge"] == {"keep_person_id": 7, "absorb_person_id": 8}
+    assert conns[-1].committed == 1
+    assert "identity: merged person 8 into 7" in result.output
+    assert "identity: chats marked for re-segmentation: 1" in result.output
+    assert "run `imsg segment` and then `imsg embed`" in result.output
+
+    result = runner.invoke(
+        app,
+        ["identity", "assign", "--value", "+14155552671", "--kind", "phone", "--person", "7",
+         "--config", str(mocked_pg_env)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["assign"] == {"normalized_value": "+14155552671", "kind": "phone", "person_id": 7}
+    assert conns[-1].committed == 1
+    assert "identity: assigned phone '+14155552671' to person 7" in result.output
+    assert "identity: chats marked for re-segmentation: 3" in result.output
 
 
 def test_identity_rematch_stubs_fails_loudly_without_contacts(
@@ -607,6 +746,7 @@ def test_identity_apply_overrides_wires_the_replay_and_prints_the_summary(
             ),
             invariant=_clean_invariant(),
             dry_run=dry_run,
+            chats_marked_dirty=1,
         )
 
     monkeypatch.setattr(cli_module, "apply_overrides", fake_apply)
@@ -624,6 +764,8 @@ def test_identity_apply_overrides_wires_the_replay_and_prints_the_summary(
     assert "identity: unmatched no handle in the index" in result.output
     assert "identity: invariant" in result.output and "ok=True" in result.output
     assert "identity: applied=1 already=0 unmatched=1 conflicts=0" in result.output
+    assert "identity: chats marked for re-segmentation: 1" in result.output
+    assert "run `imsg segment` and then `imsg embed`" in result.output
     assert "DRY RUN" not in result.output
 
     result = runner.invoke(
