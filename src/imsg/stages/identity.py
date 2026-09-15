@@ -50,9 +50,9 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 
 import phonenumbers
 import psycopg
@@ -139,6 +139,11 @@ class ContactRecord:
 
 ContactsImporterFn = Callable[[str], list[ContactRecord]]
 
+UNNAMED_CONTACT_DISPLAY_NAME = "Unnamed Contact"
+"""What `_contact_to_record` names a card that has neither a person's name
+nor an organization. The import stores it like any other name; the stub
+rematch (`imsg.stages.identity_rematch`) refuses to, since it names nobody."""
+
 
 def _default_contacts_importer(default_region: str) -> list[ContactRecord]:
     """Real `CNContactStore` import. Raises `ContactsAccessDeniedError`
@@ -205,7 +210,7 @@ def _contact_to_record(contact: Any, default_region: str) -> ContactRecord:
     given = str(contact.givenName() or "")
     family = str(contact.familyName() or "")
     org = str(contact.organizationName() or "") or None
-    display_name = " ".join(p for p in (given, family) if p) or (org or "Unnamed Contact")
+    display_name = " ".join(p for p in (given, family) if p) or (org or UNNAMED_CONTACT_DISPLAY_NAME)
 
     identifiers: list[tuple[str, str]] = []
     for labeled_phone in contact.phoneNumbers():
@@ -238,6 +243,81 @@ def _name_key(display_name: str) -> str:
     return " ".join(stripped.split()).casefold()
 
 
+MatchStatus = Literal["matched", "ambiguous", "unmatched"]
+"""How a Contacts lookup ended: `unmatched` — no card carries the
+identifier; `ambiguous` — cards carry it but do not agree on who it is;
+`matched` — exactly one person, under `_unique_by_name`'s rules."""
+
+
+@dataclass(frozen=True, slots=True)
+class ContactsLookup:
+    """`find_unique` with its two `None` cases told apart. The import
+    treats both the same (a review stub either way); `imsg identity
+    rematch-stubs` counts them separately, because "nobody has this
+    number" and "two people have this number" call for different work."""
+
+    status: MatchStatus
+    contact: ContactRecord | None = None
+
+
+def _unique_by_name(matches: list[ContactRecord]) -> ContactRecord | None:
+    """The one person `matches` describe, or `None` when they describe
+    nobody or more than one — SPEC §8 S3: "zero or multiple matches create
+    a review stub/conflict rather than guessing."
+
+    **Cards that agree on the name are not a conflict (2026-08-15).**
+    Multiple `CNContact` identifiers routinely describe ONE person: macOS
+    surfaces the same human once per configured account, so anyone present
+    in both a Google and an iCloud address book yields two identifiers for
+    the same number. Treating that as "ambiguous" refused a match where
+    there was nothing to decide.
+
+    Measured on the real address books: of 1,375 identifiers, **1,338 had
+    every card agreeing on the display name** and only 37 genuinely
+    disagreed. The cost of the old rule was not spread evenly either — it
+    landed on the highest-volume correspondents, because the people you
+    message most are exactly the people saved in more than one account. Of
+    the top 20 correspondents, 14 were unnamed *solely* for this reason and
+    only 1 was truly absent from Contacts.
+
+    So: collapse identifiers that share a normalized display name, and
+    return a match when exactly one distinct name survives. A real
+    disagreement (a shared household number listed under two people) still
+    yields `None` and a review stub, which is the case the rule was written
+    for.
+    """
+    if not matches:
+        return None
+
+    by_name: dict[str, ContactRecord] = {}
+    for m in matches:
+        by_name.setdefault(_name_key(m.display_name), m)
+    if len(by_name) == 1:
+        return next(iter(by_name.values()))
+
+    # One name's words being a subset of another's is the same person
+    # recorded at two levels of completeness — "Erin" / "Erin Delgado",
+    # "Whitfield" / "Doctor Whitfield", "Alice Carter" / "Alice Bell Carter".
+    # Prefer the most complete name. This is a containment test, NOT a
+    # fuzzy-match: it deliberately does not fire on "Acme Pool" vs
+    # "Bob Pool" (shared surname, different first names) or on
+    # "Alice Nguyen" vs "Bob Feldman" (a shared front-desk number for
+    # two real people, owner-confirmed 2026-08-15). Nickname equivalence
+    # — Joe/Joseph, Becca/Rebecca — is deliberately NOT inferred either:
+    # the same reasoning would wrongly fuse Chris/Christina.
+    token_sets = {k: frozenset(k.split()) for k in by_name}
+    keys = list(by_name)
+    winner: str | None = None
+    for cand in keys:
+        if all(token_sets[other] <= token_sets[cand] for other in keys):
+            if winner is not None and token_sets[cand] != token_sets[winner]:
+                return None
+            winner = cand
+    if winner is not None:
+        return by_name[winner]
+    return None
+
+
 class ContactsIndex:
     """Looks up Contacts matches by normalized `(value, kind)`."""
 
@@ -249,61 +329,41 @@ class ContactsIndex:
 
     def find_unique(self, normalized_value: str, kind: str) -> ContactRecord | None:
         """The matching contact, or `None` if there are zero or genuinely
-        conflicting matches — SPEC §8 S3: "zero or multiple matches create a
-        review stub/conflict rather than guessing."
+        conflicting matches. The rules (and their history) are
+        `_unique_by_name`'s; `lookup` tells the two `None` cases apart."""
+        return self.lookup(normalized_value, kind).contact
 
-        **Cards that agree on the name are not a conflict (2026-08-15).**
-        Multiple `CNContact` identifiers routinely describe ONE person: macOS
-        surfaces the same human once per configured account, so anyone present
-        in both a Google and an iCloud address book yields two identifiers for
-        the same number. Treating that as "ambiguous" refused a match where
-        there was nothing to decide.
-
-        Measured on the real address books: of 1,375 identifiers, **1,338 had
-        every card agreeing on the display name** and only 37 genuinely
-        disagreed. The cost of the old rule was not spread evenly either — it
-        landed on the highest-volume correspondents, because the people you
-        message most are exactly the people saved in more than one account. Of
-        the top 20 correspondents, 14 were unnamed *solely* for this reason and
-        only 1 was truly absent from Contacts.
-
-        So: collapse identifiers that share a normalized display name, and
-        return a match when exactly one distinct name survives. A real
-        disagreement (a shared household number listed under two people) still
-        yields `None` and a review stub, which is the case the rule was written
-        for.
-        """
+    def lookup(self, normalized_value: str, kind: str) -> ContactsLookup:
         matches = self._by_identifier.get((normalized_value, kind), [])
         if not matches:
-            return None
+            return ContactsLookup("unmatched")
+        contact = _unique_by_name(matches)
+        if contact is None:
+            return ContactsLookup("ambiguous")
+        return ContactsLookup("matched", contact)
 
-        by_name: dict[str, ContactRecord] = {}
-        for m in matches:
-            by_name.setdefault(_name_key(m.display_name), m)
-        if len(by_name) == 1:
-            return next(iter(by_name.values()))
-
-        # One name's words being a subset of another's is the same person
-        # recorded at two levels of completeness — "Erin" / "Erin Delgado",
-        # "Whitfield" / "Doctor Whitfield", "Alice Carter" / "Alice Bell Carter".
-        # Prefer the most complete name. This is a containment test, NOT a
-        # fuzzy-match: it deliberately does not fire on "Acme Pool" vs
-        # "Bob Pool" (shared surname, different first names) or on
-        # "Alice Nguyen" vs "Bob Feldman" (a shared front-desk number for
-        # two real people, owner-confirmed 2026-08-15). Nickname equivalence
-        # — Joe/Joseph, Becca/Rebecca — is deliberately NOT inferred either:
-        # the same reasoning would wrongly fuse Chris/Christina.
-        token_sets = {k: frozenset(k.split()) for k in by_name}
-        keys = list(by_name)
-        winner: str | None = None
-        for cand in keys:
-            if all(token_sets[other] <= token_sets[cand] for other in keys):
-                if winner is not None and token_sets[cand] != token_sets[winner]:
-                    return None
-                winner = cand
-        if winner is not None:
-            return by_name[winner]
-        return None
+    def lookup_all(self, identifiers: Iterable[tuple[str, str]]) -> ContactsLookup:
+        """One person for several identifiers — a person holding more than
+        one handle. Every identifier must match on its own, and the matches
+        must name one person under the same rule a single identifier's cards
+        are held to (duplicate accounts, decoration, and a name contained in
+        a fuller one agree; anything else does not). An identifier no card
+        carries makes the whole lookup `unmatched`; an identifier whose cards
+        disagree, or identifiers naming different people, make it
+        `ambiguous`. Ambiguity is reported ahead of absence when both occur,
+        since it is the one a human has to look at."""
+        lookups = [self.lookup(value, kind) for value, kind in identifiers]
+        if not lookups:
+            return ContactsLookup("unmatched")
+        if any(found.status == "ambiguous" for found in lookups):
+            return ContactsLookup("ambiguous")
+        contacts = [found.contact for found in lookups if found.contact is not None]
+        if len(contacts) < len(lookups):
+            return ContactsLookup("unmatched")
+        agreed = _unique_by_name(contacts)
+        if agreed is None:
+            return ContactsLookup("ambiguous")
+        return ContactsLookup("matched", agreed)
 
 
 # --------------------------------------------------------------------------
@@ -901,12 +961,15 @@ def assign_handle(conn: psycopg.Connection, *, normalized_value: str, kind: str,
 
 
 __all__ = [
+    "UNNAMED_CONTACT_DISPLAY_NAME",
     "ContactRecord",
     "ContactsAccessDeniedError",
     "ContactsImportOutcome",
     "ContactsIndex",
+    "ContactsLookup",
     "IdentityResult",
     "InvariantReport",
+    "MatchStatus",
     "assert_invariant_or_raise",
     "assign_handle",
     "compute_invariant_report",
