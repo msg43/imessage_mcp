@@ -90,6 +90,7 @@ import structlog
 from imsg.errors import ExtractionError
 from imsg.hashing import sha256_file
 from imsg.keys import attachment_key, message_key, thread_key
+from imsg.sqlite_readonly import open_readonly_immutable, wal_frame_bytes, wal_sidecar_path
 from imsg.stages.imsg_dump import ImsgDumpMessage, ImsgDumpRun, run_imsg_dump
 from imsg.textnorm import normalize_text, strip_nul
 
@@ -220,7 +221,33 @@ OpenSnapshotFn = Callable[[str], "apsw.Connection"]
 
 
 def _default_open_snapshot(path: str) -> apsw.Connection:
-    return apsw.Connection(path, flags=apsw.SQLITE_OPEN_READONLY)
+    """Open the snapshot (an S1 output, or a `--snapshot` seed) strictly
+    read-only and without leaving `-wal`/`-shm` sidecars next to it.
+
+    Uses `imsg.sqlite_readonly`'s `mode=ro&immutable=1` open, which is
+    what keeps a read from writing anything beside a chat.db-shaped file
+    (observed 2026-09-14: the plain `SQLITE_OPEN_READONLY` open this used
+    to be moved a seed corpus's `-shm` mtime on every run). `immutable=1`
+    also makes SQLite ignore the file's write-ahead log, so it is only
+    correct for a file with no uncheckpointed frames — true of every S1
+    output (the backup API writes the whole database into the main file)
+    but not guaranteed for a seed someone copied together with its
+    `-wal`. Refusing such a file, naming the one-line fix, is the
+    fail-closed choice: an open that succeeded would silently skip every
+    message committed to that log, and AT-2 (`imsg verify-seed
+    --reference-db`) would not catch it, because it reads the reference
+    the same way.
+    """
+    pending = wal_frame_bytes(path)
+    if pending:
+        raise ExtractionError(
+            f"refusing to read '{path}': its write-ahead log '{wal_sidecar_path(path)}' holds "
+            f"{pending} bytes of frames, and the immutable read-only open S2 uses (so that it "
+            f"never writes next to a database) cannot see rows committed there — they would "
+            f"be skipped silently. Fold the log into the file first, on this copy only, never "
+            f"on the live chat.db: sqlite3 '{path}' 'PRAGMA wal_checkpoint(TRUNCATE)'"
+        )
+    return open_readonly_immutable(path)
 
 
 class SnapshotReader:

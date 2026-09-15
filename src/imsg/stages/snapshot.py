@@ -17,7 +17,37 @@ Per SPEC §8 S1 / D6, deliberately **not**:
   hard requirement 1 wants a connection that is *incapable* of writing.
 - `?immutable=1` on the source URI — that flag asserts the file will
   not change for the lifetime of the connection, which is false for a
-  live, actively-synced `chat.db`.
+  live, actively-synced `chat.db`, and SQLite acts on the assertion by
+  never reading the write-ahead log: every message Messages.app has
+  committed but not yet checkpointed is invisible, and the read races
+  the checkpointer. Measured 2026-09-14 against a live `chat.db`: the
+  immutable open was four messages (and four ROWIDs) behind the plain
+  read-only open. `imsg.sqlite_readonly` is where `immutable=1` *is*
+  the right open — every other chat.db-shaped file this pipeline
+  reads — and says why.
+- `readonly_shm=1` or `locking_mode=EXCLUSIVE` as ways to read the
+  live WAL without touching `chat.db-shm`. The first can fail hard
+  (`SQLITE_CANTOPEN`, `SQLITE_READONLY_*`) when the wal-index it may
+  not write is missing, stale, or holds no usable read mark — an
+  unattended job cannot tolerate that. The second needs an EXCLUSIVE
+  lock on the database file, which a read-only descriptor cannot even
+  request (measured: `SQLITE_IOERR_LOCK`, "disk I/O error", on the
+  first read) and which Messages.app's always-open connections would
+  hold off with their SHARED lock if it could.
+
+What the source open therefore does touch, and why that is accepted:
+a plain read-only connection to a WAL-mode database takes part in
+SQLite's reader protocol through the `chat.db-shm` wal-index — it may
+record a read mark there, and it would rebuild the index from
+`chat.db-wal` if it found it invalid. That file is coordination state
+Messages.app's own readers write in exactly the same way, not database
+content, and it is the price of reading the live database correctly.
+`chat.db` and `chat.db-wal` are never modified: a read-only connection
+cannot write frames and cannot checkpoint (verified 2026-09-14 — an
+end-to-end backup of the live database left both files' sizes and
+mtimes unchanged). Every *other* chat.db-shaped file this pipeline
+opens goes through `imsg.sqlite_readonly`, which leaves the directory
+untouched.
 
 This module never loads config or opens its own long-lived database
 handle for anything beyond the backup itself — callers pass in
@@ -41,6 +71,7 @@ import apsw
 from imsg.errors import SnapshotError
 from imsg.hashing import sha256_file
 from imsg.paths import resolve_path
+from imsg.sqlite_readonly import open_readonly_immutable
 
 SNAPSHOT_SUBDIR = "snapshots"
 SNAPSHOT_FILENAME = "snapshot.db"
@@ -105,6 +136,10 @@ SleepFn = Callable[[float], None]
 
 
 def _default_open_source(path: str) -> apsw.Connection:
+    """The one plain `SQLITE_OPEN_READONLY` open of a chat.db-shaped file
+    in this codebase, on purpose: the module docstring says why the live
+    source must read the write-ahead log (so not `immutable=1`) and why
+    its `chat.db-shm` participation is accepted."""
     conn = apsw.Connection(path, flags=apsw.SQLITE_OPEN_READONLY)
     conn.set_busy_timeout(BUSY_TIMEOUT_MS)
     return conn
@@ -143,12 +178,18 @@ def _verify_snapshot(path: Path) -> None:
     """`quick_check` + expected-core-tables verification (SPEC §8 S1).
 
     Raises `SnapshotError` naming the specific problem. Opens the
-    freshly-backed-up file readonly — it is our own temp file at this
-    point, not the live source, so there is no hard-requirement-1
-    concern, but there is no reason to open it writable either.
+    freshly-backed-up file through `imsg.sqlite_readonly`: read-only
+    *and* `immutable=1`. Immutable is correct here, unlike for the live
+    source — this is our own temp file, fully written and closed by the
+    backup API, with no write-ahead log for the flag to hide. It is also
+    load-bearing: the file carries the live database's WAL header byte,
+    so a plain read-only open created `-wal`/`-shm` sidecars next to it,
+    and `run_snapshot`'s rename of the temp file then orphaned them under
+    `snapshots/` for good (observed 2026-09-14: `.tmp-snapshot-*.db-shm`
+    and `-wal` files from 2026-08-14 still sitting there).
     """
     try:
-        check = apsw.Connection(str(path), flags=apsw.SQLITE_OPEN_READONLY)
+        check = open_readonly_immutable(path)
     except apsw.Error as exc:
         raise SnapshotError(f"backed-up snapshot at '{path}' will not even open: {exc}") from exc
     try:

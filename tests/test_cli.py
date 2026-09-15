@@ -5,6 +5,7 @@ so this file stays in the "no network, no live Postgres" unit suite."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1330,6 +1331,25 @@ def test_sync_seed_refuses_the_live_chat_db(
     result = runner.invoke(
         app,
         ["sync", "--config", str(mocked_pg_env), "--snapshot", str(live), "--source", "seed-2026"],
+    )
+    assert result.exit_code == 1
+    assert "is the live Messages database" in result.output
+
+
+def test_seed_refuses_a_hard_link_to_the_live_chat_db(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A hard link resolves to a different string for the same inode — the
+    shape of the macOS `/System/Volumes/Data/…` firmlink alias too, which
+    cannot be built under tmp_path. Resolved-path equality alone would let
+    it through; `is_same_file` compares inodes as well."""
+    live = _live_chat_db_from_config(mocked_pg_env)
+    link = tmp_path / "innocent-looking-seed.db"
+    os.link(live, link)
+    monkeypatch.setattr(cli_module, "run_extract", _refuse_to_extract)
+    result = runner.invoke(
+        app,
+        ["extract", "--config", str(mocked_pg_env), "--snapshot", str(link), "--source", "seed-2026"],
     )
     assert result.exit_code == 1
     assert "is the live Messages database" in result.output
