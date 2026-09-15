@@ -10,6 +10,45 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-14 — read-only means the directory is untouched: no sidecars beside chat.db-shaped files
+
+- **`SQLITE_OPEN_READONLY` was leaving `-wal`/`-shm` files next to databases
+  the pipeline only reads.** Every chat.db-shaped file here carries the WAL
+  header byte (the live database, S1's backup output, the seed corpora), and
+  SQLite's read path opens the `-shm` wal-index read-write even on a
+  read-only connection. Evidence: `imsg extract --snapshot <seed>` moved the
+  seed's `-shm` mtime to the run's start, and `snapshots/` held orphaned
+  `.tmp-snapshot-*.db-shm`/`-wal` files dated 2026-08-14, left by the
+  post-backup verify open before the temp file was renamed. New
+  `imsg.sqlite_readonly` opens `file:<path>?mode=ro&immutable=1` (path
+  percent-encoded); S2's snapshot open and S1's verify open use it, and the
+  tests now assert the containing directory is byte-identical before and
+  after a read — the flags-only test could not see this class.
+- **S1's live source deliberately stays a plain read-only open.**
+  `immutable=1` makes SQLite ignore the write-ahead log: measured against the
+  live `chat.db`, the immutable open was four messages behind, and it would
+  race Messages.app's checkpointer. `readonly_shm=1` and
+  `locking_mode=EXCLUSIVE` were rejected too (the first fails hard when the
+  wal-index it may not write is missing or unusable; the second needs an
+  exclusive lock a read-only descriptor cannot take — measured: disk I/O
+  error). The reader-protocol writes to `chat.db-shm` are accepted and
+  documented in the module; `chat.db` and `chat.db-wal` are never modified
+  by a read-only connection (end-to-end S1 run against the live database:
+  both files' sizes and mtimes unchanged).
+- **Fail closed where immutable would hide data.** S2 refuses a `--snapshot`
+  whose `-wal` holds frames and names the one-line fix
+  (`PRAGMA wal_checkpoint(TRUNCATE)` on the copy). Without this, a seed
+  copied together with its log would silently lose its newest messages, and
+  AT-2 would agree, because `--reference-db` reads the reference the same
+  immutable way.
+- **The `--snapshot` live-database refusal (landed earlier today, below) now
+  compares by inode as well as by resolved path.** Resolved paths catch
+  symlinks and `..`, but a hard link, and the macOS firmlink alias
+  `/System/Volumes/Data/Users/…` of `~`, resolve to a different string for
+  the same file — verified on the host: `Path.resolve()` says different,
+  `os.path.samefile` says same. `imsg.paths.is_same_file` does both, and a
+  hard-link test pins it.
+
 ## 2026-09-14 — real model providers behind `models.backend`, and the QA pass that read them together
 
 Four agents built the real providers in parallel against a contract and the

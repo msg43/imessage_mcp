@@ -71,7 +71,7 @@ from imsg.mcp.auth import build_public_gate
 from imsg.mcp.tools.local_server import LocalMcpServer, run_local_server
 from imsg.mcp.tools.public_server import PublicMcpServer, build_public_asgi_app, parse_bind_address
 from imsg.mount.guard import run_guard_mount_or_exit
-from imsg.paths import is_contained_in, resolve_path
+from imsg.paths import is_contained_in, is_same_file, resolve_path
 from imsg.providers.factory import (
     ResolvedPrompt,
     backend_status_line,
@@ -538,7 +538,10 @@ def _validate_seed_or_die(cfg: Config, snapshot: Path | None, source: str | None
     must not be one the pipeline is actively snapshotting. And the file
     must not be the live `chat.db` (or anything beside it): the pipeline
     reads the live database exactly once, through S1's SQLite `.backup`,
-    and nothing else may ever open it (CLAUDE.md non-negotiable #1).
+    and nothing else may ever open it (CLAUDE.md non-negotiable #1). That
+    comparison is by inode as well as by resolved path — a hard link, or
+    the macOS `/System/Volumes/Data/…` firmlink alias of `~`, is a
+    different string for the same file.
     """
     if snapshot is None:
         return
@@ -561,7 +564,8 @@ def _validate_seed_or_die(cfg: Config, snapshot: Path | None, source: str | None
         )
         raise typer.Exit(code=1)
     # Compared by *resolved* path, so a symlink or `..` cannot dodge the
-    # check (SPEC §5.4: never infer containment from a string prefix).
+    # check (SPEC §5.4: never infer containment from a string prefix), and
+    # by inode, so neither can a hard link or the macOS firmlink alias.
     seed_resolved = resolve_path(snapshot)
     live_databases = [("paths.live_chat_db", resolve_path(cfg.paths.live_chat_db))]
     live_databases += [
@@ -569,7 +573,7 @@ def _validate_seed_or_die(cfg: Config, snapshot: Path | None, source: str | None
         for i, s in enumerate(cfg.sync.sources)
     ]
     for label, live in live_databases:
-        if seed_resolved == live:
+        if is_same_file(seed_resolved, live):
             typer.echo(
                 f"imsg: --snapshot '{snapshot}' is the live Messages database ({label}). "
                 f"A seed must be a snapshot or a prepared copy — the pipeline never opens "

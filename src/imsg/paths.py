@@ -14,6 +14,7 @@ prefix comparisons.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -56,4 +57,26 @@ def join_under_root(root: Path | str, value: Path | str) -> Path:
     return Path(root) / Path(value)
 
 
-__all__ = ["is_contained_in", "join_under_root", "resolve_path"]
+def is_same_file(candidate: Path | str, target: Path | str) -> bool:
+    """True if ``candidate`` and ``target`` name the same file.
+
+    Resolved-path equality (via :func:`resolve_path`) catches ``~``,
+    ``..`` and symlinks. When both paths exist, ``os.path.samefile``
+    (device + inode) additionally catches hard links and the macOS
+    firmlink alias ``/System/Volumes/Data/Users/…`` of ``/Users/…``,
+    which ``Path.resolve`` leaves as two different strings for one
+    file. A missing path can only match by resolved-path equality —
+    the guard that uses this must still refuse a protected path whether
+    or not the file is present.
+    """
+    resolved_candidate = resolve_path(candidate)
+    resolved_target = resolve_path(target)
+    if resolved_candidate == resolved_target:
+        return True
+    try:
+        return os.path.samefile(resolved_candidate, resolved_target)
+    except OSError:
+        return False
+
+
+__all__ = ["is_contained_in", "is_same_file", "join_under_root", "resolve_path"]
