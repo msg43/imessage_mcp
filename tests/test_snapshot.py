@@ -272,3 +272,82 @@ def test_verify_snapshot_rejects_a_non_chatdb_shaped_file(tmp_path: Path) -> Non
 
     with pytest.raises(SnapshotError, match="missing expected chat\\.db table"):
         snapshot_mod._verify_snapshot(bogus)
+
+
+# --------------------------------------------------------------------------
+# What S1 leaves on disk. The live chat.db, S1's own output and every seed
+# carry the WAL header byte, and a plain read-only open of such a file
+# creates `-wal`/`-shm` sidecars next to it (observed 2026-09-14). S1's
+# *source* open stays plain on purpose (see the module docstring); every
+# other open must leave the directory exactly as it found it.
+# --------------------------------------------------------------------------
+
+
+def _make_wal_mode_live_chat_db(path: Path) -> Path:
+    """The fixture chat.db switched to WAL journal mode and closed cleanly —
+    the header shape of the real live database, with no sidecars yet."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    live = _make_live_chat_db(path)
+    conn = sqlite3.connect(str(live), isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.close()
+    assert live.read_bytes()[18:20] == b"\x02\x02"
+    assert sorted(p.name for p in live.parent.iterdir()) == [live.name]
+    return live
+
+
+def _fingerprint(directory: Path) -> dict[str, tuple[int, int, str]]:
+    from imsg.hashing import sha256_file
+
+    return {
+        p.name: (p.stat().st_size, p.stat().st_mtime_ns, sha256_file(p))
+        for p in sorted(directory.iterdir())
+    }
+
+
+def test_default_open_source_reads_wal_frames_and_cannot_write(tmp_path: Path) -> None:
+    """Why the source open is NOT `immutable=1`: a message Messages.app has
+    committed but not yet checkpointed lives only in `chat.db-wal`, and an
+    immutable open would not see it (measured on the live database,
+    2026-09-14: four messages behind). The plain read-only open sees it
+    and still cannot write."""
+    live = _make_wal_mode_live_chat_db(tmp_path / "chat.db")
+    writer = sqlite3.connect(str(live), isolation_level=None)  # stands in for Messages.app
+    try:
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("INSERT INTO message (guid) VALUES ('msg-only-in-the-wal')")
+
+        conn = snapshot_mod._default_open_source(str(live))
+        try:
+            guids = {row[0] for row in conn.execute("SELECT guid FROM message")}
+            assert guids == {"msg-1", "msg-only-in-the-wal"}
+            with pytest.raises(apsw.ReadOnlyError):
+                conn.execute("DELETE FROM message")
+        finally:
+            conn.close()
+    finally:
+        writer.close()
+
+
+def test_run_snapshot_leaves_only_the_snapshot_file_under_snapshots(tmp_path: Path) -> None:
+    """The orphan class: the post-backup verify open used to create
+    `.tmp-snapshot-<uuid>.db-wal`/`-shm` next to the temp file, and the
+    rename to `snapshot.db` then stranded them under `snapshots/` forever
+    (found there on 2026-09-14, dated 2026-08-14)."""
+    live = _make_wal_mode_live_chat_db(tmp_path / "chat.db")
+    data_root = tmp_path / "data_root"
+    data_root.mkdir()
+
+    result = run_snapshot(live_chat_db=live, data_root=data_root)
+
+    assert result.path.read_bytes()[18:20] == b"\x02\x02"  # the backup inherits the WAL header
+    assert sorted(p.name for p in result.path.parent.iterdir()) == [SNAPSHOT_FILENAME]
+
+
+def test_verify_snapshot_leaves_the_directory_byte_identical(tmp_path: Path) -> None:
+    candidate = _make_wal_mode_live_chat_db(tmp_path / "check" / "candidate.db")
+    before = _fingerprint(candidate.parent)
+
+    snapshot_mod._verify_snapshot(candidate)
+
+    assert _fingerprint(candidate.parent) == before

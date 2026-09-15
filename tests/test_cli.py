@@ -5,6 +5,7 @@ so this file stays in the "no network, no live Postgres" unit suite."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1193,6 +1194,75 @@ def test_seed_refuses_a_missing_file(mocked_pg_env: Path, tmp_path: Path) -> Non
     )
     assert result.exit_code == 1
     assert "--snapshot file not found" in result.output
+
+
+def _live_chat_db_from_config(config_path: Path) -> Path:
+    for line in config_path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("live_chat_db:"):
+            return Path(stripped.split(":", 1)[1].strip())
+    raise AssertionError("live_chat_db not found in test config fixture")
+
+
+def test_seed_refuses_the_live_chat_db_itself(mocked_pg_env: Path) -> None:
+    """The gap this guard closes: nothing compared `--snapshot` with
+    `paths.live_chat_db`, so `imsg extract --snapshot ~/Library/Messages/chat.db
+    --source anything-else` was accepted."""
+    live = _live_chat_db_from_config(mocked_pg_env)
+    assert live.is_file()  # the fixture creates it — this must not be the not-found branch
+    result = runner.invoke(
+        app,
+        [
+            "extract", "--config", str(mocked_pg_env),
+            "--snapshot", str(live), "--source", "seed-2026",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "may not be the live chat.db" in result.output
+    assert "paths.live_chat_db" in result.output
+    assert "file not found" not in result.output
+
+
+@pytest.mark.parametrize("alias_kind", ["symlink", "hardlink"])
+def test_seed_refuses_an_alias_of_the_live_chat_db(
+    mocked_pg_env: Path, tmp_path: Path, alias_kind: str
+) -> None:
+    """Resolved-path equality catches a symlink; only an inode comparison
+    catches a hard link (and the macOS `/System/Volumes/Data/…` firmlink
+    alias, which cannot be reproduced under tmp_path). Both are refused."""
+    live = _live_chat_db_from_config(mocked_pg_env)
+    alias = tmp_path / "looks-like-a-seed.db"
+    if alias_kind == "symlink":
+        alias.symlink_to(live)
+    else:
+        os.link(live, alias)
+    result = runner.invoke(
+        app,
+        [
+            "extract", "--config", str(mocked_pg_env),
+            "--snapshot", str(alias), "--source", "seed-2026",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "may not be the live chat.db" in result.output
+
+
+def test_seed_refusal_of_the_live_chat_db_applies_to_sync_too(mocked_pg_env: Path) -> None:
+    """`imsg sync --snapshot` goes through the same guard as `imsg extract`."""
+    data_root = _data_root_from_config(mocked_pg_env)
+    prompt_path = data_root / "prompts" / "segment_boundaries.txt"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text("x")
+    live = _live_chat_db_from_config(mocked_pg_env)
+    result = runner.invoke(
+        app,
+        [
+            "sync", "--config", str(mocked_pg_env),
+            "--snapshot", str(live), "--source", "seed-2026",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "may not be the live chat.db" in result.output
 
 
 def test_extract_seed_uses_the_given_file_and_source(
