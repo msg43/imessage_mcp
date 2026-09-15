@@ -95,6 +95,12 @@ from imsg.stages.identity import (
     rename_person,
     run_identity,
 )
+from imsg.stages.identity_overrides import (
+    apply_overrides,
+    export_overrides,
+    load_overrides,
+    write_overrides,
+)
 from imsg.stages.imsg_dump import default_binary_path
 from imsg.stages.snapshot import SNAPSHOT_FILENAME, SNAPSHOT_SUBDIR, run_snapshot
 from imsg.stages.sync import EmbedFn, SegmentFn, run_sync, run_sync_all_sources
@@ -1035,6 +1041,129 @@ def identity_assign(
     finally:
         conn.close()
     typer.echo(f"identity: assigned {kind} {value!r} to person {person}")
+
+
+OverridesPathArgument = Annotated[
+    Path,
+    typer.Argument(
+        help="The curated-decisions file (JSON; schema in imsg.stages.identity_overrides). "
+        "It carries real names and identifiers: keep it under paths.data_root.",
+    ),
+]
+
+
+@identity_app.command("apply-overrides")
+def identity_apply_overrides(
+    path: OverridesPathArgument,
+    config: ConfigOption = None,
+    dry_run: DryRunOption = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Also apply decisions that conflict with the current person table (a handle "
+            "now on a person named since, or a person renamed since). The owner person and an "
+            "ambiguous target are never forced.",
+        ),
+    ] = False,
+) -> None:
+    """Replay curated decisions (rename/assign/merge) idempotently — run after any identity rebuild.
+
+    Every decision is keyed on its normalized identifier, so it also finds
+    handles created after the file was written. Already-applied decisions
+    are no-ops; identifiers absent from the index are reported as
+    `unmatched`, never invented; conflicts are reported and skipped unless
+    `--force`. Ends with the S3 invariant report and a one-line summary.
+    """
+    cfg = _load_config_or_die(config)
+    try:
+        decisions = load_overrides(path)
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        result = apply_overrides(
+            conn,
+            overrides=decisions.overrides,
+            default_region=cfg.identity.default_region,
+            dry_run=dry_run,
+            force=force,
+        )
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    typer.echo(f"identity: {len(decisions.overrides)} decision(s) from {path}")
+    for outcome in result.outcomes:
+        if outcome.status == "applied":
+            forced = " (forced)" if outcome.forced else ""
+            typer.echo(f"identity: applied{forced} {outcome.detail}")
+        elif outcome.status in ("unmatched", "conflict"):
+            typer.echo(f"identity: {outcome.status} {outcome.detail}", err=True)
+    typer.echo(
+        "identity: invariant "
+        f"unresolved_message_senders={result.invariant.unresolved_message_senders} "
+        f"unresolved_tapback_senders={result.invariant.unresolved_tapback_senders} "
+        f"unresolved_chat_participants={result.invariant.unresolved_chat_participants} "
+        f"ok={result.invariant.ok}"
+    )
+    if not result.invariant.ok:
+        typer.echo(
+            "identity: invariant NOT satisfied — segmentation (S4) must not run "
+            "until this is clean (SPEC §8 S3)",
+            err=True,
+        )
+    typer.echo(f"identity: {result.summary}")
+    if dry_run:
+        typer.echo(DRY_RUN_MARKER)
+
+
+@identity_app.command("export-overrides")
+def identity_export_overrides(path: OverridesPathArgument, config: ConfigOption = None) -> None:
+    """Write the current curated decisions as an overrides file — regenerate it after hand-curation.
+
+    One decision per handle of every reviewed (or multi-handle) non-owner
+    person. An existing file at `path` is merged in: its `was`/`why` are
+    kept, and decisions the index cannot currently express are carried
+    forward rather than dropped.
+    """
+    cfg = _load_config_or_die(config)
+    if not is_contained_in(path, cfg.paths.data_root):
+        typer.echo(
+            f"imsg: refusing to write {path}: the decisions file carries every named handle "
+            f"and belongs under paths.data_root ({cfg.paths.data_root}) — CLAUDE.md "
+            "non-negotiable #2",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    previous = None
+    if path.exists():
+        try:
+            previous = load_overrides(path)
+        except ImsgError as exc:
+            typer.echo(f"imsg: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        exported = export_overrides(
+            conn, default_region=cfg.identity.default_region, previous=previous
+        )
+    finally:
+        conn.close()
+    try:
+        write_overrides(path, exported.file)
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        f"identity: exported {exported.exported} decision(s) to {path} "
+        f"(carried_forward={exported.carried_forward}, total={len(exported.file.overrides)})"
+    )
 
 
 @app.command()

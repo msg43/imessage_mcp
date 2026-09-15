@@ -494,6 +494,155 @@ def test_identity_wires_run_identity_and_warns_on_degraded_contacts(
     assert "no TCC grant" in result.output
 
 
+def _write_overrides_fixture(path: Path) -> None:
+    """A tiny, fictional decisions file (schema: imsg.stages.identity_overrides)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "note": "fixture",
+                "decided": "2026-08-15",
+                "overrides": [
+                    {"value": "+14155552671", "kind": "phone", "name": "Alice Example", "was": []},
+                    {"value": "24273", "kind": "unknown", "name": "Acme Bank Alerts", "was": [], "why": "alerts"},
+                ],
+            }
+        )
+    )
+
+
+def _clean_invariant() -> Any:
+    from imsg.stages.identity import InvariantReport
+
+    return InvariantReport(
+        unresolved_message_senders=0,
+        unresolved_tapback_senders=0,
+        unresolved_chat_participants=0,
+        owner_person_count=1,
+    )
+
+
+def test_identity_apply_overrides_wires_the_replay_and_prints_the_summary(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.stages.identity_overrides import ApplyOverridesResult, OverrideOutcome
+
+    overrides_path = _data_root_from_config(mocked_pg_env) / "private" / "identity-overrides.json"
+    _write_overrides_fixture(overrides_path)
+    captured: dict[str, Any] = {}
+
+    def fake_apply(conn: Any, *, overrides: Any, default_region: str, dry_run: bool, force: bool) -> Any:
+        captured.update(overrides=overrides, default_region=default_region, dry_run=dry_run, force=force)
+        return ApplyOverridesResult(
+            outcomes=(
+                OverrideOutcome(overrides[0], "applied", "renamed person 7 '+14155552671' -> 'Alice Example'"),
+                OverrideOutcome(overrides[1], "unmatched", "no handle in the index for unknown '24273'"),
+            ),
+            invariant=_clean_invariant(),
+            dry_run=dry_run,
+        )
+
+    monkeypatch.setattr(cli_module, "apply_overrides", fake_apply)
+
+    result = runner.invoke(
+        app, ["identity", "apply-overrides", str(overrides_path), "--config", str(mocked_pg_env)]
+    )
+    assert result.exit_code == 0, result.output
+    assert [o.name for o in captured["overrides"]] == ["Alice Example", "Acme Bank Alerts"]
+    assert captured["default_region"] == "US"
+    assert captured["dry_run"] is False
+    assert captured["force"] is False
+    assert "identity: 2 decision(s) from" in result.output
+    assert "identity: applied renamed person 7" in result.output
+    assert "identity: unmatched no handle in the index" in result.output
+    assert "identity: invariant" in result.output and "ok=True" in result.output
+    assert "identity: applied=1 already=0 unmatched=1 conflicts=0" in result.output
+    assert "DRY RUN" not in result.output
+
+    result = runner.invoke(
+        app,
+        ["identity", "apply-overrides", str(overrides_path), "--config", str(mocked_pg_env),
+         "--dry-run", "--force"],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["dry_run"] is True
+    assert captured["force"] is True
+    assert "DRY RUN — nothing was written" in result.output
+
+
+def test_identity_apply_overrides_rejects_a_bad_file_before_touching_the_database(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    overrides_path = _data_root_from_config(mocked_pg_env) / "private" / "identity-overrides.json"
+    overrides_path.parent.mkdir(parents=True)
+    overrides_path.write_text(json.dumps({"overrides": [{"value": "+14155552671", "kind": "phone"}]}))
+
+    def must_not_run(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("apply_overrides must not be called for an invalid file")
+
+    monkeypatch.setattr(cli_module, "apply_overrides", must_not_run)
+    result = runner.invoke(
+        app, ["identity", "apply-overrides", str(overrides_path), "--config", str(mocked_pg_env)]
+    )
+    assert result.exit_code == 1
+    assert "imsg: " in result.output and "overrides[0]: 'name' must be" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_identity_export_overrides_refuses_a_path_outside_data_root(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def must_not_run(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("export_overrides must not be called for a path outside data_root")
+
+    monkeypatch.setattr(cli_module, "export_overrides", must_not_run)
+    outside = tmp_path / "elsewhere" / "identity-overrides.json"
+    result = runner.invoke(
+        app, ["identity", "export-overrides", str(outside), "--config", str(mocked_pg_env)]
+    )
+    assert result.exit_code == 1
+    assert "refusing to write" in result.output and "non-negotiable #2" in result.output
+    assert not outside.exists()
+
+
+def test_identity_export_overrides_writes_the_file_and_merges_the_existing_one(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.stages.identity_overrides import (
+        ExportOverridesResult,
+        IdentityOverride,
+        IdentityOverridesFile,
+        load_overrides,
+    )
+
+    overrides_path = _data_root_from_config(mocked_pg_env) / "private" / "identity-overrides.json"
+    _write_overrides_fixture(overrides_path)
+    captured: dict[str, Any] = {}
+
+    def fake_export(conn: Any, *, default_region: str, previous: Any) -> ExportOverridesResult:
+        captured.update(default_region=default_region, previous=previous)
+        file = IdentityOverridesFile(
+            overrides=(
+                IdentityOverride(value="+14155552671", kind="phone", name="Alice Example"),
+                IdentityOverride(value="24273", kind="unknown", name="Acme Bank Alerts", why="alerts"),
+            ),
+            note="fixture",
+            decided="2026-09-15",
+        )
+        return ExportOverridesResult(file=file, exported=1, carried_forward=1)
+
+    monkeypatch.setattr(cli_module, "export_overrides", fake_export)
+    result = runner.invoke(
+        app, ["identity", "export-overrides", str(overrides_path), "--config", str(mocked_pg_env)]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["default_region"] == "US"
+    assert [o.name for o in captured["previous"].overrides] == ["Alice Example", "Acme Bank Alerts"]
+    assert "identity: exported 1 decision(s) to" in result.output
+    assert "(carried_forward=1, total=2)" in result.output
+    assert load_overrides(overrides_path).decided == "2026-09-15"
+
+
 def test_segment_rebuild_requires_chat(mocked_pg_env: Path) -> None:
     result = runner.invoke(app, ["segment", "--rebuild", "--config", str(mocked_pg_env)])
     assert result.exit_code == 2
