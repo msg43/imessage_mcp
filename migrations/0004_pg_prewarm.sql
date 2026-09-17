@@ -1,0 +1,27 @@
+-- 0004_pg_prewarm.sql
+--
+-- Make the buffer pool warmable.
+--
+-- Vector search is only fast while its HNSW index is in memory. Measured
+-- on the live index (2026-09-16/17): a segment-vector search took 300-900
+-- ms when its pages were cold and 7-24 ms once cached, and the three HNSW
+-- indexes alone are 1.2 GiB against a 128 MB default `shared_buffers`. The
+-- buffer pool is being raised to hold the whole search working set
+-- (instance config, not this migration: `shared_buffers`,
+-- `shared_preload_libraries = 'pg_prewarm'`, `pg_prewarm.autoprewarm = on`
+-- in postgresql.conf), and a pool that large is only worth having if
+-- something fills it:
+--
+--   * `autoprewarm` (the background worker the extension registers) dumps
+--     the list of resident blocks periodically and reloads them when the
+--     postmaster starts, so a reboot no longer costs the first queries;
+--   * `pg_prewarm(relation)` — the function this extension provides — is
+--     called by `RetrievalService.warm_up()` for the relations the query
+--     path reads, so a freshly started MCP server is warm even when the
+--     dump is missing or stale (a first start, a restore, a new index).
+--
+-- The extension is a set of functions plus a worker: it creates no table,
+-- takes no lock on user data, and changes no query plan. Migrations are
+-- immutable once merged (SPEC §7.1) — a later change is a new file.
+
+CREATE EXTENSION IF NOT EXISTS pg_prewarm;

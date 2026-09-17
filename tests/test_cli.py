@@ -18,7 +18,7 @@ import imsg.cli as cli_module
 import imsg.providers.factory as factory_module
 from imsg.cli import app
 from imsg.db.migrations import AppliedMigration, MigrationFile, MigrationPlan
-from imsg.diagnostics import AtRestPosture, MountCheck, PostgresCheck
+from imsg.diagnostics import AtRestPosture, BufferPoolCheck, MountCheck, PostgresCheck
 from imsg.mount.guard import MountInfo
 
 runner = CliRunner()
@@ -316,6 +316,27 @@ class _FakePgConn:
 
     def close(self) -> None:
         self.closed = True
+
+    def cursor(self) -> Any:
+        """Enough of a cursor for the warm-up's buffer-pool step, which
+        asks whether the `pg_prewarm` function exists (migration 0004) before it does
+        anything: this database has no extensions, so the answer is no and
+        the step reports that instead of prewarming."""
+
+        class _Cursor:
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def execute(self, sql: str, params: Any = None) -> None:
+                assert "proname = 'pg_prewarm'" in sql, f"unexpected statement: {sql}"
+
+            def fetchone(self) -> tuple[Any, ...]:
+                return (False,)
+
+        return _Cursor()
 
 
 @pytest.fixture
@@ -1870,6 +1891,11 @@ def _patch_status_probes(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda config: PostgresCheck(reachable=True, cluster_fingerprint_ok=True, reason=None),
     )
     monkeypatch.setattr(cli_module, "disk_free_bytes", lambda path: 1)
+    monkeypatch.setattr(
+        cli_module,
+        "check_buffer_pool",
+        lambda config: BufferPoolCheck(3 * 2**30, 1_250_557_952, None),
+    )
 
 
 def _strip_models_section(config_path: Path) -> None:
@@ -1902,6 +1928,54 @@ def test_status_prints_the_backend_line_and_reports_it_in_json(
     result = runner.invoke(app, ["status", "--config", str(cli_config), "--json"])
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["models_backend"] == "fake"
+
+
+def test_status_reports_shared_buffers_against_the_hnsw_indexes(
+    cli_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vector search is only fast while its index pages are cached, and a
+    pool smaller than the indexes can never hold them — so `status` says
+    both sizes, and says so loudly when the pool is too small."""
+    _patch_status_probes(monkeypatch)
+    result = runner.invoke(app, ["status", "--config", str(cli_config), "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["postgres_shared_buffers_bytes"] == 3 * 2**30
+    assert payload["hnsw_index_bytes"] == 1_250_557_952
+    assert payload["shared_buffers_holds_hnsw_indexes"] is True
+    assert payload["shared_buffers_warning"] is None
+
+    warning = "shared_buffers (0.12 GiB) is smaller than the HNSW indexes (1.16 GiB): ..."
+    monkeypatch.setattr(
+        cli_module,
+        "check_buffer_pool",
+        lambda config: BufferPoolCheck(128 * 2**20, 1_250_557_952, warning),
+    )
+    result = runner.invoke(app, ["status", "--config", str(cli_config)])
+    assert result.exit_code == 0, result.output
+    assert warning in result.output
+    assert "shared_buffers_holds_hnsw_indexes: False" in result.output
+
+
+def test_status_does_not_ask_an_unreachable_database_about_its_buffer_pool(
+    cli_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_status_probes(monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "check_postgres",
+        lambda config: PostgresCheck(reachable=False, cluster_fingerprint_ok=None, reason="down"),
+    )
+
+    def never(config: object) -> object:
+        raise AssertionError("the buffer pool is not probed when Postgres is down")
+
+    monkeypatch.setattr(cli_module, "check_buffer_pool", never)
+    result = runner.invoke(app, ["status", "--config", str(cli_config), "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["postgres_shared_buffers_bytes"] is None
+    assert payload["shared_buffers_holds_hnsw_indexes"] is None
 
 
 def test_status_reports_the_real_default_when_config_is_silent(
@@ -2095,12 +2169,14 @@ def test_mcp_local_serves_first_and_warms_every_provider_in_the_background(
     result = runner.invoke(app, ["mcp", "local", "--config", str(mocked_pg_env)])
     assert result.exit_code == 0, result.output
     assert order == ["serve", "text", "multimodal", "reranker"]
+    assert "mcp local: database buffer pool ready in " in result.stderr
+    assert "pg_prewarm is not installed" in result.stderr  # this test's database has no extensions
     assert phases == [WarmUpPhase.NOT_STARTED, WarmUpPhase.READY]
     assert len(threads) == 1 and threading.main_thread() not in threads
-    assert "mcp local: warm-up started: loading 3 models in the background" in result.stderr
+    assert "mcp local: warm-up started: 4 steps in the background" in result.stderr
     for model in ("text embedder", "multimodal text tower", "reranker"):
         assert f"mcp local: {model} ready in " in result.stderr
-    assert "mcp local: warm-up done: 3 models ready in " in result.stderr
+    assert "mcp local: warm-up done: 4 steps ready in " in result.stderr
     assert "warm-up" not in result.stdout
 
 

@@ -19,6 +19,16 @@
 #     UPSTREAM sha as the revision; the provider records `model_id` as
 #     `<output_dir>@<upstream sha>`.
 #
+# `status` says whether an entry is in use:
+#   resolved — pinned and ACTIVE: it serves its `role`s and the config
+#     defaults mirror it; at most one active entry per role.
+#   retained — pinned and verified exactly like a resolved entry (upstream
+#     drift, the directory's digest, runtime floors), but NOT ACTIVE: its
+#     `role` says what it would serve and it claims nothing, so nothing
+#     builds it by default. `imsg models verify` prints the active entry
+#     for every role and lists retained entries separately.
+#   system — ships with the OS; unresolved — no confirmed pin yet.
+#
 # A build MUST NOT silently advance a model or MLX package because
 # "latest" changed: `imsg models verify` (scripts/verify_model_manifest.py)
 # re-resolves each repo — a local conversion's upstream repo — against
@@ -96,9 +106,55 @@ models:
       considered: mlx-community/Qwen3-Embedding-8B-4bit-DWQ (affine 4-bit, sha
       885642d6b98742ea03b77a1673579c92ca961efd) — rejected because the spec pins 8-bit.
       Upstream: Qwen/Qwen3-Embedding-8B @ 1d8ad4ca9b3dd8059ad90a75d4983776a23d44af (apache-2.0).
-  qwen3-reranker-8b:
+  qwen3-reranker-0.6b:
     role: [reranker]
     status: resolved
+    source: local_conversion
+    upstream_repo: Qwen/Qwen3-Reranker-0.6B
+    upstream_revision: e61197ed45024b0ed8a2d74b80b4d909f1255473
+    upstream_license: apache-2.0
+    tool: mlx-lm==0.31.3
+    command: >-
+      python -c "from huggingface_hub import snapshot_download; from mlx_lm.convert import
+      convert; src = snapshot_download('Qwen/Qwen3-Reranker-0.6B',
+      revision='e61197ed45024b0ed8a2d74b80b4d909f1255473'); convert(hf_path=src,
+      mlx_path='$DATA_ROOT/models/qwen3-reranker-0.6b-mxfp8-e61197ed', quantize=True,
+      q_mode='mxfp8', q_bits=8, q_group_size=32)"
+    output_dir: models/qwen3-reranker-0.6b-mxfp8-e61197ed
+    expected_dim: null
+    quantization: {mode: mxfp8, bits: 8, group_size: 32}
+    artifact_sha256: '120fd5c238c01be0c51256c1ad3048e6b710d279cd4e81b565fbde5bc1311746'
+    min_runtime: {mlx: '0.32.2', mlx-lm: '0.31.3', huggingface_hub: '1.31.0'}
+    smoke_test:
+      status: passed
+      date: '2026-09-17'
+      host_class: Apple M2 Ultra, 128 GB unified memory
+      load_seconds: 2.71
+      inference_seconds: 0.08
+      peak_memory_gb: 0.87
+      peak_memory_source: mlx.core.get_peak_memory
+      result: 'P(yes): relevant=0.9981 > irrelevant=0.0000, both in [0, 1]'
+    notes: >-
+      The ACTIVE reranker since 2026-09-17 (owner decision): search's latency budget is
+      p95 <= 2.0 s for a whole query on the production host, and on the 2026-09-16/17
+      sweep only this size could score 20 candidates inside it — the 8B at its fastest
+      setting (10 candidates, 64-token documents) missed the budget and agreed with the
+      8B's full 50-candidate ranking no better than the fused order with no reranker.
+      Retrieval defaults move with it: retrieval.rerank_top 20,
+      retrieval.rerank_doc_max_tokens 256. Same recipe and entry kind as the 8B below:
+      mlx-lm's own 8-bit mxfp8 conversion (group size 32) of upstream
+      Qwen/Qwen3-Reranker-0.6B at the sha above, converted from the pinned snapshot
+      DIRECTORY (see the 8B entry's notes for why not the repo id). Output: 507 tensors
+      (595,776,512 parameters, 0.58 GiB of artifact files), config.json quantization
+      {group_size: 32, bits: 8, mode: mxfp8}. tie_word_embeddings is TRUE upstream (310
+      tensors, no lm_head.weight) and in the conversion, so the yes/no logits come from
+      the tied, quantized embedding matrix (model.embed_tokens.as_linear;
+      imsg.mlx_runtime.lm_head_logits) rather than a separate lm_head. Reproducibility
+      checked 2026-09-17: re-running the recorded command into a fresh directory gave a
+      byte-identical artifact (same artifact_sha256, all 7 hashed files equal).
+  qwen3-reranker-8b:
+    role: [reranker]
+    status: retained
     source: local_conversion
     upstream_repo: Qwen/Qwen3-Reranker-8B
     upstream_revision: 77d193c791ed757ca307ee72715aa132723da912
@@ -125,8 +181,15 @@ models:
       peak_memory_source: mlx.core.get_peak_memory
       result: 'P(yes): relevant=0.9707 > irrelevant=0.0000, both in [0, 1]'
     notes: >-
-      Pinned as a LOCAL CONVERSION (owner decision 2026-09-15): mlx-lm's own 8-bit
-      mxfp8 conversion (group size 32) of upstream Qwen/Qwen3-Reranker-8B at the sha
+      RETAINED, NOT ACTIVE since 2026-09-17: replaced as the reranker by
+      qwen3-reranker-0.6b (above) for the search latency budget, and kept on disk, with
+      this recipe and digest still verified, for the retrieval-quality comparison of the
+      two sizes. It claims no role; to use it again, set retrieval.reranker_model /
+      reranker_revision to this entry's output_dir / upstream_revision (and swap the two
+      entries' status to keep the lock's config defaults in step). Its smoke_test record
+      is from when it was active. Pinned as a LOCAL CONVERSION (owner decision
+      2026-09-15): mlx-lm's own 8-bit mxfp8 conversion (group size 32) of upstream
+      Qwen/Qwen3-Reranker-8B at the sha
       above, written to output_dir under paths.data_root by the recorded command.
       `python` is the project venv with the `models` extra (mlx-lm 0.31.3, mlx 0.32.2,
       huggingface_hub 1.31.0); $DATA_ROOT is paths.data_root. The command fetches the

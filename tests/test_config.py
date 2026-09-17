@@ -578,7 +578,28 @@ def test_rerank_defaults_are_the_measured_latency_settings(config_dict_factory: 
     raw["retrieval"].pop("rerank_top", None)
     raw["retrieval"].pop("rerank_doc_max_tokens", None)
     retrieval = load_config_dict(raw).retrieval
-    assert (retrieval.rerank_top, retrieval.rerank_doc_max_tokens) == (10, 64)
+    assert (retrieval.rerank_top, retrieval.rerank_doc_max_tokens) == (20, 256)
+
+
+def test_hnsw_ef_search_defaults_to_pgvectors_maximum_and_is_bounded_by_it(
+    config_dict_factory: object,
+) -> None:
+    """Recall against exact search was measured at 40/100/200/400/1000 and
+    rises all the way (schema docstring); 1000 is pgvector's own ceiling,
+    so a larger value is a config error, not a slower search."""
+    from imsg.config.schema import HNSW_EF_SEARCH_MAX
+
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["retrieval"].pop("hnsw_ef_search", None)
+    assert load_config_dict(raw).retrieval.hnsw_ef_search == HNSW_EF_SEARCH_MAX == 1000
+
+    raw["retrieval"]["hnsw_ef_search"] = 40
+    assert load_config_dict(raw).retrieval.hnsw_ef_search == 40
+
+    for bad in (0, -1, HNSW_EF_SEARCH_MAX + 1):
+        raw["retrieval"]["hnsw_ef_search"] = bad
+        with pytest.raises(ConfigError, match=r"retrieval\.hnsw_ef_search"):
+            load_config_dict(raw)
 
 
 @pytest.mark.parametrize("value", [None, 1, 256, 8192])

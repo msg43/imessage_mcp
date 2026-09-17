@@ -53,7 +53,9 @@ from imsg.db.connection import connect
 from imsg.db.fingerprint import ensure_cluster_fingerprint, verify_data_directory
 from imsg.db.migrations import PostgresMigrationRunner, format_mismatches
 from imsg.diagnostics import (
+    BufferPoolCheck,
     check_at_rest_posture,
+    check_buffer_pool,
     check_full_disk_access,
     check_mount,
     check_postgres,
@@ -439,6 +441,7 @@ def status(
     mount = check_mount(cfg.paths.data_root)
     posture = check_at_rest_posture(cfg.paths.data_root)
     pg = check_postgres(cfg)
+    pool = check_buffer_pool(cfg) if pg.reachable else BufferPoolCheck(None, None, None)
     free_bytes = disk_free_bytes(cfg.paths.data_root)
 
     report = {
@@ -448,6 +451,10 @@ def status(
         "postgres_reachable": pg.reachable,
         "postgres_cluster_fingerprint_ok": pg.cluster_fingerprint_ok,
         "postgres_reason": pg.reason,
+        "postgres_shared_buffers_bytes": pool.shared_buffers_bytes,
+        "hnsw_index_bytes": pool.hnsw_index_bytes,
+        "shared_buffers_holds_hnsw_indexes": pool.holds_hnsw_indexes,
+        "shared_buffers_warning": pool.warning,
         "at_rest_posture": posture.label,
         "at_rest_posture_caveat": posture.caveat,
         "disk_free_bytes": free_bytes,

@@ -102,22 +102,31 @@ retrieval:
   # reads: rerank_top candidates, each cut to rerank_doc_max_tokens (reranker tokens,
   # document only — never the query; the count includes the ~40-token segment header).
   # Never fewer than a request's `limit` are reranked. Chosen by
-  # scripts/bench_retrieval_latency.py; read the README's measurements before changing.
-  rerank_top: 10
-  rerank_doc_max_tokens: 64      # null = no cap beyond the model's 8,192-token row
+  # scripts/bench_retrieval_latency.py for a whole-query p95 <= 2.0 s; read the
+  # README's measurements before changing.
+  rerank_top: 20
+  rerank_doc_max_tokens: 256     # null = no cap beyond the model's 8,192-token row
   # The reranker is pinned as a LOCAL CONVERSION (models/manifest.lock.yaml,
   # `source: local_conversion`): reranker_model is that entry's output_dir, a
   # directory relative to data_root that the lock's recorded `command`
-  # produces from the upstream repo (the mlx-community conversion ships no
-  # lm_head and cannot score). The other accepted form is a Hugging Face repo
-  # id (owner/name); the factory reads the value as a directory when
+  # produces from the upstream repo. The other accepted form is a Hugging Face
+  # repo id (owner/name); the factory reads the value as a directory when
   # <data_root>/<value> exists and as a repo id otherwise. Absolute paths,
   # `~` and `..` are rejected — a directory must stay under data_root.
-  reranker_model: models/qwen3-reranker-8b-mxfp8-77d193c7
-  reranker_revision: 77d193c791ed757ca307ee72715aa132723da912   # the UPSTREAM commit the conversion was made from
-                                                                # (Qwen/Qwen3-Reranker-8B; manifest upstream_revision).
+  # The lock also keeps the 8B conversion (qwen3-reranker-8b, status: retained —
+  # verified, not active) for a quality comparison.
+  reranker_model: models/qwen3-reranker-0.6b-mxfp8-e61197ed
+  reranker_revision: e61197ed45024b0ed8a2d74b80b4d909f1255473   # the UPSTREAM commit the conversion was made from
+                                                                # (Qwen/Qwen3-Reranker-0.6B; manifest upstream_revision).
                                                                 # For a repo id: that repo's immutable commit sha.
   default_limit: 10
+  # HNSW dynamic candidate list per vector search (pgvector's hnsw.ef_search,
+  # range 1-1000), applied with SET LOCAL in each channel's transaction. 1000 is
+  # pgvector's maximum and this build's default: measured recall@100 against exact
+  # search rises from 0.94/0.79 (text/image channel) at the pgvector default of 40
+  # to 1.00/1.00 at 1000, for about 50 ms more per query — small against the 2 s
+  # whole-query budget the reranker dominates. See the README.
+  hnsw_ef_search: 1000
 
 render:
   timezone: America/Los_Angeles

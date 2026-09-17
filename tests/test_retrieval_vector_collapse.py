@@ -151,10 +151,14 @@ def test_sets_the_scan_and_cursor_planning_inside_the_same_transaction_before_st
     conn = _FakeConn([(1, 0.1)])
     predicate = compile_predicate(SearchFilters(), LOCAL_FULL_ACCESS)
     search_multimodal_vector(cast(psycopg.Connection, conn), [0.1, 0.2], predicate, 5)
-    (scan_name, scan_sql, _), (plan_name, plan_sql, _), (cursor_name, sql, params) = (
-        conn.statements
-    )
+    (scan_name, scan_sql, _), (seq_name, seq_sql, _), (plan_name, plan_sql, _), (
+        cursor_name,
+        sql,
+        params,
+    ) = conn.statements
     assert scan_name is None and "hnsw.iterative_scan = 'strict_order'" in scan_sql
+    # the planner may not swap the HNSW index for an exact sort (module docstring)
+    assert seq_name is None and "enable_seqscan = off" in seq_sql
     # planned like the plain query, so the cursor cannot switch plans (and rows)
     assert plan_name is None and "cursor_tuple_fraction = 1.0" in plan_sql
     assert cursor_name is not None and "attachment_mm_embedding" in sql
@@ -163,6 +167,102 @@ def test_sets_the_scan_and_cursor_planning_inside_the_same_transaction_before_st
 
     conn = _FakeConn([(1, 0.1)])
     search_attachment_chunk_vector(cast(psycopg.Connection, conn), [0.1, 0.2], predicate, 20)
-    (_, _, _), (_, _, _), (_, chunk_sql, chunk_params) = conn.statements
+    (_, _, _), (_, _, _), (_, _, _), (_, chunk_sql, chunk_params) = conn.statements
     assert "attachment_chunk_embedding" in chunk_sql
     assert chunk_params is not None and chunk_params["row_limit"] == 100
+
+
+def test_ef_search_is_set_for_the_transaction_only_when_one_is_given() -> None:
+    """`retrieval.hnsw_ef_search` reaches the server as a transaction-local
+    `set_config`, next to the iterative-scan setting; without a value the
+    server's own (40) stands."""
+    predicate = compile_predicate(SearchFilters(), LOCAL_FULL_ACCESS)
+
+    conn = _FakeConn([(1, 0.1)])
+    search_multimodal_vector(
+        cast(psycopg.Connection, conn), [0.1, 0.2], predicate, 5, ef_search=1000
+    )
+    settings = [(sql, params) for name, sql, params in conn.statements if name is None]
+    assert "set_config('hnsw.ef_search'" in settings[2][0]
+    assert settings[2][1] == {"ef_search": "1000"}  # is_local => true, so the transaction only
+    assert [sql for sql, _ in settings[:2]] == [
+        s for s, _ in settings[:2] if "iterative_scan" in s or "enable_seqscan" in s
+    ]
+
+    conn = _FakeConn([(1, 0.1)])
+    search_multimodal_vector(cast(psycopg.Connection, conn), [0.1, 0.2], predicate, 5)
+    assert not any("ef_search" in sql for _, sql, _ in conn.statements)
+
+
+# --------------------------------------------------------------------------
+# the service hands its configured ef_search to every vector channel
+# --------------------------------------------------------------------------
+
+
+def test_every_channel_gets_the_configured_ef_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`retrieval.hnsw_ef_search` is a search-quality knob, so it has to
+    reach all three vector channels — not just the one that was easiest to
+    wire."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from imsg.retrieval import service as service_module
+    from imsg.retrieval.service import RetrievalService
+
+    seen: dict[str, object] = {}
+    channel = SimpleNamespace(segment_ids=(7,), scan_cap_reached=False)
+    summary = SimpleNamespace(
+        segment_key="seg_fictional",
+        thread_key="thread_fictional",
+        chat_kind="direct",
+        chat_display_name=None,
+        people=("alice",),
+        started_at=datetime(2026, 1, 2, tzinfo=UTC),
+        ended_at=datetime(2026, 1, 2, tzinfo=UTC),
+        message_count=1,
+        has_attachments=False,
+        text="[09:00] alice: kite festival on saturday?",
+    )
+    config = SimpleNamespace(
+        embedding=SimpleNamespace(
+            query_instruction="find it", multimodal=SimpleNamespace(enabled=True)
+        ),
+        retrieval=SimpleNamespace(
+            default_limit=5,
+            k_fts=10,
+            k_vector=100,
+            rrf_k=60,
+            rerank_top=20,
+            hnsw_ef_search=777,
+        ),
+        render=SimpleNamespace(timezone="America/Los_Angeles"),
+    )
+    service = RetrievalService(
+        pg_conn=cast(Any, object()),
+        fts_conn=cast(Any, object()),
+        config=cast(Any, config),
+        text_provider=cast(Any, SimpleNamespace(embed_query=lambda text, *, instruction: [0.1])),
+        reranker=cast(Any, SimpleNamespace(score=lambda query, documents: [1.0] * len(documents))),
+        multimodal_provider=cast(Any, SimpleNamespace(embed_text=lambda text: [0.2])),
+    )
+    monkeypatch.setattr(service_module, "resolve_filters", lambda *a, **k: None)
+    monkeypatch.setattr(service_module, "compile_predicate", lambda *a, **k: None)
+    for name in ("search_segment_fts", "search_attachment_chunk_fts"):
+        monkeypatch.setattr(service_module.fts_search, name, lambda *a, **k: channel)
+    for name in ("search_segment_vector", "search_attachment_chunk_vector", "search_multimodal_vector"):
+
+        def record(*args: Any, _name: str = name, **kwargs: Any) -> Any:
+            seen[_name] = kwargs.get("ef_search")
+            return channel
+
+        monkeypatch.setattr(service_module.vector_search, name, record)
+    monkeypatch.setattr(
+        service_module.segments, "fetch_segment_summaries", lambda *a, **k: {7: summary}
+    )
+
+    service.search_messages(LOCAL_FULL_ACCESS, query="kite festival")
+    assert seen == {
+        "search_segment_vector": 777,
+        "search_attachment_chunk_vector": 777,
+        "search_multimodal_vector": 777,
+    }
