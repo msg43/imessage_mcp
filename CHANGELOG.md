@@ -10,6 +10,45 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-17 — search latency: reranker batching, early-stopping vector collapse, startup warm-up
+
+First measured sweep against a real index (20 generic queries, numbers only).
+
+- **Reranker batching.** Length-sorted batches under a padded-token budget
+  (1,024, measured best) replaced fixed unsorted batches of 8. At 50
+  candidates, rerank time fell from p50 58.4 s / p95 83.1 s to 27.0 / 35.9 s
+  with scores unchanged. A new `retrieval.rerank_doc_max_tokens` caps the
+  document body only, so the position the yes/no logits are read from never
+  moves. The rerank pool is never smaller than the request's `limit`, so a
+  small `rerank_top` cannot silently truncate results.
+- **The multimodal channel read 500 rows to find 100 distinct segments,**
+  which were reached by row 115 (median) / 157 (max). Collapsing channels now
+  stream and stop once no unread row can change the result; identical output
+  on the live index (40/40, 12/12), 128–192 rows read. The cursor is planned
+  like the plain query — default cursor planning chose a different index and
+  made an integration test flaky.
+- **`RetrievalService.warm_up()`**, called by `imsg mcp local` before
+  serving. The 1.27 s / 1.40 s embedding stages seen on a "warm" query were
+  first-call loading and compilation: tokenizing 0.15 ms and a 51.6 ms forward
+  pass for the query embedding, 17.6 ms for the PE-Core text tower. Without
+  warm-up the first query took 113.6 s.
+- **Not changed, measured:** vector searches are fast on warm pages and slow
+  on cold ones (segment 304 → 7 ms, multimodal 898 → 24 ms via
+  `EXPLAIN (ANALYZE, BUFFERS)`) — `shared_buffers` is the 128 MB default
+  against 1.19 GB of HNSW indexes. HNSW recall@100 against exact search at
+  the default `ef_search` 40 is 0.944 (text) and 0.792 (multimodal, worst
+  query 0.38); at 400 it is 0.997 / 0.985. Shared-prefix caching for the
+  reranker saved 18–28 % but moves scores by up to 1e-3 and reorders near-ties.
+- Defaults `rerank_top` 10 / `rerank_doc_max_tokens` 64 were set as the
+  fastest configuration within the pinned 8B reranker. They do not meet a
+  2 s budget on the production host, and their ranking agreement with the
+  full 50-candidate rerank equals the no-reranker order; see the private
+  design record for the model decision this forces.
+- `scripts/bench_retrieval_latency.py`: read-only, prints numbers only;
+  rerank-only mode matched the full service in 24/24 comparisons.
+
+Suite: 1,524 passed with a scratch database.
+
 ## 2026-09-15 — identity changes now mark their chats for re-segmentation
 
 Rendered segments carry people's names — the chat header lists
