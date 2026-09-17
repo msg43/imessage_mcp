@@ -12,6 +12,31 @@ inside its own transaction (`SET LOCAL` only applies for the remainder
 of the current transaction) so nothing leaks into whatever the caller
 does next on the same long-lived connection.
 
+**How much of the index each search looks at (2026-09-17).**
+`hnsw.ef_search` is "the size of the dynamic candidate list for search
+(40 by default) ... a higher value provides better recall at the cost of
+speed" (pgvector 0.8.6 README §Query Options), and it is also the size of
+each batch an iterative scan reads. It is set per search from
+`retrieval.hnsw_ef_search`, next to the iterative-scan setting and in the
+same transaction. The two interact: with `iterative_scan` on, pgvector
+"will automatically scan more of the index until enough results are found
+(or it reaches `hnsw.max_scan_tuples`)" — 20,000 by default, and "this is
+approximate and does not affect the initial scan" (README §Iterative Index
+Scans). So `ef_search` sets what the first pass considers and what each
+later pass adds, while `max_scan_tuples` bounds the total; the iterative
+scan rescues a filtered query that would otherwise return fewer than `k`
+rows (README §Filtering), it does not make a small `ef_search` as accurate
+as a large one.
+
+Measured on the live index, 20 fictional queries, warm pages, recall@100
+against exact search — `ef_search` 40 / 100 / 200 / 400 / 1000: 0.944,
+0.969, 0.989, 0.997, 1.000 for the segment channel and 0.792, 0.887,
+0.945, 0.985, 0.998 for the multimodal one, worst single query 0.79 and
+0.38 at 40 against 1.00 and 0.98 at 1000. Per-channel p95 over the same
+queries: 10.6 and 10.1 ms at 40 against 45.5 and 27.3 ms at 1000. The
+default is 1000 (pgvector's maximum): the whole-query budget is 2 s and
+the reranker spends most of it, so recall is the better use of 50 ms.
+
 **Simplification, flagged**: pgvector does not surface an explicit
 "iterative scan hit its cap" signal over plain SQL. This module treats
 "returned fewer than the requested `k`" as the metric SPEC §9.4 step 5
@@ -51,6 +76,54 @@ if TYPE_CHECKING:
     import psycopg
 
 _SET_ITERATIVE_SCAN = "SET LOCAL hnsw.iterative_scan = 'strict_order'"
+
+_SET_EF_SEARCH = "SELECT set_config('hnsw.ef_search', %(ef_search)s, true)"
+"""`SET LOCAL hnsw.ef_search`, written as `set_config(..., is_local =>
+true)` because `SET` takes no query parameters. pgvector's own range is
+1..1000 (rejected at 1001 by the live instance, pgvector 0.8.6,
+2026-09-17); `imsg.config.schema` bounds the config field the same way."""
+
+_KEEP_THE_INDEX = "SET LOCAL enable_seqscan = off"
+"""Keep the planner on the HNSW index — pgvector's own remedy ("You can
+encourage the planner to use an index for a query with: BEGIN; SET LOCAL
+enable_seqscan = off; ...", README §"Why isn't my index being used?",
+pgvector 0.8.6).
+
+It is needed because the planner's two estimates are not comparable here
+(all numbers measured on the live index, 2026-09-17, `EXPLAIN`):
+
+- The sequential alternative is undercosted. pgvector says so directly:
+  "The planner doesn't consider out-of-line storage in cost estimates,
+  which can make a serial scan look cheaper" (same README) — and the
+  vectors this channel sorts are exactly that, 642 MiB of TOAST against a
+  25 MiB main fork. Its estimate is a flat 8,827; running it touched
+  538,197 buffers and took 240-260 ms, against 4,032 buffers and 10-18 ms
+  for the index scan at `ef_search` 400.
+- The index estimate is not monotonic in `ef_search`. pgvector's
+  `hnswcostestimate` bounds layer-0 tuples by `HnswGetLayerM(m, 0) *
+  hnsw_ef_search` while its selectivity term carries `1 + log(ef_search)`
+  in the denominator (src/hnsw.c, v0.8.6), so the estimate climbs with
+  `ef_search` until the other term takes over and it drops back: 3,252 at
+  40, 8,558 at 160, 13,287 at 280, then 3,719 at 285 and 3,765 at 1,000.
+  Between those two curves — `ef_search` 170 through 284 here — the seq
+  scan wins the comparison, and the same query that took 9 ms at 160 took
+  245 ms at 200.
+
+Without this, the search's latency would depend on where a tuned
+`ef_search` happened to fall against a cost curve, and on a corpus size
+that moves the seq-scan estimate. A penalty, not a prohibition: with no
+usable index the planner still scans, so the channel degrades instead of
+failing."""
+
+
+def _apply_scan_settings(cur: Any, ef_search: int | None) -> None:
+    """The GUCs every vector channel runs under, for the remainder of the
+    caller's transaction. `ef_search` of `None` leaves the server's own
+    value (40 by default) alone."""
+    cur.execute(_SET_ITERATIVE_SCAN)
+    cur.execute(_KEEP_THE_INDEX)
+    if ef_search is not None:
+        cur.execute(_SET_EF_SEARCH, {"ef_search": str(int(ef_search))})
 
 _PLAN_CURSOR_LIKE_A_QUERY = "SET LOCAL cursor_tuple_fraction = 1.0"
 """PostgreSQL plans a `DECLARE ... CURSOR` for fast start — for the first
@@ -94,12 +167,17 @@ def _result(rows: list[tuple[int, ...]], k: int) -> VectorChannelResult:
 
 
 def search_segment_vector(
-    conn: psycopg.Connection, query_vector: list[float], predicate: CompiledPredicate, k: int
+    conn: psycopg.Connection,
+    query_vector: list[float],
+    predicate: CompiledPredicate,
+    k: int,
+    *,
+    ef_search: int | None = None,
 ) -> VectorChannelResult:
     """Channel B1: primary text vector search over `segment_embedding`."""
     qv = vector_literal(query_vector)
     with conn.transaction(), conn.cursor() as cur:
-        cur.execute(_SET_ITERATIVE_SCAN)
+        _apply_scan_settings(cur, ef_search)
         cur.execute(
             f"""
             SELECT s.segment_id
@@ -116,7 +194,12 @@ def search_segment_vector(
 
 
 def search_attachment_chunk_vector(
-    conn: psycopg.Connection, query_vector: list[float], predicate: CompiledPredicate, k: int
+    conn: psycopg.Connection,
+    query_vector: list[float],
+    predicate: CompiledPredicate,
+    k: int,
+    *,
+    ef_search: int | None = None,
 ) -> VectorChannelResult:
     """Channel B2: primary text vector search over
     `attachment_chunk_embedding`, mapped to parent segments and
@@ -143,11 +226,17 @@ def search_attachment_chunk_vector(
         """,
         {"qv": qv, "row_limit": chunk_limit, **predicate.params},
         k,
+        ef_search=ef_search,
     )
 
 
 def search_multimodal_vector(
-    conn: psycopg.Connection, query_vector: list[float], predicate: CompiledPredicate, k: int
+    conn: psycopg.Connection,
+    query_vector: list[float],
+    predicate: CompiledPredicate,
+    k: int,
+    *,
+    ef_search: int | None = None,
 ) -> VectorChannelResult:
     """Channel C: secondary multimodal vector search over
     `attachment_mm_embedding` (SPEC §9.5, D3a) — active whenever the
@@ -171,6 +260,7 @@ def search_multimodal_vector(
         """,
         {"qv": qv, "row_limit": attachment_limit, **predicate.params},
         k,
+        ef_search=ef_search,
     )
 
 
@@ -197,7 +287,12 @@ def collapse_is_settled(
 
 
 def _collapsed_nearest_segments(
-    conn: psycopg.Connection, sql: str, params: dict[str, Any], k: int
+    conn: psycopg.Connection,
+    sql: str,
+    params: dict[str, Any],
+    k: int,
+    *,
+    ef_search: int | None = None,
 ) -> VectorChannelResult:
     """Run an item-level `(segment_id, distance)` query ordered by
     distance and collapse it to the `k` nearest segments, reading only as
@@ -207,7 +302,7 @@ def _collapsed_nearest_segments(
     farthest = float("-inf")
     with conn.transaction():
         with conn.cursor() as cur:
-            cur.execute(_SET_ITERATIVE_SCAN)
+            _apply_scan_settings(cur, ef_search)
             cur.execute(_PLAN_CURSOR_LIKE_A_QUERY)
         with conn.cursor(name="imsg_vector_overfetch") as cur:
             cur.execute(sql, params)

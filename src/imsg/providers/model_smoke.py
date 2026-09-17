@@ -131,6 +131,7 @@ revision is fetched, so the hashed set is always complete."""
 
 SMOKE_RUN_ORDER: tuple[str, ...] = (
     "qwen3-embedding-8b",
+    "qwen3-reranker-0.6b",
     "qwen3-reranker-8b",
     "whisper-large-v3",
     "pe-core-g14-448",
@@ -747,15 +748,26 @@ def _pin(by_role: Mapping[str, ManifestEntry], role: str) -> tuple[str, str]:
     return model, revision
 
 
-def config_from_manifest(lock: ManifestLock, *, data_root: Path) -> Config:
+def config_from_manifest(
+    lock: ManifestLock, *, data_root: Path, entry: ManifestEntry | None = None
+) -> Config:
     """A `Config` whose every model field equals the lock's pins and whose
     backend is `real`, for `imsg.providers.factory`. The sections are
     validated individually; the root is assembled with `model_construct`
     so the root path-containment validators — which resolve the live
     `chat.db` path — never run (module docstring). `data_root` is where
     a local conversion's `output_dir` is resolved and where prompt
-    overrides would be looked for."""
+    overrides would be looked for.
+
+    Each role takes the pin of its ACTIVE entry (`entries_by_role`),
+    except that `entry`, when given, pins the roles it serves itself: a
+    smoke run exercises the entry it records its result under. Without
+    that, smoke-testing a `retained` entry would build the active model
+    for the same role and file its numbers under the retained name."""
     by_role = entries_by_role(lock)
+    if entry is not None:
+        for role in entry.roles:
+            by_role[role] = entry
     text_repo, text_revision = _pin(by_role, "text_embedding")
     mm_repo, mm_revision = _pin(by_role, "multimodal_embedding")
     reranker_repo, reranker_revision = _pin(by_role, "reranker")
@@ -1170,10 +1182,13 @@ def _print_role_result(role_result: RoleResult, stream: TextIO) -> None:
 def in_process_runner(
     lock: ManifestLock, work_dir: Path, deps: SmokeDeps, *, data_root: Path
 ) -> RoleRunner:
-    cfg = config_from_manifest(lock, data_root=data_root)
+    configs = {
+        entry.name: config_from_manifest(lock, data_root=data_root, entry=entry)
+        for entry in lock.entries
+    }
 
     def _run(entry: ManifestEntry, role: str) -> RoleResult:
-        return run_role(entry, role, cfg, work_dir / entry.name, deps)
+        return run_role(entry, role, configs[entry.name], work_dir / entry.name, deps)
 
     return _run
 
@@ -1196,7 +1211,7 @@ def run_child(
         entry = next((e for e in lock.entries if e.name == entry_name), None)
         if entry is None:
             raise SmokeError(f"no entry '{entry_name}' in {lock_path}")
-        cfg = config_from_manifest(lock, data_root=data_root)
+        cfg = config_from_manifest(lock, data_root=data_root, entry=entry)
     except ImsgError as exc:
         print(f"smoke child: {exc}", file=sys.stderr)
         return 2

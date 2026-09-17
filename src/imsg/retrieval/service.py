@@ -19,6 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from imsg.db.prewarm import prewarm_query_path
 from imsg.embed.provider import MultimodalEmbeddingProvider, TextEmbeddingProvider
 from imsg.retrieval import directory, fts_search, segments, vector_search
 from imsg.retrieval.access import AccessContext, segment_eligibility_predicate
@@ -44,20 +45,27 @@ model — fixed, generic, never a real query."""
 TEXT_EMBEDDER_STEP = "text embedder"
 MULTIMODAL_STEP = "multimodal text tower"
 RERANKER_STEP = "reranker"
+BUFFER_POOL_STEP = "database buffer pool"
 
 ESTIMATED_WARM_UP_SECONDS: dict[str, float] = {
-    TEXT_EMBEDDER_STEP: 5.0,
-    MULTIMODAL_STEP: 32.0,
-    RERANKER_STEP: 155.0,
+    TEXT_EMBEDDER_STEP: 13.0,
+    MULTIMODAL_STEP: 51.0,
+    RERANKER_STEP: 10.0,
+    BUFFER_POOL_STEP: 30.0,
 }
 """How long each warm-up step is expected to take, used only for the
 seconds-remaining estimate a tool call gets while the models load
 (`imsg.retrieval.background_warm_up`). Each is the slowest time seen for
-that step on the M2 Ultra host, rounded up, so the estimate errs long: in
-`imsg mcp local` runs on 2026-09-17 the text embedder took 3.3-4.5 s, the
-PE-Core text tower 22.5-26.1 s and the reranker 51.3-154.8 s — reading its
-7.9 GiB of weights is the step that varies — and PE-Core loading alone
-took 26-32 s on 2026-09-16."""
+that step on the M2 Ultra host, rounded up, so the estimate errs long.
+
+Measured through `imsg mcp local` on 2026-09-17, four cold starts, with
+the data volume's array carrying another job's 216-2,177 MB/s throughout:
+text embedder 4.8-12.5 s, PE-Core text tower 33.8-50.2 s, reranker (the
+0.58 GiB 0.6B conversion) 2.7-3.2 s, buffer pool 0.1 s with the pages
+already resident — 14.3 s when it has to read all 2,296 MiB
+(`imsg.db.prewarm`). Whole warm-up: 41.8-65.4 s. The reranker step took
+51.3-154.8 s while the 7.9 GiB 8B conversion was pinned, which is what
+made the old estimate 155 s."""
 
 MAX_QUERY_CHARS = 1000
 MAX_SEARCH_LIMIT = 50
@@ -116,8 +124,17 @@ class RetrievalService:
         server's first real query does not pay for loading weights and
         compiling kernels (loading alone took 4-5 s for the text embedder,
         4-7 s for the reranker and 26-32 s for PE-Core on an M2 Ultra,
-        2026-09-16). Touches no database. A provider that cannot load
-        raises from its step."""
+        2026-09-16), and one last step that pulls the query path's
+        relations into the database's buffer pool
+        (`imsg.db.prewarm.prewarm_query_path`), so a server started after a
+        reboot does not pay 300-900 ms per vector search for cold index
+        pages either. A provider that cannot load raises from its step; a
+        pool that cannot be prewarmed is reported, not raised (an unwarmed
+        pool is slow, not wrong).
+
+        The models come first because nothing can be answered without
+        them, and because both they and the prewarm read from the same
+        volume."""
         instruction = self._config.embedding.query_instruction
 
         def text_embedder() -> None:
@@ -140,6 +157,11 @@ class RetrievalService:
                 WarmUpStep(MULTIMODAL_STEP, estimate[MULTIMODAL_STEP], multimodal_text_tower)
             )
         steps.append(WarmUpStep(RERANKER_STEP, estimate[RERANKER_STEP], reranker))
+
+        def buffer_pool() -> str:
+            return prewarm_query_path(self._pg).summary
+
+        steps.append(WarmUpStep(BUFFER_POOL_STEP, estimate[BUFFER_POOL_STEP], buffer_pool))
         return tuple(steps)
 
     def warm_up(self) -> float:
@@ -188,6 +210,7 @@ class RetrievalService:
 
         k_fts = self._config.retrieval.k_fts
         k_vector = self._config.retrieval.k_vector
+        ef_search = self._config.retrieval.hnsw_ef_search
 
         seg_fts = fts_search.search_segment_fts(self._fts, self._pg, analyzed, predicate, k_fts)
         att_fts = fts_search.search_attachment_chunk_fts(
@@ -198,9 +221,11 @@ class RetrievalService:
         query_vec = self._run_model(
             lambda: self._text_provider.embed_query(analyzed.phrase, instruction=instruction)
         )
-        seg_vec = vector_search.search_segment_vector(self._pg, query_vec, predicate, k_vector)
+        seg_vec = vector_search.search_segment_vector(
+            self._pg, query_vec, predicate, k_vector, ef_search=ef_search
+        )
         att_vec = vector_search.search_attachment_chunk_vector(
-            self._pg, query_vec, predicate, k_vector
+            self._pg, query_vec, predicate, k_vector, ef_search=ef_search
         )
 
         mm_channel = None
@@ -208,7 +233,7 @@ class RetrievalService:
         if self._config.embedding.multimodal.enabled and multimodal is not None:
             mm_query_vec = self._run_model(lambda: multimodal.embed_text(analyzed.phrase))
             mm_channel = vector_search.search_multimodal_vector(
-                self._pg, mm_query_vec, predicate, k_vector
+                self._pg, mm_query_vec, predicate, k_vector, ef_search=ef_search
             )
 
         lists: dict[str, tuple[int, ...]] = {
@@ -376,6 +401,7 @@ class RetrievalService:
 
 
 __all__ = [
+    "BUFFER_POOL_STEP",
     "ESTIMATED_WARM_UP_SECONDS",
     "MULTIMODAL_STEP",
     "RERANKER_STEP",

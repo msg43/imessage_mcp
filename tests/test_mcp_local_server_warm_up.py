@@ -31,6 +31,7 @@ import pytest
 
 from imsg.errors import ProviderUnavailableError
 from imsg.mcp.audit import MemoryAuditSink
+from imsg.mcp.tools import local_server
 from imsg.mcp.tools.local_server import TOOL_CALL_WARM_UP_WAIT_SECONDS, LocalMcpServer
 from imsg.retrieval.background_warm_up import BackgroundWarmUp, WarmUpPhase, WarmUpStep
 from imsg.retrieval.model_thread import ModelThread
@@ -106,6 +107,13 @@ def _text(result: types.CallToolResult) -> str:
     block = result.content[0]
     assert isinstance(block, types.TextContent)
     return block.text
+
+
+def _wait_until(condition: Any, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition not reached"
+        time.sleep(0.005)
 
 
 def _release_after(event: threading.Event, seconds: float) -> threading.Timer:
@@ -274,6 +282,114 @@ def _read_json_line(lines: queue.Queue[bytes | None], stray: list[bytes], timeou
             stray.append(line)
 
 
+# --------------------------------------------------------------------------
+# check_permissions: diagnostics, answered while the models are loading
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stub_check_permissions(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """`check_permissions` reads the mount, the OS and Postgres; here it
+    only records that it ran."""
+    ran: list[str] = []
+
+    def fake(*, config: Any, conn: Any) -> dict[str, Any]:
+        ran.append("check_permissions")
+        return {"mount_ok": True, "pg_ok": True}
+
+    monkeypatch.setattr(local_server.handlers, "check_permissions", fake)
+    return ran
+
+
+def _permissions(harness: _Harness) -> dict[str, Any]:
+    async def main() -> types.CallToolResult:
+        with anyio.fail_after(2.0):  # far below the wait bound: it must not wait
+            return await harness.call("check_permissions", {})
+
+    result = anyio.run(main)
+    assert not result.is_error, _text(result)
+    assert result.structured_content is not None
+    return dict(result.structured_content)
+
+
+def test_check_permissions_answers_during_warm_up_and_says_what_is_loading(
+    model_thread: ModelThread, stub_check_permissions: list[str]
+) -> None:
+    """The question "what is this server doing?" must be answerable while
+    it is doing it — so this call neither waits for the warm-up nor is
+    refused by it."""
+    harness = _Harness(model_thread, wait_seconds=300.0)
+    harness.warm_up.start()
+    _wait_until(lambda: harness.warm_up.status().loading == "reranker")
+
+    payload = _permissions(harness)
+
+    assert payload["mount_ok"] is True and stub_check_permissions == ["check_permissions"]
+    warm_up = payload["warm_up"]
+    assert warm_up["state"] == "warming"
+    assert warm_up["loading"] == "reranker"
+    assert (warm_up["steps_done"], warm_up["steps_total"]) == (0, 1)
+    assert isinstance(warm_up["seconds_remaining"], int) and warm_up["seconds_remaining"] >= 1
+    assert warm_up["failure"] is None
+    assert harness.warm_up.status().phase is WarmUpPhase.WARMING  # still loading
+    harness.release.set()
+
+
+def test_check_permissions_reports_not_started_ready_and_failed(
+    model_thread: ModelThread, stub_check_permissions: list[str]
+) -> None:
+    harness = _Harness(model_thread, wait_seconds=300.0)
+    not_started = _permissions(harness)["warm_up"]
+    assert (not_started["state"], not_started["loading"]) == ("not_started", None)
+    assert not_started["steps_done"] == 0
+
+    harness.warm_up.start()
+    harness.release.set()
+    assert harness.warm_up.wait(timeout=5).phase is WarmUpPhase.READY
+    ready = _permissions(harness)["warm_up"]
+    assert ready == {
+        "state": "ready",
+        "loading": None,
+        "steps_done": 1,
+        "steps_total": 1,
+        "seconds_remaining": None,
+        "failure": None,
+    }
+
+    failing = _Harness(
+        model_thread,
+        wait_seconds=300.0,
+        failure=ProviderUnavailableError("weights missing from the data volume"),
+        held=False,
+    )
+    failing.warm_up.start()
+    assert failing.warm_up.wait(timeout=5).phase is WarmUpPhase.FAILED
+    failed = _permissions(failing)["warm_up"]
+    assert failed["state"] == "failed" and failed["loading"] is None
+    assert failed["failure"] is not None
+    assert "weights missing from the data volume" in failed["failure"]
+    assert failed["seconds_remaining"] is None
+
+    # ... while every retrieval tool still refuses, naming the same cause.
+    async def search() -> types.CallToolResult:
+        return await failing.call("search_messages", {"query": "kite festival"})
+
+    refused = anyio.run(search)
+    assert refused.is_error and _text(refused).startswith("WARM_UP_FAILED\n")
+
+
+def test_check_permissions_is_audited_like_any_other_call(
+    model_thread: ModelThread, stub_check_permissions: list[str]
+) -> None:
+    harness = _Harness(model_thread, wait_seconds=300.0)
+    harness.warm_up.start()
+    _permissions(harness)
+    records = harness.audit.snapshot()
+    assert [r.tool for r in records] == ["check_permissions"]
+    assert records[0].error is None and records[0].surface == "local"
+    harness.release.set()
+
+
 def test_over_real_stdio_the_handshake_is_answered_while_the_warm_up_is_held(
     tmp_path: Path,
 ) -> None:
@@ -357,6 +473,6 @@ def test_over_real_stdio_the_handshake_is_answered_while_the_warm_up_is_held(
     assert "stray print from a loading model" in log
     assert "stray structlog line from a loading model" in log
     assert "stray write to fd 1 from a loading model" in log
-    assert "warm-up started: loading 1 model in the background (text embedder)" in log
+    assert "warm-up started: 1 step in the background (text embedder)" in log
     assert "text embedder ready in " in log
-    assert "warm-up done: 1 model ready in " in log
+    assert "warm-up done: 1 step ready in " in log
