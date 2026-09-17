@@ -10,6 +10,42 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-17 — `imsg mcp local` answers the handshake immediately and warms models in the background
+
+The startup warm-up added earlier the same day ran before the server
+answered `initialize`, so the handshake took 121.9 s. Claude Code bounds
+MCP server startup with `MCP_TIMEOUT`, 30,000 ms by default (per its
+environment-variable documentation and the installed client code), so the
+server would have been dropped before it could answer anything.
+
+- `initialize` and `tools/list` never wait for models; measured 0.77–1.06 s
+  after process start on the Studio with the live config (four runs).
+  Warm-up starts once the server is serving and logs per-model and total
+  time to stderr.
+- A tool call during warm-up waits up to 90 s without blocking the server
+  (under the client's 2-minute point where a call moves to a background
+  task; its hard tool timeouts are far longer), then returns a structured
+  `WARMING_UP` error with an estimate of seconds remaining. A failed warm-up
+  is logged once and every later call returns `WARM_UP_FAILED` naming the
+  cause, instead of the process exiting at startup.
+- **All model work runs on one dedicated thread.** A lock was not enough:
+  MLX refused to run work prepared on another thread (`There is no
+  Stream(gpu, 1) in current thread`). Serializing on one thread cost nothing
+  measurable.
+- **Found and fixed on the way: PE-Core wrote log lines to stdout**, which is
+  the MCP protocol channel — two stray lines reached the stream before the
+  fix, zero after, because warm-up now starts after the MCP library has
+  redirected stdout. A real stdio child-process test holds warm-up and
+  asserts no stray bytes reach the stream; it fails if warm-up runs before
+  serving or starts too early.
+- `WARMING_UP` and `WARM_UP_FAILED` are stored as themselves in `mcp_audit`
+  (they were collapsing to `INTERNAL`).
+- Measured: warm-up 77–185 s, dominated by loading the 8B reranker's 7.9 GiB
+  (51–155 s); a warm search 2.1–2.3 s with the current 8B default. One first
+  query after warm-up took ~70 s with the cause not established.
+
+Suite: 1,553 passed with a scratch database.
+
 ## 2026-09-17 — search latency: reranker batching, early-stopping vector collapse, startup warm-up
 
 First measured sweep against a real index (20 generic queries, numbers only).
