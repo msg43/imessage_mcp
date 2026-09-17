@@ -35,7 +35,11 @@ from imsg.mcp.errors import AuditWriteError
 # Stable machine codes permitted in mcp_audit.error. RATE_LIMITED and
 # INTERNAL overlap SPEC §10.1's tool-error codes; UNAUTHORIZED and
 # UNAVAILABLE are HTTP-boundary rejections that occur before any tool
-# runs and therefore have no §10.1 equivalent.
+# runs and therefore have no §10.1 equivalent. WARMING_UP and
+# WARM_UP_FAILED are the local surface's answers while its models load
+# in the background (imsg.retrieval.errors) — fixed codes like the rest,
+# kept distinct so a warm-up shows in the table as what it is, not as
+# INTERNAL.
 ALLOWED_ERROR_CODES: frozenset[str] = frozenset(
     {
         "INVALID_ARGUMENT",
@@ -49,6 +53,8 @@ ALLOWED_ERROR_CODES: frozenset[str] = frozenset(
         "INTERNAL",
         "UNAUTHORIZED",
         "UNAVAILABLE",
+        "WARMING_UP",
+        "WARM_UP_FAILED",
     }
 )
 

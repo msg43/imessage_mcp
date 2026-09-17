@@ -2036,32 +2036,43 @@ def test_mcp_local_sends_the_backend_line_to_stderr_not_the_stdio_channel(
     assert "models: backend=fake" not in result.stdout
 
 
-def test_mcp_local_warms_every_provider_before_serving(
+def test_mcp_local_serves_first_and_warms_every_provider_in_the_background(
     mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The first real query must not be the one that loads the weights:
-    every provider runs one throwaway input before the server starts, and
-    the time is reported on stderr (stdout is the JSON-RPC channel)."""
+    """No model is touched before the server starts serving — an MCP
+    client drops a server that has not answered `initialize` within its
+    startup timeout. `run_local_server` starts the warm-up once serving;
+    the fake below does the same, and every provider then runs one
+    throwaway input on the model thread, with progress on stderr only."""
+    import threading
+
     import anyio
 
     from imsg.embed.provider import FakeMultimodalEmbeddingProvider, FakeTextEmbeddingProvider
+    from imsg.mcp.tools.local_server import LocalMcpServer
+    from imsg.retrieval.background_warm_up import WarmUpPhase
     from imsg.retrieval.reranker import FakeRerankerProvider
 
     order: list[str] = []
+    threads: set[threading.Thread] = set()
+
+    def note(name: str) -> None:
+        order.append(name)
+        threads.add(threading.current_thread())
 
     class _Text(FakeTextEmbeddingProvider):
         def embed_query(self, text: str, *, instruction: str) -> list[float]:
-            order.append("text")
+            note("text")
             return super().embed_query(text, instruction=instruction)
 
     class _Multimodal(FakeMultimodalEmbeddingProvider):
         def embed_text(self, text: str) -> list[float]:
-            order.append("multimodal")
+            note("multimodal")
             return super().embed_text(text)
 
     class _Reranker(FakeRerankerProvider):
         def score(self, query: str, documents: list[str]) -> list[float]:
-            order.append("reranker")
+            note("reranker")
             return super().score(query, documents)
 
     monkeypatch.setattr(cli_module, "build_text_provider", lambda cfg: _Text(dim=cfg.embedding.dim))
@@ -2071,34 +2082,63 @@ def test_mcp_local_warms_every_provider_before_serving(
         lambda cfg: _Multimodal(dim=cfg.embedding.multimodal.dim),
     )
     monkeypatch.setattr(cli_module, "build_reranker", lambda cfg: _Reranker())
-    monkeypatch.setattr(anyio, "run", lambda func, *args: order.append("serve"))
+    phases: list[WarmUpPhase] = []
+
+    def fake_serve(func: Any, local: LocalMcpServer) -> None:
+        order.append("serve")
+        phases.append(local.warm_up.status().phase)
+        local.warm_up.start()
+        phases.append(local.warm_up.wait(timeout=10).phase)
+
+    monkeypatch.setattr(anyio, "run", fake_serve)
 
     result = runner.invoke(app, ["mcp", "local", "--config", str(mocked_pg_env)])
     assert result.exit_code == 0, result.output
-    assert order == ["text", "multimodal", "reranker", "serve"]
-    assert "mcp local: providers loaded and warmed in " in result.stderr
-    assert "warmed" not in result.stdout
+    assert order == ["serve", "text", "multimodal", "reranker"]
+    assert phases == [WarmUpPhase.NOT_STARTED, WarmUpPhase.READY]
+    assert len(threads) == 1 and threading.main_thread() not in threads
+    assert "mcp local: warm-up started: loading 3 models in the background" in result.stderr
+    for model in ("text embedder", "multimodal text tower", "reranker"):
+        assert f"mcp local: {model} ready in " in result.stderr
+    assert "mcp local: warm-up done: 3 models ready in " in result.stderr
+    assert "warm-up" not in result.stdout
 
 
-def test_mcp_local_exits_cleanly_when_a_provider_cannot_warm_up(
+def test_mcp_local_keeps_serving_when_a_provider_cannot_warm_up(
     mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A provider that cannot load no longer stops the server — it would
+    then vanish from the client with nothing to say why. The server keeps
+    answering, the cause is logged once on stderr, and every tool call
+    reports it (tests/test_mcp_local_server_warm_up.py)."""
     import anyio
 
     from imsg.errors import ProviderUnavailableError
+    from imsg.mcp.tools.local_server import LocalMcpServer
+    from imsg.retrieval.background_warm_up import WarmUpPhase
     from imsg.retrieval.reranker import FakeRerankerProvider
 
     class _Broken(FakeRerankerProvider):
         def score(self, query: str, documents: list[str]) -> list[float]:
             raise ProviderUnavailableError("reranker weights could not load")
 
-    served: list[bool] = []
+    failures: list[str | None] = []
+
+    def fake_serve(func: Any, local: LocalMcpServer) -> None:
+        local.warm_up.start()
+        status = local.warm_up.wait(timeout=10)
+        assert status.phase is WarmUpPhase.FAILED
+        failures.append(status.failure)
+
     monkeypatch.setattr(cli_module, "build_reranker", lambda cfg: _Broken())
-    monkeypatch.setattr(anyio, "run", lambda func, *args: served.append(True))
+    monkeypatch.setattr(anyio, "run", fake_serve)
     result = runner.invoke(app, ["mcp", "local", "--config", str(mocked_pg_env)])
-    assert result.exit_code == 1
-    assert "imsg: reranker weights could not load" in result.stderr
-    assert served == []
+    assert result.exit_code == 0, result.output
+    assert failures == ["reranker: reranker weights could not load"]
+    assert result.stderr.count("warm-up FAILED") == 1
+    assert "reranker: reranker weights could not load" in result.stderr
+    assert "warm-up done" not in result.stderr
+    assert "FAILED" not in result.stdout
 
 
 def test_real_backend_with_a_missing_provider_module_exits_cleanly(

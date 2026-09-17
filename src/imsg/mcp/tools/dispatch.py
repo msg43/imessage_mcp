@@ -98,12 +98,17 @@ def call_tool(
     tool: str,
     params: Mapping[str, Any] | None,
     handler: Callable[[], dict[str, Any]],
+    started: float | None = None,
 ) -> ToolCallResult:
     """Run `handler` (a zero-argument closure over the already-parsed
     params — the caller decides how those get there), catching
     `RetrievalError` into the SPEC §10.1 error model and anything else
-    into `INTERNAL`. Always writes exactly one audit row."""
-    started = monotonic()
+    into `INTERNAL`. Always writes exactly one audit row. `started` (a
+    `time.monotonic()` reading) is when the call arrived, if the caller
+    did work before this — such as waiting for the model warm-up — that
+    the audited latency should include; it defaults to now."""
+    if started is None:
+        started = monotonic()
     try:
         payload = handler()
     except RetrievalError as exc:

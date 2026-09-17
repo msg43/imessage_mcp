@@ -85,6 +85,8 @@ from imsg.providers.factory import (
     resolve_prompt_path,
 )
 from imsg.providers.manifest import verify_manifest
+from imsg.retrieval.background_warm_up import BackgroundWarmUp
+from imsg.retrieval.model_thread import ModelThread
 from imsg.retrieval.service import RetrievalService
 from imsg.segment.pipeline import REBUILD_ALL_SENTINEL, run_segment, run_segment_for_chat
 from imsg.stages.extract import run_extract
@@ -288,23 +290,6 @@ def _build_or_die[T](build: Callable[[], T]) -> T:
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-
-
-def _warm_up_or_die(
-    service: RetrievalService, label: str, fts_conn: apsw.Connection, conn: psycopg.Connection
-) -> None:
-    """Load and warm every provider before serving (`RetrievalService.
-    warm_up`), reporting the time on stderr — for `mcp local` stdout is
-    the JSON-RPC channel. A provider that cannot load is one `imsg: ...`
-    line and exit 1, as at construction."""
-    try:
-        seconds = service.warm_up()
-    except ImsgError as exc:
-        fts_conn.close()
-        conn.close()
-        typer.echo(f"imsg: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    typer.echo(f"{label}: providers loaded and warmed in {seconds:.1f} s", err=True)
 
 
 def _decode_prompt(prompt_bytes: bytes) -> str:
@@ -1665,6 +1650,9 @@ def mcp_local(config: ConfigOption = None) -> None:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
+    # Every model call — the background warm-up and every query — runs on
+    # this one thread (imsg.retrieval.model_thread explains why).
+    model_thread = ModelThread()
     service = RetrievalService(
         pg_conn=conn,
         fts_conn=fts_conn,
@@ -1672,13 +1660,22 @@ def mcp_local(config: ConfigOption = None) -> None:
         text_provider=text_provider,
         reranker=reranker,
         multimodal_provider=multimodal_provider,
+        model_thread=model_thread,
     )
-    _warm_up_or_die(service, "mcp local", fts_conn, conn)
+    # Not warmed here: the server answers the MCP handshake first and
+    # run_local_server starts this once it is serving. Tool calls wait for
+    # it (imsg.mcp.tools.local_server); its progress goes to stderr.
+    warm_up = BackgroundWarmUp(
+        service.warm_up_steps(),
+        model_thread=model_thread,
+        log=lambda line: typer.echo(f"mcp local: {line}", err=True),
+    )
     audit = PostgresAuditSink(lambda: connect(cfg.database, autocommit=True))
-    local = LocalMcpServer(service=service, audit=audit, config=cfg, conn=conn)
+    local = LocalMcpServer(service=service, audit=audit, config=cfg, conn=conn, warm_up=warm_up)
     try:
         anyio.run(run_local_server, local)
     finally:
+        model_thread.close()
         fts_conn.close()
         conn.close()
 
