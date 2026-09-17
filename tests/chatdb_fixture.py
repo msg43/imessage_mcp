@@ -88,7 +88,7 @@ class FixtureChat:
     guid: str
     style: int = 45  # dm by default
     display_name: str | None = None
-    service_name: str = "iMessage"
+    service_name: str | None = "iMessage"
     rowid: int | None = None
 
 
@@ -105,7 +105,10 @@ class FixtureMessage:
     chat_guid: str
     is_from_me: bool = False
     handle_raw_value: str | None = None
-    date: datetime = field(default_factory=lambda: datetime(2024, 1, 1, tzinfo=UTC))
+    date: datetime | None = field(default_factory=lambda: datetime(2024, 1, 1, tzinfo=UTC))
+    """None writes a NULL `message.date`, which a real `chat.db` does carry on
+    some rows. Extraction raises on it for a message and tolerates it for a
+    tapback, so both paths need a fixture that can produce it."""
     date_edited: datetime | None = None
     date_retracted: datetime | None = None
     service: str = "iMessage"
@@ -118,11 +121,11 @@ class FixtureMessage:
 @dataclass
 class FixtureAttachment:
     guid: str
-    filename: str = "IMG_0001.jpeg"  # transfer_name (display name)
+    filename: str | None = "IMG_0001.jpeg"  # transfer_name (display name)
     source_path: str | None = "~/Library/Messages/Attachments/a/b/IMG_0001.jpeg"  # filename (disk path); None = never landed on disk
-    uti: str = "public.jpeg"
-    mime_type: str = "image/jpeg"
-    byte_size: int = 12345
+    uti: str | None = "public.jpeg"
+    mime_type: str | None = "image/jpeg"
+    byte_size: int | None = 12345
     is_sticker: bool = False
     rowid: int | None = None
 
@@ -212,7 +215,7 @@ class ChatDbBuilder:
                         message.guid,
                         handle_id,
                         int(message.is_from_me),
-                        apple_ns(message.date),
+                        apple_ns(message.date) if message.date is not None else None,
                         apple_ns(message.date_edited) if message.date_edited else None,
                         apple_ns(message.date_retracted) if message.date_retracted else None,
                         message.service,

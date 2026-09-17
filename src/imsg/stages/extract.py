@@ -174,6 +174,20 @@ def _normalize_service(raw: str | None) -> str:
     return _KNOWN_SERVICES.get(raw.strip().lower(), "unknown")
 
 
+def _service_evidence(raw: str | None) -> str | None:
+    """`_normalize_service`, but returning None where it would return
+    `"unknown"`.
+
+    `unknown` is not a service; it is this module's marker for "the
+    snapshot did not say". Written as a value it overwrites a service
+    another source knew, which is the merge-policy defect this module
+    documents under `Merge` — so the evidence-bearing callers take this
+    form instead, and `unknown` survives only as the value a first
+    INSERT records."""
+    normalized = _normalize_service(raw)
+    return None if normalized == "unknown" else normalized
+
+
 def _apple_ns_to_datetime(value: int | None) -> datetime | None:
     if value is None or value == 0:
         return None
@@ -1062,6 +1076,206 @@ def _do_extract(
 
 
 # --------------------------------------------------------------------------
+# merge policy: what each source is allowed to overwrite
+# --------------------------------------------------------------------------
+#
+# INVARIANT (2026-09-17): a source that carries no evidence for a column
+# must never overwrite a value another source supplied -- extraction
+# writes a column only where the incoming snapshot positively asserts
+# it, so absence of evidence is never recorded as evidence of absence.
+#
+# Several witnesses of the same conversations feed this index (each
+# Mac's own `chat.db`, plus a recovered seed), and they do not carry
+# the same information. Until this date every `ON CONFLICT DO UPDATE`
+# assigned each column from the incoming row unconditionally, so the
+# *last* source to run won every column, including the columns it
+# simply could not see. Measured on the target host after the mini
+# re-extracted its own `chat.db` (compared against a pre-run dump of
+# the same index): 14,282 messages lost `has_attachments`, 2,203 lost
+# `is_edited` and its `date_edited`, 263 lost `is_unsent`, 3,125 chats
+# lost `display_name`, and 4,775 attachments lost `source_path` --
+# every one of them because the incoming snapshot was silent, not
+# because anything about those messages had changed.
+#
+# The rule is per column and declared once, in the `_Column` tables
+# below, rather than spelled out per column inside each statement. Each
+# column answers one question: *can this source's "empty" be told apart
+# from this source having nothing to say?*
+
+
+class Merge(StrEnum):
+    """How one column of an already-present row may be rewritten."""
+
+    ASSERTED = "asserted"
+    """Every source that has the row at all carries this column, so
+    whatever it says -- NULL and false included -- is a positive
+    assertion and overwrites. `message.sent_at` is the type case: it is
+    a plain `chat.db` column, present on every row of every source."""
+
+    PRESENT = "present"
+    """NULL means "this source has nothing here", which no source can
+    distinguish from "this source says this is empty". A NULL therefore
+    leaves the stored value alone; any non-NULL value still overwrites,
+    so a genuine correction (an edited body, a renamed chat) flows
+    through untouched."""
+
+    POSITIVE = "positive"
+    """A boolean naming the presence of something (`has_attachments`,
+    `is_edited`, `is_unsent`, `is_sticker`, `removed`). Only `true`
+    carries evidence: `false` is what a source reports both when the
+    thing is genuinely absent and when the source cannot see it -- a
+    `chat.db` whose `message_attachment_join` rows never synced, or a
+    row whose typedstream blob is gone, reports exactly the same
+    `false` as a plain text message. All five also name facts that do
+    not un-happen: a message that was edited, retracted or given an
+    attachment stays that way, so `true -> false` is never a
+    correction being blocked."""
+
+    INSERT_ONLY = "insert_only"
+    """First write wins: recorded on insert as provenance, never
+    updated. Keys and derived keys, plus the columns documented on
+    `_upsert_message` as deliberately frozen."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Column:
+    """One column of a guarded upsert, and how it merges."""
+
+    name: str
+    merge: Merge
+    cast: str = ""
+    """Postgres cast appended to the VALUES placeholder, e.g.
+    `::service_kind`. Only needed where the parameter is a bare Python
+    string feeding an enum column."""
+    insert_default: str | None = None
+    """SQL fragment supplying the INSERT value when the parameter is
+    NULL, for a `PRESENT` column that the schema declares NOT NULL (a
+    NULL there means "no evidence", but the row still has to be
+    insertable). Unused on the UPDATE path, which keeps the stored
+    value instead."""
+
+
+def _known_param(column: str) -> str:
+    return f"{column}__known"
+
+
+def _evidence_flags(columns: Sequence[_Column], values: dict[str, Any]) -> dict[str, Any]:
+    """Derive one `<column>__known` boolean per evidence-bearing column,
+    from the policy declared on the column rather than from anything the
+    call site remembers to pass. This is the whole rule, mechanically
+    applied: `PRESENT` is known when the value is not NULL, `POSITIVE`
+    when it is true."""
+    flags: dict[str, Any] = {}
+    for column in columns:
+        if column.merge is Merge.PRESENT:
+            flags[_known_param(column.name)] = values[column.name] is not None
+        elif column.merge is Merge.POSITIVE:
+            flags[_known_param(column.name)] = bool(values[column.name])
+    return flags
+
+
+def _insert_value_sql(column: _Column) -> str:
+    placeholder = f"%({column.name})s{column.cast}"
+    if column.insert_default is None:
+        return placeholder
+    return f"COALESCE({placeholder}, {column.insert_default})"
+
+
+def _set_clause(table: str, column: _Column) -> str | None:
+    """The `SET` fragment for one column, or None when the column is
+    never updated."""
+    if column.merge is Merge.INSERT_ONLY:
+        return None
+    if column.merge is Merge.ASSERTED:
+        return f"{column.name} = EXCLUDED.{column.name}"
+    known = f"%({_known_param(column.name)})s::boolean"
+    return (
+        f"{column.name} = CASE WHEN {known} "
+        f"THEN EXCLUDED.{column.name} ELSE {table}.{column.name} END"
+    )
+
+
+def _differs_clause(table: str, column: _Column) -> str | None:
+    """The `WHERE` disjunct for one column: the row is rewritten only
+    when this column would actually change.
+
+    The compared columns are exactly the assigned columns, and the
+    comparison is `IS DISTINCT FROM`, never `<>` -- both rules are the
+    2026-09-17 state-idempotence fix and both still hold here, with the
+    evidence flag ANDed in so a column the source cannot see is not
+    merely left unwritten but also cannot drag the row into an UPDATE
+    (which would move `updated_at` and re-segment the chat for nothing).
+    """
+    if column.merge is Merge.INSERT_ONLY:
+        return None
+    differs = f"{table}.{column.name} IS DISTINCT FROM EXCLUDED.{column.name}"
+    if column.merge is Merge.ASSERTED:
+        return differs
+    return f"(%({_known_param(column.name)})s::boolean AND {differs})"
+
+
+def _build_upsert_sql(
+    *,
+    table: str,
+    conflict: Sequence[str],
+    columns: Sequence[_Column],
+    returning: str | None = None,
+    extra_set: str = "",
+    extra_where: str = "",
+) -> str:
+    """Render one guarded, provenance-respecting upsert statement.
+
+    Built once per table at import time, so the SQL below is a constant
+    a reader can print, not a string assembled per row. `returning` is
+    the primary-key column for the three upserts whose caller needs the
+    row id back (chat, attachment, message); the shape it produces and
+    why it has a `UNION ALL` branch is documented on `_read_upsert_row`.
+    """
+    set_clauses = [c for c in (_set_clause(table, col) for col in columns) if c]
+    where_clauses = [c for c in (_differs_clause(table, col) for col in columns) if c]
+    if extra_set:
+        set_clauses.append(extra_set)
+    if extra_where:
+        where_clauses.append(extra_where)
+    assert set_clauses, f"{table}: nothing to update — use ON CONFLICT DO NOTHING instead"
+
+    insert_columns = ", ".join(col.name for col in columns)
+    insert_values = ", ".join(_insert_value_sql(col) for col in columns)
+    conflict_columns = ", ".join(conflict)
+    body = (
+        f"INSERT INTO {table} ({insert_columns})\n"
+        f"VALUES ({insert_values})\n"
+        f"ON CONFLICT ({conflict_columns}) DO UPDATE SET\n    "
+        + ",\n    ".join(set_clauses)
+        + "\nWHERE "
+        + "\n   OR ".join(where_clauses)
+    )
+    if returning is None:
+        return body
+
+    match = " AND ".join(f"{col} = %({col})s" for col in conflict)
+    return (
+        "WITH upserted AS (\n"
+        f"{body}\n"
+        f"RETURNING {returning}, (xmax = 0) AS inserted\n"
+        ")\n"
+        f"SELECT {returning}, inserted, true FROM upserted\n"
+        "UNION ALL\n"
+        f"SELECT {returning}, false, false FROM {table}\n"
+        f" WHERE {match} AND NOT EXISTS (SELECT 1 FROM upserted)"
+    )
+
+
+def _execute_upsert(
+    cur: psycopg.Cursor[Any], sql: str, columns: Sequence[_Column], values: dict[str, Any]
+) -> None:
+    """Run one built statement, adding the evidence flags the policy
+    implies. Call sites pass values only; they never hand-write a flag,
+    which is what keeps the rule in one place."""
+    cur.execute(sql, {**values, **_evidence_flags(columns, values)})
+
+
+# --------------------------------------------------------------------------
 # Postgres upsert helpers
 # --------------------------------------------------------------------------
 
@@ -1102,7 +1316,41 @@ def _read_upsert_row(cur: psycopg.Cursor[Any]) -> tuple[int, UpsertOutcome]:
     return row_id, UpsertOutcome.INSERTED if inserted else UpsertOutcome.UPDATED
 
 
+_CHAT_COLUMNS: tuple[_Column, ...] = (
+    _Column("source_guid", Merge.INSERT_ONLY),
+    _Column("thread_key", Merge.INSERT_ONLY),
+    # `kind` is read off `chat.style`, a plain column — but only the two
+    # documented values mean anything, and an unrecognized one falls back to a
+    # participant-count guess. A guess is not evidence: a source whose
+    # `chat_handle_join` rows are incomplete would guess `dm` for a group and
+    # overwrite a correctly-typed row. So the parameter carries the value only
+    # when `style` said it, and the heuristic supplies the INSERT default.
+    _Column(
+        "kind", Merge.PRESENT, cast="::chat_kind",
+        insert_default="%(kind_fallback)s::chat_kind",
+    ),
+    # A device that joined a named group late, or never received the rename
+    # event, has NULL here — indistinguishable from a group whose name was
+    # cleared. Measured cost of getting this wrong on the target host: 3,125
+    # chats lost their `display_name` to a silent re-extraction.
+    _Column("display_name", Merge.PRESENT),
+    # `_service_evidence` returns NULL for the `unknown` bucket, which is the
+    # absence marker itself: `chat.service_name` was NULL, or held a string
+    # this build does not recognize. `unknown` is still what a first insert
+    # records.
+    _Column(
+        "service", Merge.PRESENT, cast="::service_kind",
+        insert_default="'unknown'::service_kind",
+    ),
+)
+
+_CHAT_UPSERT_SQL = _build_upsert_sql(
+    table="chat", conflict=("source_guid",), columns=_CHAT_COLUMNS, returning="chat_id"
+)
+
+
 def _upsert_chat(cur: psycopg.Cursor[Any], chat: ChatRow) -> tuple[int, UpsertOutcome]:
+    kind: str | None
     if chat.style == CHAT_STYLE_GROUP:
         kind = "group"
     elif chat.style == CHAT_STYLE_DM:
@@ -1110,39 +1358,31 @@ def _upsert_chat(cur: psycopg.Cursor[Any], chat: ChatRow) -> tuple[int, UpsertOu
     else:
         # Unexpected/unknown `style` value: fall back to a participant-count
         # heuristic rather than guessing a magic number wrong (logged so an
-        # unexpected chat.db `style` value is visible, not silent).
-        kind = "group" if chat.participant_count > 1 else "dm"
+        # unexpected chat.db `style` value is visible, not silent). The
+        # fallback is good enough to insert a new row with and not good enough
+        # to overwrite an existing one, which is what `kind`'s NULL says.
+        kind = None
         logger.warning(
-            "extract.unexpected_chat_style", guid=chat.guid, style=chat.style, fallback_kind=kind
+            "extract.unexpected_chat_style",
+            guid=chat.guid,
+            style=chat.style,
+            fallback_kind="group" if chat.participant_count > 1 else "dm",
         )
 
     # `thread_key` is a pure function of `source_guid` (the conflict key),
     # so it can never differ and is neither assigned nor compared.
     # `created_at` is first-write provenance and is likewise left alone.
-    cur.execute(
-        """
-        WITH upserted AS (
-            INSERT INTO chat (source_guid, thread_key, kind, display_name, service)
-            VALUES (%(source_guid)s, %(thread_key)s, %(kind)s, %(display_name)s, %(service)s)
-            ON CONFLICT (source_guid) DO UPDATE SET
-                kind = EXCLUDED.kind, display_name = EXCLUDED.display_name,
-                service = EXCLUDED.service
-            WHERE chat.kind IS DISTINCT FROM EXCLUDED.kind
-               OR chat.display_name IS DISTINCT FROM EXCLUDED.display_name
-               OR chat.service IS DISTINCT FROM EXCLUDED.service
-            RETURNING chat_id, (xmax = 0) AS inserted
-        )
-        SELECT chat_id, inserted, true FROM upserted
-        UNION ALL
-        SELECT chat_id, false, false FROM chat
-         WHERE source_guid = %(source_guid)s AND NOT EXISTS (SELECT 1 FROM upserted)
-        """,
+    _execute_upsert(
+        cur,
+        _CHAT_UPSERT_SQL,
+        _CHAT_COLUMNS,
         {
             "source_guid": chat.guid,
             "thread_key": thread_key(chat.guid),
             "kind": kind,
+            "kind_fallback": "group" if chat.participant_count > 1 else "dm",
             "display_name": chat.display_name,
-            "service": _normalize_service(chat.service_name),
+            "service": _service_evidence(chat.service_name),
         },
     )
     return _read_upsert_row(cur)
@@ -1176,6 +1416,43 @@ def _upsert_source_handle(
     return _read_upsert_row(cur)
 
 
+_ATTACHMENT_COLUMNS: tuple[_Column, ...] = (
+    _Column("source_guid", Merge.INSERT_ONLY),
+    _Column("attachment_key", Merge.INSERT_ONLY),
+    _Column("filename", Merge.PRESENT),
+    _Column("source_path", Merge.PRESENT),
+    _Column("uti", Merge.PRESENT),
+    _Column("mime_type", Merge.PRESENT),
+    _Column("byte_size", Merge.PRESENT),
+    _Column("is_sticker", Merge.POSITIVE),
+    # S5a owns both of these from the first insert onwards; the one
+    # exception is spelled out in `_ATTACHMENT_STATE_SET` below.
+    _Column("state", Merge.INSERT_ONLY, cast="::materialization_state"),
+    _Column("materialization_last_error", Merge.INSERT_ONLY),
+)
+
+_ATTACHMENT_STATE_SET = """state = CASE
+        WHEN attachment.state = 'missing' AND attachment.source_path IS NULL
+             AND EXCLUDED.source_path IS NOT NULL
+        THEN 'dataless'::materialization_state
+        ELSE attachment.state
+    END,
+    materialization_last_error = CASE
+        WHEN attachment.state = 'missing' AND attachment.source_path IS NULL
+             AND EXCLUDED.source_path IS NOT NULL
+        THEN NULL
+        ELSE attachment.materialization_last_error
+    END"""
+
+_ATTACHMENT_UPSERT_SQL = _build_upsert_sql(
+    table="attachment",
+    conflict=("source_guid",),
+    columns=_ATTACHMENT_COLUMNS,
+    returning="attachment_id",
+    extra_set=_ATTACHMENT_STATE_SET,
+)
+
+
 def _upsert_attachment(
     cur: psycopg.Cursor[Any], att: AttachmentRow
 ) -> tuple[int, UpsertOutcome]:
@@ -1207,49 +1484,22 @@ def _upsert_attachment(
     assigns it on every real UPDATE, and spelling it out here invited
     the reading that the bump is this statement's choice. It is not —
     it is the schema's, and the fix is to not perform the UPDATE.
+
+    Every chat.db-derived column here is `PRESENT` or `POSITIVE` (see
+    `Merge`): each is nullable in `chat.db` itself, so a NULL is exactly
+    what a snapshot missing the row's metadata reports, and `is_sticker`
+    arrives through a `COALESCE(is_sticker, 0)` that turns a missing
+    flag into `false`. On the target host a silent re-extraction blanked
+    `source_path` on 4,775 already-materialized attachments this way.
+    `source_path` differing *between* hosts is normal and still flows —
+    it is a per-device path — because a non-NULL value is evidence.
     """
     initial_state = "dataless" if att.source_path is not None else "missing"
     initial_error = None if att.source_path is not None else NO_SOURCE_PATH_ERROR
-    cur.execute(
-        """
-        WITH upserted AS (
-            INSERT INTO attachment (
-                source_guid, attachment_key, filename, source_path, uti, mime_type, byte_size,
-                is_sticker, state, materialization_last_error
-            ) VALUES (
-                %(source_guid)s, %(attachment_key)s, %(filename)s, %(source_path)s, %(uti)s,
-                %(mime_type)s, %(byte_size)s, %(is_sticker)s,
-                %(initial_state)s::materialization_state, %(initial_error)s
-            )
-            ON CONFLICT (source_guid) DO UPDATE SET
-                filename = EXCLUDED.filename, source_path = EXCLUDED.source_path,
-                uti = EXCLUDED.uti, mime_type = EXCLUDED.mime_type,
-                byte_size = EXCLUDED.byte_size, is_sticker = EXCLUDED.is_sticker,
-                state = CASE
-                    WHEN attachment.state = 'missing' AND attachment.source_path IS NULL
-                         AND EXCLUDED.source_path IS NOT NULL
-                    THEN 'dataless'::materialization_state
-                    ELSE attachment.state
-                END,
-                materialization_last_error = CASE
-                    WHEN attachment.state = 'missing' AND attachment.source_path IS NULL
-                         AND EXCLUDED.source_path IS NOT NULL
-                    THEN NULL
-                    ELSE attachment.materialization_last_error
-                END
-            WHERE attachment.filename IS DISTINCT FROM EXCLUDED.filename
-               OR attachment.source_path IS DISTINCT FROM EXCLUDED.source_path
-               OR attachment.uti IS DISTINCT FROM EXCLUDED.uti
-               OR attachment.mime_type IS DISTINCT FROM EXCLUDED.mime_type
-               OR attachment.byte_size IS DISTINCT FROM EXCLUDED.byte_size
-               OR attachment.is_sticker IS DISTINCT FROM EXCLUDED.is_sticker
-            RETURNING attachment_id, (xmax = 0) AS inserted
-        )
-        SELECT attachment_id, inserted, true FROM upserted
-        UNION ALL
-        SELECT attachment_id, false, false FROM attachment
-         WHERE source_guid = %(source_guid)s AND NOT EXISTS (SELECT 1 FROM upserted)
-        """,
+    _execute_upsert(
+        cur,
+        _ATTACHMENT_UPSERT_SQL,
+        _ATTACHMENT_COLUMNS,
         {
             "source_guid": att.guid,
             "attachment_key": attachment_key(att.guid),
@@ -1259,8 +1509,8 @@ def _upsert_attachment(
             "mime_type": att.mime_type,
             "byte_size": att.byte_size,
             "is_sticker": att.is_sticker,
-            "initial_state": initial_state,
-            "initial_error": initial_error,
+            "state": initial_state,
+            "materialization_last_error": initial_error,
         },
     )
     return _read_upsert_row(cur)
@@ -1269,6 +1519,10 @@ def _upsert_attachment(
 def _upsert_attachment_source(
     cur: psycopg.Cursor[Any], source_name: str, source_rowid: int, attachment_id: int
 ) -> None:
+    """Not evidence-gated, and does not need to be: `attachment_id` is a
+    row id this same transaction just resolved, so it is never absent.
+    The statement records "this source's row N is that attachment", which
+    only the source itself can assert."""
     cur.execute(
         """
         INSERT INTO attachment_source (attachment_id, source_name, source_rowid)
@@ -1278,6 +1532,53 @@ def _upsert_attachment_source(
         """,
         (attachment_id, source_name, source_rowid),
     )
+
+
+_MESSAGE_COLUMNS: tuple[_Column, ...] = (
+    _Column("source_guid", Merge.INSERT_ONLY),
+    _Column("message_key", Merge.INSERT_ONLY),
+    _Column("chat_id", Merge.INSERT_ONLY),
+    # NULL here has two causes that this stage cannot tell apart from the
+    # row alone: the message is the owner's (there is no handle to point
+    # at), or the snapshot's `handle` table is missing the row its
+    # `message.handle_id` refers to. The second is a real possibility for a
+    # recovered or merged corpus, and writing its NULL would detach the
+    # message from the only column S3 joins on to resolve a sender.
+    # `PRESENT` costs one thing: a message that later flips to
+    # `is_from_me` keeps the handle id it already had. Nothing renders
+    # from it in that case — `is_from_me` is checked first — and no
+    # observed `chat.db` flips that column.
+    _Column("sender_source_handle_id", Merge.PRESENT),
+    # Plain `chat.db` columns, NOT NULL on the way in (`sent_at` is
+    # checked above and raises), so every source asserts them.
+    _Column("is_from_me", Merge.ASSERTED),
+    _Column("sent_at", Merge.ASSERTED),
+    _Column("service", Merge.INSERT_ONLY, cast="::service_kind"),
+    # NULL means the shim returned no record for this guid at all, or
+    # returned one whose typedstream body it could not decode. Neither is
+    # "this message has no text": an attachment-only message comes back as
+    # the object-replacement character, not NULL. Before this policy a run
+    # whose shim was silent wrote NULL over a body an earlier run had
+    # stored, counted it in `bodies_missing`, logged it, and kept going.
+    _Column("text_original", Merge.PRESENT),
+    _Column("text_normalized", Merge.PRESENT),
+    # `POSITIVE`: false is what a source reports both for "not retracted /
+    # not edited / no attachments" and for "I cannot see whether it was",
+    # and all three name facts that do not un-happen. False -> true (a
+    # message really is unsent later) still flows; true -> false was never
+    # a correction.
+    _Column("is_unsent", Merge.POSITIVE),
+    _Column("is_edited", Merge.POSITIVE),
+    # The timestamp that goes with `is_edited`; a source without the edit
+    # carries NULL, and an edit's timestamp only ever moves forward.
+    _Column("date_edited", Merge.PRESENT),
+    _Column("reply_to_guid", Merge.INSERT_ONLY),
+    _Column("has_attachments", Merge.POSITIVE),
+)
+
+_MESSAGE_UPSERT_SQL = _build_upsert_sql(
+    table="message", conflict=("source_guid",), columns=_MESSAGE_COLUMNS, returning="message_id"
+)
 
 
 def _upsert_message(
@@ -1336,6 +1637,16 @@ def _upsert_message(
         key, so it cannot differ.
       * `sender_person_id` is S3's to write and S2's never (hard
         requirement 3); `created_at` is first-write provenance.
+
+    **And which of the assigned columns a silent source may write.**
+    Being allowed to invalidate downstream work is not the same as
+    having something to say; `_MESSAGE_COLUMNS` below carries the
+    second decision, one `Merge` value per column, and the reasoning
+    for each is on the declaration. Only `is_from_me` and `sent_at` are
+    `ASSERTED` — they are plain `chat.db` columns present on every row
+    of every source, so no source can be silent about them. Everything
+    else this statement writes is something a witness of the same
+    conversation can genuinely lack.
     """
     sender_source_handle_id = None
     if not msg.is_from_me and msg.handle_rowid is not None:
@@ -1377,45 +1688,10 @@ def _upsert_message(
     if msg.date is None:
         raise ExtractionError(f"message guid={msg.guid!r} rowid={msg.rowid} has no 'date' — chat.db invariant violated")
 
-    cur.execute(
-        """
-        WITH upserted AS (
-            INSERT INTO message (
-                source_guid, message_key, chat_id, sender_source_handle_id, is_from_me, sent_at,
-                service, text_original, text_normalized, is_unsent, is_edited, date_edited,
-                reply_to_guid, has_attachments
-            ) VALUES (
-                %(source_guid)s, %(message_key)s, %(chat_id)s, %(sender_source_handle_id)s,
-                %(is_from_me)s, %(sent_at)s, %(service)s::service_kind, %(text_original)s,
-                %(text_normalized)s, %(is_unsent)s, %(is_edited)s, %(date_edited)s,
-                %(reply_to_guid)s, %(has_attachments)s
-            )
-            ON CONFLICT (source_guid) DO UPDATE SET
-                sender_source_handle_id = EXCLUDED.sender_source_handle_id,
-                is_from_me = EXCLUDED.is_from_me,
-                sent_at = EXCLUDED.sent_at,
-                text_original = EXCLUDED.text_original,
-                text_normalized = EXCLUDED.text_normalized,
-                is_unsent = EXCLUDED.is_unsent,
-                is_edited = EXCLUDED.is_edited,
-                date_edited = EXCLUDED.date_edited,
-                has_attachments = EXCLUDED.has_attachments
-            WHERE message.sender_source_handle_id IS DISTINCT FROM EXCLUDED.sender_source_handle_id
-               OR message.is_from_me IS DISTINCT FROM EXCLUDED.is_from_me
-               OR message.sent_at IS DISTINCT FROM EXCLUDED.sent_at
-               OR message.text_original IS DISTINCT FROM EXCLUDED.text_original
-               OR message.text_normalized IS DISTINCT FROM EXCLUDED.text_normalized
-               OR message.is_unsent IS DISTINCT FROM EXCLUDED.is_unsent
-               OR message.is_edited IS DISTINCT FROM EXCLUDED.is_edited
-               OR message.date_edited IS DISTINCT FROM EXCLUDED.date_edited
-               OR message.has_attachments IS DISTINCT FROM EXCLUDED.has_attachments
-            RETURNING message_id, (xmax = 0) AS inserted
-        )
-        SELECT message_id, inserted, true FROM upserted
-        UNION ALL
-        SELECT message_id, false, false FROM message
-         WHERE source_guid = %(source_guid)s AND NOT EXISTS (SELECT 1 FROM upserted)
-        """,
+    _execute_upsert(
+        cur,
+        _MESSAGE_UPSERT_SQL,
+        _MESSAGE_COLUMNS,
         {
             "source_guid": msg.guid,
             "message_key": message_key(msg.guid),
@@ -1460,21 +1736,67 @@ def _upsert_message_source(
     )
 
 
+_MESSAGE_VERSION_COLUMNS: tuple[_Column, ...] = (
+    _Column("message_id", Merge.INSERT_ONLY),
+    _Column("version_idx", Merge.INSERT_ONLY),
+    # A version the shim could not decode arrives as None, which the
+    # column's NOT NULL forces to `''` on insert — and `''` written over a
+    # version text another source decoded is the same loss as a blanked
+    # body. The parameter therefore carries None for "could not decode"
+    # and the empty string is only ever an INSERT default.
+    _Column("text", Merge.PRESENT, insert_default="''"),
+    _Column("edited_at", Merge.PRESENT),
+)
+
+_MESSAGE_VERSION_UPSERT_SQL = _build_upsert_sql(
+    table="message_version",
+    conflict=("message_id", "version_idx"),
+    columns=_MESSAGE_VERSION_COLUMNS,
+)
+
+
 def _upsert_message_version(
     cur: psycopg.Cursor[Any], message_id: int, version_idx: int, version: Any
 ) -> None:
-    edited_at = _parse_iso(version.edited_at)
-    cur.execute(
-        """
-        INSERT INTO message_version (message_id, version_idx, text, edited_at)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (message_id, version_idx) DO UPDATE SET
-            text = EXCLUDED.text, edited_at = EXCLUDED.edited_at
-        WHERE message_version.text IS DISTINCT FROM EXCLUDED.text
-           OR message_version.edited_at IS DISTINCT FROM EXCLUDED.edited_at
-        """,
-        (message_id, version_idx, strip_nul(version.text or ""), edited_at),
+    _execute_upsert(
+        cur,
+        _MESSAGE_VERSION_UPSERT_SQL,
+        _MESSAGE_VERSION_COLUMNS,
+        {
+            "message_id": message_id,
+            "version_idx": version_idx,
+            "text": None if version.text is None else strip_nul(version.text),
+            "edited_at": _parse_iso(version.edited_at),
+        },
     )
+
+
+_TAPBACK_COLUMNS: tuple[_Column, ...] = (
+    _Column("source_guid", Merge.INSERT_ONLY),
+    _Column("target_source_guid", Merge.INSERT_ONLY),
+    # NULL means the target message is not in this database *yet* — it may
+    # be outside the run's scope, or simply later in the same run.
+    # `_backfill_tapback_targets` resolves those at the end of the
+    # transaction; writing the NULL first would blank an id an earlier run
+    # had already resolved, only for the backfill to re-derive it, so this
+    # is both a correctness and a churn fix.
+    _Column("target_message_id", Merge.PRESENT),
+    _Column("sender_source_handle_id", Merge.INSERT_ONLY),
+    _Column("is_from_me", Merge.INSERT_ONLY),
+    _Column("kind", Merge.INSERT_ONLY),
+    # `ImsgDumpMessage.action` defaults to "added" when the shim omits it,
+    # so `removed=false` is also what "the shim said nothing" looks like.
+    # Un-reacting is a separate event that only ever sets this true.
+    _Column("removed", Merge.POSITIVE),
+    # `msg.date` — NULL for a tapback row whose `chat.db` date is missing.
+    # (Unlike `_upsert_message`, this path has no NOT NULL check to raise
+    # on, because `tapback.acted_at` is nullable.)
+    _Column("acted_at", Merge.PRESENT),
+)
+
+_TAPBACK_UPSERT_SQL = _build_upsert_sql(
+    table="tapback", conflict=("source_guid",), columns=_TAPBACK_COLUMNS
+)
 
 
 def _upsert_tapback(
@@ -1504,29 +1826,20 @@ def _upsert_tapback(
         kind = f"emoji:{dump_msg.tapback.emoji}"
     removed = dump_msg.tapback.action == "removed"
 
-    cur.execute(
-        """
-        INSERT INTO tapback (
-            source_guid, target_source_guid, target_message_id, sender_source_handle_id,
-            is_from_me, kind, removed, acted_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (source_guid) DO UPDATE SET
-            target_message_id = EXCLUDED.target_message_id, removed = EXCLUDED.removed,
-            acted_at = EXCLUDED.acted_at
-        WHERE tapback.target_message_id IS DISTINCT FROM EXCLUDED.target_message_id
-           OR tapback.removed IS DISTINCT FROM EXCLUDED.removed
-           OR tapback.acted_at IS DISTINCT FROM EXCLUDED.acted_at
-        """,
-        (
-            msg.guid,
-            dump_msg.tapback.target_guid,
-            target_message_id,
-            sender_source_handle_id,
-            msg.is_from_me,
-            kind,
-            removed,
-            msg.date,
-        ),
+    _execute_upsert(
+        cur,
+        _TAPBACK_UPSERT_SQL,
+        _TAPBACK_COLUMNS,
+        {
+            "source_guid": msg.guid,
+            "target_source_guid": dump_msg.tapback.target_guid,
+            "target_message_id": target_message_id,
+            "sender_source_handle_id": sender_source_handle_id,
+            "is_from_me": msg.is_from_me,
+            "kind": kind,
+            "removed": removed,
+            "acted_at": msg.date,
+        },
     )
 
 
@@ -1545,18 +1858,35 @@ def _backfill_tapback_targets(cur: psycopg.Cursor[Any]) -> None:
     )
 
 
+_LINK_PREVIEW_COLUMNS: tuple[_Column, ...] = (
+    _Column("message_id", Merge.INSERT_ONLY),
+    _Column("url", Merge.INSERT_ONLY),
+    # `parse_link_preview` is a best-effort walk of an NSKeyedArchiver
+    # blob: a key it does not find comes back NULL, whether the preview
+    # genuinely had no title or this source's `payload_data` was truncated
+    # or shaped differently. Same policy as everywhere else.
+    _Column("title", Merge.PRESENT),
+    _Column("summary", Merge.PRESENT),
+    _Column("site_name", Merge.PRESENT),
+)
+
+_LINK_PREVIEW_UPSERT_SQL = _build_upsert_sql(
+    table="link_preview", conflict=("message_id", "url"), columns=_LINK_PREVIEW_COLUMNS
+)
+
+
 def _upsert_link_preview(cur: psycopg.Cursor[Any], message_id: int, preview: LinkPreview) -> None:
-    cur.execute(
-        """
-        INSERT INTO link_preview (message_id, url, title, summary, site_name)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (message_id, url) DO UPDATE SET
-            title = EXCLUDED.title, summary = EXCLUDED.summary, site_name = EXCLUDED.site_name
-        WHERE link_preview.title IS DISTINCT FROM EXCLUDED.title
-           OR link_preview.summary IS DISTINCT FROM EXCLUDED.summary
-           OR link_preview.site_name IS DISTINCT FROM EXCLUDED.site_name
-        """,
-        (message_id, preview.url, preview.title, preview.summary, preview.site_name),
+    _execute_upsert(
+        cur,
+        _LINK_PREVIEW_UPSERT_SQL,
+        _LINK_PREVIEW_COLUMNS,
+        {
+            "message_id": message_id,
+            "url": preview.url,
+            "title": preview.title,
+            "summary": preview.summary,
+            "site_name": preview.site_name,
+        },
     )
 
 

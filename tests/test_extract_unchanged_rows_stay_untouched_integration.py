@@ -542,14 +542,29 @@ def test_a_null_to_value_transition_counts_as_a_change(
 ) -> None:
     """`IS DISTINCT FROM` is the reason a NULL-sided change is caught at
     all -- plain `<>` would evaluate to NULL and skip the update, leaving
-    a message that gained a body looking unchanged forever. Proven in
-    both directions, plus NULL-to-NULL as the control."""
+    a message that gained a body looking unchanged forever. Proven here
+    in the direction that is still a change, with NULL-to-NULL as the
+    control.
+
+    The opposite direction is asserted here too, and it changed on
+    2026-09-17: value -> NULL is no longer a change, because a NULL body
+    from `imsg-dump` is not "this message has no text", it is "this
+    source could not produce the text" -- and several witnesses of the
+    same conversation feed this index. See
+    `test_extract_poorer_source_never_overwrites_integration.py` for the
+    invariant and the production damage that motivated it. The two rules
+    are independent: this suite is about not writing a row whose content
+    is unchanged, that one about not writing a column this source cannot
+    see.
+    """
     chat_ids = _chat_ids_by_guid(pg_conn)
     with pg_conn.cursor() as cur:
         cur.execute("SELECT text_original FROM message WHERE source_guid = %s", (_TAPBACK_1,))
         assert cur.fetchone() is None, "the tapback row is folded, not a message"
 
-    # The owner's message loses its body: value -> NULL.
+    # A source that returns no body for the owner's message no longer blanks
+    # the body an earlier source stored -- and, being no change at all, does
+    # not move the row either.
     dump = _dump_run()
     without_owner_body = ImsgDumpRun(
         messages=tuple(
@@ -560,34 +575,52 @@ def test_a_null_to_value_transition_counts_as_a_change(
     before_updated_at = _message_updated_at(pg_conn)
     _reset_watermark(pg_conn)
     result = _extract(pg_conn, tmp_path, settled_corpus, without_owner_body)
-    assert result.message_upserts.updated == 1
-    after_updated_at = _message_updated_at(pg_conn)
-    assert {g for g, s in after_updated_at.items() if before_updated_at[g] != s} == {_OWNER_1}
+    assert result.message_upserts.updated == 0
+    assert _message_updated_at(pg_conn) == before_updated_at
     with pg_conn.cursor() as cur:
         cur.execute("SELECT text_original FROM message WHERE source_guid = %s", (_OWNER_1,))
+        assert cur.fetchone() == ("thanks",)
+
+    # A row that arrives with no body at all, and later gains one. This is the
+    # NULL-sided comparison `IS DISTINCT FROM` exists for: `<>` against a
+    # stored NULL evaluates to NULL, so the update would be skipped and the
+    # message would stay bodyless forever.
+    grown = _build_snapshot(tmp_path / "snapshot_grown.db", extra_message=True)
+    bodyless = ImsgDumpRun(
+        messages=tuple(
+            replace(m, body_text=None) if m.guid == "msg-bob-3" else m
+            for m in _dump_run(extra_message=True).messages
+        ),
+        stderr_lines=(),
+    )
+    result = _extract(pg_conn, tmp_path, grown, bodyless)
+    assert result.message_upserts.inserted == 1
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT text_original FROM message WHERE source_guid = %s", ("msg-bob-3",))
         assert cur.fetchone() == (None,)
 
     # NULL -> NULL is the control: it must NOT count as a change.
     before_updated_at = _message_updated_at(pg_conn)
     _reset_watermark(pg_conn)
-    result = _extract(pg_conn, tmp_path, settled_corpus, without_owner_body)
+    result = _extract(pg_conn, tmp_path, grown, bodyless)
     assert result.message_upserts.updated == 0
-    assert result.message_upserts.unchanged == 5
+    assert result.message_upserts.unchanged == 6
     assert _message_updated_at(pg_conn) == before_updated_at
 
-    # And back: NULL -> value.
+    # And NULL -> value, which must.
     before_updated_at = _message_updated_at(pg_conn)
     _reset_watermark(pg_conn)
-    result = _extract(pg_conn, tmp_path, settled_corpus, _dump_run())
+    result = _extract(pg_conn, tmp_path, grown, _dump_run(extra_message=True))
     assert result.message_upserts.updated == 1
     after_updated_at = _message_updated_at(pg_conn)
-    assert {g for g, s in after_updated_at.items() if before_updated_at[g] != s} == {_OWNER_1}
+    assert {g for g, s in after_updated_at.items() if before_updated_at[g] != s} == {"msg-bob-3"}
     with pg_conn.cursor() as cur:
-        cur.execute("SELECT text_original FROM message WHERE source_guid = %s", (_OWNER_1,))
-        assert cur.fetchone() == ("thanks",)
+        cur.execute("SELECT text_original FROM message WHERE source_guid = %s", ("msg-bob-3",))
+        assert cur.fetchone() == ("one more thing",)
 
+    run_identity(conn=pg_conn, config=config, contacts_importer=_fake_contacts_importer)  # type: ignore[arg-type]
     assert set(find_dirty_chats(pg_conn, index_unsent=config.policy.index_unsent)) == {
-        chat_ids["chat-alice"]
+        chat_ids["chat-bob"]
     }
 
 
