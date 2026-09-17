@@ -41,6 +41,12 @@ RUNTIME_MODULE_NAMES = (
 )
 
 
+FAKE_RUNTIME_DEFAULT_CACHE_LIMIT = 121 * 2**30
+"""What the fake ``mx.set_cache_limit`` reports as the previous limit before
+any call: the real runtime's default is its memory limit (121.6 GiB on a
+128 GB M2 Ultra), far above any bound a provider applies."""
+
+
 class FakeArray:
     """A nested-list array with just ``shape`` / ``astype`` / ``tolist``."""
 
@@ -89,13 +95,15 @@ def make_mx_module() -> types.ModuleType:
     module.float32 = "float32"  # type: ignore[attr-defined]
     module.int32 = "int32"  # type: ignore[attr-defined]
     # Buffer-cache bound (D10.2): records every ``set_cache_limit`` call
-    # and answers like the real one (the previous limit).
+    # and answers like the real one (the previous limit, starting from the
+    # runtime default, which equals the memory limit).
     module.cache_limit_calls = []  # type: ignore[attr-defined]
 
     def _set_cache_limit(limit: int) -> int:
-        previous = module.cache_limit_calls[-1] if module.cache_limit_calls else 0  # type: ignore[attr-defined]
-        module.cache_limit_calls.append(limit)  # type: ignore[attr-defined]
-        return previous
+        calls = module.cache_limit_calls  # type: ignore[attr-defined]
+        previous = calls[-1] if calls else FAKE_RUNTIME_DEFAULT_CACHE_LIMIT
+        calls.append(limit)
+        return int(previous)
 
     module.set_cache_limit = _set_cache_limit  # type: ignore[attr-defined]
     return module

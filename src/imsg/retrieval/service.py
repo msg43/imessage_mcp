@@ -14,6 +14,7 @@ codebase.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,11 @@ if TYPE_CHECKING:
     import psycopg
 
     from imsg.config.schema import Config
+
+WARM_UP_QUERY = "warm-up query"
+WARM_UP_DOCUMENT = "warm-up document"
+"""The throwaway inputs :meth:`RetrievalService.warm_up` runs through each
+model — fixed, generic, never a real query."""
 
 MAX_QUERY_CHARS = 1000
 MAX_SEARCH_LIMIT = 50
@@ -67,6 +73,26 @@ class RetrievalService:
         self._text_provider = text_provider
         self._reranker = reranker
         self._multimodal_provider = multimodal_provider
+
+    # -- warm-up ------------------------------------------------------------
+
+    def warm_up(self) -> float:
+        """Load every model provider and run one throwaway input through
+        each — the query embedder, the multimodal text tower when channel
+        C is enabled, and the reranker — so a server's first real query
+        does not pay for loading weights and compiling kernels (loading
+        alone took 4-5 s for the text embedder, 4-7 s for the reranker and
+        26-32 s for PE-Core on an M2 Ultra, 2026-09-16). Touches no
+        database. Returns the seconds it took; a provider that cannot load
+        raises here, at startup, instead of on the first query."""
+        started = time.perf_counter()
+        self._text_provider.embed_query(
+            WARM_UP_QUERY, instruction=self._config.embedding.query_instruction
+        )
+        if self._config.embedding.multimodal.enabled and self._multimodal_provider is not None:
+            self._multimodal_provider.embed_text(WARM_UP_QUERY)
+        self._reranker.score(WARM_UP_QUERY, [WARM_UP_DOCUMENT])
+        return time.perf_counter() - started
 
     # -- search_messages ----------------------------------------------------
 
@@ -136,7 +162,12 @@ class RetrievalService:
 
         fused = reciprocal_rank_fusion(lists, rrf_k=self._config.retrieval.rrf_k)
 
-        rerank_top = self._config.retrieval.rerank_top
+        # The pool is never smaller than the caller's `limit`: SPEC §9.4
+        # step 8 returns the top `limit` of the reranked pool, so a
+        # `rerank_top` tuned below `limit` for latency must not silently
+        # return fewer results. A caller asking for more results pays for
+        # reranking them.
+        rerank_top = max(self._config.retrieval.rerank_top, effective_limit)
         pool = fused[:rerank_top]
         summaries = segments.fetch_segment_summaries(self._pg, [r.segment_id for r in pool])
         # A fused id can vanish between fusion and this fetch (concurrent
@@ -284,4 +315,4 @@ class RetrievalService:
         }
 
 
-__all__ = ["RetrievalService", "SearchMessagesResult"]
+__all__ = ["WARM_UP_DOCUMENT", "WARM_UP_QUERY", "RetrievalService", "SearchMessagesResult"]
