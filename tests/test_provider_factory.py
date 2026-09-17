@@ -183,7 +183,9 @@ def test_real_backend_resolves_each_class_by_dotted_path(
 
     reranker = build_reranker(cfg)
     assert type(reranker).__name__ == REAL_PROVIDERS["reranker"].class_name
-    assert calls["reranker"] == [((r.reranker_model, r.reranker_revision), {})]
+    assert calls["reranker"] == [
+        ((r.reranker_model, r.reranker_revision), {"doc_max_tokens": r.rerank_doc_max_tokens})
+    ]
 
     providers = build_enrichment_providers(cfg, caption_prompt="CAPTION PROMPT")
     assert type(providers.ocr).__name__ == REAL_PROVIDERS["ocr"].class_name
@@ -558,8 +560,28 @@ def test_reranker_directory_under_data_root_builds_with_revision_none_and_a_rela
     # records is the config's relative path plus the upstream sha — never
     # the absolute path.
     assert calls["reranker"] == [
-        ((str(directory.resolve()), None), {"model_id": f"{LOCAL_DIR}@{UPSTREAM_SHA}"})
+        (
+            (str(directory.resolve()), None),
+            {
+                "model_id": f"{LOCAL_DIR}@{UPSTREAM_SHA}",
+                "doc_max_tokens": cfg.retrieval.rerank_doc_max_tokens,
+            },
+        )
     ]
+
+
+def test_reranker_document_cap_flows_from_config_to_the_provider(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _install_stub_modules(monkeypatch)
+    for value in (256, None):
+        raw = config_dict_factory()
+        del raw["models"]  # real backend
+        raw["retrieval"]["reranker_model"] = "example-org/Example-Reranker-8bit"
+        raw["retrieval"]["reranker_revision"] = UPSTREAM_SHA
+        raw["retrieval"]["rerank_doc_max_tokens"] = value
+        build_reranker(load_config_dict(raw))
+    assert [kwargs["doc_max_tokens"] for _, kwargs in calls["reranker"]] == [256, None]
 
 
 def test_reranker_repo_id_stays_a_hub_pin_when_no_such_directory_exists(
@@ -569,7 +591,12 @@ def test_reranker_repo_id_stays_a_hub_pin_when_no_such_directory_exists(
     cfg = _local_reranker_config(config_dict_factory, "example-org/Example-Reranker-8bit")
     assert not (cfg.paths.data_root / "example-org").exists()
     build_reranker(cfg)
-    assert calls["reranker"] == [(("example-org/Example-Reranker-8bit", UPSTREAM_SHA), {})]
+    assert calls["reranker"] == [
+        (
+            ("example-org/Example-Reranker-8bit", UPSTREAM_SHA),
+            {"doc_max_tokens": cfg.retrieval.rerank_doc_max_tokens},
+        )
+    ]
 
 
 def test_reranker_missing_models_directory_is_one_clear_error_not_a_hub_lookup(

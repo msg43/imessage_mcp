@@ -8,13 +8,22 @@ from types import SimpleNamespace
 
 import pytest
 
-from _mlx_fakes import FakeArray, FakeModel, FakeRuntime, make_mx_module, uninstall_runtime
+from _mlx_fakes import (
+    FAKE_RUNTIME_DEFAULT_CACHE_LIMIT,
+    FakeArray,
+    FakeModel,
+    FakeRuntime,
+    make_mx_module,
+    uninstall_runtime,
+)
 from imsg.errors import ImsgError
 from imsg.mlx_runtime import (
+    DEFAULT_CACHE_LIMIT_BYTES,
     MlxRuntimeError,
     MlxRuntimeUnavailableError,
     base_transformer_hidden_states,
     batched,
+    bound_buffer_cache,
     float_rows,
     format_model_id,
     gather_last_token_states,
@@ -44,6 +53,42 @@ def test_installed_fake_runtime_is_importable(monkeypatch: pytest.MonkeyPatch) -
     FakeRuntime().install(monkeypatch)
     assert hasattr(import_mlx_lm(), "load")
     assert hasattr(import_mlx_core(), "take_along_axis")
+
+
+# --- the process-wide buffer-cache bound -----------------------------------
+
+
+def test_bound_buffer_cache_applies_the_bound_over_the_runtime_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeRuntime().install(monkeypatch)
+    mx = import_mlx_core()
+    assert FAKE_RUNTIME_DEFAULT_CACHE_LIMIT > DEFAULT_CACHE_LIMIT_BYTES
+    bound_buffer_cache(DEFAULT_CACHE_LIMIT_BYTES)
+    assert mx.cache_limit_calls == [DEFAULT_CACHE_LIMIT_BYTES]
+    bound_buffer_cache(DEFAULT_CACHE_LIMIT_BYTES)  # a second provider, same bound
+    assert mx.cache_limit_calls == [DEFAULT_CACHE_LIMIT_BYTES, DEFAULT_CACHE_LIMIT_BYTES]
+
+
+def test_bound_buffer_cache_never_loosens_a_tighter_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeRuntime().install(monkeypatch)
+    mx = import_mlx_core()
+    bound_buffer_cache(2**30)
+    bound_buffer_cache(DEFAULT_CACHE_LIMIT_BYTES)
+    assert mx.cache_limit_calls == [2**30, DEFAULT_CACHE_LIMIT_BYTES, 2**30]
+    bound_buffer_cache(0)  # caching disabled is tighter still
+    bound_buffer_cache(2**30)
+    assert mx.cache_limit_calls[-1] == 0
+
+
+def test_bound_buffer_cache_tolerates_a_runtime_without_the_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeRuntime().install(monkeypatch)
+    monkeypatch.delattr(import_mlx_core(), "set_cache_limit")
+    bound_buffer_cache(DEFAULT_CACHE_LIMIT_BYTES)  # no error
+    with pytest.raises(ValueError):
+        bound_buffer_cache(-1)
 
 
 # --- model id / loading ---------------------------------------------------

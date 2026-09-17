@@ -382,7 +382,22 @@ class RetrievalConfig(StrictModel):
     k_fts: int = Field(default=100, ge=1)
     k_vector: int = Field(default=100, ge=1)
     rrf_k: int = Field(default=60, ge=1)
-    rerank_top: int = Field(default=50, ge=1)
+    rerank_top: int = Field(default=10, ge=1)
+    """How many of the fused candidates the reranker scores (SPEC §9.4
+    step 7) — never fewer than a request's `limit`; candidates past the
+    pool are dropped. The reranker's cost grows with the tokens it reads,
+    so this and `rerank_doc_max_tokens` set search latency
+    (`scripts/bench_retrieval_latency.py`; the defaults and their measured
+    trade-off are in the README)."""
+    rerank_doc_max_tokens: int | None = Field(default=64, ge=1)
+    """Most tokens (the reranker's own tokenizer) of each candidate's text
+    the reranker reads; `null` means no cap beyond the model's 8,192-token
+    row. Only the document is cut — the instruction, the query and the
+    chat suffix the yes/no score is read after are always kept. The count
+    includes the rendered segment's header (`Chat:` / `Time:` lines, ~40
+    tokens for two participants): at 32 the reranker sees only part of the
+    header, and on the benchmark's proxy it then ordered results worse than
+    the fused order it replaces."""
     reranker_model: str = Field(default=constants.RERANKER_MODEL, min_length=1)
     """Either form named by `RERANKER_MODEL_FORMS`. `imsg.providers.factory`
     reads the value as a local directory when `<paths.data_root>/<value>`

@@ -19,12 +19,30 @@ asks for ("selectivity **or** the cap" — the spec itself groups both
 causes under one flag), rather than trying to distinguish "the corpus
 genuinely has fewer than k matches" from "the scan cap was hit". See
 the build report for the same caveat repeated once, not per-channel.
+
+**The collapsing channels stop reading early (2026-09-16).** Channels
+B2 and C overfetch `max(5k, 50)` item-level rows and collapse them to
+the `k` nearest segments. Measured on the real corpus (20 fictional
+queries, `k` = 100), channel C's 500 rows held 316-465 distinct
+segments, and the 100th distinct segment had appeared by row 115
+(median) / 157 (max): reading all 500 did three to four times the index
+and heap work the answer needs, which is what a query pays in page reads
+when the index is not cached. The query is unchanged, but its rows are
+now pulled through a server-side cursor in batches, and reading stops
+once no unread row can change the collapsed result — see
+:func:`collapse_is_settled`. The result is identical to collapsing the
+whole overfetch: on the real corpus, 40 of 40 fictional queries returned
+the same segments in the same order, reading 192 rows instead of 500
+(channel C per call, repeated queries: median 20.0 -> 8.9 ms, p95 157 ->
+46 ms).
 """
 
 from __future__ import annotations
 
+import heapq
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from imsg.embed.vector_codec import vector_literal
 from imsg.retrieval.filters import CompiledPredicate
@@ -33,6 +51,35 @@ if TYPE_CHECKING:
     import psycopg
 
 _SET_ITERATIVE_SCAN = "SET LOCAL hnsw.iterative_scan = 'strict_order'"
+
+_PLAN_CURSOR_LIKE_A_QUERY = "SET LOCAL cursor_tuple_fraction = 1.0"
+"""PostgreSQL plans a `DECLARE ... CURSOR` for fast start — for the first
+`cursor_tuple_fraction` (default 0.1) of its rows — so the cursor can get a
+different plan, and different rows, from the same SELECT run plainly.
+Observed on a small scratch table (2026-09-16, `auto_explain`): the plain
+query sorted exactly over hash joins while the cursor at 0.1 chose the
+approximate HNSW index scan, and an integration test that compared the two
+failed intermittently. At 1.0 the cursor is planned exactly like the
+plain query; the executor still produces rows only as they are fetched,
+so reading stops early all the same."""
+
+COLLAPSE_FETCH_ROWS = 64
+"""Rows per round trip while a collapsing channel streams its overfetch.
+The 100th distinct segment arrived by row 157 at worst on the measured
+query set, so a `k` = 100 search usually settles within three fetches."""
+
+DISTANCE_ORDER_TOLERANCE = 1e-3
+"""How much closer a later row may be than an earlier one. With
+`hnsw.iterative_scan = strict_order` the index returns rows in order of
+its own distance — pgvector 0.8.6's `halfvec_cosine_ops` for HNSW orders
+by `halfvec_negative_inner_product` over `l2_norm`-normalized half-
+precision vectors — while the `<=>` the query selects is the cosine
+distance recomputed from the stored vectors, so the two orders differ by
+rounding. Measured on the real corpus (20 queries, 500 rows each): a
+later row was at most 3.7e-5 closer than an earlier one, up to 13
+positions out of place. The early stop keeps a margin 27 times that; a
+query whose rows were further out of order than this could collapse
+differently from reading every row."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,24 +128,22 @@ def search_attachment_chunk_vector(
     # nearest chunk for a given segment may not be within the first `k`
     # chunk-level rows once duplicates from other segments are removed.
     chunk_limit = max(k * 5, 50)
-    with conn.transaction(), conn.cursor() as cur:
-        cur.execute(_SET_ITERATIVE_SCAN)
-        cur.execute(
-            f"""
-            SELECT s.segment_id, ace.vec <=> %(qv)s::halfvec AS distance
-            FROM attachment_chunk_embedding ace
-            JOIN attachment_chunk ac ON ac.chunk_id = ace.chunk_id
-            JOIN message_attachment ma ON ma.attachment_id = ac.attachment_id
-            JOIN segment_message sm ON sm.message_id = ma.message_id
-            JOIN segment s ON s.segment_id = sm.segment_id
-            WHERE {predicate.sql}
-            ORDER BY ace.vec <=> %(qv)s::halfvec
-            LIMIT %(chunk_limit)s
-            """,
-            {"qv": qv, "chunk_limit": chunk_limit, **predicate.params},
-        )
-        rows = cur.fetchall()
-    return _best_distance_per_segment(rows, k)
+    return _collapsed_nearest_segments(
+        conn,
+        f"""
+        SELECT s.segment_id, ace.vec <=> %(qv)s::halfvec AS distance
+        FROM attachment_chunk_embedding ace
+        JOIN attachment_chunk ac ON ac.chunk_id = ace.chunk_id
+        JOIN message_attachment ma ON ma.attachment_id = ac.attachment_id
+        JOIN segment_message sm ON sm.message_id = ma.message_id
+        JOIN segment s ON s.segment_id = sm.segment_id
+        WHERE {predicate.sql}
+        ORDER BY ace.vec <=> %(qv)s::halfvec
+        LIMIT %(row_limit)s
+        """,
+        {"qv": qv, "row_limit": chunk_limit, **predicate.params},
+        k,
+    )
 
 
 def search_multimodal_vector(
@@ -112,26 +157,76 @@ def search_multimodal_vector(
     config access and always searches if asked to)."""
     qv = vector_literal(query_vector)
     attachment_limit = max(k * 5, 50)
-    with conn.transaction(), conn.cursor() as cur:
-        cur.execute(_SET_ITERATIVE_SCAN)
-        cur.execute(
-            f"""
-            SELECT s.segment_id, mm.vec <=> %(qv)s::halfvec AS distance
-            FROM attachment_mm_embedding mm
-            JOIN message_attachment ma ON ma.attachment_id = mm.attachment_id
-            JOIN segment_message sm ON sm.message_id = ma.message_id
-            JOIN segment s ON s.segment_id = sm.segment_id
-            WHERE {predicate.sql}
-            ORDER BY mm.vec <=> %(qv)s::halfvec
-            LIMIT %(attachment_limit)s
-            """,
-            {"qv": qv, "attachment_limit": attachment_limit, **predicate.params},
-        )
-        rows = cur.fetchall()
+    return _collapsed_nearest_segments(
+        conn,
+        f"""
+        SELECT s.segment_id, mm.vec <=> %(qv)s::halfvec AS distance
+        FROM attachment_mm_embedding mm
+        JOIN message_attachment ma ON ma.attachment_id = mm.attachment_id
+        JOIN segment_message sm ON sm.message_id = ma.message_id
+        JOIN segment s ON s.segment_id = sm.segment_id
+        WHERE {predicate.sql}
+        ORDER BY mm.vec <=> %(qv)s::halfvec
+        LIMIT %(row_limit)s
+        """,
+        {"qv": qv, "row_limit": attachment_limit, **predicate.params},
+        k,
+    )
+
+
+def collapse_is_settled(
+    best: dict[int, float],
+    farthest_read: float,
+    k: int,
+    *,
+    tolerance: float = DISTANCE_ORDER_TOLERANCE,
+) -> bool:
+    """Whether reading more rows could still change the `k` segments
+    :func:`_best_distance_per_segment` keeps (or their order).
+
+    `best` holds each segment's smallest distance among the rows read so
+    far and `farthest_read` the largest distance read. Rows arrive in
+    distance order to within `tolerance`, so every unread row is at least
+    `farthest_read - tolerance` away; once that exceeds the `k`-th best
+    distance, no unread row can enter the top `k`, improve a segment in
+    it, or tie with one."""
+    if len(best) < k:
+        return False
+    kth_best = heapq.nsmallest(k, best.values())[-1]
+    return farthest_read - tolerance > kth_best
+
+
+def _collapsed_nearest_segments(
+    conn: psycopg.Connection, sql: str, params: dict[str, Any], k: int
+) -> VectorChannelResult:
+    """Run an item-level `(segment_id, distance)` query ordered by
+    distance and collapse it to the `k` nearest segments, reading only as
+    many rows as the answer needs (module docstring)."""
+    rows: list[tuple[int, float]] = []
+    best: dict[int, float] = {}
+    farthest = float("-inf")
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(_SET_ITERATIVE_SCAN)
+            cur.execute(_PLAN_CURSOR_LIKE_A_QUERY)
+        with conn.cursor(name="imsg_vector_overfetch") as cur:
+            cur.execute(sql, params)
+            while True:
+                batch = cur.fetchmany(COLLAPSE_FETCH_ROWS)
+                for segment_id, distance in batch:
+                    sid, dist = int(segment_id), float(distance)
+                    rows.append((sid, dist))
+                    if sid not in best or dist < best[sid]:
+                        best[sid] = dist
+                    farthest = max(farthest, dist)
+                if len(batch) < COLLAPSE_FETCH_ROWS or collapse_is_settled(best, farthest, k):
+                    break
     return _best_distance_per_segment(rows, k)
 
 
-def _best_distance_per_segment(rows: list[tuple[int, float]], k: int) -> VectorChannelResult:
+def _best_distance_per_segment(
+    rows: Sequence[tuple[int, float]], k: int
+) -> VectorChannelResult:
     best: dict[int, float] = {}
     for segment_id, distance in rows:
         if segment_id not in best or distance < best[segment_id]:
@@ -142,7 +237,10 @@ def _best_distance_per_segment(rows: list[tuple[int, float]], k: int) -> VectorC
 
 
 __all__ = [
+    "COLLAPSE_FETCH_ROWS",
+    "DISTANCE_ORDER_TOLERANCE",
     "VectorChannelResult",
+    "collapse_is_settled",
     "search_attachment_chunk_vector",
     "search_multimodal_vector",
     "search_segment_vector",

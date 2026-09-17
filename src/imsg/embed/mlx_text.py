@@ -42,7 +42,9 @@ from typing import Any
 from imsg.embed.batching import DEFAULT_MAX_BATCH_TOKENS, plan_batches
 from imsg.errors import EmbeddingError
 from imsg.mlx_runtime import (
+    DEFAULT_CACHE_LIMIT_BYTES,
     base_transformer_hidden_states,
+    bound_buffer_cache,
     float_rows,
     format_model_id,
     gather_last_token_states,
@@ -70,22 +72,6 @@ tensor the checkpoint does ship is loaded. A conversion that *does* ship
 a head still loads — ``mlx_lm``'s ``sanitize`` drops ``lm_head.weight``
 for a tied model — and the reranker, which needs the head, does not use
 this override."""
-
-DEFAULT_CACHE_LIMIT_BYTES = 8 * 2**30
-"""``mx.set_cache_limit`` applied when the weights load (D10.2: bound
-MLX's buffer cache explicitly at process start). MLX's default cache
-limit equals its memory limit — 121.6 GiB on a 128 GB M2 Ultra
-(``mx.device_info`` / ``set_cache_limit``, 2026-09-15) — so every
-freed activation buffer is retained and, because consecutive batches
-have different shapes, rarely reused: measured with
-`scripts/bench_text_embedding.py`, the cache grew by ~1.3 GiB per
-batch without bound (44-54 GiB after 8-64 batches; peak *active*
-memory never above 28 GiB), and the first production run reached a
-102 GB GPU footprint, filled the 30 GB swap and stalled the GPU on
-paging (`footprint`/`vm.swapusage`, 2026-09-15). 8 GiB is comfortably
-above the active working set of the batches the pipeline plans (peak
-9-11 GiB *including* the 8.4 GB of weights for 4k-16k padded
-tokens), so bounding it costs nothing and keeps the process resident."""
 
 
 def format_query_text(instruction: str, text: str) -> str:
@@ -179,10 +165,12 @@ class MlxTextEmbeddingProvider:
         :func:`imsg.embed.batching.plan_batches` packs every
         ``embed_documents`` call under both, longest rows first, and the
         results come back in input order. ``cache_limit_bytes`` bounds
-        MLX's buffer cache once the weights load (``None`` leaves the
-        runtime default). ``model_id`` overrides the recorded
-        ``'<repo>@<revision>'`` — a local conversion passes its
-        data-root-relative directory plus the upstream sha."""
+        MLX's process-wide buffer cache once the weights load, keeping a
+        tighter bound already in place (``imsg.mlx_runtime.
+        bound_buffer_cache``; ``None`` leaves the cache alone).
+        ``model_id`` overrides the recorded ``'<repo>@<revision>'`` — a
+        local conversion passes its data-root-relative directory plus the
+        upstream sha."""
         if not model_repo:
             raise ValueError("model_repo must be a non-empty repo id or local path")
         if dim < 1:
@@ -238,9 +226,7 @@ class MlxTextEmbeddingProvider:
         self._model = model
         self._tokenizer = tokenizer
         if self._cache_limit_bytes is not None:
-            set_cache_limit = getattr(import_mlx_core(), "set_cache_limit", None)
-            if set_cache_limit is not None:
-                set_cache_limit(self._cache_limit_bytes)
+            bound_buffer_cache(self._cache_limit_bytes)
 
     @property
     def tokenizer(self) -> Any:

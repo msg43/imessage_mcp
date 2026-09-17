@@ -115,8 +115,9 @@ below rely on (positional required args, keyword-only options):
                          allow_cpu_fallback=False)
 - boundary:             (model_repo, revision, prompt_template: str, *, max_tokens=512,
                          timeout_seconds=120.0)
-- reranker:             (model_repo, revision, *, instruction=None, batch_size=8,
-                         max_length=8192, model_id=None)
+- reranker:             (model_repo, revision, *, instruction=None, batch_size=32,
+                         max_length=8192, max_batch_tokens=1024, doc_max_tokens=None,
+                         cache_limit_bytes=8 GiB, model_id=None)
 - ocr:                  (*, recognition_languages=None, minimum_text_height=None)
 - transcription:        (model_repo, revision, *, language=None)
 - caption:              (model_repo, revision, prompt: str, *, max_tokens=256)
@@ -406,14 +407,19 @@ def build_reranker(cfg: Config) -> RerankerProvider:
     reranker_model` is a local conversion when `<paths.data_root>/<value>`
     is an existing directory — built with `revision=None` and `model_id`
     `<value>@<retrieval.reranker_revision>`, the upstream sha — and a Hub
-    repo id pinned at `reranker_revision` otherwise."""
+    repo id pinned at `reranker_revision` otherwise. Either way the
+    provider reads at most `retrieval.rerank_doc_max_tokens` tokens of
+    each document."""
     if cfg.models.backend == "fake":
         return FakeRerankerProvider()
     spec = REAL_PROVIDERS["reranker"]
     model, revision = cfg.retrieval.reranker_model, cfg.retrieval.reranker_revision
+    options: dict[str, object] = {"doc_max_tokens": cfg.retrieval.rerank_doc_max_tokens}
     local_dir = resolve_local_model_dir(cfg.paths.data_root, model)
     if local_dir is not None:
-        provider = _construct(spec, str(local_dir), None, model_id=local_model_id(model, revision))
+        provider = _construct(
+            spec, str(local_dir), None, model_id=local_model_id(model, revision), **options
+        )
         return cast("RerankerProvider", provider)
     if _looks_like_local_model_dir(model):
         raise ProviderUnavailableError(
@@ -423,7 +429,7 @@ def build_reranker(cfg: Config) -> RerankerProvider:
             f"`output_dir`): produce it with the `command` recorded there, or set a Hugging "
             f"Face repo id ('owner/name') instead"
         )
-    provider = _construct(spec, model, revision)
+    provider = _construct(spec, model, revision, **options)
     return cast("RerankerProvider", provider)
 
 
