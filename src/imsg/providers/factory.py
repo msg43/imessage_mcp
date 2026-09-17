@@ -403,7 +403,8 @@ def build_boundary_provider(cfg: Config, prompt_template: str) -> BoundaryProvid
 
 
 def build_reranker(cfg: Config) -> RerankerProvider:
-    """SPEC §9.4 step 7's reranker (Qwen3-Reranker-8B). `retrieval.
+    """SPEC §9.4 step 7's reranker (the lock's active `reranker` entry,
+    Qwen3-Reranker-0.6B). `retrieval.
     reranker_model` is a local conversion when `<paths.data_root>/<value>`
     is an existing directory — built with `revision=None` and `model_id`
     `<value>@<retrieval.reranker_revision>`, the upstream sha — and a Hub

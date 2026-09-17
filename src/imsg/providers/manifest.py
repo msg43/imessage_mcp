@@ -21,6 +21,20 @@ Two kinds of entry share the lock, told apart by `source`:
   directory (`artifact_digest`, the same definition the smoke harness
   records for hosted snapshots).
 
+An entry's `status` says whether it is in use:
+
+- `resolved` — pinned and **active**: it serves its roles, and the
+  config-schema defaults mirror it. At most one active entry per role
+  (`entries_by_role`).
+- `retained` — pinned exactly like a resolved entry and verified the
+  same way (upstream drift, directory digest, runtime floors), but
+  **not active**: it claims no role, so nothing builds it by default. A
+  model replaced by another is kept this way when its weights are still
+  needed (a later quality comparison, say) — its recipe stays recorded
+  and checkable instead of living only in a commit message.
+- `system` — ships with the OS; nothing to pin. `unresolved` — no
+  confirmed pin yet.
+
 This module enforces the *silently* part. `verify_manifest`:
 
 (a) re-resolves every pinned Hub repo's current `main` revision and
@@ -78,9 +92,14 @@ MACOS_PSEUDO_PACKAGE = "macos"
 release (`platform.mac_ver()`), not a Python distribution."""
 
 STATUS_RESOLVED = "resolved"
+STATUS_RETAINED = "retained"
 STATUS_SYSTEM = "system"
 STATUS_UNRESOLVED = "unresolved"
-KNOWN_STATUSES = frozenset({STATUS_RESOLVED, STATUS_SYSTEM, STATUS_UNRESOLVED})
+KNOWN_STATUSES = frozenset({STATUS_RESOLVED, STATUS_RETAINED, STATUS_SYSTEM, STATUS_UNRESOLVED})
+PINNED_STATUSES = frozenset({STATUS_RESOLVED, STATUS_RETAINED})
+"""Statuses whose entry carries a full pin (a Hub repo@sha, or a local
+conversion's upstream pin + recipe) — `resolved` in use, `retained` kept
+but not in use (module docstring)."""
 
 SOURCE_HUB = "hub"
 SOURCE_LOCAL_CONVERSION = "local_conversion"
@@ -160,11 +179,16 @@ class ManifestEntry:
     def hosted(self) -> bool:
         """True when the bytes come from a Hugging Face repo pinned in
         this entry — the smoke harness downloads such entries."""
-        return self.status == STATUS_RESOLVED and bool(self.repo)
+        return self.status in PINNED_STATUSES and bool(self.repo)
 
     @property
     def local_conversion(self) -> bool:
         return self.source == SOURCE_LOCAL_CONVERSION
+
+    @property
+    def retained(self) -> bool:
+        """Pinned and verified, but serving no role (`status: retained`)."""
+        return self.status == STATUS_RETAINED
 
     @property
     def hub_pin(self) -> tuple[str, str, str | None] | None:
@@ -316,10 +340,11 @@ def _parse_entry(name: str, raw: Any) -> ManifestEntry:
     license_id = _require_str(name, raw, "license")
     local: dict[str, str] = {}
     if source == SOURCE_LOCAL_CONVERSION:
-        if status != STATUS_RESOLVED:
+        if status not in PINNED_STATUSES:
             raise ModelManifestError(
-                f"manifest entry '{name}': a local_conversion entry is always 'resolved' "
-                f"(its provenance is the upstream pin), got status '{status}'"
+                f"manifest entry '{name}': a local_conversion entry is always pinned by its "
+                f"upstream revision — status 'resolved' (active) or 'retained' (kept, not "
+                f"active), got '{status}'"
             )
         if repo or revision or license_id:
             raise ModelManifestError(
@@ -335,12 +360,14 @@ def _parse_entry(name: str, raw: Any) -> ManifestEntry:
                 f"manifest entry '{name}': {stray} belong only to 'source: local_conversion' "
                 f"entries"
             )
-        if status == STATUS_RESOLVED:
+        if status in PINNED_STATUSES:
             if not repo:
-                raise ModelManifestError(f"manifest entry '{name}': resolved entries need a 'repo'")
+                raise ModelManifestError(
+                    f"manifest entry '{name}': {status} entries need a 'repo'"
+                )
             if not revision or not _SHA_RE.match(revision):
                 raise ModelManifestError(
-                    f"manifest entry '{name}': resolved entries need a 40-hex commit sha in "
+                    f"manifest entry '{name}': {status} entries need a 40-hex commit sha in "
                     f"'revision', got {revision!r} — a branch name or tag is not immutable"
                 )
     expected_dim = raw.get("expected_dim")
@@ -439,8 +466,14 @@ def load_manifest(path: Path) -> ManifestLock:
 
 
 def entries_by_role(lock: ManifestLock) -> dict[str, ManifestEntry]:
+    """The ACTIVE entry for each role. A `retained` entry's `role` says
+    what it would serve, but it claims nothing here, so exactly one entry
+    is in use per role; two active entries claiming one role is an
+    unusable lock."""
     out: dict[str, ManifestEntry] = {}
     for entry in lock.entries:
+        if entry.retained:
+            continue
         for role in entry.roles:
             if role in out:
                 raise ModelManifestError(
@@ -673,7 +706,8 @@ def verify_remote(lock: ManifestLock, fetch: Fetch) -> list[EntryReport]:
                 tuple(messages)
                 or (
                     f"{what}{repo} @ {current_sha[:12]} ({current_license})"
-                    + (f" -> {entry.output_dir}" if entry.local_conversion else ""),
+                    + (f" -> {entry.output_dir}" if entry.local_conversion else "")
+                    + (" [retained, not active]" if entry.retained else ""),
                 ),
                 current_revision=current_sha,
                 current_license=current_license,
@@ -977,6 +1011,7 @@ def verify_manifest(
     root = data_root or default_data_root()
     try:
         lock = load_manifest(lock_path)
+        active = entries_by_role(lock)
     except ModelManifestError as exc:
         print(f"models verify: {exc}", file=stream)
         return 2
@@ -986,6 +1021,17 @@ def verify_manifest(
         f"resolved_at {lock.resolved_at})",
         file=stream,
     )
+    print(
+        "active by role: " + ", ".join(f"{role}={active[role].name}" for role in sorted(active)),
+        file=stream,
+    )
+    retained = [entry for entry in lock.entries if entry.retained]
+    if retained:
+        print(
+            "retained, not active: "
+            + ", ".join(f"{entry.name} ({', '.join(entry.roles)})" for entry in retained),
+            file=stream,
+        )
     problems = 0
     drift_count = 0
     unwritable_drift = 0
@@ -1131,8 +1177,11 @@ __all__ = [
     "KNOWN_SOURCES",
     "LOCAL_CONVERSION_KEYS",
     "MANIFEST_SCHEMA_VERSION",
+    "PINNED_STATUSES",
     "SOURCE_HUB",
     "SOURCE_LOCAL_CONVERSION",
+    "STATUS_RESOLVED",
+    "STATUS_RETAINED",
     "ArtifactDigest",
     "ArtifactFile",
     "EntryReport",

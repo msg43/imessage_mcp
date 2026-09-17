@@ -10,6 +10,102 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-17 — Qwen3-Reranker-0.6B pinned, buffer pool sized and prewarmed, HNSW recall raised: a whole query is p95 1.14 s
+
+A search cost p95 36 s when it was first measured and 2.1-2.3 s a day
+later. It now costs **p50 0.87 s / p95 1.14 s / max 1.28 s** end to end
+through the real MCP surface on the M2 Ultra (20 fictional queries, three
+cold starts, another job using the same disk array at 216-2,177 MB/s
+throughout). Estimated for the production host from the measured
+per-stage ratios (reranker 0.58, query embedding 0.64, PE-Core text 0.82,
+database ~1:1): **p50 1.36 s / p95 1.61 s**, inside the p95 <= 2.0 s
+budget.
+
+- **The reranker is Qwen3-Reranker-0.6B** (owner decision), pinned as a
+  local conversion like the 8B before it: `rerank_top` 20,
+  `rerank_doc_max_tokens` 256. Reproducibility was checked before
+  re-pinning — re-running the recorded recipe into a fresh directory
+  produced a byte-identical artifact (same `artifact_sha256`, all seven
+  hashed files equal). Smoke run through the factory: P(yes) 0.9981 for
+  the relevant document against 1.7e-5 for the irrelevant one, load 2.7 s,
+  inference 0.08 s, peak 0.87 GiB — against 8.09 GiB for the 8B. The
+  conversion's `tie_word_embeddings` is true, so its yes/no logits come
+  from the tied embedding matrix rather than an `lm_head`
+  (`imsg.mlx_runtime.lm_head_logits` already handled both).
+- **The lock gained `status: retained`**, so the 8B conversion stays
+  pinned, digest-checked and reproducible without claiming the `reranker`
+  role — it is kept for the Phase 4 quality comparison. `entries_by_role`
+  ignores retained entries, `imsg models verify` prints the active entry
+  per role and lists the retained ones, and the smoke harness now builds
+  *the entry it is testing* rather than whatever is active for that role
+  (without that, smoke-testing the retained 8B would have loaded the 0.6B
+  and filed its numbers under the 8B's name).
+- **`shared_buffers` 128 MB -> 3 GB, and something to fill it.** The
+  search path's working set was measured, not guessed: `pg_statio_*`
+  deltas over the 20 queries name 11 tables and 31 indexes, 2,296 MiB in
+  all — the three HNSW indexes (1,193 MiB), the two embedding tables'
+  heaps + TOAST + TOAST indexes (857 MiB, most of it `segment_embedding`'s
+  642 MiB of TOAST, which every text search detoasts) and the
+  summary-fetch and filter relations (246 MiB). `message`'s 629 MiB heap
+  is deliberately excluded: 20 queries read 17 MiB of it. 3 GB holds that
+  with 30 % headroom and leaves the production host's 64 GB for ~34 GiB of
+  query-side models and a later ~20 GiB enrichment model. Migration 0004
+  adds `pg_prewarm`; `RetrievalService.warm_up()` prewarms the whole set
+  as its last step (2,296 MiB in 14.3 s cold, 0.1 s when already
+  resident) and the instance config turns on `autoprewarm` for reboots.
+  `imsg status` now prints `shared_buffers` against the total HNSW index
+  size and warns when the pool is smaller.
+- **`retrieval.hnsw_ef_search`, default 1000** (pgvector's maximum),
+  applied with `SET LOCAL` in each vector channel's transaction. Measured
+  recall@100 against exact search at 40 / 100 / 200 / 400 / 1000: 0.944,
+  0.969, 0.989, 0.997, 1.000 (text) and 0.792, 0.887, 0.945, 0.985, 0.998
+  (image); the worst single query 0.79 and 0.38 at the old default of 40
+  against 1.00 and 0.98 at 1000. It costs ~52 ms of the two channels' p95
+  together. Filtered searches, where the iterative scan does the work,
+  were no slower at 1000 than at 40.
+- **Found by measuring: the planner abandons the HNSW index in a band of
+  `ef_search` values.** At 170-284 the text channel ran an exact
+  `Sort + Seq Scan` — 538,197 buffer hits and 245 ms against 4,032 and
+  9-18 ms — because pgvector's cost estimate for the index is not
+  monotonic in `ef_search` (3,252 at 40, 13,287 at 280, 3,719 at 285)
+  while the sequential alternative sits at a flat 8,827 and is undercosted
+  anyway: the planner "doesn't consider out-of-line storage in cost
+  estimates" (pgvector's FAQ) and the vectors it sorts are TOAST. Every
+  vector channel now sets `enable_seqscan = off` for its own transaction —
+  pgvector's documented remedy — so search latency no longer depends on
+  where a tuned `ef_search` falls against a cost curve.
+- **`check_permissions` answers during warm-up** instead of waiting for
+  it, and reports the warm-up's own state: which step is loading, how many
+  are done, the estimate, and the failure when there is one. It is how an
+  operator finds out why searches are returning `WARMING_UP`. Measured:
+  0.42-0.58 s while the models were loading.
+- **The earlier unexplained ~70 s first query did not recur** in three
+  cold starts: the first query after warm-up took 0.94-4.08 s. What is
+  left of it is localized — the query embedder's first forward pass at a
+  real shape, 0.13-3.07 s against 0.055 s afterwards; every other stage is
+  already at its steady value. The likeliest explanation for the old
+  number is the one this change set removed (cold index pages: the same
+  day's stage log shows a single query spending 16.2 s in the segment
+  vector channel and 12.9 s in the multimodal one), but it cannot be
+  re-measured, so it is not asserted.
+- **Deleted, reproducible:** the two rejected Qwen3-Reranker-4B conversions
+  and the upstream 4B snapshot in the Hugging Face cache. Both recipes were
+  re-run into fresh directories first and reproduced byte for byte, so
+  either can be rebuilt with the `models/manifest.lock.yaml` recipe form
+  (`python` = the project venv, `mlx-lm==0.31.3`):
+  - `models/qwen3-reranker-4b-mxfp8-22e68366`: `src = snapshot_download('Qwen/Qwen3-Reranker-4B',
+    revision='22e683669bc0f0bd69640a1354a6d0aebcfeede5'); convert(hf_path=src,
+    mlx_path='$DATA_ROOT/models/qwen3-reranker-4b-mxfp8-22e68366', quantize=True,
+    q_mode='mxfp8', q_bits=8, q_group_size=32)` → `artifact_sha256`
+    `93458e04b142083f925c52c133e00a7b7872c2fb7c5095d688d66fe3446a4e77` (7 files, 4,159,200,136 bytes).
+  - `models/qwen3-reranker-4b-4bit-22e68366`: the same with `q_mode='affine', q_bits=4,
+    q_group_size=64` → `f6a8b9d4be75443a8036d3326bed980cda32f48b7d0f10e14c75c60eed677650`
+    (7 files, 2,274,126,904 bytes).
+
+Suite: 1,583 passed with a scratch database (30 new tests). The instance
+config now carries `retrieval.hnsw_ef_search`, so it needs this build:
+an older checkout rejects the key (`extra inputs are not permitted`).
+
 ## 2026-09-17 — `imsg mcp local` answers the handshake immediately and warms models in the background
 
 The startup warm-up added earlier the same day ran before the server

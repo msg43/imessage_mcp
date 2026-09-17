@@ -1767,6 +1767,124 @@ def test_run_child_uses_the_given_data_root(local_lock: tuple[Path, Path], tmp_p
     assert json.loads(result_json.read_text(encoding="utf-8"))["status"] == "passed"
 
 
+# --------------------------------------------------------------------------
+# status: retained — a smoke run builds the entry it records its result under
+# --------------------------------------------------------------------------
+
+RETAINED_SHA = "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
+RETAINED_OUTPUT_DIR = "models/example-reranker-large-mxfp8-4d4d4d4d"
+RETAINED_RERANKER_TEXT = (
+    LOCAL_RERANKER_TEXT.replace("  reranker:\n", "  reranker-large:\n")
+    .replace("    status: resolved\n", "    status: retained\n")
+    .replace(LOCAL_OUTPUT_DIR, RETAINED_OUTPUT_DIR)
+    .replace(LOCAL_SHA, RETAINED_SHA)
+    .replace("example-org/Upstream-Reranker", "example-org/Upstream-Reranker-Large")
+)
+
+
+@pytest.fixture
+def retained_lock(tmp_path: Path) -> tuple[Path, Path]:
+    """`local_lock`'s active local-conversion reranker, followed by a
+    retained one for the same role; both directories under data_root."""
+    path = tmp_path / "manifest-retained.lock.yaml"
+    path.write_text(
+        LOCAL_LOCK_TEXT.replace(LOCAL_RERANKER_TEXT, LOCAL_RERANKER_TEXT + RETAINED_RERANKER_TEXT),
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "data_root"
+    _write_snapshot(data_root / LOCAL_OUTPUT_DIR, LOCAL_FILES)
+    _write_snapshot(
+        data_root / RETAINED_OUTPUT_DIR, {**LOCAL_FILES, "model.safetensors": b"larger" * 80}
+    )
+    return path, data_root
+
+
+def test_config_from_manifest_pins_the_entry_under_test_even_when_it_is_retained(
+    retained_lock: tuple[Path, Path],
+) -> None:
+    lock_path, data_root = retained_lock
+    lock = load_manifest(lock_path)
+    retained = next(e for e in lock.entries if e.name == "reranker-large")
+    assert retained.retained
+
+    active_cfg = config_from_manifest(lock, data_root=data_root)
+    assert (active_cfg.retrieval.reranker_model, active_cfg.retrieval.reranker_revision) == (
+        LOCAL_OUTPUT_DIR,
+        LOCAL_SHA,
+    )
+    cfg = config_from_manifest(lock, data_root=data_root, entry=retained)
+    assert (cfg.retrieval.reranker_model, cfg.retrieval.reranker_revision) == (
+        RETAINED_OUTPUT_DIR,
+        RETAINED_SHA,
+    )
+    # Every other role keeps its active pin.
+    assert (cfg.embedding.model, cfg.embedding.revision) == (
+        active_cfg.embedding.model,
+        active_cfg.embedding.revision,
+    )
+    assert cfg.enrichment.caption_model == active_cfg.enrichment.caption_model
+
+
+def test_smoke_testing_a_retained_entry_builds_and_records_that_entry(
+    retained_lock: tuple[Path, Path], tmp_path: Path
+) -> None:
+    lock_path, data_root = retained_lock
+    recorder = Recorder()
+    download, calls = _snapshot_downloader(tmp_path)
+    out = io.StringIO()
+    code = main(
+        [
+            "--lock",
+            str(lock_path),
+            "--in-process",
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--data-root",
+            str(data_root),
+            "--only",
+            "reranker-large",
+            "--write",
+        ],
+        deps=_main_deps(recorder),
+        downloader=download,
+        out=out,
+    )
+    assert code == 0, out.getvalue()
+    assert calls == []
+    assert recorder.reranker_pins == [(RETAINED_OUTPUT_DIR, RETAINED_SHA)]
+    by_name = {e.name: e for e in load_manifest(lock_path).entries}
+    assert by_name["reranker-large"].raw["smoke_test"]["status"] == "passed"
+    assert (
+        by_name["reranker-large"].artifact_sha256
+        == artifact_digest(data_root / RETAINED_OUTPUT_DIR).sha256
+    )
+    assert by_name["reranker-large"].retained  # --write leaves the status alone
+    assert by_name["reranker"].raw["smoke_test"] == {"status": "not_run"}
+
+
+def test_run_child_builds_the_retained_entry_it_was_asked_for(
+    retained_lock: tuple[Path, Path], tmp_path: Path
+) -> None:
+    lock_path, data_root = retained_lock
+    recorder = Recorder()
+    for name, pin in (
+        ("reranker-large", (RETAINED_OUTPUT_DIR, RETAINED_SHA)),
+        ("reranker", (LOCAL_OUTPUT_DIR, LOCAL_SHA)),
+    ):
+        recorder.reranker_pins.clear()
+        code = smoke.run_child(
+            lock_path,
+            name,
+            "reranker",
+            tmp_path / "work",
+            tmp_path / "work" / f"{name}.reranker.result.json",
+            _main_deps(recorder),
+            data_root=data_root,
+        )
+        assert code == 0
+        assert recorder.reranker_pins == [pin], name
+
+
 def test_spawn_role_hands_the_data_root_to_the_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -140,6 +140,7 @@ class _Cfg:
         rrf_k = 60
         rerank_top = 50
         default_limit = 10
+        hnsw_ef_search = 1000
 
     class _Render:
         timezone = "UTC"
@@ -627,7 +628,11 @@ def test_multimodal_channel_early_stop_matches_collapsing_every_row(
         streamed = search_multimodal_vector(scratch_db, query, predicate, k)
         row_limit = max(k * 5, 50)
         with scratch_db.transaction(), scratch_db.cursor() as cur:
+            # The same scan settings the channel itself applies, so the two
+            # run the same plan and any difference is the streaming, not the
+            # planner (imsg.retrieval.vector_search).
             cur.execute("SET LOCAL hnsw.iterative_scan = 'strict_order'")
+            cur.execute("SET LOCAL enable_seqscan = off")
             cur.execute(
                 """
                 SELECT s.segment_id, mm.vec <=> %(qv)s::halfvec AS distance

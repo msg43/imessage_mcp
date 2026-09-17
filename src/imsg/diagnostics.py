@@ -21,8 +21,11 @@ from pathlib import Path
 from imsg.config.schema import Config
 from imsg.db.connection import connect
 from imsg.db.fingerprint import verify_data_directory
+from imsg.db.prewarm import hnsw_index_bytes, shared_buffers_bytes
 from imsg.errors import ClusterFingerprintError, MountGateError, SecretResolutionError
 from imsg.mount.guard import MountInfo, guard_mount, real_diskutil_info
+
+GIB = float(2**30)
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +189,54 @@ def check_postgres(config: Config) -> PostgresCheck:
         conn.close()
 
 
+@dataclass(frozen=True, slots=True)
+class BufferPoolCheck:
+    """`shared_buffers` against the HNSW indexes it has to hold.
+
+    Vector search is only fast while its index pages are cached (300-900
+    ms cold against 7-24 ms warm, measured 2026-09-16/17), and a pool
+    smaller than the indexes cannot hold them however often they are read,
+    so this is a configuration mistake a status line should name rather
+    than leave as unexplained latency. The HNSW total is the floor, not
+    the target — the whole query path reads more (`imsg.db.prewarm`)."""
+
+    shared_buffers_bytes: int | None
+    hnsw_index_bytes: int | None
+    warning: str | None
+
+    @property
+    def holds_hnsw_indexes(self) -> bool | None:
+        if self.shared_buffers_bytes is None or self.hnsw_index_bytes is None:
+            return None
+        return self.shared_buffers_bytes >= self.hnsw_index_bytes
+
+
+def check_buffer_pool(config: Config) -> BufferPoolCheck:
+    """`shared_buffers` and the total HNSW index size, read from the live
+    instance. An unreachable database is reported as `None`s with the
+    reason, not as a failure — `check_postgres` already says it is down."""
+    try:
+        conn = connect(config.database, autocommit=True)
+    except Exception as exc:
+        return BufferPoolCheck(None, None, f"buffer pool not read: {exc}")
+    try:
+        pool = shared_buffers_bytes(conn)
+        indexes = hnsw_index_bytes(conn)
+    except Exception as exc:
+        return BufferPoolCheck(None, None, f"buffer pool not read: {exc}")
+    finally:
+        conn.close()
+    warning = None
+    if indexes and pool < indexes:
+        warning = (
+            f"shared_buffers ({pool / GIB:.2f} GiB) is smaller than the HNSW indexes "
+            f"({indexes / GIB:.2f} GiB): vector searches will read index pages from disk "
+            f"(measured 300-900 ms cold against 7-24 ms warm). Raise shared_buffers in the "
+            f"instance's postgresql.conf and restart."
+        )
+    return BufferPoolCheck(pool, indexes, warning)
+
+
 def disk_free_bytes(path: Path) -> int | None:
     """`shutil.disk_usage` on the nearest existing ancestor of `path`."""
     candidate = path
@@ -201,10 +252,13 @@ def disk_free_bytes(path: Path) -> int | None:
 
 
 __all__ = [
+    "GIB",
     "AtRestPosture",
+    "BufferPoolCheck",
     "MountCheck",
     "PostgresCheck",
     "check_at_rest_posture",
+    "check_buffer_pool",
     "check_full_disk_access",
     "check_mount",
     "check_postgres",

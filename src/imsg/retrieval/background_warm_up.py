@@ -1,5 +1,5 @@
-"""Warm the retrieval models in the background while the server already
-answers.
+"""Warm the retrieval models — and the database's buffer pool — in the
+background while the server already answers.
 
 `imsg mcp local` used to load and warm every model before it answered
 anything — 120.9 s in one run on the M2 Ultra host (2026-09-17), with
@@ -12,8 +12,9 @@ for it (`imsg.mcp.tools.local_server`).
 
 What this module promises:
 
-- **One logged pass.** `start()` logs the start, each model's completion
-  is logged with its time, then the total. A failure is logged once and
+- **One logged pass.** `start()` logs the start, each step's completion is
+  logged with its time (and with whatever the step itself returns, such as
+  how many bytes a prewarm moved), then the total. A failure is logged once and
   the models after it are not loaded: a server that cannot load one model
   answers no tool call, instead of serving with some models loaded and
   others not.
@@ -62,8 +63,13 @@ class WarmUpPhase(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class WarmUpStep:
-    """One model to warm: `run` loads it and pushes one throwaway input
-    through it; `estimated_seconds` is how long that is expected to take."""
+    """One thing to warm: `run` does it (loads a model and pushes one
+    throwaway input through it, or fills the database's buffer pool) and
+    `estimated_seconds` is how long that is expected to take.
+
+    A `run` that returns a non-empty string has that appended to its log
+    line — the step's own numbers, which only it knows (how many bytes the
+    prewarm moved, say)."""
 
     name: str
     estimated_seconds: float
@@ -117,8 +123,10 @@ def describe_failure(exc: BaseException) -> str:
     return text
 
 
-def _models(count: int) -> str:
-    return "1 model" if count == 1 else f"{count} models"
+def _steps(count: int) -> str:
+    """The warm-up's own unit: a step is a model to load or the database's
+    buffer pool to fill, so the log line cannot say "models"."""
+    return "1 step" if count == 1 else f"{count} steps"
 
 
 def log_to_stderr(line: str) -> None:
@@ -163,7 +171,7 @@ class BackgroundWarmUp:
             self._phase = WarmUpPhase.WARMING
             self._started_at = self._clock()
         names = ", ".join(step.name for step in self._steps)
-        self._log(f"warm-up started: loading {_models(len(self._steps))} in the background ({names})")
+        self._log(f"warm-up started: {_steps(len(self._steps))} in the background ({names})")
         try:
             self._model_thread.submit(self._run)
         except Exception as exc:
@@ -198,14 +206,17 @@ class BackgroundWarmUp:
                     self._step_index = index
                     self._step_started_at = step_started
                 try:
-                    step.run()
+                    detail = step.run()
                 except Exception as exc:
                     self._fail(step, describe_failure(exc), seconds=self._clock() - step_started)
                     return
-                self._log(f"{step.name} ready in {self._clock() - step_started:.1f} s")
+                described = f" ({detail})" if isinstance(detail, str) and detail.strip() else ""
+                self._log(
+                    f"{step.name} ready in {self._clock() - step_started:.1f} s{described}"
+                )
             finished = self._clock()
             total = finished - (self._started_at if self._started_at is not None else finished)
-            self._log(f"warm-up done: {_models(len(self._steps))} ready in {total:.1f} s")
+            self._log(f"warm-up done: {_steps(len(self._steps))} ready in {total:.1f} s")
             with self._condition:
                 self._phase = WarmUpPhase.READY
                 self._finished_at = finished

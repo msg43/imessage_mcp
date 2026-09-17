@@ -1,6 +1,9 @@
 """Qwen3-Reranker via MLX — the real :class:`~imsg.retrieval.reranker.
 RerankerProvider` (SPEC §4.1, §9.4 step 7: "Rerank top ``rerank_top``
-with Qwen3-Reranker-8B on (query, rendered_text) pairs").
+with Qwen3-Reranker-0.6B on (query, rendered_text) pairs"). Any
+Qwen3-Reranker size loads through it: the 8B has a separate ``lm_head``,
+the 0.6B ties it to the input embedding
+(:func:`imsg.mlx_runtime.lm_head_logits` reads either).
 
 The scoring recipe is the model card's Transformers reference, verified
 against the published card and tokenizer files (not from memory):
@@ -134,7 +137,7 @@ def _single_token_id(tokenizer: Any, token: str) -> int:
 
 
 class MlxRerankerProvider:
-    """Qwen3-Reranker-8B (or any Qwen3-Reranker size) through ``mlx_lm``.
+    """Any Qwen3-Reranker size (0.6B pinned, 8B retained) through ``mlx_lm``.
 
     Constructor arguments are plain values (the CLI reads
     ``retrieval.reranker_model`` / ``retrieval.reranker_revision`` /

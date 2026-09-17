@@ -372,6 +372,11 @@ class EmbeddingConfig(StrictModel):
 # --------------------------------------------------------------------------
 
 
+HNSW_EF_SEARCH_MAX = 1000
+"""pgvector's own upper bound for `hnsw.ef_search` (1..1000): setting
+1001 is rejected by the server (checked against pgvector 0.8.6 on the
+live instance, 2026-09-17)."""
+
 RERANKER_MODEL_FORMS = (
     "a Hugging Face repo id ('owner/name') or a directory relative to paths.data_root "
     "holding a local MLX conversion (e.g. 'models/<conversion>', the lock's output_dir)"
@@ -382,14 +387,14 @@ class RetrievalConfig(StrictModel):
     k_fts: int = Field(default=100, ge=1)
     k_vector: int = Field(default=100, ge=1)
     rrf_k: int = Field(default=60, ge=1)
-    rerank_top: int = Field(default=10, ge=1)
+    rerank_top: int = Field(default=20, ge=1)
     """How many of the fused candidates the reranker scores (SPEC §9.4
     step 7) — never fewer than a request's `limit`; candidates past the
     pool are dropped. The reranker's cost grows with the tokens it reads,
     so this and `rerank_doc_max_tokens` set search latency
     (`scripts/bench_retrieval_latency.py`; the defaults and their measured
     trade-off are in the README)."""
-    rerank_doc_max_tokens: int | None = Field(default=64, ge=1)
+    rerank_doc_max_tokens: int | None = Field(default=256, ge=1)
     """Most tokens (the reranker's own tokenizer) of each candidate's text
     the reranker reads; `null` means no cap beyond the model's 8,192-token
     row. Only the document is cut — the instruction, the query and the
@@ -411,6 +416,22 @@ class RetrievalConfig(StrictModel):
     (the lock's `upstream_revision`). The provider records
     `<reranker_model>@<reranker_revision>` as its `model_id` either way."""
     default_limit: int = Field(default=10, ge=1)
+    hnsw_ef_search: int = Field(default=1000, ge=1, le=HNSW_EF_SEARCH_MAX)
+    """`hnsw.ef_search` for every vector channel — the size of the HNSW
+    search's dynamic candidate list ("a higher value provides better recall
+    at the cost of speed", pgvector 0.8.6 README §Query Options), applied
+    with `SET LOCAL` inside each channel's own transaction
+    (`imsg.retrieval.vector_search`). pgvector's own range is 1..1000.
+
+    The default is the maximum, chosen by measurement on the live index
+    (20 fictional queries, warm pages, 2026-09-17): recall@100 against
+    exact search rises 0.944 -> 0.969 -> 0.989 -> 0.997 -> 1.000 (text) and
+    0.792 -> 0.887 -> 0.945 -> 0.985 -> 0.998 (multimodal) at 40 / 100 /
+    200 / 400 / 1000, and the worst single query rises from 0.79 and 0.38
+    to 1.00 and 0.98. It costs about 52 ms of the two channels' p95
+    together (20.7 ms at 40, 72.8 ms at 1000) — 2.6 % of a 2 s query
+    budget the reranker otherwise dominates. Filtered searches, where the
+    iterative scan does the work, were not slower at 1000 than at 40."""
 
     @field_validator("reranker_model", mode="after")
     @classmethod
@@ -706,6 +727,7 @@ class Config(StrictModel):
 PathLike = Annotated[Path, "resolved via imsg.paths helpers before use"]
 
 __all__ = [
+    "HNSW_EF_SEARCH_MAX",
     "RERANKER_MODEL_FORMS",
     "Config",
     "DatabaseConfig",
