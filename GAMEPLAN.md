@@ -16,9 +16,8 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 Every buildable component of the governing spec is implemented: 8
 pipeline stages, hybrid retrieval, both MCP surfaces, the export gate,
 the eval harness, 33 CLI commands (counting subcommands), migrations
-0001–0003. 1,315 tests (1,116 without a database, 199 integration tests
-that skip without a scratch Postgres — measured 2026-09-15); ruff and
-mypy strict clean; DDL lint clean.
+0001–0004. 1,583 tests, all passing against a scratch Postgres (measured
+2026-09-17); ruff and mypy strict clean; DDL lint clean.
 
 **This status previously read "code complete, unrun" and stayed that way
 for three weeks after it stopped being true** — see `CHANGELOG.md`
@@ -36,7 +35,13 @@ converted locally), checksummed and run once on a synthetic input through
 the factory (`scripts/smoke_test_models.py`, 2026-09-14/15; results in the
 lock). The reranker is pinned as a reproducible local `mlx_lm.convert` of
 the upstream repo since 2026-09-15, because the Hub conversion ships no
-LM head. **No model has run on the pipeline end to end**: segmentation,
+LM head; since 2026-09-17 it is the 0.6B rather than the 8B (owner
+decision, for the p95 <= 2.0 s search budget — the 8B conversion is kept
+in the lock as `status: retained` for the Phase 4 quality comparison).
+**Search now meets its latency budget end to end on the Studio**: p50
+0.87 s / p95 1.14 s through the real MCP surface, p95 1.61 s estimated
+for the production host from measured per-stage ratios (`CHANGELOG.md`
+2026-09-17). **No model has run on the pipeline end to end**: segmentation,
 embedding and retrieval quality with the real 8B / 35B weights is unknown,
 batched throughput and memory are unmeasured, and a `fake` run still
 reports success with meaningless results. Phase 1's exit criteria — seed

@@ -81,13 +81,32 @@ def test_warms_every_model_in_order_on_the_model_thread_and_logs_each(
     assert steps.ran == ["text embedder", "multimodal text tower", "reranker"]
     assert set(steps.threads) == {model_thread.thread}
     assert lines[0] == (
-        "warm-up started: loading 3 models in the background "
+        "warm-up started: 3 steps in the background "
         "(text embedder, multimodal text tower, reranker)"
     )
     assert [line.split(" ready in ")[0] for line in lines[1:4]] == steps.ran
     assert all(line.endswith(" s") for line in lines[1:])
-    assert lines[4].startswith("warm-up done: 3 models ready in ")
+    assert lines[4].startswith("warm-up done: 3 steps ready in ")
     assert len(lines) == 5
+
+
+def test_a_step_that_returns_its_own_numbers_has_them_logged(
+    model_thread: ModelThread,
+) -> None:
+    """Only the step knows what it did — how many bytes a prewarm moved,
+    say — so a string it returns is appended to its line."""
+    lines: list[str] = []
+    steps = [
+        WarmUpStep("text embedder", 1.0, lambda: None),
+        WarmUpStep("database buffer pool", 1.0, lambda: "2,296 MiB in 17 relation(s), 16.2 s"),
+        WarmUpStep("quiet step", 1.0, lambda: "   "),
+    ]
+    warm_up = BackgroundWarmUp(steps, model_thread=model_thread, log=lines.append)
+    warm_up.start()
+    assert warm_up.wait(timeout=5).phase is WarmUpPhase.READY
+    assert lines[1].startswith("text embedder ready in ") and lines[1].endswith(" s")
+    assert lines[2].endswith(" s (2,296 MiB in 17 relation(s), 16.2 s)")
+    assert lines[3].endswith(" s")  # whitespace is not a detail
 
 
 def test_start_returns_at_once_and_the_status_names_the_model_loading(

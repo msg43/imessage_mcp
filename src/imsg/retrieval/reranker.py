@@ -1,6 +1,7 @@
 """Reranker provider abstraction (SPEC §4.1, §9.4 step 7):
-"Rerank top `rerank_top` (50) with Qwen3-Reranker-8B on (query,
-rendered_text) pairs."
+"Rerank top `rerank_top` (20) with Qwen3-Reranker-0.6B on (query,
+rendered_text) pairs, each document capped at `rerank_doc_max_tokens`
+(256)."
 
 Same shape as `imsg.embed.provider`'s embedding Protocols (this build's
 established pattern): a `Protocol` the real MLX-backed model drops in
@@ -19,7 +20,8 @@ from typing import Protocol
 
 class RerankerProvider(Protocol):
     model_id: str
-    """e.g. `'Qwen/Qwen3-Reranker-8B@<revision>'`."""
+    """e.g. `'models/qwen3-reranker-0.6b-mxfp8-e61197ed@<upstream sha>'` for a
+    local conversion, `'<owner>/<repo>@<revision>'` for a Hub pin."""
 
     def score(self, query: str, documents: list[str]) -> list[float]:
         """One relevance score per document, same order as `documents`.

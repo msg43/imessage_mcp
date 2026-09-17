@@ -1,6 +1,7 @@
 """`RetrievalService.warm_up`: one throwaway input through every model
-provider, no database, so a server's first real query is not the one that
-loads the weights."""
+provider and then the database's buffer pool pulled in behind them, so a
+server's first real query pays for neither loading weights nor reading
+index pages from disk."""
 
 from __future__ import annotations
 
@@ -12,11 +13,13 @@ from typing import Any, cast
 
 import pytest
 
+from imsg.db.prewarm import PREWARM_UNAVAILABLE, PrewarmReport
 from imsg.errors import ImsgError
 from imsg.retrieval import service as service_module
 from imsg.retrieval.access import LOCAL_FULL_ACCESS
 from imsg.retrieval.model_thread import ModelThread
 from imsg.retrieval.service import (
+    BUFFER_POOL_STEP,
     ESTIMATED_WARM_UP_SECONDS,
     MULTIMODAL_STEP,
     RERANKER_STEP,
@@ -30,6 +33,36 @@ from imsg.retrieval.service import (
 class _NoDatabase:
     def __getattr__(self, name: str) -> Any:
         raise AssertionError(f"warm_up must not touch a connection (asked for {name!r})")
+
+
+class _PoolCursor:
+    """Answers only the `pg_prewarm` availability probe, with "no" — so the
+    prewarm step runs for real against this connection and reports that the
+    extension is absent, without a database."""
+
+    def __init__(self, conn: _BufferPool) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> _PoolCursor:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def execute(self, sql: str, params: Any = None) -> None:
+        assert "proname = 'pg_prewarm'" in sql, f"unexpected statement during warm-up: {sql}"
+        self._conn.probes += 1
+
+    def fetchone(self) -> tuple[Any, ...]:
+        return (False,)
+
+
+class _BufferPool:
+    def __init__(self) -> None:
+        self.probes = 0
+
+    def cursor(self) -> _PoolCursor:
+        return _PoolCursor(self)
 
 
 class _Text:
@@ -88,7 +121,9 @@ def _config(*, multimodal: bool) -> Any:
             query_instruction="find the conversation",
             multimodal=SimpleNamespace(enabled=multimodal),
         ),
-        retrieval=SimpleNamespace(default_limit=5, k_fts=10, k_vector=10, rrf_k=60, rerank_top=5),
+        retrieval=SimpleNamespace(
+            default_limit=5, k_fts=10, k_vector=10, rrf_k=60, rerank_top=5, hnsw_ef_search=1000
+        ),
         render=SimpleNamespace(timezone="America/Los_Angeles"),
     )
 
@@ -99,9 +134,10 @@ def _service(
     text: _Text,
     mm: _Multimodal | None,
     model_thread: ModelThread | None = None,
+    pg_conn: Any = None,
 ) -> RetrievalService:
     return RetrievalService(
-        pg_conn=cast(Any, _NoDatabase()),
+        pg_conn=cast(Any, pg_conn if pg_conn is not None else _BufferPool()),
         fts_conn=cast(Any, _NoDatabase()),
         config=_config(multimodal=multimodal_enabled),
         text_provider=text,
@@ -143,9 +179,48 @@ def test_warm_up_steps_name_each_model_and_its_estimated_duration() -> None:
         (TEXT_EMBEDDER_STEP, ESTIMATED_WARM_UP_SECONDS[TEXT_EMBEDDER_STEP]),
         (MULTIMODAL_STEP, ESTIMATED_WARM_UP_SECONDS[MULTIMODAL_STEP]),
         (RERANKER_STEP, ESTIMATED_WARM_UP_SECONDS[RERANKER_STEP]),
+        (BUFFER_POOL_STEP, ESTIMATED_WARM_UP_SECONDS[BUFFER_POOL_STEP]),
     ]
     text_only = _service(False, _Reranker(), _Text(), _Multimodal()).warm_up_steps()
-    assert [step.name for step in text_only] == [TEXT_EMBEDDER_STEP, RERANKER_STEP]
+    assert [step.name for step in text_only] == [
+        TEXT_EMBEDDER_STEP,
+        RERANKER_STEP,
+        BUFFER_POOL_STEP,
+    ]
+
+
+def test_the_buffer_pool_is_warmed_last_on_the_service_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The models come first (nothing is answerable without them); the pool
+    is pulled in behind them, on the service's own connection, and the step
+    reports what it moved so the server's log says so."""
+    pool = _BufferPool()
+    calls: list[Any] = []
+    report = PrewarmReport(
+        relations=17, blocks=294_000, bytes_prewarmed=294_000 * 8192, seconds=16.2
+    )
+
+    def fake_prewarm(conn: Any) -> PrewarmReport:
+        calls.append(conn)
+        return report
+
+    monkeypatch.setattr(service_module, "prewarm_query_path", fake_prewarm)
+    service = _service(True, _Reranker(), _Text(), _Multimodal(), pg_conn=pool)
+    steps = service.warm_up_steps()
+    assert steps[-1].name == BUFFER_POOL_STEP
+    assert steps[-1].run() == report.summary
+    assert calls == [pool]
+
+
+def test_a_buffer_pool_that_cannot_be_warmed_does_not_fail_the_warm_up() -> None:
+    """A cold pool is slow, not wrong: the step reports the cause and the
+    server still serves (contrast a model that cannot load, above)."""
+    pool = _BufferPool()
+    service = _service(True, _Reranker(), _Text(), _Multimodal(), pg_conn=pool)
+    assert service.warm_up() >= 0.0
+    assert pool.probes == 1
+    assert service.warm_up_steps()[-1].run() == PREWARM_UNAVAILABLE
 
 
 def test_with_a_model_thread_every_model_call_runs_there() -> None:

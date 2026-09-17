@@ -397,7 +397,7 @@ def test_repo_lock_is_well_formed() -> None:
         if entry.local_conversion:
             # Provenance is the upstream pin plus the recorded, reproducible
             # command; the directory itself has no Hub repo/revision.
-            assert entry.status == "resolved", entry.name
+            assert entry.status in {"resolved", "retained"}, entry.name
             assert (entry.repo, entry.revision, entry.license) == (None, None, None), entry.name
             assert entry.upstream_repo and "/" in entry.upstream_repo, entry.name
             assert entry.upstream_revision and re.fullmatch(
@@ -416,7 +416,7 @@ def test_repo_lock_is_well_formed() -> None:
                 f"{entry.name}: the command must write to $DATA_ROOT/<output_dir>"
             )
             assert "/Volumes/" not in entry.command, entry.name
-        elif entry.status == "resolved":
+        elif entry.status in {"resolved", "retained"}:
             assert entry.repo and "/" in entry.repo, entry.name
             assert entry.revision and re.fullmatch(r"[0-9a-f]{40}", entry.revision), entry.name
             assert entry.license, entry.name
@@ -620,7 +620,7 @@ def test_local_conversion_entry_parses_with_its_provenance(local_lock: tuple[Pat
         (
             "    status: resolved\n    source: local_conversion\n",
             "    status: system\n    source: local_conversion\n",
-            "always 'resolved'",
+            "'resolved' (active) or 'retained' (kept, not active)",
         ),
         ("    artifact_sha256: null\n", "    artifact_sha256: not-a-digest\n", "64-hex sha256"),
     ],
@@ -885,3 +885,150 @@ def test_main_and_cli_accept_data_root_and_skip_artifacts(local_lock: tuple[Path
         )
         == 0
     )
+
+
+def test_repo_lock_pins_the_0_6b_as_the_active_reranker_and_retains_the_8b() -> None:
+    """Exactly one reranker is active; the replaced 8B conversion stays in
+    the lock, verified, but claims no role."""
+    lock = load_manifest(default_manifest_path())
+    active = entries_by_role(lock)["reranker"]
+    assert (active.name, active.status) == ("qwen3-reranker-0.6b", "resolved")
+    assert active.local_conversion and active.upstream_repo == "Qwen/Qwen3-Reranker-0.6B"
+    retained = [e for e in lock.entries if e.retained]
+    assert [(e.name, e.roles) for e in retained] == [("qwen3-reranker-8b", ("reranker",))]
+    assert retained[0].local_conversion and retained[0].artifact_sha256 is not None
+    assert [e.name for e in lock.entries if "reranker" in e.roles and not e.retained] == [
+        active.name
+    ]
+
+
+# --------------------------------------------------------------------------
+# status: retained — pinned and verified like a resolved entry, serving no role
+# --------------------------------------------------------------------------
+
+RETAINED_UPSTREAM = "example-org/Upstream-Reranker-Large"
+RETAINED_SHA = "cccccccccccccccccccccccccccccccccccccccc"
+RETAINED_OUTPUT_DIR = "models/upstream-reranker-large-mxfp8-cccccccc"
+RETAINED_ENTRY_TEXT = (
+    LOCAL_ENTRY_TEXT.replace("  converted-reranker:\n", "  retained-reranker:\n")
+    .replace("    status: resolved\n", "    status: retained\n")
+    .replace(OUTPUT_DIR, RETAINED_OUTPUT_DIR)
+    .replace(UPSTREAM_SHA, RETAINED_SHA)
+    .replace(UPSTREAM, RETAINED_UPSTREAM)
+)
+
+
+@pytest.fixture
+def retained_lock(local_lock: tuple[Path, Path]) -> tuple[Path, Path]:
+    """`local_lock` plus a retained conversion for the same role, both
+    directories under data_root and both digests recorded."""
+    lock_path, data_root = local_lock
+    directory = data_root / RETAINED_OUTPUT_DIR
+    directory.mkdir(parents=True)
+    (directory / "config.json").write_text('{"model_type": "example-large"}', encoding="utf-8")
+    (directory / "model.safetensors").write_bytes(b"larger-weights" * 128)
+    _record_digest(lock_path, artifact_digest(data_root / OUTPUT_DIR).sha256)
+    retained = RETAINED_ENTRY_TEXT.replace(
+        "artifact_sha256: null", f"artifact_sha256: '{artifact_digest(directory).sha256}'"
+    )
+    lock_path.write_text(lock_path.read_text(encoding="utf-8") + retained, encoding="utf-8")
+    return lock_path, data_root
+
+
+def _all_three_unchanged() -> Any:
+    return _stub_fetch(
+        {
+            hf_model_url(REPO): _info(PINNED),
+            hf_model_url(UPSTREAM): _info(UPSTREAM_SHA),
+            hf_model_url(RETAINED_UPSTREAM): _info(RETAINED_SHA),
+        }
+    )
+
+
+def test_a_retained_entry_is_pinned_but_claims_no_role(retained_lock: tuple[Path, Path]) -> None:
+    lock_path, _ = retained_lock
+    lock = load_manifest(lock_path)
+    by_name = {e.name: e for e in lock.entries}
+    retained = by_name["retained-reranker"]
+    assert retained.retained and retained.status == "retained"
+    assert retained.local_conversion and retained.roles == ("reranker",)
+    assert retained.hub_pin == (RETAINED_UPSTREAM, RETAINED_SHA, "apache-2.0")
+    assert (retained.config_model, retained.config_revision) == (RETAINED_OUTPUT_DIR, RETAINED_SHA)
+    assert not by_name["converted-reranker"].retained
+    assert entries_by_role(lock)["reranker"].name == "converted-reranker"
+
+
+def test_verify_names_the_active_entry_per_role_and_checks_the_retained_one_too(
+    retained_lock: tuple[Path, Path],
+) -> None:
+    lock_path, data_root = retained_lock
+    code, out = _run_local(lock_path, data_root=data_root, fetch=_all_three_unchanged())
+    assert code == 0, out
+    assert (
+        "active by role: caption=unresolved-thing, ocr=system-ocr, "
+        "reranker=converted-reranker, text_embedding=text-embedder\n"
+    ) in out
+    assert "retained, not active: retained-reranker (reranker)" in out
+    assert re.search(
+        rf"ok\s+retained-reranker\s+upstream {re.escape(RETAINED_UPSTREAM)} @ "
+        rf"{RETAINED_SHA[:12]} \(apache-2.0\) -> {re.escape(RETAINED_OUTPUT_DIR)} "
+        rf"\[retained, not active\]",
+        out,
+    )
+    assert re.search(r"ok\s+converted-reranker\s+'.*artifact_sha256 matches", out)
+    assert re.search(r"ok\s+retained-reranker\s+'.*artifact_sha256 matches", out)
+    assert "models verify: clean" in out
+
+
+def test_a_retained_conversion_is_verified_like_an_active_one(
+    retained_lock: tuple[Path, Path],
+) -> None:
+    lock_path, data_root = retained_lock
+    shutil.rmtree(data_root / RETAINED_OUTPUT_DIR)
+    code, out = _run_local(lock_path, data_root=data_root, fetch=_all_three_unchanged())
+    assert code == 1
+    assert "ERROR    retained-reranker" in out
+    assert f"'{RETAINED_OUTPUT_DIR}' is not a directory under data_root" in out
+
+    fetch = _stub_fetch(
+        {
+            hf_model_url(REPO): _info(PINNED),
+            hf_model_url(UPSTREAM): _info(UPSTREAM_SHA),
+            hf_model_url(RETAINED_UPSTREAM): _info(MOVED),
+            hf_model_url(RETAINED_UPSTREAM, RETAINED_SHA): _info(RETAINED_SHA),
+        }
+    )
+    code, out = _run_local(lock_path, fetch=fetch, skip_artifacts=True, write=True)
+    assert code == 1
+    assert "DRIFT    retained-reranker" in out
+    assert "1 local conversion(s) whose upstream moved" in out
+
+
+def test_two_active_entries_for_one_role_are_an_unusable_lock(
+    retained_lock: tuple[Path, Path],
+) -> None:
+    lock_path, data_root = retained_lock
+    text = lock_path.read_text(encoding="utf-8")
+    both_active = text.replace("    status: retained\n", "    status: resolved\n")
+    assert both_active != text
+    lock_path.write_text(both_active, encoding="utf-8")
+    code, out = _run_local(lock_path, data_root=data_root, fetch=_all_three_unchanged())
+    assert code == 2
+    assert "role 'reranker' is claimed by both 'converted-reranker' and 'retained-reranker'" in out
+
+
+def test_a_retained_hub_entry_needs_a_full_pin(tmp_path: Path) -> None:
+    path = tmp_path / "lock.yaml"
+    retained_hub = LOCK_TEXT.replace(
+        "  text-embedder:\n    role: [text_embedding]\n    status: resolved\n",
+        "  text-embedder:\n    role: [text_embedding]\n    status: retained\n",
+    )
+    assert retained_hub != LOCK_TEXT
+    path.write_text(retained_hub, encoding="utf-8")
+    entry = next(e for e in load_manifest(path).entries if e.name == "text-embedder")
+    assert entry.retained and entry.hosted
+    assert "text_embedding" not in entries_by_role(load_manifest(path))
+
+    path.write_text(retained_hub.replace(f"    revision: {PINNED}\n", "    revision: main\n", 1), encoding="utf-8")
+    with pytest.raises(ModelManifestError, match=r"retained entries need a 40-hex commit sha"):
+        load_manifest(path)

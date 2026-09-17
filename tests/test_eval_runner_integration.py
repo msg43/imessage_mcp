@@ -115,6 +115,7 @@ class _Cfg:
         rrf_k = 60
         rerank_top = 50
         default_limit = 10
+        hnsw_ef_search = 1000
 
     class _Render:
         timezone = "UTC"

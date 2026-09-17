@@ -191,11 +191,18 @@ notes). The lock therefore pins the reranker as `source: local_conversion`:
 the upstream repo and commit sha, the license, the converter
 (`mlx-lm==0.31.3`), the exact `command` that produces it, its
 `output_dir` relative to `paths.data_root`, and the `artifact_sha256` of
-that directory. To reproduce it, run the recorded command with
-`$DATA_ROOT` set to your data root and the `models` extra installed
-(about 16 seconds on an M2 Ultra; 7.9 GiB on disk), then
-`scripts/smoke_test_models.py --only qwen3-reranker-8b --data-root
-$DATA_ROOT` to confirm the digest. In `config.yaml`,
+that directory. The pinned reranker is **Qwen3-Reranker-0.6B** (0.58 GiB
+on disk) since 2026-09-17, for the latency budget below; the 8B
+conversion stays in the lock as `status: retained` — pinned and verified
+exactly like an active entry, claiming no role, kept for a
+retrieval-quality comparison. `imsg models verify` prints which entry is
+active for every role and lists the retained ones separately. To
+reproduce a conversion, run the recorded command with `$DATA_ROOT` set to
+your data root and the `models` extra installed (a few seconds for the
+0.6B, about 16 for the 8B), then
+`scripts/smoke_test_models.py --only qwen3-reranker-0.6b --data-root
+$DATA_ROOT` to confirm the digest — re-running the 0.6B recipe on
+2026-09-17 reproduced its artifact byte for byte. In `config.yaml`,
 `retrieval.reranker_model` names that directory (data-root-relative) and
 `retrieval.reranker_revision` the *upstream* commit; the factory reads
 the value as a local directory when it exists under the data root and as
@@ -206,40 +213,60 @@ directory's digest against the lock, and checks the runtimes; `--write`
 never advances an upstream pin (the directory was converted from the
 pinned commit — re-convert and re-pin by hand to move it).
 
-**Search latency is how much the reranker reads.** Measured 2026-09-16 on
-an M2 Ultra with `scripts/bench_retrieval_latency.py` (20 fictional
-queries against the real index): the pinned Qwen3-Reranker-8B conversion
-reads roughly 650-780 tokens a second plus a few tens of milliseconds per
-forward pass, its
-chat template, instruction and the query put 76-80 tokens into every pair
-before any document text, and scoring 50 uncapped candidates meant
-~20,000 tokens a query — p95 36 s end
-to end (83 s before its batches were length-sorted). Once warm, the rest
-of `search_messages` — the two query embeddings, the vector and full-text
-searches, fusion — took p95 0.25-0.31 s, the database part of it about
-60 ms when the index pages are cached (see below). Two settings therefore
-decide latency: `retrieval.rerank_top`, how many fused candidates are
-scored (never fewer than the request's `limit`), and
-`retrieval.rerank_doc_max_tokens`, how many reranker tokens of each
-candidate are read — the document only, but counting the rendered
-segment's `Chat:`/`Time:` header (~40 tokens for two participants). The
-defaults, 10 and 64 (p95 1.97 s of reranking here), are the fastest
-setting whose ranking the benchmark could not tell apart from the fused
-order it replaces: at 32 tokens (1.56 s) the reranker sees only part of
-the header and ordered results worse, and no larger setting of the pinned
-model comes near a 2 s budget. The benchmark's quality columns are a
-proxy — agreement with scoring 50 uncapped candidates — not an
-evaluation: re-run it before moving either setting, and let the eval
-harness settle what latency costs. `imsg mcp local` answers the MCP
-handshake at once and loads and warms every model in the background,
-logging each model's time and the total on stderr: warming first took
-121 s on 2026-09-17, and Claude Code gives up on a server that has not
-answered the handshake within `MCP_TIMEOUT`, 30 s by default. A tool call
-that arrives during warm-up waits up to 90 s for it, then returns
-`WARMING_UP` with an estimate of the seconds remaining; a model that
-fails to load makes every tool call return `WARM_UP_FAILED` with the
-cause. A server that loads lazily spends its first query there instead —
-92 s of loading and first-call compilation measured.
+**Search latency: the reranker's size, and whether the index is in
+memory.** Measured end to end through the real MCP surface on an M2 Ultra
+on 2026-09-17 — `imsg mcp local` under a stdio client, 20 fictional
+queries, three cold starts, with another job using the same disk array at
+216-2,177 MB/s throughout — a whole `search_messages` round trip took
+**p50 0.87 s, p95 1.14 s, max 1.28 s**. Where it goes, p95 per stage:
+reranking 0.67 s, the full-text channel 0.24 s, the two vector channels
+0.05 and 0.03 s, the query embedding 0.06 s, the multimodal text tower
+0.02 s, summary fetch 0.002 s, the audit row 0.07 s.
+
+Three settings decide most of that, and all three were chosen by
+measurement rather than taste:
+
+- **Which reranker.** Qwen3-Reranker-0.6B, at `retrieval.rerank_top` 20
+  and `retrieval.rerank_doc_max_tokens` 256. The 8B conversion pinned
+  before it reads roughly 650-780 tokens a second here: scoring 50
+  uncapped candidates meant ~20,000 tokens and a p95 of 36 s, and its
+  fastest setting that fit a budget (10 candidates, 64 tokens, p95 1.97 s
+  of reranking) agreed with its own full ranking no better than doing no
+  reranking at all. How many candidates are reranked matters more than
+  the reranker's size: with 10, the returned top 10 *is* the fused top 10
+  in another order, so reranking cannot lift anything from further down.
+- **How much of the HNSW index each search reads.**
+  `retrieval.hnsw_ef_search`, applied with `SET LOCAL` in each channel's
+  own transaction, defaults to 1000 — pgvector's maximum. On the live
+  index, recall@100 against exact search rises 0.944 -> 1.000 (text
+  channel) and 0.792 -> 0.998 (image channel) from pgvector's default of
+  40 to 1000, and the worst single query rises from 0.79 and 0.38 to 1.00
+  and 0.98, for about 50 ms more per query.
+- **Whether the pages are cached.** See "Things that will bite you" below:
+  `shared_buffers` holds the search working set, `pg_prewarm` fills it at
+  startup, and `imsg status` says so.
+
+`scripts/bench_retrieval_latency.py` sweeps the reranker settings against
+the real index and reports a quality *proxy* — agreement with scoring 50
+uncapped candidates, not an evaluation. Re-run it before moving either
+setting, and let the eval harness settle what latency costs.
+
+**Startup.** `imsg mcp local` answers the MCP handshake in about 1 s
+(Claude Code gives up on a server that has not answered within
+`MCP_TIMEOUT`, 30 s by default) and warms up in the background, logging
+each step's time on stderr: text embedder 4.8-12.5 s, PE-Core text tower
+33.8-50.2 s, reranker 2.7-3.2 s, database buffer pool 0.1-14.3 s —
+41.8-65.4 s in all, against 121 s before the 0.6B was pinned. A retrieval
+tool call that arrives during warm-up waits up to 90 s for it, then
+returns `WARMING_UP` with an estimate of the seconds remaining; a model
+that fails to load makes every such call return `WARM_UP_FAILED` with the
+cause. `check_permissions` is the exception: it is diagnostics, so it
+answers straight away and carries the warm-up's own state (which step is
+loading, how many are done, the estimate, the failure) — the way to find
+out what a server that is not answering searches is doing. The first
+query after warm-up still costs a little more than the rest (0.94-4.08 s
+against a 0.87 s median), and the extra is the query embedder's first
+forward pass at a real shape: 0.13-3.07 s against 0.055 s afterwards.
 
 | Interface | What it needs |
 |---|---|
@@ -296,7 +323,27 @@ Learned the expensive way; written down so you don't have to.
   volume (2026-09-16): queries whose pages the OS had not cached took p95
   302 ms (text vectors) and 609 ms (image vectors), against 37 ms and
   70 ms once the index files were in the page cache — and with another
-  job's heavy I/O on the same disk, several seconds each.
+  job's heavy I/O on the same disk, several seconds each. The fix is in
+  three parts: `shared_buffers` sized to hold what search reads (measured
+  with `pg_statio_*` deltas over the benchmark queries — 2,296 MiB here,
+  of which 1,193 MiB is the three HNSW indexes and 857 MiB the embedding
+  tables' TOAST), `pg_prewarm` (migration 0004) filling it — at every
+  server start via `RetrievalService.warm_up()`, and after a reboot via
+  `pg_prewarm.autoprewarm` — and `imsg status`, which prints
+  `shared_buffers` against the total HNSW index size and warns when the
+  pool is the smaller of the two.
+- **The planner can abandon an HNSW index at some `ef_search` values, and
+  that is not a monotonic effect.** pgvector's own cost estimate bounds
+  layer-0 tuples by `ef_search` while its selectivity term carries
+  `log(ef_search)` in a denominator, so the estimated cost climbs and
+  then drops back: on this index it was 3,252 at `ef_search` 40, 13,287
+  at 280 and 3,719 at 285, against a flat 8,827 for the sequential
+  alternative — which the planner undercosts anyway, because (pgvector's
+  own FAQ) it "doesn't consider out-of-line storage in cost estimates"
+  and the vectors it would sort are 642 MiB of TOAST. Between 170 and 284
+  the same query took 245 ms instead of 9 ms, exactly and only because of
+  the plan. Every vector channel therefore sets `enable_seqscan = off`
+  for its own transaction, pgvector's documented remedy.
 
 ---
 

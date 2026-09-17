@@ -31,13 +31,18 @@ loop, so pings and other requests are still answered — for at most
 with an estimate of the seconds remaining. A warm-up that failed turns
 every tool call into a `WARM_UP_FAILED` error naming the cause. Both are
 ordinary SPEC §10.1-style tool errors, audited like any other; arguments
-that fail the schema are rejected at once, without waiting.
+that fail the schema are rejected at once, without waiting. So is
+`check_permissions`, which is diagnostics rather than retrieval: it
+answers straight away and carries the warm-up's own state
+(`warm_up_report`), so the operator asking "what is this server doing?"
+gets an answer while it is doing it.
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
+import math
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -65,6 +70,8 @@ if TYPE_CHECKING:
     from imsg.retrieval.access import AccessContext
     from imsg.retrieval.background_warm_up import BackgroundWarmUp, WarmUpStatus
     from imsg.retrieval.service import RetrievalService
+
+
 
 SERVER_NAME = "imsg-local"
 
@@ -112,6 +119,25 @@ def _to_mcp_tool(definition: ToolDefinition) -> types.Tool:
 
 WARM_UP_POLL_SECONDS = 0.1
 """How often a waiting tool call re-checks the warm-up."""
+
+
+def warm_up_report(status: WarmUpStatus) -> dict[str, Any]:
+    """The warm-up as `check_permissions` reports it: which phase the
+    server is in (`not_started`, `warming`, `ready`, `failed`), what it is
+    loading right now, how many steps are done, an estimate of the seconds
+    left, and — when it failed — the cause. Every retrieval tool is
+    unavailable until this says `ready`, so this is the field that explains
+    a `WARMING_UP` or `WARM_UP_FAILED` answer from any of them."""
+    return {
+        "state": status.phase.value,
+        "loading": status.loading,
+        "steps_done": status.steps_done,
+        "steps_total": status.steps_total,
+        "seconds_remaining": (
+            None if status.settled else max(1, math.ceil(status.seconds_remaining))
+        ),
+        "failure": status.failure,
+    }
 
 
 def _schema_error(definition: ToolDefinition, arguments: dict[str, Any]) -> str | None:
@@ -181,17 +207,6 @@ class LocalMcpServer:
                 is_error=True,
             )
 
-        real_handler: Callable[[], dict[str, Any]]
-        if name == "check_permissions":
-
-            def real_handler() -> dict[str, Any]:
-                return handlers.check_permissions(config=self.config, conn=self.conn)
-        else:
-            tool_fn = _RETRIEVAL_HANDLERS[name]
-
-            def real_handler() -> dict[str, Any]:
-                return tool_fn(self.service, LOCAL_FULL_ACCESS, arguments)
-
         handler: Callable[[], dict[str, Any]]
         schema_error = _schema_error(definition, arguments)
         if schema_error is not None:
@@ -199,12 +214,26 @@ class LocalMcpServer:
 
             def handler() -> dict[str, Any]:
                 raise InvalidArgumentError(violation)
+        elif name == "check_permissions":
+            # Diagnostics, not retrieval: it needs no model, and it is how
+            # an operator asks what the server is doing — including while
+            # it is still loading. Making it wait for the warm-up (or
+            # answer `WARMING_UP`) would withhold the answer exactly when
+            # the question is being asked, so it answers now and says how
+            # the warm-up is going.
+            status = self.warm_up.status()
+
+            def handler() -> dict[str, Any]:
+                payload = handlers.check_permissions(config=self.config, conn=self.conn)
+                payload["warm_up"] = warm_up_report(status)
+                return payload
         else:
+            tool_fn = _RETRIEVAL_HANDLERS[name]
             warm_up = await self._settled_warm_up()
 
             def handler() -> dict[str, Any]:
                 warm_up.raise_unless_ready(wait_bound_seconds=self.warm_up_wait_seconds)
-                return real_handler()
+                return tool_fn(self.service, LOCAL_FULL_ACCESS, arguments)
 
         result = call_tool(
             self.audit, tool=name, params=arguments, handler=handler, started=started
@@ -252,4 +281,9 @@ async def run_local_server(local: LocalMcpServer) -> None:
                 sys.stdout.flush()
 
 
-__all__ = ["TOOL_CALL_WARM_UP_WAIT_SECONDS", "LocalMcpServer", "run_local_server"]
+__all__ = [
+    "TOOL_CALL_WARM_UP_WAIT_SECONDS",
+    "LocalMcpServer",
+    "run_local_server",
+    "warm_up_report",
+]
