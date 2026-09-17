@@ -10,6 +10,94 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-17 — Extraction is idempotent in state, not just identity: an unchanged re-extraction now writes nothing
+
+Re-extracting a corpus whose content had not changed moved
+`message.updated_at` on **662,683 of 673,113 rows** for **972** genuinely
+new messages. S4's `find_dirty_chats` keys on that column, so **8,463 of
+8,569 chats** read as dirty and **8,331** had their incremental frontier
+dragged back to the chat's first message — proposing to discard and
+rebuild about **17 hours** of correct segmentation and embedding for no
+content change at all. Found while cutting the index over to its
+production host.
+
+The cause was not the `updated_at` trigger (migration 0003), which is
+right and unchanged: it exists precisely so no UPDATE can forget to move
+the column. The cause was S2 performing UPDATEs it had no reason to
+perform. Every `ON CONFLICT DO UPDATE` fired unconditionally, rewriting
+each in-scope row with its own values.
+
+- **Every upsert in `imsg.stages.extract` now carries an explicit
+  `WHERE <target>.col IS DISTINCT FROM excluded.col OR ...` guard**, so a
+  row whose content is unchanged is not written at all and the trigger
+  never fires. `IS DISTINCT FROM`, not `<>`: half these columns are
+  nullable, and `<>` against NULL yields NULL, so a message that gained
+  or lost a body would read as unchanged for good (proven in both
+  directions, plus NULL-to-NULL as the control, rather than assumed).
+- **The compared columns are exactly the assigned columns**, on both
+  sides of the rule. Compare a column the SET does not write and the row
+  updates on every run forever — the original defect made permanent.
+  Write one the WHERE does not compare and a genuine change to it alone
+  is dropped. For `message` that set is `text_original`,
+  `text_normalized`, `is_unsent`, `is_edited`, `date_edited`,
+  `has_attachments`, `sent_at`, `is_from_me` and
+  `sender_source_handle_id` — read off what `imsg.segment.pipeline`
+  actually selects, plus what S3 joins on to resolve the rendered
+  sender. `sender_source_handle_id`, `sent_at` and `is_from_me` were not
+  previously corrected on re-extraction at all; they are now.
+- **`chat_id` is deliberately still first-write-wins**, and not because
+  it is unimportant — it matters more than most of the list. The
+  incoming value is not trustworthy: `fetch_target_messages` derives it
+  from `chat_message_join ... LIMIT 1` with no `ORDER BY`, so for a
+  message in more than one chat SQLite may return either, and
+  reassigning per run would flap the row between chats forever and
+  orphan the `segment_message` rows placing it. Correcting a genuinely
+  wrong chat association needs a deterministic choice first — a separate
+  change, not a side effect of this one. `service` and `reply_to_guid`
+  are excluded for the ordinary reason: nothing downstream reads either
+  column, so a stale value cannot affect rendering or retrieval.
+- **`message_source` is the one upsert left unguarded**, on purpose:
+  `extraction_run_id` means "the run that last observed this row", so a
+  new run id is a real change by construction and a guard could never
+  skip anything. It carries no `updated_at` and nothing watches it, so
+  it drags no re-segmentation behind it — the cost is table churn, not
+  17 hours of recomputed embeddings. Every other upsert (`chat`,
+  `source_handle`, `attachment`, `attachment_source`, `message_version`,
+  `tapback`, `link_preview`) is guarded; the join tables were already
+  `ON CONFLICT DO NOTHING`. `source_handle`'s `DO UPDATE SET raw_value =
+  EXCLUDED.raw_value` — a no-op write performed purely so `RETURNING`
+  would fire — is gone; a `UNION ALL` branch supplies the id at no write
+  cost, and the same shape gives every guarded upsert its row id back.
+- **Counts now distinguish inserted / genuinely updated / unchanged**
+  (`ExtractResult.message_upserts` and friends, printed by `imsg extract`
+  and `imsg sync`, and persisted by **migration 0005** as
+  `extraction_run.messages_inserted/_updated/_unchanged`).
+  `messages_upserted` keeps its original meaning — rows processed — so
+  nothing reading it changes; the split is what makes it legible. "662,683
+  upserted" reads identically whether a run corrected the corpus or
+  rewrote it with its own values, and that ambiguity is what let this
+  defect sit unnoticed. The new columns are nullable and unbackfilled:
+  runs recorded before 0005 genuinely do not know their split, and zeros
+  would assert "nothing was written" about exactly the runs that wrote
+  the most.
+- **Verified against rows, not reasoning**
+  (`tests/test_extract_unchanged_rows_stay_untouched_integration.py`,
+  seven tests, all seven failing before the fix). The suite segments the
+  corpus and resolves its identities before taking the baseline, so
+  `find_dirty_chats` has real segments to compare against and could fail
+  for the right reason; it then compares every row's `xmin` — which moves
+  on any rewrite, including on tables with no `updated_at` at all — across
+  a re-extraction. After the fix: zero rows rewritten outside
+  `message_source`, `find_dirty_chats` empty, and on a real run's
+  `extraction_run` row `(upserted 3, inserted 0, updated 0, unchanged 3)`
+  with every `updated_at` still equal to its `created_at`. Changing one
+  message's body moves exactly that row and dirties exactly its chat; a
+  new message in an existing chat dirties only that chat; and S3's
+  deliberate bump (`rename_person` -> `_mark_chats_dirty_for_persons`)
+  still marks every message of the affected chat, asserted immediately
+  after a no-op re-extraction so a regression would show as an empty
+  dirty set rather than be masked by S2's churn.
+
 ## 2026-09-17 — Qwen3-Reranker-0.6B pinned, buffer pool sized and prewarmed, HNSW recall raised: a whole query is p95 1.14 s
 
 A search cost p95 36 s when it was first measured and 2.1-2.3 s a day

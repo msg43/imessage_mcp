@@ -62,6 +62,36 @@ documents" (SPEC §7.2). So a target row whose `imsg-dump` record has a
 non-null `tapback` field is written to the `tapback` table only; no
 `message` row is created for it at all.
 
+**Idempotence is about state, not just identity (2026-09-17)**: every
+upsert here keys on a chat.db GUID, so a second run over the same
+corpus has always produced no duplicate rows. That is identity
+idempotence, and it is not enough. Until this date each `ON CONFLICT DO
+UPDATE` fired unconditionally, rewriting every in-scope row with its
+own values; migration 0003's trigger then moved `updated_at` on all of
+them, exactly as it is supposed to for a real UPDATE. S4's
+`find_dirty_chats` keys on that column, so an unchanged re-extraction
+proposed discarding and rebuilding the segmentation and embeddings for
+effectively the whole corpus (measured on the target host: 662,683 of
+673,113 message rows bumped for 972 genuinely new messages, dragging
+8,331 chats' incremental frontier back to their first message).
+
+Each upsert below therefore carries an explicit
+`WHERE <target>.col IS DISTINCT FROM excluded.col OR ...` guard, and a
+row whose content is unchanged is not written at all. Two rules keep
+that honest:
+
+  * **The compared columns are exactly the assigned columns.** Compare
+    a column the SET does not write and the row updates on every run
+    forever (the value never converges), which is the original bug made
+    permanent. Write a column the WHERE does not compare and a genuine
+    change to it alone is silently dropped.
+  * **`IS DISTINCT FROM`, never `<>`.** Half these columns are
+    nullable; `<>` against NULL evaluates to NULL, so a message that
+    gained a body — or lost one — would read as unchanged for good.
+
+Which columns those are, and why the others are left first-write-wins,
+is documented on `_upsert_message` and `_upsert_attachment`.
+
 **System/group-action messages**: chat.db also carries non-conversational
 rows (member added/removed, group name changed, ...) via a nonzero
 `item_type` column. Migration 0001 has no dedicated table for these —
@@ -78,8 +108,9 @@ from __future__ import annotations
 
 import plistlib
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -529,6 +560,62 @@ def parse_link_preview(payload_data: bytes | None) -> LinkPreview | None:
 # --------------------------------------------------------------------------
 
 
+class UpsertOutcome(StrEnum):
+    """What one upsert statement actually did to its row."""
+
+    INSERTED = "inserted"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+    """The row already held exactly these values, so no UPDATE was
+    performed at all — no new row version, and migration 0003's trigger
+    never fired, so `updated_at` did not move."""
+
+
+@dataclass(frozen=True, slots=True)
+class UpsertCounts:
+    """How an upsert loop landed, split three ways.
+
+    `total` is the number of rows the loop processed, which is what the
+    `*_upserted` fields below have always reported — the split is the
+    part an operator needs to trust a re-extraction. "Upserted: 662,683"
+    reads identically whether the run corrected 662,683 rows or
+    rewrote them with their own values; `unchanged=662,683` says
+    plainly that the run wrote nothing, moved no `updated_at`, and
+    therefore proposes no re-segmentation downstream.
+    """
+
+    inserted: int = 0
+    updated: int = 0
+    unchanged: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.inserted + self.updated + self.unchanged
+
+
+@dataclass(slots=True)
+class _UpsertTally:
+    """Mutable accumulator for `UpsertCounts` (which is frozen, as every
+    field of `ExtractResult` is)."""
+
+    inserted: int = 0
+    updated: int = 0
+    unchanged: int = 0
+
+    def record(self, outcome: UpsertOutcome) -> None:
+        if outcome is UpsertOutcome.INSERTED:
+            self.inserted += 1
+        elif outcome is UpsertOutcome.UPDATED:
+            self.updated += 1
+        else:
+            self.unchanged += 1
+
+    def freeze(self) -> UpsertCounts:
+        return UpsertCounts(
+            inserted=self.inserted, updated=self.updated, unchanged=self.unchanged
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ExtractResult:
     run_id: int
@@ -546,6 +633,21 @@ class ExtractResult:
     all (a boundary anomaly, distinct from the shim's own per-row
     null-body degrade, which *does* appear)."""
     dump_stderr_line_count: int
+    chat_upserts: UpsertCounts = field(default_factory=UpsertCounts)
+    handle_upserts: UpsertCounts = field(default_factory=UpsertCounts)
+    message_upserts: UpsertCounts = field(default_factory=UpsertCounts)
+    attachment_upserts: UpsertCounts = field(default_factory=UpsertCounts)
+    """Inserted / genuinely updated / left untouched, for the four
+    entities whose upserts return a row id. `*.total` equals the
+    matching `*_upserted` count above, which keeps its original meaning
+    ("rows this run processed") — the breakdown is additive, so nothing
+    reading the old fields changes behaviour.
+
+    Tapbacks, link previews, message versions and the join tables are
+    deliberately not split: they have no `RETURNING` clause to hang the
+    classification on, and none of them carries an `updated_at` column,
+    so a spurious write there cost table churn but never dragged the
+    segmentation frontier."""
     dry_run: bool = False
     """True when this result came from `run_extract(dry_run=True)`
     (SPEC §8: "takes --dry-run where writes leave the machine"): every
@@ -814,16 +916,16 @@ def _do_extract(
 
     with conn.transaction(), conn.cursor() as cur:
         chat_id_by_rowid: dict[int, int] = {}
-        chats_upserted = 0
+        chat_tally = _UpsertTally()
         for chat in chats:
-            chat_id_by_rowid[chat.rowid] = _upsert_chat(cur, chat)
-            chats_upserted += 1
+            chat_id_by_rowid[chat.rowid], outcome = _upsert_chat(cur, chat)
+            chat_tally.record(outcome)
 
         handle_id_by_rowid: dict[int, int] = {}
-        handles_upserted = 0
+        handle_tally = _UpsertTally()
         for handle in handles:
-            handle_id_by_rowid[handle.rowid] = _upsert_source_handle(cur, handle)
-            handles_upserted += 1
+            handle_id_by_rowid[handle.rowid], outcome = _upsert_source_handle(cur, handle)
+            handle_tally.record(outcome)
 
         for chat_rowid, handle_rowid in chat_handle_joins:
             chat_id = chat_id_by_rowid.get(chat_rowid)
@@ -836,13 +938,13 @@ def _do_extract(
                 )
 
         attachment_id_by_rowid: dict[int, int] = {}
-        attachments_upserted = 0
+        attachment_tally = _UpsertTally()
         for att in attachments:
-            attachment_id_by_rowid[att.rowid] = _upsert_attachment(cur, att)
+            attachment_id_by_rowid[att.rowid], outcome = _upsert_attachment(cur, att)
+            attachment_tally.record(outcome)
             _upsert_attachment_source(cur, source_name, att.rowid, attachment_id_by_rowid[att.rowid])
-            attachments_upserted += 1
 
-        messages_upserted = 0
+        message_tally = _UpsertTally()
         tapbacks_upserted = 0
         system_messages_skipped = 0
         link_previews_upserted = 0
@@ -868,11 +970,11 @@ def _do_extract(
                 logger.warning("extract.message_without_chat", guid=msg.guid, rowid=msg.rowid)
                 continue
 
-            message_id = _upsert_message(
+            message_id, outcome = _upsert_message(
                 cur, msg, dump_msg, chat_id=chat_id, handle_id_by_rowid=handle_id_by_rowid,
                 has_attachments=bool(attachments_by_message.get(msg.rowid)),
             )
-            messages_upserted += 1
+            message_tally.record(outcome)
 
             _upsert_message_source(cur, message_id, source_name, msg.rowid, run_id)
 
@@ -909,29 +1011,53 @@ def _do_extract(
         # write phase entirely (2026-09-14: a seed run that worked for about
         # 2m35s recorded 11.9s). started_at is unaffected — its DEFAULT fires
         # in _begin_extraction_run's own short transaction.
+        #
+        # `messages_upserted` keeps its original meaning — rows this run
+        # processed — so anything already reading the column is unaffected.
+        # The three columns beside it (migration 0005) are what make that
+        # number legible after the fact: without them a run row saying
+        # "662,683" cannot be told apart from a run that rewrote 662,683
+        # rows, which is the ambiguity that let the state-idempotence
+        # defect sit unnoticed.
         cur.execute(
             """
             UPDATE extraction_run
             SET status = 'ok', finished_at = clock_timestamp(), rowid_after = %s,
-                messages_upserted = %s
+                messages_upserted = %s, messages_inserted = %s,
+                messages_updated = %s, messages_unchanged = %s
             WHERE run_id = %s
             """,
-            (snapshot_max_rowid, messages_upserted, run_id),
+            (
+                snapshot_max_rowid,
+                message_tally.inserted + message_tally.updated + message_tally.unchanged,
+                message_tally.inserted,
+                message_tally.updated,
+                message_tally.unchanged,
+                run_id,
+            ),
         )
 
+    message_upserts = message_tally.freeze()
+    attachment_upserts = attachment_tally.freeze()
+    chat_upserts = chat_tally.freeze()
+    handle_upserts = handle_tally.freeze()
     return ExtractResult(
         run_id=run_id,
         watermark_before=watermark_before,
         watermark_after=snapshot_max_rowid,
-        chats_upserted=chats_upserted,
-        handles_upserted=handles_upserted,
-        messages_upserted=messages_upserted,
+        chats_upserted=chat_upserts.total,
+        handles_upserted=handle_upserts.total,
+        messages_upserted=message_upserts.total,
         tapbacks_upserted=tapbacks_upserted,
         system_messages_skipped=system_messages_skipped,
-        attachments_upserted=attachments_upserted,
+        attachments_upserted=attachment_upserts.total,
         link_previews_upserted=link_previews_upserted,
         bodies_missing=bodies_missing,
         dump_stderr_line_count=len(dump_run.stderr_lines),
+        chat_upserts=chat_upserts,
+        handle_upserts=handle_upserts,
+        message_upserts=message_upserts,
+        attachment_upserts=attachment_upserts,
     )
 
 
@@ -940,7 +1066,43 @@ def _do_extract(
 # --------------------------------------------------------------------------
 
 
-def _upsert_chat(cur: psycopg.Cursor[Any], chat: ChatRow) -> int:
+def _read_upsert_row(cur: psycopg.Cursor[Any]) -> tuple[int, UpsertOutcome]:
+    """Read the single row every guarded upsert below returns.
+
+    The statements are all shaped the same way:
+
+        WITH upserted AS (
+            INSERT ... ON CONFLICT (...) DO UPDATE SET ... WHERE <differs>
+            RETURNING <pk>, (xmax = 0) AS inserted
+        )
+        SELECT <pk>, inserted, true  FROM upserted
+        UNION ALL
+        SELECT <pk>, false,    false FROM <table>
+         WHERE <conflict key> = ... AND NOT EXISTS (SELECT 1 FROM upserted)
+
+    The trailing branch exists because a WHERE-guarded `DO UPDATE` that
+    skips the row returns nothing — and the caller still needs the row
+    id. It reads the table as of statement start, which cannot see the
+    CTE's own insert; that is fine, because when the CTE inserts, the
+    `NOT EXISTS` is false and the branch contributes nothing. Exactly
+    one row comes back either way.
+
+    `xmax = 0` distinguishes the inserted row from the updated one: an
+    `INSERT ... ON CONFLICT DO UPDATE` leaves `xmax` set to the updating
+    transaction on the update path and zero on the insert path. It is
+    read-only bookkeeping — a misclassification would mis-report a
+    count, never write a wrong row — and it is asserted directly by
+    `tests/test_extract_unchanged_rows_stay_untouched_integration.py`.
+    """
+    row = cur.fetchone()
+    assert row is not None, "guarded upsert returned no row — the fallback branch is wrong"
+    row_id, inserted, written = int(row[0]), bool(row[1]), bool(row[2])
+    if not written:
+        return row_id, UpsertOutcome.UNCHANGED
+    return row_id, UpsertOutcome.INSERTED if inserted else UpsertOutcome.UPDATED
+
+
+def _upsert_chat(cur: psycopg.Cursor[Any], chat: ChatRow) -> tuple[int, UpsertOutcome]:
     if chat.style == CHAT_STYLE_GROUP:
         kind = "group"
     elif chat.style == CHAT_STYLE_DM:
@@ -954,37 +1116,69 @@ def _upsert_chat(cur: psycopg.Cursor[Any], chat: ChatRow) -> int:
             "extract.unexpected_chat_style", guid=chat.guid, style=chat.style, fallback_kind=kind
         )
 
+    # `thread_key` is a pure function of `source_guid` (the conflict key),
+    # so it can never differ and is neither assigned nor compared.
+    # `created_at` is first-write provenance and is likewise left alone.
     cur.execute(
         """
-        INSERT INTO chat (source_guid, thread_key, kind, display_name, service)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (source_guid) DO UPDATE SET
-            kind = EXCLUDED.kind, display_name = EXCLUDED.display_name, service = EXCLUDED.service
-        RETURNING chat_id
+        WITH upserted AS (
+            INSERT INTO chat (source_guid, thread_key, kind, display_name, service)
+            VALUES (%(source_guid)s, %(thread_key)s, %(kind)s, %(display_name)s, %(service)s)
+            ON CONFLICT (source_guid) DO UPDATE SET
+                kind = EXCLUDED.kind, display_name = EXCLUDED.display_name,
+                service = EXCLUDED.service
+            WHERE chat.kind IS DISTINCT FROM EXCLUDED.kind
+               OR chat.display_name IS DISTINCT FROM EXCLUDED.display_name
+               OR chat.service IS DISTINCT FROM EXCLUDED.service
+            RETURNING chat_id, (xmax = 0) AS inserted
+        )
+        SELECT chat_id, inserted, true FROM upserted
+        UNION ALL
+        SELECT chat_id, false, false FROM chat
+         WHERE source_guid = %(source_guid)s AND NOT EXISTS (SELECT 1 FROM upserted)
         """,
-        (chat.guid, thread_key(chat.guid), kind, chat.display_name, _normalize_service(chat.service_name)),
+        {
+            "source_guid": chat.guid,
+            "thread_key": thread_key(chat.guid),
+            "kind": kind,
+            "display_name": chat.display_name,
+            "service": _normalize_service(chat.service_name),
+        },
     )
-    row = cur.fetchone()
-    assert row is not None
-    return int(row[0])
+    return _read_upsert_row(cur)
 
 
-def _upsert_source_handle(cur: psycopg.Cursor[Any], handle: HandleRow) -> int:
+def _upsert_source_handle(
+    cur: psycopg.Cursor[Any], handle: HandleRow
+) -> tuple[int, UpsertOutcome]:
+    """`(raw_value, service)` IS the whole row apart from the surrogate
+    key, so there is nothing an existing row could need corrected —
+    hence `DO NOTHING` rather than a guarded `DO UPDATE`. The previous
+    `DO UPDATE SET raw_value = EXCLUDED.raw_value` was a no-op write
+    performed purely so `RETURNING` would fire; the `UNION ALL` branch
+    is what supplies the id now, at no write cost."""
     cur.execute(
         """
-        INSERT INTO source_handle (raw_value, service)
-        VALUES (%s, %s)
-        ON CONFLICT (raw_value, service) DO UPDATE SET raw_value = EXCLUDED.raw_value
-        RETURNING source_handle_id
+        WITH upserted AS (
+            INSERT INTO source_handle (raw_value, service)
+            VALUES (%(raw_value)s, %(service)s::service_kind)
+            ON CONFLICT (raw_value, service) DO NOTHING
+            RETURNING source_handle_id
+        )
+        SELECT source_handle_id, true, true FROM upserted
+        UNION ALL
+        SELECT source_handle_id, false, false FROM source_handle
+         WHERE raw_value = %(raw_value)s AND service = %(service)s::service_kind
+           AND NOT EXISTS (SELECT 1 FROM upserted)
         """,
-        (handle.raw_value, _normalize_service(handle.service)),
+        {"raw_value": handle.raw_value, "service": _normalize_service(handle.service)},
     )
-    row = cur.fetchone()
-    assert row is not None
-    return int(row[0])
+    return _read_upsert_row(cur)
 
 
-def _upsert_attachment(cur: psycopg.Cursor[Any], att: AttachmentRow) -> int:
+def _upsert_attachment(
+    cur: psycopg.Cursor[Any], att: AttachmentRow
+) -> tuple[int, UpsertOutcome]:
     """`state` is decided here, once, from whether chat.db recorded a
     path at all: with one the row starts `dataless` (S5a's "pending");
     with none there is nothing on disk to read, so it starts `missing`
@@ -993,50 +1187,83 @@ def _upsert_attachment(cur: psycopg.Cursor[Any], att: AttachmentRow) -> int:
     alone (S5a owns it from then on), with one exception: a `missing`
     row that had no path and now has one goes back to `dataless`, so
     a transfer that completed since the last run gets its first
-    attempt without anyone hand-editing the row."""
+    attempt without anyone hand-editing the row.
+
+    The columns compared below are the chat.db-derived facts this stage
+    owns: `filename`, `source_path`, `uti`, `mime_type`, `byte_size`,
+    `is_sticker`. Everything else on the row belongs to S5a/S5b
+    (`cache_path`, `sha256`, `materialization_attempts`,
+    `materialization_next_attempt_at`, the enrichment ladder) and is
+    never written here, so it is never compared either.
+
+    `state`/`materialization_last_error` are the one conditional
+    assignment, and they need no disjunct of their own: the condition
+    that moves them (`missing` with no path, now given one) requires
+    `source_path` to have changed, which the `source_path` comparison
+    already catches. Anything that guard would let through, this one
+    lets through identically.
+
+    The explicit `updated_at = now()` is gone: migration 0003's trigger
+    assigns it on every real UPDATE, and spelling it out here invited
+    the reading that the bump is this statement's choice. It is not —
+    it is the schema's, and the fix is to not perform the UPDATE.
+    """
     initial_state = "dataless" if att.source_path is not None else "missing"
     initial_error = None if att.source_path is not None else NO_SOURCE_PATH_ERROR
     cur.execute(
         """
-        INSERT INTO attachment (
-            source_guid, attachment_key, filename, source_path, uti, mime_type, byte_size,
-            is_sticker, state, materialization_last_error
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (source_guid) DO UPDATE SET
-            filename = EXCLUDED.filename, source_path = EXCLUDED.source_path,
-            uti = EXCLUDED.uti, mime_type = EXCLUDED.mime_type, byte_size = EXCLUDED.byte_size,
-            is_sticker = EXCLUDED.is_sticker,
-            state = CASE
-                WHEN attachment.state = 'missing' AND attachment.source_path IS NULL
-                     AND EXCLUDED.source_path IS NOT NULL
-                THEN 'dataless'::materialization_state
-                ELSE attachment.state
-            END,
-            materialization_last_error = CASE
-                WHEN attachment.state = 'missing' AND attachment.source_path IS NULL
-                     AND EXCLUDED.source_path IS NOT NULL
-                THEN NULL
-                ELSE attachment.materialization_last_error
-            END,
-            updated_at = now()
-        RETURNING attachment_id
+        WITH upserted AS (
+            INSERT INTO attachment (
+                source_guid, attachment_key, filename, source_path, uti, mime_type, byte_size,
+                is_sticker, state, materialization_last_error
+            ) VALUES (
+                %(source_guid)s, %(attachment_key)s, %(filename)s, %(source_path)s, %(uti)s,
+                %(mime_type)s, %(byte_size)s, %(is_sticker)s,
+                %(initial_state)s::materialization_state, %(initial_error)s
+            )
+            ON CONFLICT (source_guid) DO UPDATE SET
+                filename = EXCLUDED.filename, source_path = EXCLUDED.source_path,
+                uti = EXCLUDED.uti, mime_type = EXCLUDED.mime_type,
+                byte_size = EXCLUDED.byte_size, is_sticker = EXCLUDED.is_sticker,
+                state = CASE
+                    WHEN attachment.state = 'missing' AND attachment.source_path IS NULL
+                         AND EXCLUDED.source_path IS NOT NULL
+                    THEN 'dataless'::materialization_state
+                    ELSE attachment.state
+                END,
+                materialization_last_error = CASE
+                    WHEN attachment.state = 'missing' AND attachment.source_path IS NULL
+                         AND EXCLUDED.source_path IS NOT NULL
+                    THEN NULL
+                    ELSE attachment.materialization_last_error
+                END
+            WHERE attachment.filename IS DISTINCT FROM EXCLUDED.filename
+               OR attachment.source_path IS DISTINCT FROM EXCLUDED.source_path
+               OR attachment.uti IS DISTINCT FROM EXCLUDED.uti
+               OR attachment.mime_type IS DISTINCT FROM EXCLUDED.mime_type
+               OR attachment.byte_size IS DISTINCT FROM EXCLUDED.byte_size
+               OR attachment.is_sticker IS DISTINCT FROM EXCLUDED.is_sticker
+            RETURNING attachment_id, (xmax = 0) AS inserted
+        )
+        SELECT attachment_id, inserted, true FROM upserted
+        UNION ALL
+        SELECT attachment_id, false, false FROM attachment
+         WHERE source_guid = %(source_guid)s AND NOT EXISTS (SELECT 1 FROM upserted)
         """,
-        (
-            att.guid,
-            attachment_key(att.guid),
-            att.filename,
-            att.source_path,
-            att.uti,
-            att.mime_type,
-            att.byte_size,
-            att.is_sticker,
-            initial_state,
-            initial_error,
-        ),
+        {
+            "source_guid": att.guid,
+            "attachment_key": attachment_key(att.guid),
+            "filename": att.filename,
+            "source_path": att.source_path,
+            "uti": att.uti,
+            "mime_type": att.mime_type,
+            "byte_size": att.byte_size,
+            "is_sticker": att.is_sticker,
+            "initial_state": initial_state,
+            "initial_error": initial_error,
+        },
     )
-    row = cur.fetchone()
-    assert row is not None
-    return int(row[0])
+    return _read_upsert_row(cur)
 
 
 def _upsert_attachment_source(
@@ -1047,6 +1274,7 @@ def _upsert_attachment_source(
         INSERT INTO attachment_source (attachment_id, source_name, source_rowid)
         VALUES (%s, %s, %s)
         ON CONFLICT (source_name, source_rowid) DO UPDATE SET attachment_id = EXCLUDED.attachment_id
+        WHERE attachment_source.attachment_id IS DISTINCT FROM EXCLUDED.attachment_id
         """,
         (attachment_id, source_name, source_rowid),
     )
@@ -1060,7 +1288,55 @@ def _upsert_message(
     chat_id: int,
     handle_id_by_rowid: dict[int, int],
     has_attachments: bool,
-) -> int:
+) -> tuple[int, UpsertOutcome]:
+    """**Which columns invalidate downstream work.** The `ON CONFLICT`
+    clause assigns and compares exactly the columns whose value can
+    change what S4 renders, what S6 embeds, or whether a message is
+    indexed at all — read off what `imsg.segment.pipeline` actually
+    selects (`sent_at`, `is_from_me`, `text_original`, `is_unsent`,
+    `is_edited`, `has_attachments`, `sender_person_id`) plus what S3
+    derives `sender_person_id` from:
+
+      * `text_original` / `text_normalized` — the rendered body and its
+        indexed copy. An edit is the whole reason the rescan clause in
+        `fetch_target_messages` exists.
+      * `is_unsent` — gates whether the message is segmented at all
+        (`policy.index_unsent`, D1).
+      * `is_edited` / `date_edited` — edit-history rendering, and the
+        rescan signal itself.
+      * `has_attachments` — rendered as an attachment snippet, and a
+        retrieval filter (`imsg.retrieval.filters`).
+      * `sent_at` — session-gap boundaries and every time-window filter.
+      * `is_from_me` — renders as the literal `owner` rather than a
+        short name.
+      * `sender_source_handle_id` — S2's raw provenance and the only
+        thing S3 joins on to backfill `sender_person_id`, which is the
+        rendered sender. Stale here means a message attributed to the
+        wrong person forever.
+
+    **Deliberately left first-write-wins**, and therefore neither
+    assigned nor compared:
+
+      * `chat_id`. It affects rendering more than anything on the list,
+        and it is still excluded, for a stronger reason than
+        irrelevance: the incoming value is not trustworthy.
+        `fetch_target_messages` derives it from
+        `chat_message_join ... LIMIT 1` with no `ORDER BY`, so for a
+        message that belongs to more than one chat SQLite may return
+        either. Reassigning it per run would flap the row between chats
+        on every extraction — permanently dirty, and orphaning the
+        `segment_message` rows that place it. Correcting a genuinely
+        wrong chat association needs a deterministic choice first;
+        that is a separate change, not a side effect of this one.
+      * `service` and `reply_to_guid`. Nothing downstream reads either
+        column — not segmentation, not retrieval, not export, not the
+        MCP surface — so a stale value cannot affect rendering or
+        retrieval. They are recorded on insert as provenance.
+      * `message_key` is a pure function of `source_guid`, the conflict
+        key, so it cannot differ.
+      * `sender_person_id` is S3's to write and S2's never (hard
+        requirement 3); `created_at` is first-write provenance.
+    """
     sender_source_handle_id = None
     if not msg.is_from_me and msg.handle_rowid is not None:
         sender_source_handle_id = handle_id_by_rowid.get(msg.handle_rowid)
@@ -1103,43 +1379,77 @@ def _upsert_message(
 
     cur.execute(
         """
-        INSERT INTO message (
-            source_guid, message_key, chat_id, sender_source_handle_id, is_from_me, sent_at,
-            service, text_original, text_normalized, is_unsent, is_edited, date_edited,
-            reply_to_guid, has_attachments
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (source_guid) DO UPDATE SET
-            text_original = EXCLUDED.text_original, text_normalized = EXCLUDED.text_normalized,
-            is_unsent = EXCLUDED.is_unsent, is_edited = EXCLUDED.is_edited,
-            date_edited = EXCLUDED.date_edited, has_attachments = EXCLUDED.has_attachments,
-            updated_at = now()
-        RETURNING message_id
+        WITH upserted AS (
+            INSERT INTO message (
+                source_guid, message_key, chat_id, sender_source_handle_id, is_from_me, sent_at,
+                service, text_original, text_normalized, is_unsent, is_edited, date_edited,
+                reply_to_guid, has_attachments
+            ) VALUES (
+                %(source_guid)s, %(message_key)s, %(chat_id)s, %(sender_source_handle_id)s,
+                %(is_from_me)s, %(sent_at)s, %(service)s::service_kind, %(text_original)s,
+                %(text_normalized)s, %(is_unsent)s, %(is_edited)s, %(date_edited)s,
+                %(reply_to_guid)s, %(has_attachments)s
+            )
+            ON CONFLICT (source_guid) DO UPDATE SET
+                sender_source_handle_id = EXCLUDED.sender_source_handle_id,
+                is_from_me = EXCLUDED.is_from_me,
+                sent_at = EXCLUDED.sent_at,
+                text_original = EXCLUDED.text_original,
+                text_normalized = EXCLUDED.text_normalized,
+                is_unsent = EXCLUDED.is_unsent,
+                is_edited = EXCLUDED.is_edited,
+                date_edited = EXCLUDED.date_edited,
+                has_attachments = EXCLUDED.has_attachments
+            WHERE message.sender_source_handle_id IS DISTINCT FROM EXCLUDED.sender_source_handle_id
+               OR message.is_from_me IS DISTINCT FROM EXCLUDED.is_from_me
+               OR message.sent_at IS DISTINCT FROM EXCLUDED.sent_at
+               OR message.text_original IS DISTINCT FROM EXCLUDED.text_original
+               OR message.text_normalized IS DISTINCT FROM EXCLUDED.text_normalized
+               OR message.is_unsent IS DISTINCT FROM EXCLUDED.is_unsent
+               OR message.is_edited IS DISTINCT FROM EXCLUDED.is_edited
+               OR message.date_edited IS DISTINCT FROM EXCLUDED.date_edited
+               OR message.has_attachments IS DISTINCT FROM EXCLUDED.has_attachments
+            RETURNING message_id, (xmax = 0) AS inserted
+        )
+        SELECT message_id, inserted, true FROM upserted
+        UNION ALL
+        SELECT message_id, false, false FROM message
+         WHERE source_guid = %(source_guid)s AND NOT EXISTS (SELECT 1 FROM upserted)
         """,
-        (
-            msg.guid,
-            message_key(msg.guid),
-            chat_id,
-            sender_source_handle_id,
-            msg.is_from_me,
-            msg.date,
-            _normalize_service(msg.service),
-            body_text,
-            text_for_index,
-            is_unsent,
-            is_edited,
-            msg.date_edited,
-            reply_to_guid,
-            has_attachments,
-        ),
+        {
+            "source_guid": msg.guid,
+            "message_key": message_key(msg.guid),
+            "chat_id": chat_id,
+            "sender_source_handle_id": sender_source_handle_id,
+            "is_from_me": msg.is_from_me,
+            "sent_at": msg.date,
+            "service": _normalize_service(msg.service),
+            "text_original": body_text,
+            "text_normalized": text_for_index,
+            "is_unsent": is_unsent,
+            "is_edited": is_edited,
+            "date_edited": msg.date_edited,
+            "reply_to_guid": reply_to_guid,
+            "has_attachments": has_attachments,
+        },
     )
-    row = cur.fetchone()
-    assert row is not None
-    return int(row[0])
+    return _read_upsert_row(cur)
 
 
 def _upsert_message_source(
     cur: psycopg.Cursor[Any], message_id: int, source_name: str, source_rowid: int, run_id: int
 ) -> None:
+    """Deliberately NOT guarded by an `IS DISTINCT FROM` clause, unlike
+    every other upsert in this module. `extraction_run_id` means "the
+    run that last observed this row", so a new run id is a genuine
+    change by construction and the guard could never skip anything —
+    it would be a comparison that can only ever be true.
+
+    This is therefore the one write a no-op re-extraction still
+    performs, once per in-scope message. It is affordable because
+    `message_source` carries no `updated_at` column and nothing
+    downstream watches it, so it drags no re-segmentation behind it:
+    the cost is table churn, not 17 hours of recomputed embeddings."""
     cur.execute(
         """
         INSERT INTO message_source (message_id, source_name, source_rowid, extraction_run_id)
@@ -1160,6 +1470,8 @@ def _upsert_message_version(
         VALUES (%s, %s, %s, %s)
         ON CONFLICT (message_id, version_idx) DO UPDATE SET
             text = EXCLUDED.text, edited_at = EXCLUDED.edited_at
+        WHERE message_version.text IS DISTINCT FROM EXCLUDED.text
+           OR message_version.edited_at IS DISTINCT FROM EXCLUDED.edited_at
         """,
         (message_id, version_idx, strip_nul(version.text or ""), edited_at),
     )
@@ -1201,6 +1513,9 @@ def _upsert_tapback(
         ON CONFLICT (source_guid) DO UPDATE SET
             target_message_id = EXCLUDED.target_message_id, removed = EXCLUDED.removed,
             acted_at = EXCLUDED.acted_at
+        WHERE tapback.target_message_id IS DISTINCT FROM EXCLUDED.target_message_id
+           OR tapback.removed IS DISTINCT FROM EXCLUDED.removed
+           OR tapback.acted_at IS DISTINCT FROM EXCLUDED.acted_at
         """,
         (
             msg.guid,
@@ -1237,6 +1552,9 @@ def _upsert_link_preview(cur: psycopg.Cursor[Any], message_id: int, preview: Lin
         VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT (message_id, url) DO UPDATE SET
             title = EXCLUDED.title, summary = EXCLUDED.summary, site_name = EXCLUDED.site_name
+        WHERE link_preview.title IS DISTINCT FROM EXCLUDED.title
+           OR link_preview.summary IS DISTINCT FROM EXCLUDED.summary
+           OR link_preview.site_name IS DISTINCT FROM EXCLUDED.site_name
         """,
         (message_id, preview.url, preview.title, preview.summary, preview.site_name),
     )
@@ -1251,6 +1569,8 @@ __all__ = [
     "LinkPreview",
     "MessageRow",
     "SnapshotReader",
+    "UpsertCounts",
+    "UpsertOutcome",
     "parse_link_preview",
     "run_extract",
 ]

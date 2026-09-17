@@ -689,8 +689,14 @@ def extract(
         raise typer.Exit(code=1) from exc
     finally:
         conn.close()
+    # The breakdown, not just the total: "messages_upserted=662683" reads
+    # the same whether the run corrected the corpus or rewrote it with its
+    # own values, and only the second proposes re-segmenting everything.
     typer.echo(
         f"extract: messages_upserted={result.messages_upserted} "
+        f"(inserted={result.message_upserts.inserted} "
+        f"updated={result.message_upserts.updated} "
+        f"unchanged={result.message_upserts.unchanged}) "
         f"watermark {result.watermark_before}->{result.watermark_after} "
         f"bodies_missing={result.bodies_missing}"
     )
@@ -1490,6 +1496,9 @@ def sync(
             continue
         typer.echo(
             f"sync: source={r.source_name} messages_upserted={r.extract.messages_upserted} "
+            f"(inserted={r.extract.message_upserts.inserted} "
+            f"updated={r.extract.message_upserts.updated} "
+            f"unchanged={r.extract.message_upserts.unchanged}) "
             f"segment_ran={r.segment_ran} embed_ran={r.embed_ran}"
         )
     if dry_run:
