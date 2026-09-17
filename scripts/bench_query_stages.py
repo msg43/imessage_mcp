@@ -18,17 +18,39 @@ service holds them, and measures after warm-up:
   `imsg.mlx_runtime` calls each provider makes after tokenizing (base
   transformer, last-token gather, the reranker's yes/no head, values read
   back to Python), reported in seconds and tokens per second;
-- `reranker.score` (`--pool-size`, 0 to skip): the provider's own `score()`
-  over a pool of synthetic documents whose token lengths are drawn from
-  `DOC_TOKEN_LENGTHS` — tokenization and the provider's own batching
-  included;
+- `reranker.score` (`--pool-sizes`, `0` to skip): the provider's own
+  `score()` over pools of synthetic documents — tokenization, the document
+  cap and the provider's planned batches included. The reranker is built
+  the way `imsg.providers.factory.build_reranker` builds it: the provider's
+  own batch bounds (unless `--reranker-batch-size` /
+  `--reranker-max-batch-tokens` override them) and a document cap of
+  `--rerank-doc-max-tokens` (default: the config schema's
+  `retrieval.rerank_doc_max_tokens`). Every call scores a fresh pool — its
+  own query, document token lengths drawn from `--doc-tokens` — so p95
+  covers the variation between pools as well as timing noise; pools of
+  different sizes share their documents (for the same call, the pool of 15
+  is the first 15 of the pool of 30). `--capped-pool-sizes` adds pools whose
+  every document is longer than the cap, the most work a pool of that size
+  can be. Each call's pair tokens, padded tokens, forward passes and capped
+  documents, computed from the provider's own rows and batch plan, are
+  recorded next to its time;
 - memory with all three resident: `mx.get_peak_memory()` / active / cache,
   torch MPS allocations, the process's max RSS and its physical footprint
   (`proc_pid_rusage`; GPU buffers count toward the footprint but mostly not
   toward RSS), plus `memory_pressure`, swap use and the kernel's pressure
   level before loading and after the stages;
-- `--idle-gaps`: one call of each short stage after the process has sat idle
-  for each gap, to show whether an idle process pays a cold-call penalty.
+- `--idle-gaps` (cycled `--idle-repeats` times): after the process has sat
+  idle for each gap, the calls a search makes, in its order — `embed_query`,
+  `embed_text`, then `score()` on one fixed pool of the FIRST `--pool-sizes`
+  size (a fixed-shape reranker forward pass when no pool is measured) — and
+  then the same calls again, to show whether an idle process pays a
+  cold-call penalty and how quickly it recovers.
+
+`--reranker-load-only` measures, instead, the reranker alone: importing MLX,
+loading the weights (Metal setup included — nothing touches the GPU before
+it), and the first and second `score()` on a pool of the first pool size.
+Run it in a new process each time for a cold load; the OS file cache is left
+as the host has it (dropping it needs elevated privileges).
 
 Every stage records its first call (made before warm-up) separately, every
 timed repetition, nearest-rank p50/p95, and the GPU time this process and all
@@ -51,6 +73,15 @@ providers from contacting the Hub once the pinned snapshots are cached):
         --reranker "$DATA_ROOT/models/qwen3-reranker-8b-mxfp8-77d193c7" \\
         --json > host-a.json
     python scripts/bench_query_stages.py --compare host-a.json host-b.json
+
+    # pools of 20 (the idle probes' pool), 15 and 30 plus an all-capped pool
+    # of 20, documents of 40-700 tokens under a 256-token cap
+    HF_HUB_OFFLINE=1 python scripts/bench_query_stages.py --reranker DIR \\
+        --pool-sizes 20,15,30 --capped-pool-sizes 20 --doc-tokens 40-700 \\
+        --rerank-doc-max-tokens 256 --idle-gaps 30,300 --json > pools.json
+    HF_HUB_OFFLINE=1 python scripts/bench_query_stages.py --reranker DIR \\
+        --reranker-load-only --pool-sizes 20 --doc-tokens 40-700 \\
+        --rerank-doc-max-tokens 256 --json > cold-load.json
 
 With `--json` the report goes to stdout as JSON and the table to stderr;
 otherwise the table goes to stdout. Progress is always on stderr.
@@ -84,6 +115,8 @@ from typing import Any, TextIO
 import structlog
 
 from imsg import constants
+from imsg.config.schema import RetrievalConfig
+from imsg.embed.batching import plan_batches
 from imsg.embed.mlx_text import MlxTextEmbeddingProvider, format_query_text
 from imsg.embed.pe_core_multimodal import PeCoreMultimodalEmbeddingProvider
 from imsg.mlx_runtime import (
@@ -91,13 +124,19 @@ from imsg.mlx_runtime import (
     float_rows,
     gather_last_token_states,
     import_mlx_core,
+    import_mlx_lm,
     lm_head_logits,
     right_pad,
 )
 from imsg.providers.manifest import ARTIFACT_FILE_PATTERNS, artifact_digest
-from imsg.retrieval.mlx_reranker import MlxRerankerProvider, format_reranker_pair
+from imsg.retrieval.mlx_reranker import (
+    DEFAULT_RERANK_BATCH_SIZE,
+    DEFAULT_RERANK_MAX_BATCH_TOKENS,
+    MlxRerankerProvider,
+    format_reranker_pair,
+)
 
-REPORT_SCHEMA = "bench_query_stages/1"
+REPORT_SCHEMA = "bench_query_stages/2"
 GIB = float(2**30)
 
 DEFAULT_QUERY_INSTRUCTION = (
@@ -108,8 +147,16 @@ DEFAULT_QUERY_INSTRUCTION = (
 DEFAULT_SHAPES = "1x256,1x512,4x256,8x256,8x512"
 
 DOC_TOKEN_LENGTHS: tuple[int, ...] = (40, 60, 90, 120, 160, 220, 300, 400, 520, 700)
-"""Token lengths the rerank-pool documents are drawn from — a spread like
-chat segments, from a few exchanged lines to a long back-and-forth."""
+"""Default `--doc-tokens`: the token lengths rerank-pool documents are drawn
+from — a spread like chat segments, from a few exchanged lines to a long
+back-and-forth."""
+
+DEFAULT_RERANK_DOC_MAX_TOKENS: int | None = RetrievalConfig.model_fields[
+    "rerank_doc_max_tokens"
+].default
+"""`retrieval.rerank_doc_max_tokens` as the config schema defaults it — the
+cap `imsg.providers.factory.build_reranker` passes when a config leaves it
+unset."""
 
 SHORT_STAGES = frozenset({"embedder.embed_query", "pe_core.embed_text"})
 PACKAGES = (
@@ -201,6 +248,143 @@ class SyntheticChat:
             lines.append(self.line())
             ids = encode(tokenizer, "\n".join(lines))
         return str(tokenizer.decode(ids[:tokens]))
+
+
+# --------------------------------------------------------------------------
+# rerank pools
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class DocTokens:
+    """Token lengths of synthetic pool documents: drawn uniformly from
+    `choices` when there are any, else from the integers `low..high`."""
+
+    low: int
+    high: int
+    choices: tuple[int, ...] = ()
+
+    @property
+    def label(self) -> str:
+        return f"{self.low}-{self.high}" + (f"/{len(self.choices)}" if self.choices else "")
+
+    def draw(self, rng: random.Random) -> int:
+        return rng.choice(self.choices) if self.choices else rng.randint(self.low, self.high)
+
+    def as_json(self) -> dict[str, Any]:
+        return {"low": self.low, "high": self.high, "choices": list(self.choices)}
+
+
+def parse_doc_tokens(spec: str) -> DocTokens:
+    """`LOW-HIGH` (every integer from LOW to HIGH) or `A,B,C` (those values)."""
+    text = spec.strip()
+    span = re.fullmatch(r"(\d+)-(\d+)", text)
+    if span is not None and 1 <= int(span.group(1)) <= int(span.group(2)):
+        return DocTokens(int(span.group(1)), int(span.group(2)))
+    if re.fullmatch(r"\d+(,\d+)*", text):
+        values = tuple(int(v) for v in text.split(","))
+        if min(values) >= 1:
+            return DocTokens(min(values), max(values), values)
+    raise ValueError(f"bad --doc-tokens {spec!r}: expected LOW-HIGH or A,B,C, every length >= 1")
+
+
+def parse_sizes(spec: str, option: str) -> list[int]:
+    """Comma-separated pool sizes, in order, without repeats; `0` and blanks
+    are skipped."""
+    sizes: list[int] = []
+    for part in (p.strip() for p in spec.split(",")):
+        if not part:
+            continue
+        if not part.isdigit():
+            raise ValueError(f"bad {option} entry {part!r}: expected a size >= 0")
+        size = int(part)
+        if size > 0 and size not in sizes:
+            sizes.append(size)
+    return sizes
+
+
+@dataclass(frozen=True, slots=True)
+class PoolSpec:
+    """One `reranker.score` stage: pools of `size` documents whose token
+    lengths come from `tokens`."""
+
+    size: int
+    tokens: DocTokens
+
+    def label(self, cap: int | None) -> str:
+        return f"{self.size} docs {self.tokens.label} cap {'none' if cap is None else cap}"
+
+
+@dataclass(frozen=True, slots=True)
+class Pool:
+    query: str
+    documents: tuple[str, ...]
+    doc_target_tokens: tuple[int, ...]
+
+    def head(self, size: int) -> Pool:
+        return Pool(self.query, self.documents[:size], self.doc_target_tokens[:size])
+
+
+def draw_pool(chat: SyntheticChat, tokenizer: Any, size: int, tokens: DocTokens) -> Pool:
+    lengths = tuple(tokens.draw(chat.rng) for _ in range(size))
+    return Pool(chat.query(), tuple(chat.document(tokenizer, n) for n in lengths), lengths)
+
+
+def pool_specs(args: argparse.Namespace) -> list[PoolSpec]:
+    """`--pool-sizes` over `--doc-tokens`, then `--capped-pool-sizes` over
+    lengths from just past the cap to the longest `--doc-tokens` length
+    (`parse_args` checks that range is not empty)."""
+    specs = [PoolSpec(size, args.doc_tokens) for size in args.pool_sizes]
+    if args.capped_pool_sizes:
+        over_cap = DocTokens(args.rerank_doc_max_tokens + 1, args.doc_tokens.high)
+        specs += [PoolSpec(size, over_cap) for size in args.capped_pool_sizes]
+    return specs
+
+
+def pool_settings(args: argparse.Namespace) -> dict[str, Any]:
+    """The reranker and pool settings a report records."""
+    return {
+        "pool_sizes": args.pool_sizes,
+        "capped_pool_sizes": args.capped_pool_sizes,
+        "pool_repetitions": args.pool_repetitions,
+        "doc_tokens": args.doc_tokens.as_json(),
+        "rerank_doc_max_tokens": args.rerank_doc_max_tokens,
+        "reranker_batch_size": args.reranker_batch_size,
+        "reranker_max_batch_tokens": args.reranker_max_batch_tokens,
+        "reranker_revision": args.reranker_revision,
+    }
+
+
+POOL_WORK_KEYS = ("pair_tokens", "padded_tokens", "batches", "longest_row", "docs_capped")
+
+
+def pool_work(reranker: MlxRerankerProvider, pool: Pool) -> dict[str, int]:
+    """What one `score()` call on `pool` computes, from the provider's own
+    rows (`token_rows`, the cap applied) and batch plan (`plan_batches` with
+    the provider's bounds): real pair tokens, padded tokens (`rows x longest
+    row`, summed over batches), forward passes, the longest row, and how
+    many documents the cap shortened."""
+    documents = list(pool.documents)
+    lengths = [len(row) for row in reranker.token_rows(pool.query, documents)]
+    plan = plan_batches(
+        lengths, max_batch_size=reranker.batch_size, max_batch_tokens=reranker.max_batch_tokens
+    )
+    capped = 0
+    cap = reranker.doc_max_tokens
+    if cap is not None:
+        reranker.doc_max_tokens = None
+        try:
+            uncapped = [len(row) for row in reranker.token_rows(pool.query, documents)]
+        finally:
+            reranker.doc_max_tokens = cap
+        capped = sum(1 for kept, full in zip(lengths, uncapped, strict=True) if kept < full)
+    return {
+        "pair_tokens": sum(lengths),
+        "padded_tokens": sum(len(group) * max(lengths[i] for i in group) for group in plan),
+        "batches": len(plan),
+        "longest_row": max(lengths),
+        "docs_capped": capped,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -673,20 +857,61 @@ def measure(
     result.update(extra or {})
     rate = f"  {result['tokens_per_s_p50']:9.1f} tok/s" if tokens_per_call is not None else ""
     log(
-        f"  {stage:22s} {shape:10s} first {first:8.4f}s  p50 {p50:8.4f}s  "
+        f"  {stage:22s} {shape:26s} first {first:8.4f}s  p50 {p50:8.4f}s  "
         f"p95 {result['p95_s']:8.4f}s  max {result['max_s']:8.4f}s{rate}  "
         f"other-GPU {result.get('gpu_s_other')}s of {wall:.1f}s"
     )
     return result
 
 
-def fixed_batches_padded(lengths: Sequence[int], batch_size: int) -> int:
-    """Padded tokens (`rows x longest row`, summed) when rows are batched
-    `batch_size` at a time in input order — how `MlxRerankerProvider.score`
-    groups pairs as of this script."""
-    return sum(
-        len(lengths[i : i + batch_size]) * max(lengths[i : i + batch_size])
-        for i in range(0, len(lengths), batch_size)
+def measure_pool(
+    spec: PoolSpec,
+    pools: Sequence[Pool],
+    reranker: MlxRerankerProvider,
+    *,
+    warmup: int,
+    mx: Any,
+) -> dict[str, Any]:
+    """`reranker.score` once per pool (see `measure` for which calls are
+    timed), with each timed call's work (`pool_work`) listed in the same
+    order as its seconds."""
+    work = [pool_work(reranker, pool) for pool in pools]
+    timed = slice(1 + warmup, None)
+    targets = [n for pool in pools[timed] for n in pool.doc_target_tokens]
+    result = measure(
+        "reranker.score",
+        spec.label(reranker.doc_max_tokens),
+        [functools.partial(reranker.score, pool.query, list(pool.documents)) for pool in pools],
+        warmup=warmup,
+        mx=mx,
+        extra={
+            "pool_size": spec.size,
+            "doc_tokens": spec.tokens.as_json(),
+            "doc_max_tokens": reranker.doc_max_tokens,
+            "batch_size": reranker.batch_size,
+            "max_batch_tokens": reranker.max_batch_tokens,
+            "doc_target_tokens_mean": round(sum(targets) / len(targets), 1),
+            "first_call_work": work[0],
+            **{key: [w[key] for w in work[timed]] for key in POOL_WORK_KEYS},
+        },
+    )
+    result["pair_tokens_per_s"] = round(sum(result["pair_tokens"]) / sum(result["seconds"]), 1)
+    return result
+
+
+def make_reranker(args: argparse.Namespace) -> MlxRerankerProvider:
+    """The reranker as `imsg.providers.factory.build_reranker` constructs it
+    — a local directory with `revision=None` and a `<dir>@<sha>` model id,
+    the document cap, the provider's own batch bounds — except for batch
+    bounds given on the command line."""
+    directory = local_dir(args.reranker)
+    return MlxRerankerProvider(
+        str(directory) if directory else args.reranker,
+        None if directory else args.reranker_revision,
+        batch_size=args.reranker_batch_size,
+        max_batch_tokens=args.reranker_max_batch_tokens,
+        doc_max_tokens=args.rerank_doc_max_tokens,
+        model_id=f"{directory.name}@{args.reranker_revision}" if directory else None,
     )
 
 
@@ -703,20 +928,17 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "warmup": args.warmup,
             "repetitions": args.repetitions,
             "shapes": [s.label for s in shapes],
-            "pool_size": args.pool_size,
-            "pool_repetitions": args.pool_repetitions,
-            "reranker_batch_size": args.reranker_batch_size,
+            **pool_settings(args),
             "idle_gaps_s": args.idle_gaps,
+            "idle_repeats": args.idle_repeats,
             "idle_baseline_seconds": args.idle_baseline_seconds,
             "query_instruction": args.query_instruction,
-            "doc_token_lengths": list(DOC_TOKEN_LENGTHS),
             "hf_hub_offline": os.environ.get("HF_HUB_OFFLINE"),
         },
     }
     log(f"host: {report['host']['host_class']}, {report['host']['gpu_cores']}-core GPU")
 
     embedder_dir = local_dir(args.embedder)
-    reranker_dir = local_dir(args.reranker)
     log("digesting model directories" if args.digest else "skipping digests (--no-digest)")
     report["models"] = {
         "embedder": model_provenance(
@@ -754,12 +976,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         constants.PRIMARY_EMBEDDING_DIM,
         model_id=f"{embedder_dir.name}@{args.embedder_revision}" if embedder_dir else None,
     )
-    reranker = MlxRerankerProvider(
-        str(reranker_dir) if reranker_dir else args.reranker,
-        None if reranker_dir else args.reranker_revision,
-        batch_size=args.reranker_batch_size,
-        model_id=f"{reranker_dir.name}@{args.reranker_revision}" if reranker_dir else None,
-    )
+    reranker = make_reranker(args)
     pe_core = PeCoreMultimodalEmbeddingProvider(
         args.pe_core,
         args.pe_core_revision,
@@ -842,43 +1059,22 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 )
             )
 
-    if args.pool_size > 0:
-        lengths = [chat.rng.choice(DOC_TOKEN_LENGTHS) for _ in range(args.pool_size)]
-        documents = [chat.document(rerank_loaded.tokenizer, n) for n in lengths]
-        pool_query = chat.query()
-        budget = reranker.body_token_budget
-        fixed = len(rerank_loaded.row_prefix) + len(rerank_loaded.row_suffix)
-        pair_tokens = [
-            fixed
-            + min(
-                len(
-                    encode(
-                        rerank_loaded.tokenizer,
-                        format_reranker_pair(reranker.instruction, pool_query, document),
-                    )
-                ),
-                budget,
-            )
-            for document in documents
-        ]
-        score_call = functools.partial(reranker.score, pool_query, documents)
-        stages.append(
-            measure(
-                "reranker.score",
-                f"{args.pool_size} pairs",
-                [score_call] * (1 + args.warmup + args.pool_repetitions),
-                warmup=args.warmup,
-                mx=mx,
-                tokens_per_call=sum(pair_tokens),
-                extra={
-                    "doc_target_tokens": lengths,
-                    "pair_tokens": pair_tokens,
-                    "padded_tokens_fixed_batches": fixed_batches_padded(
-                        pair_tokens, args.reranker_batch_size
-                    ),
-                },
-            )
-        )
+    specs = pool_specs(args)
+    if specs:
+        pool_calls = 1 + args.warmup + args.pool_repetitions
+        largest: dict[DocTokens, int] = {}
+        for spec in specs:
+            largest[spec.tokens] = max(largest.get(spec.tokens, 0), spec.size)
+        log(f"drawing {pool_calls} synthetic pools per length range: {largest}")
+        drawn = {
+            tokens: [
+                draw_pool(chat, rerank_loaded.tokenizer, size, tokens) for _ in range(pool_calls)
+            ]
+            for tokens, size in largest.items()
+        }
+        for spec in specs:
+            pools = [pool.head(spec.size) for pool in drawn[spec.tokens]]
+            stages.append(measure_pool(spec, pools, reranker, warmup=args.warmup, mx=mx))
 
     memory["after_stages"] = memory_state(mx, torch)
     memory["mx_peak_gib_whole_run"] = max(
@@ -888,53 +1084,131 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     probes: list[dict[str, Any]] = []
     report["idle_probes"] = probes
-    fitting = [s for s in shapes if rerank_loaded.fits(s)]
-    smallest = min(fitting, key=lambda s: s.batch * s.tokens) if fitting else None
-    probe_rows = (
-        build_rows(rerank_loaded, smallest, chat, reranker_instruction=reranker.instruction)
-        if smallest
-        else None
-    )
-    for gap in args.idle_gaps:
-        # What a search request runs, in its order, right after the idle gap;
-        # then the two short calls once more to show how fast they recover.
-        query_a, query_b = chat.query(), chat.query()
-        sequence: list[tuple[str, Callable[[], object]]] = [
-            (
-                "embedder.embed_query",
-                functools.partial(embedder.embed_query, query_a, instruction=instruction),
-            ),
-            ("pe_core.embed_text", functools.partial(pe_core.embed_text, query_a)),
-        ]
-        if smallest is not None and probe_rows is not None:
-            sequence.append(
-                (
-                    f"reranker.forward {smallest.label}",
-                    functools.partial(forward, mx, rerank_loaded, probe_rows),
-                )
-            )
-        sequence += [
-            (
-                "embedder.embed_query again",
-                functools.partial(embedder.embed_query, query_b, instruction=instruction),
-            ),
-            ("pe_core.embed_text again", functools.partial(pe_core.embed_text, query_b)),
-        ]
-        log(f"idle probe: sleeping {gap:g}s")
-        gap_start = gpu_time_by_process()
-        time.sleep(gap)
-        probe: dict[str, Any] = {
-            "idle_seconds": gap,
-            **(gpu_time_delta(gap_start, gpu_time_by_process()) or {}),
-            "calls_s": {name: round(time_call(call), 5) for name, call in sequence},
+    rerank_probe: tuple[str, Callable[[], object]] | None = None
+    if specs:
+        probe_pool = draw_pool(chat, rerank_loaded.tokenizer, specs[0].size, specs[0].tokens)
+        rerank_probe = (
+            f"reranker.score {specs[0].label(reranker.doc_max_tokens)}",
+            functools.partial(reranker.score, probe_pool.query, list(probe_pool.documents)),
+        )
+        report["idle_probe_pool"] = {
+            "doc_target_tokens": list(probe_pool.doc_target_tokens),
+            **pool_work(reranker, probe_pool),
         }
-        log(f"  {probe}")
-        probes.append(probe)
+    else:
+        fitting = [s for s in shapes if rerank_loaded.fits(s)]
+        if fitting:
+            smallest = min(fitting, key=lambda s: s.batch * s.tokens)
+            probe_rows = build_rows(
+                rerank_loaded, smallest, chat, reranker_instruction=reranker.instruction
+            )
+            rerank_probe = (
+                f"reranker.forward {smallest.label}",
+                functools.partial(forward, mx, rerank_loaded, probe_rows),
+            )
+    for repeat in range(args.idle_repeats):
+        for gap in args.idle_gaps:
+            # What a search request runs, in its order, right after the idle
+            # gap; then the same calls once more to show how fast they recover.
+            query_a, query_b = chat.query(), chat.query()
+            first: list[tuple[str, Callable[[], object]]] = [
+                (
+                    "embedder.embed_query",
+                    functools.partial(embedder.embed_query, query_a, instruction=instruction),
+                ),
+                ("pe_core.embed_text", functools.partial(pe_core.embed_text, query_a)),
+            ]
+            again: list[tuple[str, Callable[[], object]]] = [
+                (
+                    "embedder.embed_query again",
+                    functools.partial(embedder.embed_query, query_b, instruction=instruction),
+                ),
+                ("pe_core.embed_text again", functools.partial(pe_core.embed_text, query_b)),
+            ]
+            if rerank_probe is not None:
+                first.append(rerank_probe)
+                again.append((f"{rerank_probe[0]} again", rerank_probe[1]))
+            log(f"idle probe {repeat + 1}/{args.idle_repeats}: sleeping {gap:g}s")
+            gap_start = gpu_time_by_process()
+            time.sleep(gap)
+            gap_end = gpu_time_by_process()
+            calls_s = {name: round(time_call(call), 5) for name, call in [*first, *again]}
+            calls_end = gpu_time_by_process()
+            probe: dict[str, Any] = {
+                "idle_seconds": gap,
+                "repeat": repeat,
+                **(gpu_time_delta(gap_start, gap_end) or {}),
+                "calls_s": calls_s,
+                "search_order_s": round(sum(calls_s[name] for name, _ in first), 5),
+                "search_order_again_s": round(sum(calls_s[name] for name, _ in again), 5),
+                "gpu_during_calls": gpu_time_delta(gap_end, calls_end),
+            }
+            log(f"  {probe}")
+            probes.append(probe)
 
     memory["final"] = memory_state(mx, torch)
     report["finished_at"] = datetime.now(UTC).isoformat(timespec="seconds")
     report["anomalies"] = find_anomalies(report, args.anomaly_seconds)
     return report
+
+
+def run_reranker_load_only(args: argparse.Namespace) -> dict[str, Any]:
+    """The reranker's cold start, for a fresh process: import `mlx.core`
+    and `mlx_lm`, `load()` (weights, tokenizer, and Metal setup — nothing
+    touches the GPU before it), then two `score()` calls on one pool of the
+    first pool spec (one document of `--doc-tokens` when there is none).
+    Host probes and the digest run only after the timed steps."""
+    started = datetime.now(UTC)
+    before_load = memory_state(None, None)
+    t0 = time.perf_counter()
+    mx = import_mlx_core()
+    import_mlx_lm()
+    import_s = time.perf_counter() - t0
+    reranker = make_reranker(args)
+    load_s = time_call(reranker.load)
+    after_load = {**memory_state(mx, None), **mlx_memory(mx, include_peak=True)}
+    specs = pool_specs(args)
+    spec = specs[0] if specs else PoolSpec(1, args.doc_tokens)
+    chat = SyntheticChat(args.seed)
+    pool = draw_pool(chat, reranker_internals(reranker).tokenizer, spec.size, spec.tokens)
+    call = functools.partial(reranker.score, pool.query, list(pool.documents))
+    first_s = time_call(call)
+    second_s = time_call(call)
+    log(
+        f"import {import_s:.2f}s, load {load_s:.2f}s, first score {first_s:.3f}s, "
+        f"second score {second_s:.3f}s"
+    )
+    return {
+        "schema": REPORT_SCHEMA,
+        "mode": "reranker_load_only",
+        "started_at": started.isoformat(timespec="seconds"),
+        "host": host_info(mx),
+        "settings": {
+            "seed": args.seed,
+            **pool_settings(args),
+            "hf_hub_offline": os.environ.get("HF_HUB_OFFLINE"),
+        },
+        "models": {
+            "reranker": model_provenance(
+                args.reranker, args.reranker_revision, cache_dir=None, digest=args.digest
+            )
+        },
+        "reranker_load_only": {
+            "import_mlx_s": round(import_s, 3),
+            "load_s": round(load_s, 3),
+            "first_score_s": round(first_s, 4),
+            "second_score_s": round(second_s, 4),
+            "pool": spec.label(reranker.doc_max_tokens),
+            "doc_target_tokens": list(pool.doc_target_tokens),
+            **pool_work(reranker, pool),
+        },
+        "memory": {
+            "before_load": before_load,
+            "after_load": after_load,
+            "after_scores": {**memory_state(mx, None), **mlx_memory(mx, include_peak=True)},
+        },
+        "finished_at": datetime.now(UTC).isoformat(timespec="seconds"),
+    }
 
 
 def find_anomalies(report: dict[str, Any], threshold_s: float) -> list[str]:
@@ -1006,7 +1280,7 @@ def print_report(report: dict[str, Any], out: TextIO) -> None:
     loads = ", ".join(f"{k} {v['seconds']:.1f}s" for k, v in report["load"].items())
     print(f"load: {loads}", file=out)
     print(
-        f"\n{'stage':22s} {'shape':10s} {'n':>3s} {'first_s':>8s} {'min_s':>8s} {'p50_s':>8s} "
+        f"\n{'stage':22s} {'shape':26s} {'n':>3s} {'first_s':>8s} {'min_s':>8s} {'p50_s':>8s} "
         f"{'p95_s':>8s} {'max_s':>8s} {'tok/s@p50':>10s} {'wall_s':>7s} {'otherGPU_s':>10s}",
         file=out,
     )
@@ -1014,9 +1288,21 @@ def print_report(report: dict[str, Any], out: TextIO) -> None:
         rate = f"{st['tokens_per_s_p50']:10.1f}" if "tokens_per_s_p50" in st else f"{'-':>10s}"
         other = st.get("gpu_s_other")
         print(
-            f"{st['stage']:22s} {st['shape']:10s} {st['repetitions']:3d} {st['first_call_s']:8.4f} "
+            f"{st['stage']:22s} {st['shape']:26s} {st['repetitions']:3d} {st['first_call_s']:8.4f} "
             f"{st['min_s']:8.4f} {st['p50_s']:8.4f} {st['p95_s']:8.4f} {st['max_s']:8.4f} "
             f"{rate} {st['wall_s']:7.1f} {'-' if other is None else other:>10}",
+            file=out,
+        )
+    for st in report["stages"]:
+        if "pair_tokens" not in st:
+            continue
+        print(
+            f"{st['shape']}: per timed call, mean of {len(st['pair_tokens'])}: pair tokens "
+            f"{mean(st['pair_tokens']):.0f} (max {max(st['pair_tokens'])}), padded "
+            f"{mean(st['padded_tokens']):.0f}, forward passes {mean(st['batches']):.1f}, "
+            f"documents capped {mean(st['docs_capped']):.1f} of {st['pool_size']} "
+            f"(drawn length mean {st['doc_target_tokens_mean']}); "
+            f"{st['pair_tokens_per_s']} pair tokens/s",
             file=out,
         )
     memory = report["memory"]
@@ -1044,15 +1330,48 @@ def print_report(report: dict[str, Any], out: TextIO) -> None:
         )
     for probe in report.get("idle_probes", []):
         calls = ", ".join(f"{name} {s:.3f}s" for name, s in probe.get("calls_s", {}).items())
+        totals = (
+            f" | search order {probe['search_order_s']:.3f}s, again "
+            f"{probe['search_order_again_s']:.3f}s"
+            if "search_order_s" in probe
+            else ""
+        )
         print(
             f"after {probe['idle_seconds']:g}s idle (other processes' GPU "
-            f"{probe.get('gpu_s_other')}s): {calls}",
+            f"{probe.get('gpu_s_other')}s): {calls}{totals}",
             file=out,
         )
     anomalies = report.get("anomalies") or []
     print("anomalies: " + ("none" if not anomalies else ""), file=out)
     for note in anomalies:
         print(f"  - {note}", file=out)
+
+
+def mean(values: Sequence[float]) -> float:
+    return sum(values) / len(values)
+
+
+def print_load_only(report: dict[str, Any], out: TextIO) -> None:
+    host = report["host"]
+    cold = report["reranker_load_only"]
+    after = report["memory"]["after_scores"]
+    print(
+        f"{host['host_class']}, {host['gpu_cores']}-core GPU, macOS {host['macos']}; reranker "
+        f"{report['models']['reranker'].get('model')}",
+        file=out,
+    )
+    print(
+        f"import mlx+mlx_lm {cold['import_mlx_s']:.2f}s, load {cold['load_s']:.2f}s, "
+        f"first score {cold['first_score_s']:.3f}s, second score {cold['second_score_s']:.3f}s "
+        f"({cold['pool']}: {cold['pair_tokens']} pair tokens, {cold['batches']} forward passes)",
+        file=out,
+    )
+    print(
+        f"after scores: mx peak {after.get('mx_peak_gib')} GiB, mx active "
+        f"{after.get('mx_active_gib')} GiB, phys footprint {after.get('phys_footprint_gib')} GiB, "
+        f"max RSS {after.get('max_rss_gib')} GiB",
+        file=out,
+    )
 
 
 def compare_reports(base_path: Path, other_path: Path, out: TextIO) -> None:
@@ -1075,7 +1394,7 @@ def compare_reports(base_path: Path, other_path: Path, out: TextIO) -> None:
         b = other.get("models", {}).get(key, {}).get("artifact_sha256")
         print(f"{key}: {'same bytes' if a and a == b else 'NOT VERIFIED SAME'}", file=out)
     print(
-        f"\n{'stage':22s} {'shape':10s} {'A p50_s':>8s} {'B p50_s':>8s} {'B/A p50':>8s} "
+        f"\n{'stage':22s} {'shape':26s} {'A p50_s':>8s} {'B p50_s':>8s} {'B/A p50':>8s} "
         f"{'A p95_s':>8s} {'B p95_s':>8s} {'B/A p95':>8s} {'A tok/s':>8s} {'B tok/s':>8s} "
         f"{'A oGPU':>7s} {'B oGPU':>7s}",
         file=out,
@@ -1091,15 +1410,17 @@ def compare_reports(base_path: Path, other_path: Path, out: TextIO) -> None:
             else f"{'-':>8s} {'-':>8s}"
         )
         print(
-            f"{st['stage']:22s} {st['shape']:10s} {st['p50_s']:8.4f} {match['p50_s']:8.4f} "
+            f"{st['stage']:22s} {st['shape']:26s} {st['p50_s']:8.4f} {match['p50_s']:8.4f} "
             f"{match['p50_s'] / st['p50_s']:8.3f} {st['p95_s']:8.4f} {match['p95_s']:8.4f} "
             f"{match['p95_s'] / st['p95_s']:8.3f} {rates} "
             f"{st.get('gpu_s_other', '-')!s:>7} {match.get('gpu_s_other', '-')!s:>7}",
             file=out,
         )
-    other_probes = {p["idle_seconds"]: p for p in other.get("idle_probes", [])}
+    other_probes = {
+        (p["idle_seconds"], p.get("repeat", 0)): p for p in other.get("idle_probes", [])
+    }
     for probe in base.get("idle_probes", []):
-        match = other_probes.get(probe["idle_seconds"])
+        match = other_probes.get((probe["idle_seconds"], probe.get("repeat", 0)))
         if match is None:
             continue
         calls = ", ".join(
@@ -1158,7 +1479,26 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="commit sha for a Hub repo; for a local directory the upstream sha, recorded in "
         "model_id only (as the provider factory does)",
     )
-    parser.add_argument("--reranker-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--reranker-batch-size",
+        type=int,
+        default=DEFAULT_RERANK_BATCH_SIZE,
+        help="most pairs in one reranker forward pass (default: the provider's own bound, which "
+        "the provider factory keeps)",
+    )
+    parser.add_argument(
+        "--reranker-max-batch-tokens",
+        type=int,
+        default=DEFAULT_RERANK_MAX_BATCH_TOKENS,
+        help="most padded tokens in one reranker forward pass (default: the provider's own bound)",
+    )
+    parser.add_argument(
+        "--rerank-doc-max-tokens",
+        type=parse_doc_cap,
+        default=DEFAULT_RERANK_DOC_MAX_TOKENS,
+        help="reranker document-token cap, or 'none' (default: the config schema's "
+        "retrieval.rerank_doc_max_tokens)",
+    )
     parser.add_argument(
         "--pe-core", default=constants.MULTIMODAL_EMBEDDING_MODEL_REPO, help="PE-Core Hub repo id"
     )
@@ -1172,16 +1512,38 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--repetitions", type=int, default=20)
     parser.add_argument("--shapes", default=DEFAULT_SHAPES, help="comma-separated BATCHxTOKENS")
     parser.add_argument(
+        "--pool-sizes",
         "--pool-size",
-        type=int,
-        default=10,
-        help="rerank-pool documents for reranker.score (0 skips)",
+        dest="pool_sizes",
+        default="10",
+        help="comma-separated rerank-pool sizes for reranker.score ('0' skips); the first is the "
+        "pool the idle probes and --reranker-load-only score",
+    )
+    parser.add_argument(
+        "--capped-pool-sizes",
+        default="",
+        help="comma-separated sizes of extra pools whose every document is longer than the cap",
+    )
+    parser.add_argument(
+        "--doc-tokens",
+        default=",".join(str(n) for n in DOC_TOKEN_LENGTHS),
+        help="token lengths of pool documents: LOW-HIGH (uniform over the integers) or A,B,C "
+        "(uniform over the values)",
     )
     parser.add_argument("--pool-repetitions", type=int, default=None)
     parser.add_argument(
         "--idle-gaps",
         default="3,30,300",
         help="comma-separated seconds of idle before each probe ('' for none)",
+    )
+    parser.add_argument(
+        "--idle-repeats", type=int, default=1, help="how many times to cycle through --idle-gaps"
+    )
+    parser.add_argument(
+        "--reranker-load-only",
+        action="store_true",
+        help="measure only the reranker's import, load and first two score() calls, then exit "
+        "(run in a fresh process)",
     )
     parser.add_argument(
         "--idle-baseline-seconds",
@@ -1197,15 +1559,39 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.compare is None and not args.reranker:
         parser.error("--reranker is required (the local conversion's directory or a repo id)")
-    if args.warmup < 0 or args.repetitions < 1 or args.pool_size < 0:
-        parser.error("--warmup must be >= 0, --repetitions >= 1, --pool-size >= 0")
+    if args.warmup < 0 or args.repetitions < 1 or args.idle_repeats < 0:
+        parser.error("--warmup must be >= 0, --repetitions >= 1, --idle-repeats >= 0")
+    if args.reranker_batch_size < 1 or args.reranker_max_batch_tokens < 1:
+        parser.error("--reranker-batch-size and --reranker-max-batch-tokens must be >= 1")
     if args.pool_repetitions is None:
         args.pool_repetitions = args.repetitions
+    if args.pool_repetitions < 1:
+        parser.error("--pool-repetitions must be >= 1")
+    try:
+        args.pool_sizes = parse_sizes(args.pool_sizes, "--pool-sizes")
+        args.capped_pool_sizes = parse_sizes(args.capped_pool_sizes, "--capped-pool-sizes")
+        args.doc_tokens = parse_doc_tokens(args.doc_tokens)
+    except ValueError as exc:
+        parser.error(str(exc))
+    cap = args.rerank_doc_max_tokens
+    if args.capped_pool_sizes and (cap is None or args.doc_tokens.high <= cap):
+        parser.error(
+            "--capped-pool-sizes needs --rerank-doc-max-tokens below the longest --doc-tokens length"
+        )
     try:
         args.idle_gaps = [float(g) for g in args.idle_gaps.split(",") if g.strip()]
     except ValueError:
         parser.error("--idle-gaps must be comma-separated numbers of seconds")
     return args
+
+
+def parse_doc_cap(value: str) -> int | None:
+    """`--rerank-doc-max-tokens`: a token count >= 1, or `none` for no cap."""
+    if value.strip().lower() in ("none", "null"):
+        return None
+    if not value.strip().isdigit() or int(value) < 1:
+        raise argparse.ArgumentTypeError(f"expected a token count >= 1 or 'none', got {value!r}")
+    return int(value)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1216,13 +1602,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Provider logs (structlog's default printer writes to stdout) must not
     # interleave with the JSON report.
     structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
-    report = run_benchmark(args)
+    run, show = (
+        (run_reranker_load_only, print_load_only)
+        if args.reranker_load_only
+        else (run_benchmark, print_report)
+    )
+    report = run(args)
     if args.json:
         json.dump(report, sys.stdout, indent=2)
         sys.stdout.write("\n")
-        print_report(report, sys.stderr)
+        show(report, sys.stderr)
     else:
-        print_report(report, sys.stdout)
+        show(report, sys.stdout)
     return 0
 
 
