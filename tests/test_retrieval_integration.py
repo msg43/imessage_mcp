@@ -23,7 +23,9 @@ tests here:
 
 from __future__ import annotations
 
+import math
 import os
+import random
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -39,6 +41,7 @@ from imsg.db.migrations import PostgresMigrationRunner
 from imsg.embed.fts.schema import create_schema
 from imsg.embed.fts.sync import upsert_segment_row
 from imsg.embed.provider import FakeMultimodalEmbeddingProvider, FakeTextEmbeddingProvider
+from imsg.embed.vector_codec import vector_literal
 from imsg.keys import message_key as derive_message_key
 from imsg.keys import thread_key as derive_thread_key
 from imsg.retrieval.access import LOCAL_FULL_ACCESS, AccessContext
@@ -55,6 +58,7 @@ from imsg.retrieval.people import resolve_person
 from imsg.retrieval.query import analyze_query
 from imsg.retrieval.reranker import FakeRerankerProvider
 from imsg.retrieval.service import RetrievalService
+from imsg.retrieval.vector_search import _best_distance_per_segment, search_multimodal_vector
 
 TEST_PG_HOST = os.environ.get("IMSG_TEST_PG_HOST", "/tmp/imsgpg1")
 TEST_PG_PORT = os.environ.get("IMSG_TEST_PG_PORT", "55432")
@@ -540,6 +544,112 @@ def test_scan_cap_reached_is_reported_when_the_pool_is_exhausted(
 
 
 # ==========================================================================
+# Channel C streams its overfetch and stops early — same answer as reading it all
+# ==========================================================================
+
+
+def _unit(vec: list[float]) -> list[float]:
+    norm = math.sqrt(sum(v * v for v in vec))
+    return [v / norm for v in vec]
+
+
+def test_multimodal_channel_early_stop_matches_collapsing_every_row(
+    scratch_db: psycopg.Connection, fts_conn: apsw.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real pgvector HNSW scan, real server-side cursor: bursts of
+    near-identical photos per segment (the shape that makes the 500-row
+    overfetch mostly duplicates), fetched a few rows at a time so the
+    early stop has to decide across several round trips."""
+    import imsg.retrieval.vector_search as vector_search_module
+
+    fetched: list[int] = []
+    real_fetchmany = psycopg.ServerCursor.fetchmany
+
+    def counting_fetchmany(self: psycopg.ServerCursor[Any], size: int = 0) -> list[Any]:
+        rows = real_fetchmany(self, size)
+        fetched.append(len(rows))
+        return rows
+
+    monkeypatch.setattr(vector_search_module, "COLLAPSE_FETCH_ROWS", 4)
+    monkeypatch.setattr(psycopg.ServerCursor, "fetchmany", counting_fetchmany)
+
+    rng = random.Random(20260916)
+    dim = constants.MULTIMODAL_EMBEDDING_DIM
+    owner_id, _ = _insert_person(scratch_db, "Owner", is_owner=True)
+    chat_id, _ = _insert_chat(scratch_db, participants=[owner_id])
+    base = datetime(2025, 6, 1, tzinfo=UTC)
+    for i in range(40):
+        started = base + timedelta(hours=i)
+        segment_id, _ = _make_segment(
+            scratch_db,
+            fts_conn,
+            chat_id=chat_id,
+            rendered_text=f"photo burst {i}",
+            started_at=started,
+            person_id=owner_id,
+        )
+        message_id, _ = _insert_message(
+            scratch_db,
+            chat_id=chat_id,
+            segment_id=segment_id,
+            sender_person_id=owner_id,
+            is_from_me=True,
+            sent_at=started + timedelta(minutes=1),
+            text="",
+        )
+        centre = [rng.gauss(0.0, 1.0) for _ in range(dim)]
+        with scratch_db.cursor() as cur:
+            for burst in range(rng.randint(1, 6)):
+                cur.execute(
+                    "INSERT INTO attachment (source_guid, attachment_key) VALUES (%s, %s) "
+                    "RETURNING attachment_id",
+                    (f"att-{uuid.uuid4()}", f"attachment-key-{uuid.uuid4().hex}"),
+                )
+                row = cur.fetchone()
+                assert row is not None
+                attachment_id = int(row[0])
+                cur.execute(
+                    "INSERT INTO message_attachment (message_id, attachment_id, ordinal) "
+                    "VALUES (%s, %s, %s)",
+                    (message_id, attachment_id, burst),
+                )
+                vec = _unit([c + rng.gauss(0.0, 0.05) for c in centre])
+                cur.execute(
+                    "INSERT INTO attachment_mm_embedding (attachment_id, model, media_sha256, vec) "
+                    "VALUES (%s, 'fake/multimodal@test', %s, %s::halfvec)",
+                    (attachment_id, uuid.uuid4().hex, vector_literal(vec)),
+                )
+
+    predicate = compile_predicate(SearchFilters(), LOCAL_FULL_ACCESS)
+    for k in (3, 10, 60):
+        query = _unit([rng.gauss(0.0, 1.0) for _ in range(dim)])
+        fetched.clear()
+        streamed = search_multimodal_vector(scratch_db, query, predicate, k)
+        row_limit = max(k * 5, 50)
+        with scratch_db.transaction(), scratch_db.cursor() as cur:
+            cur.execute("SET LOCAL hnsw.iterative_scan = 'strict_order'")
+            cur.execute(
+                """
+                SELECT s.segment_id, mm.vec <=> %(qv)s::halfvec AS distance
+                FROM attachment_mm_embedding mm
+                JOIN message_attachment ma ON ma.attachment_id = mm.attachment_id
+                JOIN segment_message sm ON sm.message_id = ma.message_id
+                JOIN segment s ON s.segment_id = sm.segment_id
+                ORDER BY mm.vec <=> %(qv)s::halfvec
+                LIMIT %(n)s
+                """,
+                {"qv": vector_literal(query), "n": row_limit},
+            )
+            every_row = [(int(r[0]), float(r[1])) for r in cur.fetchall()]
+        assert streamed == _best_distance_per_segment(every_row, k)
+        if k < 40:
+            assert len(streamed.segment_ids) == k
+            assert sum(fetched) < len(every_row), "a small k settles before the overfetch runs out"
+        else:
+            assert streamed.scan_cap_reached is True  # only 40 segments exist
+
+
+# ==========================================================================
 # Person resolution ladder (SPEC §9.4 step 1, D6)
 # ==========================================================================
 
@@ -617,6 +727,53 @@ def test_search_messages_returns_a_matching_segment_with_expected_shape(
     assert str(hit["text"]).startswith("the deck rebuild bid")
     assert result.candidate_lists["segment_fts"] >= 1
     assert isinstance(result.scan_cap_reached, bool)
+
+
+def test_search_messages_reranks_at_least_limit_candidates_when_rerank_top_is_smaller(
+    scratch_db: psycopg.Connection, fts_conn: apsw.Connection
+) -> None:
+    """`retrieval.rerank_top` is a latency setting, not a result cap: with
+    a pool of 2 and `limit=5`, all five matching segments come back, and
+    every one of them went through the reranker."""
+    owner_id, _ = _insert_person(scratch_db, "Owner", is_owner=True)
+    chat_id, _ = _insert_chat(scratch_db, participants=[owner_id])
+    for i in range(6):
+        _make_segment(
+            scratch_db,
+            fts_conn,
+            chat_id=chat_id,
+            rendered_text=f"harbor kite festival notes part {i}",
+            started_at=datetime(2024, 5, 1 + i, 9, 0, tzinfo=UTC),
+            person_id=owner_id,
+        )
+
+    scored: list[int] = []
+
+    class _CountingReranker(FakeRerankerProvider):
+        def score(self, query: str, documents: list[str]) -> list[float]:
+            scored.append(len(documents))
+            return super().score(query, documents)
+
+    class _SmallPoolCfg(_Cfg):
+        class _Retrieval(_Cfg._Retrieval):
+            rerank_top = 2
+
+        retrieval = _Retrieval()
+
+    small_pool = RetrievalService(
+        pg_conn=scratch_db,
+        fts_conn=fts_conn,
+        config=_SmallPoolCfg(),  # type: ignore[arg-type]
+        text_provider=FakeTextEmbeddingProvider(dim=constants.PRIMARY_EMBEDDING_DIM),
+        reranker=_CountingReranker(),
+        multimodal_provider=FakeMultimodalEmbeddingProvider(dim=constants.MULTIMODAL_EMBEDDING_DIM),
+    )
+    assert len(small_pool.search_messages(LOCAL_FULL_ACCESS, query="kite festival", limit=5).results) == 5
+    assert scored == [5]
+    # at or below rerank_top, the pool is rerank_top
+    scored.clear()
+    assert len(small_pool.search_messages(LOCAL_FULL_ACCESS, query="kite festival", limit=1).results) == 1
+    assert scored == [2]
 
 
 def test_search_messages_empty_result_is_success_not_error(

@@ -56,6 +56,24 @@ the ``huggingface_hub`` fallback path so a pinned-revision download does
 not pull duplicate weight formats (``*.bin`` next to ``*.safetensors``)."""
 
 
+DEFAULT_CACHE_LIMIT_BYTES = 8 * 2**30
+"""The bound :func:`bound_buffer_cache` applies when a provider's weights
+load (D10.2: bound MLX's buffer cache explicitly at process start) —
+the text embedder and the reranker both apply it. MLX's default cache
+limit equals its memory limit — 121.6 GiB on a 128 GB M2 Ultra
+(``mx.device_info`` / ``set_cache_limit``, 2026-09-15) — so every
+freed activation buffer is retained and, because consecutive batches
+have different shapes, rarely reused: measured with
+`scripts/bench_text_embedding.py`, the cache grew by ~1.3 GiB per
+batch without bound (44-54 GiB after 8-64 batches; peak *active*
+memory never above 28 GiB), and the first production run reached a
+102 GB GPU footprint, filled the 30 GB swap and stalled the GPU on
+paging (`footprint`/`vm.swapusage`, 2026-09-15). 8 GiB is comfortably
+above the active working set of the batches the pipeline plans (peak
+9-11 GiB *including* the 8.4 GB of weights for 4k-16k padded
+tokens), so bounding it costs nothing and keeps the process resident."""
+
+
 class MlxRuntimeError(ImsgError):
     """An MLX-backed provider could not load or run its model (weights
     missing/unloadable, an unexpected model class, a tokenizer that does
@@ -88,6 +106,30 @@ def import_mlx_core() -> ModuleType:
 def import_mlx_lm() -> ModuleType:
     """Lazily import ``mlx_lm`` (``load`` / ``stream_generate``)."""
     return _import("mlx_lm")
+
+
+def bound_buffer_cache(limit_bytes: int) -> None:
+    """Bound MLX's buffer cache to at most ``limit_bytes``, keeping any
+    tighter bound already in place.
+
+    The cache limit is process-wide, and several providers share one
+    process (the retrieval service loads the text embedder and the
+    reranker), so each applies its bound at load without loosening one
+    another's. ``mx.set_cache_limit`` returns the previous limit — MLX
+    has no getter — so the only way to read the current bound is to set
+    one: a previous limit below ``limit_bytes`` was an explicit, tighter
+    choice and is put back. The runtime default (the memory limit) is
+    never below a sane bound, so a fresh process always ends at
+    ``limit_bytes``. A runtime without ``set_cache_limit`` is left alone.
+    """
+    if limit_bytes < 0:
+        raise ValueError(f"limit_bytes must be >= 0, got {limit_bytes}")
+    set_cache_limit = getattr(import_mlx_core(), "set_cache_limit", None)
+    if set_cache_limit is None:
+        return
+    previous = set_cache_limit(limit_bytes)
+    if isinstance(previous, int) and not isinstance(previous, bool) and 0 <= previous < limit_bytes:
+        set_cache_limit(previous)
 
 
 def format_model_id(model_repo: str, revision: str | None) -> str:
@@ -275,10 +317,12 @@ def batched[T](items: Sequence[T], batch_size: int) -> Iterator[list[T]]:
 
 
 __all__ = [
+    "DEFAULT_CACHE_LIMIT_BYTES",
     "MlxRuntimeError",
     "MlxRuntimeUnavailableError",
     "base_transformer_hidden_states",
     "batched",
+    "bound_buffer_cache",
     "float_rows",
     "format_model_id",
     "gather_last_token_states",

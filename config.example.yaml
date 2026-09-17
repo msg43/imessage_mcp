@@ -98,7 +98,13 @@ retrieval:
   k_fts: 100
   k_vector: 100
   rrf_k: 60
-  rerank_top: 50
+  # The reranker is nearly all of search latency, and it scales with the tokens it
+  # reads: rerank_top candidates, each cut to rerank_doc_max_tokens (reranker tokens,
+  # document only — never the query; the count includes the ~40-token segment header).
+  # Never fewer than a request's `limit` are reranked. Chosen by
+  # scripts/bench_retrieval_latency.py; read the README's measurements before changing.
+  rerank_top: 10
+  rerank_doc_max_tokens: 64      # null = no cap beyond the model's 8,192-token row
   # The reranker is pinned as a LOCAL CONVERSION (models/manifest.lock.yaml,
   # `source: local_conversion`): reranker_model is that entry's output_dir, a
   # directory relative to data_root that the lock's recorded `command`

@@ -569,6 +569,38 @@ def test_multimodal_batch_size_must_be_positive(config_dict_factory: object) -> 
 
 
 # --------------------------------------------------------------------------
+# retrieval.rerank_top / rerank_doc_max_tokens: the reranker's latency knobs
+# --------------------------------------------------------------------------
+
+
+def test_rerank_defaults_are_the_measured_latency_settings(config_dict_factory: object) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["retrieval"].pop("rerank_top", None)
+    raw["retrieval"].pop("rerank_doc_max_tokens", None)
+    retrieval = load_config_dict(raw).retrieval
+    assert (retrieval.rerank_top, retrieval.rerank_doc_max_tokens) == (10, 64)
+
+
+@pytest.mark.parametrize("value", [None, 1, 256, 8192])
+def test_rerank_doc_max_tokens_accepts_null_or_a_positive_count(
+    config_dict_factory: object, value: int | None
+) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["retrieval"]["rerank_doc_max_tokens"] = value
+    assert load_config_dict(raw).retrieval.rerank_doc_max_tokens == value
+
+
+@pytest.mark.parametrize("value", [0, -1, "many"])
+def test_rerank_doc_max_tokens_rejects_non_positive_values(
+    config_dict_factory: object, value: object
+) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["retrieval"]["rerank_doc_max_tokens"] = value
+    with pytest.raises(ConfigError, match=r"retrieval\.rerank_doc_max_tokens"):
+        load_config_dict(raw)
+
+
+# --------------------------------------------------------------------------
 # retrieval.reranker_model: a Hub repo id, or a directory under data_root
 # --------------------------------------------------------------------------
 

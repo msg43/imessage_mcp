@@ -206,6 +206,35 @@ directory's digest against the lock, and checks the runtimes; `--write`
 never advances an upstream pin (the directory was converted from the
 pinned commit — re-convert and re-pin by hand to move it).
 
+**Search latency is how much the reranker reads.** Measured 2026-09-16 on
+an M2 Ultra with `scripts/bench_retrieval_latency.py` (20 fictional
+queries against the real index): the pinned Qwen3-Reranker-8B conversion
+reads roughly 650-780 tokens a second plus a few tens of milliseconds per
+forward pass, its
+chat template, instruction and the query put 76-80 tokens into every pair
+before any document text, and scoring 50 uncapped candidates meant
+~20,000 tokens a query — p95 36 s end
+to end (83 s before its batches were length-sorted). Once warm, the rest
+of `search_messages` — the two query embeddings, the vector and full-text
+searches, fusion — took p95 0.25-0.31 s, the database part of it about
+60 ms when the index pages are cached (see below). Two settings therefore
+decide latency: `retrieval.rerank_top`, how many fused candidates are
+scored (never fewer than the request's `limit`), and
+`retrieval.rerank_doc_max_tokens`, how many reranker tokens of each
+candidate are read — the document only, but counting the rendered
+segment's `Chat:`/`Time:` header (~40 tokens for two participants). The
+defaults, 10 and 64 (p95 1.97 s of reranking here), are the fastest
+setting whose ranking the benchmark could not tell apart from the fused
+order it replaces: at 32 tokens (1.56 s) the reranker sees only part of
+the header and ordered results worse, and no larger setting of the pinned
+model comes near a 2 s budget. The benchmark's quality columns are a
+proxy — agreement with scoring 50 uncapped candidates — not an
+evaluation: re-run it before moving either setting, and let the eval
+harness settle what latency costs. `imsg mcp local` loads and warms every
+model before it serves (one line on stderr says how long); a server that
+loads lazily spends its first query there instead — 92 s of loading and
+first-call compilation measured.
+
 | Interface | What it needs |
 |---|---|
 | `TextEmbeddingProvider` | `embed_documents()` (bare) and `embed_query()` (instruction-prefixed); **2048-dim**, L2-normalized |
@@ -255,6 +284,13 @@ Learned the expensive way; written down so you don't have to.
   few or zero hits and it looks like "nothing matched."
 - **Ingest-time and query-time text normalization must match exactly.**
   If they drift, exact-phrase search silently stops working.
+- **Vector search is only fast while its index is in memory.** An HNSW
+  query touches a few thousand pages of an index far larger than the
+  default 128 MB `shared_buffers`. Measured on the external encrypted
+  volume (2026-09-16): queries whose pages the OS had not cached took p95
+  302 ms (text vectors) and 609 ms (image vectors), against 37 ms and
+  70 ms once the index files were in the page cache — and with another
+  job's heavy I/O on the same disk, several seconds each.
 
 ---
 

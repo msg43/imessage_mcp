@@ -290,6 +290,23 @@ def _build_or_die[T](build: Callable[[], T]) -> T:
         raise typer.Exit(code=1) from exc
 
 
+def _warm_up_or_die(
+    service: RetrievalService, label: str, fts_conn: apsw.Connection, conn: psycopg.Connection
+) -> None:
+    """Load and warm every provider before serving (`RetrievalService.
+    warm_up`), reporting the time on stderr — for `mcp local` stdout is
+    the JSON-RPC channel. A provider that cannot load is one `imsg: ...`
+    line and exit 1, as at construction."""
+    try:
+        seconds = service.warm_up()
+    except ImsgError as exc:
+        fts_conn.close()
+        conn.close()
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"{label}: providers loaded and warmed in {seconds:.1f} s", err=True)
+
+
 def _decode_prompt(prompt_bytes: bytes) -> str:
     # Same decode the segmentation config hash applies to these bytes
     # (imsg.segment.hashing), so the model sees exactly what was hashed.
@@ -1656,6 +1673,7 @@ def mcp_local(config: ConfigOption = None) -> None:
         reranker=reranker,
         multimodal_provider=multimodal_provider,
     )
+    _warm_up_or_die(service, "mcp local", fts_conn, conn)
     audit = PostgresAuditSink(lambda: connect(cfg.database, autocommit=True))
     local = LocalMcpServer(service=service, audit=audit, config=cfg, conn=conn)
     try:
