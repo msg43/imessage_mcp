@@ -2036,6 +2036,71 @@ def test_mcp_local_sends_the_backend_line_to_stderr_not_the_stdio_channel(
     assert "models: backend=fake" not in result.stdout
 
 
+def test_mcp_local_warms_every_provider_before_serving(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first real query must not be the one that loads the weights:
+    every provider runs one throwaway input before the server starts, and
+    the time is reported on stderr (stdout is the JSON-RPC channel)."""
+    import anyio
+
+    from imsg.embed.provider import FakeMultimodalEmbeddingProvider, FakeTextEmbeddingProvider
+    from imsg.retrieval.reranker import FakeRerankerProvider
+
+    order: list[str] = []
+
+    class _Text(FakeTextEmbeddingProvider):
+        def embed_query(self, text: str, *, instruction: str) -> list[float]:
+            order.append("text")
+            return super().embed_query(text, instruction=instruction)
+
+    class _Multimodal(FakeMultimodalEmbeddingProvider):
+        def embed_text(self, text: str) -> list[float]:
+            order.append("multimodal")
+            return super().embed_text(text)
+
+    class _Reranker(FakeRerankerProvider):
+        def score(self, query: str, documents: list[str]) -> list[float]:
+            order.append("reranker")
+            return super().score(query, documents)
+
+    monkeypatch.setattr(cli_module, "build_text_provider", lambda cfg: _Text(dim=cfg.embedding.dim))
+    monkeypatch.setattr(
+        cli_module,
+        "build_multimodal_provider",
+        lambda cfg: _Multimodal(dim=cfg.embedding.multimodal.dim),
+    )
+    monkeypatch.setattr(cli_module, "build_reranker", lambda cfg: _Reranker())
+    monkeypatch.setattr(anyio, "run", lambda func, *args: order.append("serve"))
+
+    result = runner.invoke(app, ["mcp", "local", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert order == ["text", "multimodal", "reranker", "serve"]
+    assert "mcp local: providers loaded and warmed in " in result.stderr
+    assert "warmed" not in result.stdout
+
+
+def test_mcp_local_exits_cleanly_when_a_provider_cannot_warm_up(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import anyio
+
+    from imsg.errors import ProviderUnavailableError
+    from imsg.retrieval.reranker import FakeRerankerProvider
+
+    class _Broken(FakeRerankerProvider):
+        def score(self, query: str, documents: list[str]) -> list[float]:
+            raise ProviderUnavailableError("reranker weights could not load")
+
+    served: list[bool] = []
+    monkeypatch.setattr(cli_module, "build_reranker", lambda cfg: _Broken())
+    monkeypatch.setattr(anyio, "run", lambda func, *args: served.append(True))
+    result = runner.invoke(app, ["mcp", "local", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 1
+    assert "imsg: reranker weights could not load" in result.stderr
+    assert served == []
+
+
 def test_real_backend_with_a_missing_provider_module_exits_cleanly(
     mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
