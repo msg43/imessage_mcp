@@ -10,6 +10,106 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-17 — A source that has nothing to say no longer overwrites what another source knew
+
+**Invariant:** a source that carries no evidence for a column must never
+overwrite a value another source supplied — extraction writes a column
+only where the incoming snapshot positively asserts it, so absence of
+evidence is never recorded as evidence of absence.
+
+Several witnesses of the same conversations feed this index: each Mac's
+own `chat.db`, plus a recovered seed. They do not carry the same
+information. Every `ON CONFLICT DO UPDATE` in S2 assigned each column
+from the incoming row unconditionally, so the *last* source to run won
+every column — including the ones it simply could not see. Found as
+`has_attachments` flipping to false on messages that still had their
+`message_attachment` rows; the flip matters because rendering reads the
+real attachment rows while the segmentation boundary prompt reads this
+column, so segmenting would have fed degraded input into new embeddings.
+
+Measured against a pre-run dump of the same index, one host's
+re-extraction of its own `chat.db` had cost:
+
+| table.column | rows | what the silent source reported |
+| --- | --- | --- |
+| `message.has_attachments` | 14,282 true→false | no `message_attachment_join` rows |
+| `message.is_edited` | 2,203 true→false | empty `edit_history`, NULL `date_edited` |
+| `message.date_edited` | 2,203 value→NULL | NULL `date_edited` |
+| `message.is_unsent` | 263 true→false | `is_unsent=false` from a blob it lacked |
+| `chat.display_name` | 3,125 value→NULL | NULL `chat.display_name` |
+| `attachment.source_path` | 4,775 value→NULL | NULL `attachment.filename` |
+
+Two candidate columns turned out to have lost nothing:
+`text_original`/`text_normalized` (0 rows) and
+`sender_source_handle_id` (0 rows). Both were still fixed — they are the
+same defect, and the second instance in the report that opened this work
+was the body-blanking path — but the live index needed no repair for
+either.
+
+- **The policy is declared per column, once, in `imsg.stages.extract`**,
+  and the SQL is generated from it (`_build_upsert_sql`) rather than
+  spelled out per column inside each statement. Each column answers one
+  question — *can this source's "empty" be told apart from this source
+  having nothing to say?* — and gets one of four values:
+  - `ASSERTED` — every source that has the row carries this column, so
+    NULL and false are positive assertions. Only `message.is_from_me`
+    and `message.sent_at` qualify: both are plain `chat.db` columns
+    present on every row.
+  - `PRESENT` — NULL means "nothing here" and no source can distinguish
+    that from "empty". A NULL leaves the stored value alone; any
+    non-NULL value still overwrites.
+  - `POSITIVE` — a boolean naming the presence of something
+    (`has_attachments`, `is_edited`, `is_unsent`, `attachment.is_sticker`,
+    `tapback.removed`). Only `true` is evidence: `false` is what a source
+    reports both when the thing is absent and when it cannot see it. All
+    five also name facts that do not un-happen, so `true → false` was
+    never a correction being blocked.
+  - `INSERT_ONLY` — recorded on insert as provenance, never updated
+    (keys, `chat_id`, `message.service`, `reply_to_guid`).
+- **A genuine correction still flows**, which is the half a "keep the
+  old value" rule can silently break. A rewritten body, a message that
+  really was unsent since, a renamed chat, an attachment whose path
+  finally arrived, a tapback that was taken back — all still overwrite,
+  and the `missing → dataless` re-open in `_upsert_attachment` still
+  fires, because a path is evidence. Asserted directly, not assumed.
+- **The 2026-09-17 state-idempotence guard is unchanged and composes
+  with this one**: the evidence flag is ANDed into each `IS DISTINCT
+  FROM` disjunct, so a column a source cannot see is not merely left
+  unwritten, it also cannot drag the row into an UPDATE that would move
+  `updated_at` and re-segment the chat for nothing. One behaviour
+  changed as a consequence: a body going value → NULL is no longer a
+  change, so
+  `test_extract_unchanged_rows_stay_untouched_integration.py` proves the
+  NULL-sided `IS DISTINCT FROM` comparison in the NULL → value
+  direction instead (with NULL → NULL as the control).
+- **`_normalize_service` gained `_service_evidence`**, which returns
+  NULL where the former returns `"unknown"`. `unknown` is not a service;
+  it is the marker for "the snapshot did not say", and written as a
+  value it overwrote a service another source knew. It survives as the
+  value a first INSERT records.
+- **`chat.kind` no longer overwrites on a guess.** An unrecognized
+  `chat.style` falls back to a participant-count heuristic; that is good
+  enough to insert a new row with and not good enough to retype an
+  existing one, so a witness with an incomplete `chat_handle_join` can
+  no longer turn a group into a DM.
+- **Live repair, three transactions, each with controls that could
+  fail.** The `BEFORE UPDATE` trigger from migration 0003 stamps
+  `updated_at` unconditionally by design, so it was disabled and
+  re-enabled inside each transaction (a ROLLBACK restores it too) and
+  `tgenabled` verified after each commit. `updated_at` was restored from
+  the pre-run witness only for rows whose content had returned to
+  exactly the pre-run content, and only for rows carrying the degrading
+  run's own stamp — 61 rows bumped deliberately by `imsg identity` to
+  mark chats for re-segmentation kept their request. The strongest
+  control: the in-index repair predicate (`has_attachments = false` with
+  a `message_attachment` row) and the independent pre-run dump selected
+  **the same 14,282 rows, with zero on either side alone**, and 656,202
+  rows the run never touched matched the witness on every content column.
+  **Dirty chats fell from 1,517 to 317** (14,282 + 2,203 + 263 message
+  rows, 3,125 chat names and 4,775 attachment paths restored); what
+  remains is 972 genuinely new messages awaiting first segmentation and
+  610 that genuinely changed.
+
 ## 2026-09-17 — Extraction is idempotent in state, not just identity: an unchanged re-extraction now writes nothing
 
 Re-extracting a corpus whose content had not changed moved
