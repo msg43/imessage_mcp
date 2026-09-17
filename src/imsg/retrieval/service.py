@@ -15,12 +15,14 @@ codebase.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from imsg.embed.provider import MultimodalEmbeddingProvider, TextEmbeddingProvider
 from imsg.retrieval import directory, fts_search, segments, vector_search
 from imsg.retrieval.access import AccessContext, segment_eligibility_predicate
+from imsg.retrieval.background_warm_up import WarmUpStep
 from imsg.retrieval.errors import InvalidArgumentError, NotFoundError
 from imsg.retrieval.filters import compile_predicate, resolve_filters
 from imsg.retrieval.fuse import reciprocal_rank_fusion
@@ -32,11 +34,30 @@ if TYPE_CHECKING:
     import psycopg
 
     from imsg.config.schema import Config
+    from imsg.retrieval.model_thread import ModelThread
 
 WARM_UP_QUERY = "warm-up query"
 WARM_UP_DOCUMENT = "warm-up document"
 """The throwaway inputs :meth:`RetrievalService.warm_up` runs through each
 model — fixed, generic, never a real query."""
+
+TEXT_EMBEDDER_STEP = "text embedder"
+MULTIMODAL_STEP = "multimodal text tower"
+RERANKER_STEP = "reranker"
+
+ESTIMATED_WARM_UP_SECONDS: dict[str, float] = {
+    TEXT_EMBEDDER_STEP: 5.0,
+    MULTIMODAL_STEP: 32.0,
+    RERANKER_STEP: 155.0,
+}
+"""How long each warm-up step is expected to take, used only for the
+seconds-remaining estimate a tool call gets while the models load
+(`imsg.retrieval.background_warm_up`). Each is the slowest time seen for
+that step on the M2 Ultra host, rounded up, so the estimate errs long: in
+`imsg mcp local` runs on 2026-09-17 the text embedder took 3.3-4.5 s, the
+PE-Core text tower 22.5-26.1 s and the reranker 51.3-154.8 s — reading its
+7.9 GiB of weights is the step that varies — and PE-Core loading alone
+took 26-32 s on 2026-09-16."""
 
 MAX_QUERY_CHARS = 1000
 MAX_SEARCH_LIMIT = 50
@@ -66,32 +87,69 @@ class RetrievalService:
         text_provider: TextEmbeddingProvider,
         reranker: RerankerProvider,
         multimodal_provider: MultimodalEmbeddingProvider | None = None,
+        model_thread: ModelThread | None = None,
     ) -> None:
+        """`model_thread`, when given, is where every model call runs —
+        the warm-up and every query alike (`imsg.retrieval.model_thread`
+        explains why a server that warms up in the background needs
+        that). Without one, models run on the calling thread."""
         self._pg = pg_conn
         self._fts = fts_conn
         self._config = config
         self._text_provider = text_provider
         self._reranker = reranker
         self._multimodal_provider = multimodal_provider
+        self._model_thread = model_thread
+
+    def _run_model[T](self, call: Callable[[], T]) -> T:
+        """The one way this class invokes a model provider."""
+        if self._model_thread is None:
+            return call()
+        return self._model_thread.run(call)
 
     # -- warm-up ------------------------------------------------------------
 
+    def warm_up_steps(self) -> tuple[WarmUpStep, ...]:
+        """One step per model provider, each loading it and running one
+        throwaway input through it — the query embedder, the multimodal
+        text tower when channel C is enabled, and the reranker — so a
+        server's first real query does not pay for loading weights and
+        compiling kernels (loading alone took 4-5 s for the text embedder,
+        4-7 s for the reranker and 26-32 s for PE-Core on an M2 Ultra,
+        2026-09-16). Touches no database. A provider that cannot load
+        raises from its step."""
+        instruction = self._config.embedding.query_instruction
+
+        def text_embedder() -> None:
+            self._run_model(
+                lambda: self._text_provider.embed_query(WARM_UP_QUERY, instruction=instruction)
+            )
+
+        def reranker() -> None:
+            self._run_model(lambda: self._reranker.score(WARM_UP_QUERY, [WARM_UP_DOCUMENT]))
+
+        estimate = ESTIMATED_WARM_UP_SECONDS
+        steps = [WarmUpStep(TEXT_EMBEDDER_STEP, estimate[TEXT_EMBEDDER_STEP], text_embedder)]
+        multimodal = self._multimodal_provider
+        if self._config.embedding.multimodal.enabled and multimodal is not None:
+
+            def multimodal_text_tower() -> None:
+                self._run_model(lambda: multimodal.embed_text(WARM_UP_QUERY))
+
+            steps.append(
+                WarmUpStep(MULTIMODAL_STEP, estimate[MULTIMODAL_STEP], multimodal_text_tower)
+            )
+        steps.append(WarmUpStep(RERANKER_STEP, estimate[RERANKER_STEP], reranker))
+        return tuple(steps)
+
     def warm_up(self) -> float:
-        """Load every model provider and run one throwaway input through
-        each — the query embedder, the multimodal text tower when channel
-        C is enabled, and the reranker — so a server's first real query
-        does not pay for loading weights and compiling kernels (loading
-        alone took 4-5 s for the text embedder, 4-7 s for the reranker and
-        26-32 s for PE-Core on an M2 Ultra, 2026-09-16). Touches no
-        database. Returns the seconds it took; a provider that cannot load
-        raises here, at startup, instead of on the first query."""
+        """Run every :meth:`warm_up_steps` step now, on this thread's
+        behalf, and return the seconds it took. The local MCP server runs
+        the same steps in the background instead
+        (`imsg.retrieval.background_warm_up`)."""
         started = time.perf_counter()
-        self._text_provider.embed_query(
-            WARM_UP_QUERY, instruction=self._config.embedding.query_instruction
-        )
-        if self._config.embedding.multimodal.enabled and self._multimodal_provider is not None:
-            self._multimodal_provider.embed_text(WARM_UP_QUERY)
-        self._reranker.score(WARM_UP_QUERY, [WARM_UP_DOCUMENT])
+        for step in self.warm_up_steps():
+            step.run()
         return time.perf_counter() - started
 
     # -- search_messages ----------------------------------------------------
@@ -136,8 +194,9 @@ class RetrievalService:
             self._fts, self._pg, analyzed, predicate, k_fts
         )
 
-        query_vec = self._text_provider.embed_query(
-            analyzed.phrase, instruction=self._config.embedding.query_instruction
+        instruction = self._config.embedding.query_instruction
+        query_vec = self._run_model(
+            lambda: self._text_provider.embed_query(analyzed.phrase, instruction=instruction)
         )
         seg_vec = vector_search.search_segment_vector(self._pg, query_vec, predicate, k_vector)
         att_vec = vector_search.search_attachment_chunk_vector(
@@ -145,8 +204,9 @@ class RetrievalService:
         )
 
         mm_channel = None
-        if self._config.embedding.multimodal.enabled and self._multimodal_provider is not None:
-            mm_query_vec = self._multimodal_provider.embed_text(analyzed.phrase)
+        multimodal = self._multimodal_provider
+        if self._config.embedding.multimodal.enabled and multimodal is not None:
+            mm_query_vec = self._run_model(lambda: multimodal.embed_text(analyzed.phrase))
             mm_channel = vector_search.search_multimodal_vector(
                 self._pg, mm_query_vec, predicate, k_vector
             )
@@ -178,7 +238,7 @@ class RetrievalService:
         reranked: list[tuple[int, float]] = []
         if pool:
             documents = [summaries[r.segment_id].text for r in pool]
-            scores = self._reranker.score(analyzed.phrase, documents)
+            scores = self._run_model(lambda: self._reranker.score(analyzed.phrase, documents))
             reranked = sorted(
                 ((r.segment_id, s) for r, s in zip(pool, scores, strict=True)),
                 key=lambda t: -t[1],
@@ -315,4 +375,13 @@ class RetrievalService:
         }
 
 
-__all__ = ["WARM_UP_DOCUMENT", "WARM_UP_QUERY", "RetrievalService", "SearchMessagesResult"]
+__all__ = [
+    "ESTIMATED_WARM_UP_SECONDS",
+    "MULTIMODAL_STEP",
+    "RERANKER_STEP",
+    "TEXT_EMBEDDER_STEP",
+    "WARM_UP_DOCUMENT",
+    "WARM_UP_QUERY",
+    "RetrievalService",
+    "SearchMessagesResult",
+]

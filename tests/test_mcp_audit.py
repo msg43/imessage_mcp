@@ -74,7 +74,25 @@ def test_hash_params_never_returns_plaintext() -> None:
 def test_sanitize_keeps_known_codes() -> None:
     assert sanitize_error_code("RATE_LIMITED") == "RATE_LIMITED"
     assert sanitize_error_code("UNAUTHORIZED") == "UNAUTHORIZED"
+    assert sanitize_error_code("WARMING_UP") == "WARMING_UP"
     assert sanitize_error_code(None) is None
+
+
+def test_every_tool_error_code_is_recorded_as_itself() -> None:
+    """A `RetrievalError` code missing from the closed set would be stored
+    as INTERNAL, so the audit table would show a bug where there is none
+    (the warm-up codes did, until they were added)."""
+    from imsg.retrieval.errors import RetrievalError
+
+    def subclasses(cls: type[RetrievalError]) -> list[type[RetrievalError]]:
+        found = list(cls.__subclasses__())
+        for sub in cls.__subclasses__():
+            found.extend(subclasses(sub))
+        return found
+
+    codes = {cls.code for cls in [RetrievalError, *subclasses(RetrievalError)]}
+    assert {"WARMING_UP", "WARM_UP_FAILED", "NOT_FOUND"} <= codes
+    assert {code: sanitize_error_code(code) for code in codes} == {code: code for code in codes}
 
 
 @pytest.mark.parametrize(

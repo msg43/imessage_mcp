@@ -230,10 +230,16 @@ the header and ordered results worse, and no larger setting of the pinned
 model comes near a 2 s budget. The benchmark's quality columns are a
 proxy — agreement with scoring 50 uncapped candidates — not an
 evaluation: re-run it before moving either setting, and let the eval
-harness settle what latency costs. `imsg mcp local` loads and warms every
-model before it serves (one line on stderr says how long); a server that
-loads lazily spends its first query there instead — 92 s of loading and
-first-call compilation measured.
+harness settle what latency costs. `imsg mcp local` answers the MCP
+handshake at once and loads and warms every model in the background,
+logging each model's time and the total on stderr: warming first took
+121 s on 2026-09-17, and Claude Code gives up on a server that has not
+answered the handshake within `MCP_TIMEOUT`, 30 s by default. A tool call
+that arrives during warm-up waits up to 90 s for it, then returns
+`WARMING_UP` with an estimate of the seconds remaining; a model that
+fails to load makes every tool call return `WARM_UP_FAILED` with the
+cause. A server that loads lazily spends its first query there instead —
+92 s of loading and first-call compilation measured.
 
 | Interface | What it needs |
 |---|---|

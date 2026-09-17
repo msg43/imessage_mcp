@@ -1,13 +1,20 @@
 """Retrieval-service error hierarchy — SPEC §10.1's error model.
 
 Every code that appears in `RetrievalError.code` below is one of the
-eight machine codes SPEC §10.1 defines: "Tool errors return MCP
+machine codes SPEC §10.1 defines: "Tool errors return MCP
 tool-error content with a stable machine code first line:
 `INVALID_ARGUMENT | PERSON_NOT_FOUND | PERSON_AMBIGUOUS |
 DATE_RANGE_INVALID | NOT_FOUND | NOT_ENRICHED | SCOPE_DENIED |
 RATE_LIMITED | INTERNAL`." `RATE_LIMITED` is a transport-boundary
 concern (the public gate in `imsg.mcp.auth`, out of this module's
 scope) and is not raised from here.
+
+Two codes are additions that SPEC §10.1's list does not name yet:
+`WARMING_UP` and `WARM_UP_FAILED`, raised on the local surface while its
+models load in the background after the server has started answering
+(`imsg.retrieval.background_warm_up`). Neither fits an existing code: the
+first is transient and worth retrying, the second lasts until the server
+is restarted, and `INTERNAL` would say neither.
 
 Retrieval code raises one of these; `imsg.mcp.tools` (the MCP-surface
 adapter) catches `RetrievalError` and formats the stable code + message
@@ -106,6 +113,41 @@ class ScopeDeniedError(RetrievalError):
     code = "SCOPE_DENIED"
 
 
+class WarmingUpError(RetrievalError):
+    """The models are still loading and did not finish within the time
+    this call was allowed to wait for them. Transient: the same call
+    succeeds once loading finishes."""
+
+    code = "WARMING_UP"
+
+    def __init__(
+        self, *, seconds_remaining: int, loading: str | None, wait_bound_seconds: float
+    ) -> None:
+        self.seconds_remaining = seconds_remaining
+        self.loading = loading
+        self.wait_bound_seconds = wait_bound_seconds
+        what = f"loading the {loading}" if loading else "its models have not started loading"
+        super().__init__(
+            f"the index is warming up ({what}): about {seconds_remaining} s remaining "
+            f"(estimate). Retry this call; each call waits up to {wait_bound_seconds:g} s "
+            f"for the models to finish loading"
+        )
+
+
+class WarmUpFailedError(RetrievalError):
+    """A model failed to load when the server started, so no tool call
+    can be answered until the cause is fixed and the server restarts."""
+
+    code = "WARM_UP_FAILED"
+
+    def __init__(self, cause: str) -> None:
+        self.cause = cause
+        super().__init__(
+            f"the index cannot answer: its models failed to load when the server "
+            f"started ({cause}). Fix the cause, then restart the MCP server"
+        )
+
+
 __all__ = [
     "DateRangeInvalidError",
     "InvalidArgumentError",
@@ -116,4 +158,6 @@ __all__ = [
     "PersonNotFoundError",
     "RetrievalError",
     "ScopeDeniedError",
+    "WarmUpFailedError",
+    "WarmingUpError",
 ]
