@@ -172,6 +172,12 @@ export:
   data_store_id: example-datastore-id
   format: txt
   batch_max_files: 100000
+  # (secret) Reference to the GCP service-account key `imsg export push`
+  # authenticates with; the resolved value is that key's raw JSON.
+  # LEAVE IT OUT until you actually intend to push: with no credential
+  # named, `imsg export push` refuses before it even loads a Google
+  # client library, so nothing here can reach GCS or Discovery Engine.
+  # gcp_credentials: keychain:imsgindex-gcp          # (secret)
 
 eval:
   seed_queries: private/eval/queries.yaml   # relative to data_root

@@ -635,6 +635,17 @@ class ExportConfig(StrictModel):
     data_store_id: str = Field(min_length=1)
     format: Literal["txt"] = "txt"
     batch_max_files: int = Field(default=100_000, ge=1)
+    # (secret) The GCP service-account key `imsg export push` authenticates
+    # with, as a `keychain:<item>` / `env:<VAR>` reference like every other
+    # secret field (SPEC §6, `imsg.config.secrets.SecretRef`); the resolved
+    # value must be the key's raw JSON text.
+    #
+    # `None` is the default ON PURPOSE and is not an oversight: with no
+    # credential named, `imsg export push` refuses before it so much as
+    # imports a Google client library, so a repo checkout with a stock
+    # config cannot reach GCS or Discovery Engine at all. Adding a default
+    # here — any default — would remove that property.
+    gcp_credentials: SecretRef | None = None
 
 
 # --------------------------------------------------------------------------

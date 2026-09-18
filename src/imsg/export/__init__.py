@@ -53,9 +53,10 @@ from imsg.export.errors import (
     ExportPlanError,
     ExportPushError,
 )
-from imsg.export.planner import plan_export
-from imsg.export.purge import purge_person
-from imsg.export.push import push_export
+from imsg.export.models import PlanPreview, PlanResult, PushPreflight, PushResult
+from imsg.export.planner import plan_export, preview_plan
+from imsg.export.purge import preview_purge, purge_person, revoke_person
+from imsg.export.push import push_export, verify_push_preconditions
 from imsg.export.review import approve_run
 from imsg.export.transport import ExportTransport, FakeTransport
 from imsg.export.unclassified import unclassified_summary, write_unclassified_report
@@ -68,10 +69,18 @@ __all__ = [
     "ExportPushError",
     "ExportTransport",
     "FakeTransport",
+    "PlanPreview",
+    "PlanResult",
+    "PushPreflight",
+    "PushResult",
     "approve_run",
     "plan_export",
+    "preview_plan",
+    "preview_purge",
     "purge_person",
     "push_export",
+    "revoke_person",
     "unclassified_summary",
+    "verify_push_preconditions",
     "write_unclassified_report",
 ]

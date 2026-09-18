@@ -10,6 +10,80 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-18 — `imsg export` is a real command surface, and cannot reach Google without a credential you named
+
+The export gate has been complete as a library since Phase 7 groundwork
+— eligibility, planner, review, push, purge, the unclassified report,
+all integration-tested — behind a CLI that raised
+`StageNotImplementedError` and exited 1. So the one stage whose failure
+mode is "private content enters a corporate index" was the one stage no
+operator could run, the deployment guide documented commands that did
+not exist, and `install-agents` already rendered a Monday-08:00 job
+invoking `imsg export unclassified-report`, which would have failed
+every week from the day the agents were installed.
+
+- **Five commands, each shaped to refuse.** `export plan`, `approve
+  <run-id>`, `push <run-id>`, `purge-person <id-or-name>`,
+  `unclassified-report`. Refusals are first-class and tested, not
+  incidental: an unknown run id, an unapproved push, a drifted push, a
+  missing credential, an allowlist with zero rows, a purge naming
+  nobody. Each prints one `imsg: …` line and exits 1 — never a
+  traceback, because from this surface a traceback leaves the operator
+  unable to tell whether anything was uploaded.
+- **`export.gcp_credentials`, with no default, ever.** A `keychain:` /
+  `env:` reference like every other secret (SPEC §6). `push` checks it
+  **before opening the database**, and imports the Google client
+  libraries only after that check passes — so a stock checkout has no
+  code path to a network call, and `import imsg.cli` pulls in no Google
+  client at all. A test asserts exactly that, in a subprocess, so a
+  future refactor that hoists the import to module scope fails loudly
+  instead of quietly putting a network-capable client in every `imsg`
+  invocation.
+- **`--dry-run` where the stage has writes worth rehearsing.** `plan`
+  reconciles and reports without staging a byte; `push` runs every
+  verification the real push runs and stops — it builds no transport, so
+  the rehearsal is provably network-free and needs no credential;
+  `purge-person` applies the real revocation inside a transaction it
+  then rolls back, so the numbers come from the code that would run
+  rather than a parallel estimate; `unclassified-report` counts without
+  writing. `plan`/`push` share their implementations with the real
+  paths (`preview_plan`, `verify_push_preconditions`) — a rehearsal that
+  checked less than the performance would be worse than none.
+- **Fixed: a purge plan told the operator to do something the push then
+  waived.** `plan_export` computed the review banner by calling
+  `compute_approval_requirements` without its `mode`, so every purge
+  plan printed "OWNER APPROVAL REQUIRED" while `push_export` — which
+  does pass the stored mode — correctly exempted the same run under
+  D9.3. Conservative, and wrong in a way that matters: §11.4 calls that
+  report *the actual control*, and a report demanding a ceremony the
+  push skips teaches the operator to stop believing the report. Purge
+  plans now say they are exempt, and say that every drift check still
+  applies.
+- **Push is deliberately not wrapped in a transaction.** Its connection
+  is autocommit, so each item's outcome is recorded as it happens.
+  Wrapping would mean a crash after a successful upload rolls back the
+  `export_document` row recording it — leaving a document in the
+  corporate store that this system's reconciler cannot see and
+  `purge-person` therefore cannot delete. Redundant re-uploads on retry
+  are cheap and idempotent; an invisible document is not.
+- **Still unverified, and the reason this entry does not claim more.**
+  Every one of these commands was exercised against a live scratch
+  PostgreSQL and `FakeTransport`. **No part of the real GCS / Discovery
+  Engine transport has ever run against a live API** — not one upload,
+  import, delete, or absence check — and nothing in the test suite is
+  permitted to make it. That remains a Phase 7 deliverable gated behind
+  AT-5.
+- **Survey, so the next gap is not a surprise.** No
+  `StageNotImplementedError` stub remains anywhere in the CLI, and a
+  test now walks the whole command tree asserting none reappears. Two
+  documented commands still do not exist: **`imsg backup`**, which the
+  daily 04:00 LaunchAgent invokes (SPEC §5.3/§14), and **`imsg mcp
+  public --probe`**, the AT-1 "Glenn test" the deployment guide makes a
+  precondition of exposing any corpus — its library half
+  (`imsg.mcp.probe.run_auth_probe`) is built and tested, but a real run
+  needs two live OAuth tokens, so it was left unwired rather than
+  half-wired.
+
 ## 2026-09-18 — The public MCP surface warms its models at start, instead of loading them inside the first request
 
 `imsg mcp local` has warmed in the background since 2026-09-17;

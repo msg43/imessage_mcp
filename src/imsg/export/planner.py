@@ -48,6 +48,7 @@ from imsg.export.models import (
     ExportSegment,
     PlannedDelete,
     PlannedUpsert,
+    PlanPreview,
     PlanResult,
 )
 from imsg.export.render import (
@@ -554,6 +555,59 @@ def _current_pushed_state(conn: psycopg.Connection) -> dict[str, str | None]:
         return {str(doc_id): sha for doc_id, sha in cur.fetchall()}
 
 
+def reconcile_desired_against_pushed(
+    desired: dict[str, _DesiredDocument], current: dict[str, str | None]
+) -> tuple[list[PlannedUpsert], list[PlannedDelete], int]:
+    """The reconcile rule, in one place: a desired document whose content
+    hash already matches what the store holds is unchanged, anything else
+    desired is an upsert, and anything the store holds that is no longer
+    desired is a delete.
+
+    Factored out so `preview_plan` (what `--dry-run` reports) and
+    `plan_export` (what actually gets staged) cannot drift apart — a
+    preview that disagrees with the plan it previews would be worse than
+    no preview at all.
+    """
+    upserts: list[PlannedUpsert] = []
+    unchanged = 0
+    for document_id in sorted(desired):
+        doc = desired[document_id]
+        if current.get(document_id) == doc.upsert.content_sha256:
+            unchanged += 1
+        else:
+            upserts.append(doc.upsert)
+    deletes = [
+        PlannedDelete(document_id=document_id, gcs_object=gcs_object_for(document_id))
+        for document_id in sorted(current)
+        if document_id not in desired
+    ]
+    return upserts, deletes, unchanged
+
+
+def preview_plan(conn: psycopg.Connection, config: Config) -> PlanPreview:
+    """What `plan_export` WOULD stage, computed without writing anything:
+    no `export_run` row, no staging directory, no rendered bytes on disk
+    (SPEC §8's `--dry-run`).
+
+    It runs the same eligibility query and the same reconcile as the real
+    plan — documents are rendered in memory to hash them, and then
+    dropped — so the counts are the counts, not an estimate. What it
+    deliberately does NOT do is compute approval requirements, because
+    those depend on the manifest a real plan mints.
+    """
+    desired = build_desired_documents(conn, config)
+    upserts, deletes, unchanged = reconcile_desired_against_pushed(
+        desired, _current_pushed_state(conn)
+    )
+    return PlanPreview(
+        upsert_count=len(upserts),
+        delete_count=len(deletes),
+        unchanged_count=unchanged,
+        chat_ids=tuple(sorted({u.chat_id for u in upserts})),
+        delete_document_ids=tuple(d.document_id for d in deletes),
+    )
+
+
 def _upsert_to_manifest_entry(upsert: PlannedUpsert) -> dict[str, Any]:
     return {
         "document_id": upsert.document_id,
@@ -584,21 +638,9 @@ def plan_export(
         raise ExportPlanError(f"unknown export plan mode '{mode}'")
 
     desired = build_desired_documents(conn, config)
-    current = _current_pushed_state(conn)
-
-    upserts: list[PlannedUpsert] = []
-    unchanged = 0
-    for document_id in sorted(desired):
-        doc = desired[document_id]
-        if current.get(document_id) == doc.upsert.content_sha256:
-            unchanged += 1
-        else:
-            upserts.append(doc.upsert)
-    deletes = [
-        PlannedDelete(document_id=document_id, gcs_object=gcs_object_for(document_id))
-        for document_id in sorted(current)
-        if document_id not in desired
-    ]
+    upserts, deletes, unchanged = reconcile_desired_against_pushed(
+        desired, _current_pushed_state(conn)
+    )
 
     allowlist = snapshot_allowlist(conn)
     allowlist_json = canonical_json(allowlist)
@@ -617,7 +659,11 @@ def plan_export(
     manifest_text = canonical_json(manifest)
     manifest_sha = sha256_text(manifest_text)
 
-    approval_reasons = compute_approval_requirements(conn, manifest)
+    # `mode=mode`, not the default: a purge plan is exempt from the §11.4
+    # gate (D9.3) and its report has to say so. Omitting this argument is
+    # what made purge plans print "OWNER APPROVAL REQUIRED" while the push
+    # correctly waived it.
+    approval_reasons = compute_approval_requirements(conn, manifest, mode=mode)
 
     with conn.cursor() as cur:
         cur.execute(
@@ -724,5 +770,7 @@ __all__ = [
     "export_config_sha256",
     "load_manifest",
     "plan_export",
+    "preview_plan",
+    "reconcile_desired_against_pushed",
     "staging_dir_for",
 ]
