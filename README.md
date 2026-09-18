@@ -52,6 +52,8 @@ already made and documented the non-obvious decisions, read on.
 | Export gate (default-deny, plan/approve/push/purge) | Implemented and wired to the CLI; **the GCS + Discovery Engine transport has never run against a live API** |
 | Eval harness (nDCG@k, recall@k, MRR) | Implemented; metrics verified against hand-computed fixtures |
 | Real model providers (MLX text/reranker/boundary LLM, Apple Vision OCR, mlx-whisper, mlx-vlm captions, PE-Core) | Implemented behind `models.backend: real` (the default); every pinned model smoke-run once on a synthetic input (2026-09-14/15, results in the lock); **never run on the pipeline end to end** |
+| Nightly backup (`imsg backup`) | Implemented and wired to the CLI; verified `pg_dump` + FTS sidecar copy, 14 retained. **Scope is deliberately narrow — see below** |
+| AT-1 auth probe (`imsg mcp public --probe`) | Wired to the CLI and fully tested up to the point where live OAuth tokens are required; **never run against real tokens or a live gate** |
 | Runs against real data | Snapshot → extract → identity: yes. Segment / embed / enrich with the pinned models: **never** |
 
 ---
@@ -113,6 +115,7 @@ uv run imsg export purge-person <who>    # revocation; exempt from the approval 
 uv run imsg export unclassified-report   # weekly: whose threads are still unclassified
 ```
 
+
 `plan` writes the review report the whole design rests on — per thread:
 participants, message count, date range, sample lines. `approve` pins
 the manifest hash and every staged file hash. `push` re-checks all of
@@ -144,6 +147,71 @@ actual protection, which is why it denies by default.
 
 ---
 
+## Operations
+
+Seven `com.imsgindex.*` LaunchAgents are rendered by `imsg
+install-agents`, and every command they invoke exists — installing them
+schedules no job that fails nightly.
+
+```bash
+uv run imsg backup                       # daily 04:00: verified pg_dump + FTS copy, 14 kept
+uv run imsg backup --dry-run             # preconditions + the retention plan, writes nothing
+uv run imsg status                       # mount, Postgres, disk, posture, unclassified threads
+```
+
+**What `imsg backup` covers, and what it does not.** In scope: the
+Postgres dump (everything the pipeline derived exists only there, and
+it is the one component that can suffer *logical* corruption) and the
+FTS5 sidecar (rebuildable, copied for recovery speed, under SPEC's
+checkpoint + integrity-check conditions). Out of scope, on purpose:
+
+- **`attachments/` (~147 GB)** — 14 nightly copies of it would be over
+  two terabytes on the same volume as the original, it is a
+  content-addressed cache that `imsg backfill-attachments` rebuilds,
+  and a blob store does not suffer the logical corruption these copies
+  defend against. **But:** anything iCloud has already purged exists
+  nowhere else, and that genuinely needs an independently encrypted
+  off-box archive, which this command is not and does not pretend to be.
+- **`models/`** — public weights already pinned by repo + immutable
+  revision in `models/manifest.lock.yaml`. Recovery is `uv sync --extra
+  models && imsg models verify`.
+- **`ops/`** — small and irreplaceable, but outside what the spec scopes
+  to this job; flagged in the command's own output rather than silently
+  added.
+
+These copies share the physical device with the data they copy: they
+protect against logical corruption, **not** theft or disk failure. The
+command prints that on every run.
+
+**Retention deletes only what it can prove.** A directory under
+`backups/` is removed only if it is a real (non-symlink) direct child,
+its name matches the exact backup-set pattern, it holds a `MANIFEST.json`
+that parses and says `"complete": true` (written last, so its presence
+*is* the completeness evidence), and it is not among the newest 14.
+Anything else — a half-written set from an interrupted run, a staging
+directory, an operator's own file — is counted, reported, and left
+alone.
+
+**Before exposing the public surface**, AT-1 must pass:
+
+```bash
+security add-generic-password -a "$USER" -s imsgindex-at1-owner -w      # prompts; no shell history
+security add-generic-password -a "$USER" -s imsgindex-at1-nonowner -w
+uv run imsg mcp public --probe \
+    --owner-token-ref keychain:imsgindex-at1-owner \
+    --foreign-token-ref keychain:imsgindex-at1-nonowner
+```
+
+Tokens are passed as `keychain:` / `env:` **references**, never values —
+a token in `argv` is readable by every process on the host via `ps -ww`
+and is recorded in shell history. Exit codes are the verdict: `0` pass,
+`1` fail (a breach), `2` invalid (*proved nothing* — which is not a
+pass), `78` the probe never ran because a precondition was missing. An
+invalid result is treated exactly like a failure: scope stays
+`allowlist`.
+
+---
+
 ## Requirements
 
 - **macOS on Apple Silicon.** The pipeline depends on macOS-only APIs:
@@ -168,8 +236,8 @@ test suite.
 cargo build --release --manifest-path tools/imsg-dump/Cargo.toml
 ```
 ```bash
-uv run pytest        # 1430 passed, 309 skipped without a database;
-                     # 1739 passed, 0 skipped against a scratch PostgreSQL — 2026-09-18
+uv run pytest        # 1523 passed, 327 skipped without a database;
+                     # 1850 passed, 0 skipped against a scratch PostgreSQL — 2026-09-18
 ```
 
 Copy `config.example.yaml`, fill it in, and point the CLI at it:
@@ -459,6 +527,7 @@ src/imsg/
   retrieval/   hybrid query flow, RRF fusion, reranking
   mcp/         auth boundary, local + public surfaces, tools
   export/      default-deny eligibility, plan/approve/push
+  backup/      nightly pg_dump + FTS copy, verification, retention
   eval/        metrics, runner, diff
   verify/      seed completeness, attachment reconciliation
 migrations/         schema, applied in order by a hash-checked runner

@@ -1,14 +1,15 @@
 """Shared diagnostic checks behind `imsg check-permissions` and `imsg status`.
 
-Foundation-build scope note: the full field set SPEC §10.2/§14 describes
-for these commands (watermarks, queue depths, FTS outbox lag, coverage,
-audit-rejection counts, unclassified-thread counts, last sync/export/
-backup) depends on pipeline stages this build does not implement yet
-(S1-S8). Those fields are reported as `None` with an explanatory note
-rather than faked — a later build wires them up once the corresponding
-stage exists. Everything checkable *without* a live pipeline (mount,
-Postgres reachability + cluster fingerprint, at-rest posture, Full Disk
-Access, disk free space) is implemented for real.
+Scope note: some of the field set SPEC §10.2/§14 describes for these
+commands (watermarks, queue depths, FTS outbox lag, coverage,
+audit-rejection counts, last sync/export/backup) is still reported as
+`None` with an explanatory note rather than faked — a later build wires
+each up. Everything else is implemented for real: mount, Postgres
+reachability + cluster fingerprint, at-rest posture, Full Disk Access,
+disk free space, buffer pool against the HNSW indexes, enrichment yield
+state, and — since the §11.5 wiring — the unclassified-thread count,
+which is live and whose `None` means "could not be read", with a reason
+saying why (see :func:`check_unclassified_threads`).
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from imsg.db.enrichment_yield_locks import YieldState, read_yield_state
 from imsg.db.fingerprint import verify_data_directory
 from imsg.db.prewarm import hnsw_index_bytes, shared_buffers_bytes
 from imsg.errors import ClusterFingerprintError, MountGateError, SecretResolutionError
+from imsg.export.unclassified import unclassified_summary
 from imsg.mount.guard import MountInfo, guard_mount, real_diskutil_info
 
 GIB = float(2**30)
@@ -261,6 +263,67 @@ def check_enrichment_yield(config: Config) -> YieldState:
         conn.close()
 
 
+@dataclass(frozen=True, slots=True)
+class UnclassifiedCheck:
+    """Active threads whose participants have never been classified for export.
+
+    SPEC §11.5 puts this count in `imsg status` ("Surfaced in `imsg
+    status`") and §14 lists it among the status fields, because a static
+    allowlist rots silently: next month's contractor joins a group, the
+    weekly report names them, and nothing in the operator's daily glance
+    says so until someone reads the report.
+
+    A previous pass declined to wire this on the grounds that `status`
+    never opens a query connection and adding one would change its
+    failure profile as a health check. That premise does not hold —
+    `check_postgres`, `check_buffer_pool` and `check_enrichment_yield`
+    each already open their own connection and run statements, and each
+    already reports failure as a `reason` string rather than raising. The
+    real hazard is different and specific: unlike those three, which read
+    tiny catalogs, this query aggregates over `message`, so on a large
+    corpus under load it could make a health check *slow* rather than
+    wrong. That is what :data:`STATEMENT_TIMEOUT_MS` is for — a busy
+    database yields `count=None` with a reason inside a bounded time,
+    which is the same shape as "database absent" and is exactly how a
+    health check should degrade.
+    """
+
+    count: int | None
+    reason: str | None
+
+
+STATEMENT_TIMEOUT_MS = 5_000
+"""Ceiling on the unclassified-threads query. `imsg status` must answer
+promptly whether or not the corpus is large and whether or not the
+enrichment worker is hammering the instance; an unavailable number with
+a reason is a better health check than a command that hangs."""
+
+
+def check_unclassified_threads(config: Config) -> UnclassifiedCheck:
+    """The SPEC §11.5 count, on a connection of its own, bounded by a timeout.
+
+    Every failure mode — unreachable instance, unresolvable password,
+    missing tables (pre-migration), statement timeout on a busy corpus —
+    comes back as `count=None` plus a reason. Nothing here can raise, by
+    the same rule `check_buffer_pool` and `check_enrichment_yield`
+    follow: `check_postgres` is the field that says the database is down,
+    and the other fields must not each restate it as a crash.
+    """
+    try:
+        conn = connect(config.database, autocommit=True)
+    except Exception as exc:
+        return UnclassifiedCheck(None, f"unclassified thread count not read: {exc}")
+    try:
+        conn.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+        return UnclassifiedCheck(unclassified_summary(conn), None)
+    except Exception as exc:
+        return UnclassifiedCheck(
+            None, f"unclassified thread count not read: {type(exc).__name__}: {exc}"
+        )
+    finally:
+        conn.close()
+
+
 def disk_free_bytes(path: Path) -> int | None:
     """`shutil.disk_usage` on the nearest existing ancestor of `path`."""
     candidate = path
@@ -277,15 +340,18 @@ def disk_free_bytes(path: Path) -> int | None:
 
 __all__ = [
     "GIB",
+    "STATEMENT_TIMEOUT_MS",
     "AtRestPosture",
     "BufferPoolCheck",
     "MountCheck",
     "PostgresCheck",
+    "UnclassifiedCheck",
     "check_at_rest_posture",
     "check_buffer_pool",
     "check_enrichment_yield",
     "check_full_disk_access",
     "check_mount",
     "check_postgres",
+    "check_unclassified_threads",
     "disk_free_bytes",
 ]

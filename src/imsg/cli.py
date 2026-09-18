@@ -2,17 +2,18 @@
 
 Wired up for real: `migrate`, `check-permissions`, `status`,
 `guard-mount`, `snapshot`, `extract`, `identity`, `segment`, `embed`,
-`sync`, `enrich`, `backfill-attachments`, `mcp local`, `mcp public`,
-`models verify`, `install-agents`, and `export` (`plan`, `approve`,
-`push`, `purge-person`, `unclassified-report` — SPEC §11,
-`src/imsg/export/`). No CLI stub remains.
+`sync`, `enrich`, `backfill-attachments`, `backup`, `mcp local`, `mcp
+public` (serve, and `--probe` for AT-1), `models verify`,
+`install-agents`, and `export` (`plan`, `approve`, `push`,
+`purge-person`, `unclassified-report` — SPEC §11, `src/imsg/export/`).
+No CLI stub remains.
 
-**`imsg backup` does not exist.** The LaunchAgent generator renders a
-daily `…backup` job that invokes it (SPEC §5.3/§14: nightly local
-recovery copies, 14 kept), so installing the agents schedules a job
-that fails every night at 04:00 until that stage is built. It is the
-one command an installed agent references and this CLI does not
-provide.
+**Every command an installed LaunchAgent invokes now exists.** All
+seven `com.imsgindex.*` plists render commands this CLI provides —
+`install-agents` no longer schedules a job that fails nightly. `backup`
+(SPEC §5.3/§14, `src/imsg/backup/`) is the daily 04:00 one; read that
+package's `pipeline` docstring for what it deliberately does *not* copy
+and why.
 
 **Model providers** come from `imsg.providers.factory` — the only place
 a model-backed command (`segment`, `embed`, `sync`, `enrich`, `mcp
@@ -55,6 +56,8 @@ import uvicorn
 
 from imsg.agents.plists import render_agent_plists
 from imsg.backfill.pipeline import DEFAULT_RATE_PER_MINUTE, run_backfill
+from imsg.backup.pipeline import OUT_OF_SCOPE_NOTE, SAME_DEVICE_CAVEAT, run_backup
+from imsg.backup.retention import DEFAULT_KEEP
 from imsg.config.loader import default_config_path, load_config
 from imsg.db.connection import connect
 from imsg.db.enrichment_yield_locks import (
@@ -71,6 +74,7 @@ from imsg.diagnostics import (
     check_full_disk_access,
     check_mount,
     check_postgres,
+    check_unclassified_threads,
     disk_free_bytes,
 )
 from imsg.embed.fts.schema import assert_schema_current, create_schema
@@ -95,6 +99,14 @@ from imsg.export import (
 )
 from imsg.mcp.audit import PostgresAuditSink
 from imsg.mcp.auth import build_public_gate
+from imsg.mcp.probe import run_auth_probe
+from imsg.mcp.probe_cli import (
+    EXIT_CONFIG,
+    ProbeConfigurationError,
+    check_probe_preconditions,
+    format_probe_report,
+    verdict_exit_code,
+)
 from imsg.mcp.tools.local_server import LocalMcpServer, run_local_server
 from imsg.mcp.tools.public_server import PublicMcpServer, build_public_asgi_app, parse_bind_address
 from imsg.mcp.warm_up_readiness import (
@@ -491,6 +503,11 @@ def status(
     pg = check_postgres(cfg)
     pool = check_buffer_pool(cfg) if pg.reachable else BufferPoolCheck(None, None, None)
     yield_state = check_enrichment_yield(cfg) if pg.reachable else None
+    # SPEC §11.5/§14: the count belongs here so a rotting allowlist is
+    # visible at a glance rather than only in the weekly report. Gated on
+    # reachability and bounded by a statement timeout inside the check —
+    # a busy or absent database yields None plus a reason, never a crash.
+    unclassified = check_unclassified_threads(cfg) if pg.reachable else None
     free_bytes = disk_free_bytes(cfg.paths.data_root)
     # The public MCP surface's own readiness. Read from a file the server
     # publishes rather than from the server itself: its transport requires
@@ -531,11 +548,14 @@ def status(
         "last_export_at": None,
         "last_backup_at": None,
         "audit_rejection_count_7d": None,
-        "unclassified_thread_count": None,
-        "pipeline_note": "fields above report None until wired to the now-built "
-        "pipeline stages (a later revision of this command's own scope, not this "
-        "build's task list) — 'imsg check-permissions'/the MCP check_permissions "
-        "tool already reports last_sync_at/watermarks",
+        "unclassified_thread_count": unclassified.count if unclassified else None,
+        "unclassified_thread_reason": unclassified.reason if unclassified else None,
+        "pipeline_note": "the remaining None fields above are not yet wired to the "
+        "now-built pipeline stages (a later revision of this command's own scope) — "
+        "'imsg check-permissions'/the MCP check_permissions tool already reports "
+        "last_sync_at/watermarks. unclassified_thread_count IS live (SPEC §11.5); "
+        "None there means the count could not be read, and "
+        "unclassified_thread_reason says why",
     }
 
     if as_json:
@@ -1800,8 +1820,91 @@ def mcp_local(config: ConfigOption = None) -> None:
         conn.close()
 
 
+def _run_at1_probe(cfg: Config, owner_token_ref: str | None, foreign_token_ref: str | None) -> None:
+    """`imsg mcp public --probe` — AT-1's synthetic auth probe (SPEC §12).
+
+    The precondition to exposing a personal corpus to the internet, so
+    the order here is load-bearing: **every** refusal happens in
+    `check_probe_preconditions`, which is a pure function over config and
+    two reference strings, before the audit sink or the auth gate exists.
+    Nothing on a refusal path can have contacted Google, because nothing
+    that could has been constructed yet.
+
+    No model providers are built and no server is started — the probe
+    tests the gate, not the service, and SPEC AT-1 step 0 has it run
+    "while the real server stays disabled". `mcp.public.enabled` is
+    therefore deliberately NOT required here.
+    """
+    try:
+        tokens = check_probe_preconditions(
+            cfg, owner_token_ref=owner_token_ref, foreign_token_ref=foreign_token_ref
+        )
+    except ProbeConfigurationError as exc:
+        typer.echo(f"imsg: AT-1 probe did not run — {exc}", err=True)
+        raise typer.Exit(code=EXIT_CONFIG) from exc
+
+    run_guard_mount_or_exit(cfg.paths.data_root)
+
+    # The audit log is not a detail of this test, it is half of it: AT-1
+    # steps 3-4 turn on the difference between "the non-owner saw nothing"
+    # and "the non-owner was rejected and the rejection is recorded", and
+    # the standing invariant is asserted over the log's entire history.
+    # So this runs against the real `mcp_audit` table and writes real rows.
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        audit = PostgresAuditSink(lambda: connect(cfg.database, autocommit=True))
+        try:
+            gate = build_public_gate(cfg.mcp.public, audit=audit)
+        except ImsgError as exc:
+            typer.echo(f"imsg: AT-1 probe did not run — {exc}", err=True)
+            raise typer.Exit(code=EXIT_CONFIG) from exc
+
+        owner_subject = cfg.mcp.public.oauth.owner_subject
+        assert owner_subject is not None  # check_probe_preconditions proved this
+        report = run_auth_probe(
+            gate,
+            audit,
+            owner_token=tokens.owner,
+            foreign_token=tokens.foreign,
+            owner_subject=owner_subject.resolve(),
+        )
+    finally:
+        conn.close()
+
+    for line in format_probe_report(report, scope=cfg.mcp.public.scope):
+        typer.echo(line)
+    raise typer.Exit(code=verdict_exit_code(report.verdict))
+
+
 @mcp_app.command("public")
-def mcp_public(config: ConfigOption = None) -> None:
+def mcp_public(
+    config: ConfigOption = None,
+    probe: Annotated[
+        bool,
+        typer.Option(
+            "--probe",
+            help="Run the AT-1 synthetic auth probe instead of serving (SPEC §12). "
+            "Requires --owner-token-ref and --foreign-token-ref.",
+        ),
+    ] = False,
+    owner_token_ref: Annotated[
+        str | None,
+        typer.Option(
+            "--owner-token-ref",
+            help="Secret REFERENCE to the owner's bearer token: 'keychain:<item>' "
+            "or 'env:<VAR>'. Never the token itself — that would land in your "
+            "shell history and in 'ps' output. --probe only.",
+        ),
+    ] = None,
+    foreign_token_ref: Annotated[
+        str | None,
+        typer.Option(
+            "--foreign-token-ref",
+            help="Secret REFERENCE to a NON-owner account's bearer token, same "
+            "form as --owner-token-ref. --probe only.",
+        ),
+    ] = None,
+) -> None:
     """`imsg mcp public` — StreamableHTTP MCP server behind cloudflared,
     OAuth subject validation, fail closed (SPEC §10.4). Binds loopback
     only (`mcp.public.bind`); cloudflared is the only process that ever
@@ -1811,8 +1914,22 @@ def mcp_public(config: ConfigOption = None) -> None:
     requirement 4: no unauthenticated path, no config flag to disable
     it); scope (`mcp.public.scope`, REQUIRED with no default, SPEC
     §10.3a/D6) is fixed for the life of this process.
+
+    `--probe` runs AT-1's synthetic auth probe instead of serving — the
+    gate that must pass before any corpus is exposed (SPEC §12 AT-1).
     """
     cfg = _load_config_or_die(config)
+    if probe:
+        _run_at1_probe(cfg, owner_token_ref, foreign_token_ref)
+        return  # pragma: no cover - _run_at1_probe always exits
+    if owner_token_ref is not None or foreign_token_ref is not None:
+        typer.echo(
+            "imsg: --owner-token-ref/--foreign-token-ref are only meaningful with "
+            "--probe; refusing to start the server with token references that would "
+            "go unused",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     if not cfg.mcp.public.enabled:
         typer.echo("imsg: mcp.public.enabled is false in config", err=True)
         raise typer.Exit(code=1)
@@ -2321,6 +2438,118 @@ def export_unclassified_report(
         f"export unclassified-report: {count} unclassified active thread(s) — "
         f"wrote {report_path}"
     )
+
+
+# --------------------------------------------------------------------------
+# backup (SPEC §5.3, §14) — the daily 04:00 LaunchAgent's command
+# --------------------------------------------------------------------------
+
+
+def _format_bytes(n: int | None) -> str:
+    if n is None:
+        return "n/a"
+    gib = n / float(2**30)
+    return f"{n} B ({gib:.2f} GiB)" if gib >= 0.01 else f"{n} B"
+
+
+@app.command()
+def backup(
+    config: ConfigOption = None,
+    keep: Annotated[
+        int,
+        typer.Option(
+            "--keep",
+            help="How many complete backup sets to retain (SPEC §5.3: 14). "
+            "Clamped to a minimum of 1 — the newest set is never a deletion candidate.",
+        ),
+    ] = DEFAULT_KEEP,
+    pg_dump_binary: Annotated[
+        Path | None,
+        typer.Option(
+            "--pg-dump",
+            help="Path to a specific pg_dump. Defaults to the one on $PATH; pass "
+            "this when $PATH's pg_dump is older than the instance's major version.",
+        ),
+    ] = None,
+    dry_run: DryRunOption = False,
+) -> None:
+    """Nightly local recovery copy: verified `pg_dump` + FTS sidecar, 14 kept.
+
+    What this does NOT cover is as important as what it does — the
+    attachment cache (~147 GB), the model directory and `ops/` are
+    deliberately out of scope, for the reasons in
+    `imsg.backup.pipeline`'s docstring, and these copies share the
+    physical device with the data they copy. Both facts are printed on
+    every run rather than left to be inferred.
+
+    Refuses rather than half-running: a missing or unwritable
+    destination, a missing `pg_dump`, a `pg_dump` older than the
+    instance, insufficient free space, a dump that fails its read-back,
+    or a corrupt FTS sidecar each abort with one `imsg: …` line and
+    leave `backups/` exactly as it was.
+    """
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        report = run_backup(
+            conn=conn,
+            config=cfg,
+            keep=keep,
+            pg_dump_binary=pg_dump_binary,
+            dry_run=dry_run,
+        )
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    plan = report.retention
+    if dry_run:
+        typer.echo(
+            f"backup: preconditions OK — {_format_bytes(report.free_bytes_before)} free, "
+            f"{_format_bytes(report.required_bytes)} required"
+        )
+        typer.echo(
+            f"backup: would retain {len(plan.retained)} set(s), delete "
+            f"{len(plan.delete)} (keep={plan.keep})"
+        )
+        for path in plan.delete:
+            typer.echo(f"backup:   would delete {path.name}")
+        typer.echo(DRY_RUN_MARKER)
+    else:
+        assert report.dump is not None and report.set_path is not None
+        fts_line = (
+            f"fts.db {_format_bytes(report.fts.byte_size)}"
+            if report.fts is not None and report.fts.present
+            else "fts.db absent (not yet built — rebuildable from Postgres)"
+        )
+        typer.echo(f"backup: wrote {report.set_path}")
+        typer.echo(
+            f"backup:   postgres.dump {_format_bytes(report.dump.byte_size)} "
+            f"(pg_dump {report.dump.pg_dump_major} -> server {report.dump.server_major}, "
+            f"read back in full), {fts_line}"
+        )
+        typer.echo(
+            f"backup:   retained {len(plan.retained)} set(s), deleted "
+            f"{len(report.deleted)} (keep={plan.keep})"
+        )
+
+    if plan.partial:
+        typer.echo(
+            f"backup: WARNING {len(plan.partial)} partial/incomplete set(s) left by an "
+            f"interrupted run are present and were NOT deleted (retention only removes "
+            f"sets it can prove are complete): "
+            f"{', '.join(p.name for p in plan.partial)}"
+        )
+    if plan.foreign:
+        typer.echo(
+            f"backup: note {len(plan.foreign)} unrecognized entr(ies) in backups/ were "
+            f"left untouched: {', '.join(p.name for p in plan.foreign)}"
+        )
+    typer.echo(f"backup: {OUT_OF_SCOPE_NOTE}")
+    typer.echo(f"backup: {SAME_DEVICE_CAVEAT}")
 
 
 # --------------------------------------------------------------------------
