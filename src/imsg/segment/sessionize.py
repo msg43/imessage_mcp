@@ -88,11 +88,15 @@ def compute_recompute_start(
     `earliest_changed_at` (including the empty-history case), this
     returns the start of the earliest session (or `earliest_changed_at`
     itself when there is no history at all) — i.e. rebuild everything.
-    """
-    if not existing_sessions:
-        return earliest_changed_at
 
+    `T` is never later than `earliest_changed_at`: it is where the
+    caller's `sent_at >= T` re-fetch *starts*, so a `T` past the change
+    would leave the changed rows unfetchable, hence unsegmentable, on
+    that run and on every run after it. See the clamp below.
+    """
     gap = timedelta(hours=session_gap_hours)
+    frontier = existing_sessions[0].started_at if existing_sessions else earliest_changed_at
+
     for i in range(len(existing_sessions) - 1, -1, -1):
         span = existing_sessions[i]
         if span.ended_at + gap <= earliest_changed_at:
@@ -101,11 +105,32 @@ def compute_recompute_start(
             # either at the next persisted session, or — if `span` was
             # the last one — at the change itself (a fresh session,
             # nothing existing needs touching).
-            if i + 1 < len(existing_sessions):
-                return existing_sessions[i + 1].started_at
-            return earliest_changed_at
+            frontier = (
+                existing_sessions[i + 1].started_at
+                if i + 1 < len(existing_sessions)
+                else earliest_changed_at
+            )
+            break
 
-    return existing_sessions[0].started_at
+    # The clamp, and the reason this function has a single exit: the
+    # candidate above is only ever a *lower* bound relaxation — "you may
+    # safely skip everything before this persisted session". It says
+    # nothing about where the changed rows are, and two arrangements put
+    # them earlier than it:
+    #
+    #   1. new messages in the *hole* between a sealed session and the
+    #      next persisted one (`existing_sessions[i + 1].started_at` is
+    #      after them), and
+    #   2. a change predating every persisted session
+    #      (`existing_sessions[0].started_at` is after it).
+    #
+    # In both, an unclamped frontier makes those messages permanently
+    # unreachable: `_fetch_messages_from` never sees them, so they are
+    # never segmented, the chat stays dirty, and the next run computes
+    # the same overshooting frontier again. Re-fetching a little earlier
+    # than strictly necessary only costs work; re-fetching too late
+    # loses messages.
+    return min(frontier, earliest_changed_at)
 
 
 __all__ = ["compute_recompute_start", "sessionize"]

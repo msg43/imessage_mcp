@@ -114,3 +114,77 @@ def test_recompute_start_edit_far_in_the_past_rebuilds_from_first_session() -> N
     changed_at = sessions[0].started_at + timedelta(minutes=5)  # edit inside session 1
     start = compute_recompute_start(sessions, changed_at, session_gap_hours=3.0)
     assert start == sessions[0].started_at
+
+
+def test_recompute_start_change_in_a_hole_between_two_sessions_is_not_skipped() -> None:
+    """The frontier is where re-fetching *starts*, so it must never land
+    after the earliest changed message.
+
+    New messages can arrive in the hole between two persisted sessions —
+    after one that the session gap already sealed, and before the next
+    one begins. Returning the next session's `started_at` unclamped
+    skips straight over them: `_fetch_messages_from` never fetches them,
+    they are never segmented, and the chat stays dirty on every
+    subsequent run.
+    """
+    sessions = [
+        _span(1, 0, 60),  # sealed: ends 20h before the change
+        _span(2, 30 * 60, 30 * 60 + 30),  # starts 10h after the change
+    ]
+    changed_at = _BASE + timedelta(hours=20)  # lands in the hole between them
+    start = compute_recompute_start(sessions, changed_at, session_gap_hours=3.0)
+    assert start == changed_at
+
+
+def test_recompute_start_change_predating_all_history_is_not_skipped() -> None:
+    """The fall-through path (`no sealed session`) has the same shape: a
+    change older than every persisted session must not be skipped by
+    rebuilding from the first session's start."""
+    sessions = [
+        _span(1, 0, 60),
+        _span(2, 60 + 4 * 60, 60 + 4 * 60 + 90),
+    ]
+    changed_at = _BASE - timedelta(hours=2)  # older than every session
+    start = compute_recompute_start(sessions, changed_at, session_gap_hours=3.0)
+    assert start == changed_at
+
+
+def test_recompute_start_change_inside_a_middle_session_rebuilds_from_that_session() -> None:
+    """A change *inside* an existing session still rebuilds from that
+    session's start (earlier than the change), not from the change —
+    the whole session has to be re-sessionized as a unit."""
+    sessions = [
+        _span(1, 0, 60),
+        _span(2, 300, 390),
+        _span(3, 700, 760),
+    ]
+    changed_at = sessions[1].started_at + timedelta(minutes=20)  # inside session 2
+    start = compute_recompute_start(sessions, changed_at, session_gap_hours=3.0)
+    assert start == sessions[1].started_at
+    assert start < changed_at
+
+
+def test_recompute_start_is_never_later_than_the_change() -> None:
+    """Property: for any arrangement of persisted sessions and any
+    `earliest_changed_at`, the returned frontier is <= the change. The
+    caller re-fetches `sent_at >= frontier`, so a frontier past the
+    change makes the changed messages permanently unfetchable."""
+    span_starts = (0, 300, 700, 1500)
+    durations = (0, 45, 200)
+    changed_offsets = (-600, -1, 0, 30, 120, 305, 500, 705, 1490, 1600, 5000)
+    for gap_hours in (1.0, 3.0, 12.0):
+        for n_sessions in range(len(span_starts) + 1):
+            for duration in durations:
+                sessions = [
+                    _span(i + 1, span_starts[i], span_starts[i] + duration)
+                    for i in range(n_sessions)
+                ]
+                for offset in changed_offsets:
+                    changed_at = _BASE + timedelta(minutes=offset)
+                    start = compute_recompute_start(
+                        sessions, changed_at, session_gap_hours=gap_hours
+                    )
+                    assert start <= changed_at, (
+                        f"frontier {start} is after the change {changed_at} "
+                        f"(gap={gap_hours}h, sessions={[(s.started_at, s.ended_at) for s in sessions]})"
+                    )
