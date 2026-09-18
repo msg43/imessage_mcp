@@ -98,11 +98,30 @@ asked the mirror for the canonical repo's sha, which the mirror cannot
 resolve (found 2026-09-14 by resolving both ids against the Hugging
 Face API; the canonical repo holds only Meta's own ``.pt`` layout)."""
 
+ENRICHMENT_YIELD_POLL_INTERVAL_SECONDS = 0.25
+"""How often an enrichment worker paused behind an in-flight query
+re-checks (`imsg.db.enrichment_yield_locks`). Reached only while a query
+is actually running — the idle check is one round trip and no sleep — so
+it sets how promptly the worker resumes, not what yielding costs."""
+
+ENRICHMENT_YIELD_MAX_PAUSE_SECONDS = 300.0
+"""How long that worker waits for one unit of work before proceeding
+anyway. Not the crash backstop (a killed MCP server's advisory lock dies
+with its database session): the "someone is searching continuously and the
+queue still has to drain overnight" backstop, five minutes out of a
+six-hour window.
+
+Here rather than in `imsg.db.enrichment_yield_locks` because
+`imsg.config.schema` defaults to both values and cannot import from
+`imsg.db` — `imsg.db.connection` imports the schema."""
+
 __all__ = [
     "BOUNDARY_MODEL_REPO",
     "BOUNDARY_MODEL_REVISION",
     "CAPTION_MODEL_REPO",
     "CAPTION_MODEL_REVISION",
+    "ENRICHMENT_YIELD_MAX_PAUSE_SECONDS",
+    "ENRICHMENT_YIELD_POLL_INTERVAL_SECONDS",
     "HALFVEC_INDEX_MAX_DIM",
     "HALFVEC_TYPE_MAX_DIM",
     "MULTIMODAL_EMBEDDING_DIM",

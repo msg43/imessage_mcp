@@ -24,6 +24,8 @@ from imsg.embed.pe_core_multimodal import (
     OPEN_CLIP_MIRRORS,
     OPEN_CLIP_PYTORCH_BIN_FILENAME,
     OPEN_CLIP_SAFETENSORS_FILENAME,
+    WIDTH_CHECK_IMAGE_SIZE,
+    WIDTH_CHECK_TEXT,
     ImageEmbeddingError,
     PeCoreMultimodalEmbeddingProvider,
     PeCoreRuntimeError,
@@ -111,6 +113,12 @@ class FakeImage:
         return FakeImage(self.path, mode)
 
 
+LOAD_CHECK_IMAGE_NAME = "<load-check>"
+"""What `PIL.Image.new` produces in these fakes: the synthetic probe the
+provider pushes through the vision tower at load time to prove the loaded
+model's output width (`_check_image_tower`)."""
+
+
 @dataclass
 class FakeWorld:
     """Knobs the fakes read, and a record of every backend call."""
@@ -121,8 +129,11 @@ class FakeWorld:
     """What the fetched `open_clip_config.json` claims; `dim` when None."""
     text_dim: int | None = None
     """Width the fake text tower actually produces; `dim` when None."""
+    image_dim: int | None = None
+    """Width the fake vision tower actually produces; `dim` when None."""
     mps_available: bool = True
     cuda_available: bool = False
+    image_new_calls: list[tuple[str, tuple[int, int]]] = field(default_factory=list)
     has_safetensors: bool = True
     has_bin: bool = True
     unreadable: set[str] = field(default_factory=set)
@@ -135,6 +146,8 @@ class FakeWorld:
     hub_error: Exception | None = None
 
     image_calls: list[list[str]] = field(default_factory=list)
+    """Every batch of tags the fake vision tower saw, load-time width
+    check included."""
     image_kwargs: list[dict[str, Any]] = field(default_factory=list)
     text_calls: list[str] = field(default_factory=list)
     text_kwargs: list[dict[str, Any]] = field(default_factory=list)
@@ -146,12 +159,20 @@ class FakeWorld:
     exif_calls: int = 0
     eval_calls: int = 0
 
+    @property
+    def embedded_image_calls(self) -> list[list[str]]:
+        """The batches that came from `embed_images`, with the load-time
+        width-check probe (`_check_image_tower`) filtered out — that one
+        is a property of loading, not of what the caller asked for."""
+        return [batch for batch in self.image_calls if batch != [LOAD_CHECK_IMAGE_NAME]]
+
     def vector_for(self, tag: str) -> list[float]:
         """Deterministic, distinct per tag, deliberately NOT unit-norm."""
+        width = self.image_dim if self.image_dim is not None else self.dim
         if tag in self.zero_vector_for:
-            return [0.0] * self.dim
+            return [0.0] * width
         seed = [float(ord(ch)) for ch in tag]
-        return [seed[i % len(seed)] + i for i in range(self.dim)]
+        return [seed[i % len(seed)] + i for i in range(width)]
 
     def text_vector(self, text: str) -> list[float]:
         width = self.text_dim if self.text_dim is not None else self.dim
@@ -163,14 +184,22 @@ class FakeWorld:
 
 
 class FakeModel:
+    """Stands in for open_clip's `CustomTextCLIP`, including the two tower
+    attributes the provider drops — `.visual` and `.text`, the names
+    `encode_image`/`encode_text` read (`TOWER_ATTRIBUTES`)."""
+
     def __init__(self, world: FakeWorld) -> None:
         self.world = world
+        self.visual: object | None = object()
+        self.text: object | None = object()
 
     def eval(self) -> FakeModel:
         self.world.eval_calls += 1
         return self
 
     def encode_image(self, batch: FakeBatch, normalize: bool = False) -> FakeTensor:
+        if self.visual is None:
+            raise AssertionError("encode_image called after the vision tower was dropped")
         tags = [t.tag for t in batch.items]
         self.world.image_calls.append(tags)
         self.world.image_kwargs.append({"normalize": normalize, "device": batch.device})
@@ -182,6 +211,8 @@ class FakeModel:
         return FakeTensor([self.world.vector_for(t) for t in tags])
 
     def encode_text(self, tokens: FakeTokens, normalize: bool = False) -> FakeTensor:
+        if self.text is None:
+            raise AssertionError("encode_text called after the text tower was dropped")
         text = tokens.texts[0]
         self.world.text_calls.append(text)
         self.world.text_kwargs.append({"normalize": normalize, "device": tokens.device})
@@ -295,6 +326,11 @@ def _install_fakes(world: FakeWorld, monkeypatch: pytest.MonkeyPatch) -> None:
         world.exif_calls += 1
         return image
 
+    def image_new(mode: str, size: tuple[int, int], color: Any = None) -> FakeImage:
+        world.image_new_calls.append((mode, size))
+        return FakeImage(Path(LOAD_CHECK_IMAGE_NAME), mode)
+
+    pil_image.new = image_new
     pil_image.open = image_open
     pil_image_ops.exif_transpose = exif_transpose
     pil.Image = pil_image
@@ -552,14 +588,28 @@ def test_open_clip_build_failure_is_wrapped(world: FakeWorld) -> None:
         _provider(world).embed_text("a dog")
 
 
-def test_load_runs_once_across_calls(world: FakeWorld, tmp_path: Path) -> None:
+def test_load_runs_once_across_calls_that_use_one_tower(world: FakeWorld) -> None:
     provider = _provider(world)
     provider.embed_text("a dog")
     provider.embed_text("a cat")
-    provider.embed_images(_images(tmp_path, ["one.png"]))
     assert len(world.build_calls) == 1
     assert len(world.snapshot_calls) == 1
     assert len(world.hub_download_calls) == 1
+
+
+def test_a_process_that_uses_both_towers_rebuilds_once_and_keeps_both(
+    world: FakeWorld, tmp_path: Path
+) -> None:
+    """Tower selection is decided on first use, so a process that only
+    later turns out to need the other tower must still work — it rebuilds
+    once, keeps both from then on, and never rebuilds again."""
+    provider = _provider(world)
+    provider.embed_text("a dog")
+    provider.embed_images(_images(tmp_path, ["one.png"]))
+    provider.embed_text("a cat")
+    provider.embed_images(_images(tmp_path, ["two.png"]))
+    assert len(world.build_calls) == 2
+    assert provider._load("text").towers == frozenset({"text", "image"})
 
 
 def test_failed_load_is_retried_on_the_next_call(world: FakeWorld) -> None:
@@ -586,7 +636,7 @@ def test_embed_images_returns_unit_vectors_in_input_order_batched(
 
     vectors = provider.embed_images(paths)
 
-    assert world.image_calls == [
+    assert world.embedded_image_calls == [
         ["alpha.png", "bravo.jpg"],
         ["charlie.png", "delta.heic"],
         ["echo.png"],
@@ -622,7 +672,7 @@ def test_images_are_exif_transposed_and_converted_to_rgb(world: FakeWorld, tmp_p
     paths = _images(tmp_path, ["gray.png", "cmyk.jpg"])
     _provider(world).embed_images(paths)
     # the fake preprocess raises unless it is handed an RGB image
-    assert world.image_calls == [["gray.png", "cmyk.jpg"]]
+    assert world.embedded_image_calls == [["gray.png", "cmyk.jpg"]]
     assert world.exif_calls == 2
 
 
@@ -639,7 +689,7 @@ def test_unreadable_image_raises_naming_the_path(world: FakeWorld, tmp_path: Pat
     assert "cannot identify image file" in excinfo.value.reason
     assert isinstance(excinfo.value, ImageEmbeddingError)
     # the bad file never reached a forward pass, and the good ones still work
-    assert world.image_calls == []
+    assert world.embedded_image_calls == []
     assert len(provider.embed_images([paths[0], paths[2]])) == 2
 
 
@@ -664,7 +714,7 @@ def test_batch_tower_failure_retries_individually_and_names_the_bad_item(
     assert "image tower failure" in excinfo.value.reason
     assert not isinstance(excinfo.value, UnreadableImageError)
     # the whole batch failed, then items were retried one by one until the culprit
-    assert world.image_calls == [
+    assert world.embedded_image_calls == [
         ["a.png", "b.png", "c.png", "d.png"],
         ["a.png"],
         ["b.png"],
@@ -681,7 +731,12 @@ def test_transient_batch_failure_recovers_through_individual_retry(
 
     vectors = provider.embed_images(paths)
 
-    assert world.image_calls == [["a.png", "b.png", "c.png"], ["a.png"], ["b.png"], ["c.png"]]
+    assert world.embedded_image_calls == [
+        ["a.png", "b.png", "c.png"],
+        ["a.png"],
+        ["b.png"],
+        ["c.png"],
+    ]
     assert [
         _close(v, _unit(world.vector_for(p.name))) for v, p in zip(vectors, paths, strict=True)
     ] == [
@@ -697,7 +752,7 @@ def test_single_image_tower_failure_names_the_path(world: FakeWorld, tmp_path: P
     with pytest.raises(ImageEmbeddingError) as excinfo:
         _provider(world).embed_images([path])
     assert excinfo.value.path == path
-    assert world.image_calls == [["solo.png"]]
+    assert world.embedded_image_calls == [["solo.png"]]
 
 
 def test_zero_vector_from_the_image_tower_is_an_image_error(
@@ -787,3 +842,56 @@ def test_load_survives_a_missing_pillow_heif(world: FakeWorld, monkeypatch: pyte
     provider comes up without it and only HEIC files fail, per item."""
     monkeypatch.setitem(sys.modules, "pillow_heif", None)
     assert len(_provider(world).embed_text("a photo")) == world.dim
+
+
+# --------------------------------------------------------------------------
+# tower selection (D10.3 defect 2): only the tower a process uses stays
+# --------------------------------------------------------------------------
+
+
+def test_embed_text_alone_drops_the_vision_tower(world: FakeWorld) -> None:
+    provider = _provider(world)
+    provider.embed_text("a dog")
+    runtime = provider._load("text")
+    assert runtime.towers == frozenset({"text"})
+    assert runtime.model.visual is None
+    assert runtime.model.text is not None
+
+
+def test_embed_images_alone_drops_the_text_tower(world: FakeWorld, tmp_path: Path) -> None:
+    provider = _provider(world)
+    provider.embed_images(_images(tmp_path, ["one.png"]))
+    runtime = provider._load("image")
+    assert runtime.towers == frozenset({"image"})
+    assert runtime.model.text is None
+    assert runtime.model.visual is not None
+
+
+def test_a_vision_only_load_checks_its_width_through_the_vision_tower(
+    world: FakeWorld, tmp_path: Path
+) -> None:
+    """The load-time width check must not reach for the tower that was
+    just dropped — an image-only process has no text tower to probe."""
+    provider = _provider(world)
+    provider.embed_images(_images(tmp_path, ["one.png"]))
+    assert world.image_new_calls == [("RGB", (WIDTH_CHECK_IMAGE_SIZE, WIDTH_CHECK_IMAGE_SIZE))]
+    assert world.image_calls[0] == [LOAD_CHECK_IMAGE_NAME]
+    assert world.text_calls == []
+
+
+def test_a_text_only_load_checks_its_width_through_the_text_tower(world: FakeWorld) -> None:
+    provider = _provider(world)
+    provider.embed_text("a dog")
+    assert world.image_new_calls == []
+    assert world.image_calls == []
+    assert world.text_calls[0] == WIDTH_CHECK_TEXT
+
+
+def test_a_vision_only_load_still_rejects_a_wrong_output_width(
+    world: FakeWorld, tmp_path: Path
+) -> None:
+    """The check exists to catch a model whose loaded width is not the
+    configured one; dropping the text tower must not lose that."""
+    world.image_dim = world.dim + 1
+    with pytest.raises(PeCoreRuntimeError, match="image embedding, expected dim"):
+        _provider(world).embed_images(_images(tmp_path, ["one.png"]))
