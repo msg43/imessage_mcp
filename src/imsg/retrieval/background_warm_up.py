@@ -23,6 +23,13 @@ What this module promises:
   and an estimate of the seconds remaining. `wait` never blocks past its
   timeout, and a warm-up that dies in an unexpected way still ends
   `failed`, so nothing waits on it forever.
+- **A status another *process* can read, when asked for one.** `on_status`
+  is called with the new status every time the phase or the running step
+  changes — the public surface uses it to publish readiness to a file
+  `imsg status` reads (`imsg.mcp.warm_up_readiness`), since the public
+  transport has no unauthenticated endpoint to ask. Like the log
+  callback, it can never change the outcome: an `on_status` that raises
+  is swallowed.
 - **The estimate** is what is left of the running step's estimated
   duration plus the estimated durations of the steps after it. Those are
   constants taken from measured runs (`RetrievalService.warm_up_steps`),
@@ -143,11 +150,13 @@ class BackgroundWarmUp:
         *,
         model_thread: ModelThread,
         log: Callable[[str], None] = log_to_stderr,
+        on_status: Callable[[WarmUpStatus], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._steps = tuple(steps)
         self._model_thread = model_thread
         self._log_line = log
+        self._on_status = on_status
         self._clock = clock
         self._condition = threading.Condition()
         self._phase = WarmUpPhase.NOT_STARTED
@@ -172,6 +181,7 @@ class BackgroundWarmUp:
             self._started_at = self._clock()
         names = ", ".join(step.name for step in self._steps)
         self._log(f"warm-up started: {_steps(len(self._steps))} in the background ({names})")
+        self._publish()
         try:
             self._model_thread.submit(self._run)
         except Exception as exc:
@@ -205,6 +215,7 @@ class BackgroundWarmUp:
                 with self._condition:
                     self._step_index = index
                     self._step_started_at = step_started
+                self._publish()
                 try:
                     detail = step.run()
                 except Exception as exc:
@@ -221,6 +232,7 @@ class BackgroundWarmUp:
                 self._phase = WarmUpPhase.READY
                 self._finished_at = finished
                 self._step_index = len(self._steps)
+                self._publish()
                 self._condition.notify_all()
         finally:
             with self._condition:
@@ -243,11 +255,35 @@ class BackgroundWarmUp:
             self._phase = WarmUpPhase.FAILED
             self._failure = failure
             self._finished_at = self._clock()
+            self._publish()
             self._condition.notify_all()
 
     def _log(self, line: str) -> None:
         with contextlib.suppress(Exception):  # a log line must never change the outcome
             self._log_line(line)
+
+    def _publish(self) -> None:
+        """Hand the current status to `on_status`, if one was given.
+
+        Called under the condition at the two terminal transitions, and
+        so before `notify_all` — the same ordering the log lines above
+        have, and for the same reason: by the time anything can observe
+        `ready` or `failed`, the readiness file already says so. A status
+        command that raced the transition would otherwise report a warm
+        server as still warming, which is exactly the question it exists
+        to answer. The lock is therefore held across the publisher, so
+        `on_status` must be quick (a local file write) and must never
+        call back into this object.
+
+        Swallows everything the publisher raises, for the same reason
+        `_log` does — readiness reporting must never decide whether the
+        models load."""
+        if self._on_status is None:
+            return
+        with self._condition:
+            status = self._status()
+            with contextlib.suppress(Exception):
+                self._on_status(status)
 
     # -- status (caller holds the condition) ----------------------------------
 

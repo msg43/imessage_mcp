@@ -40,6 +40,31 @@ layer 2 is a cache hit against layer 1's check, not a second network
 round trip to Google — see `imsg.mcp.auth`'s verdict cache. Tests in
 `tests/test_mcp_public_server.py` assert directly that no path from an
 unauthenticated or malformed request reaches a tool handler.
+
+**Serving before the models are warm.** The models load in the
+background (`imsg.retrieval.background_warm_up`), started by
+`imsg mcp public` at process start; the transport binds and answers
+without waiting for them. Only the four retrieval tools are gated on the
+warm-up: such a call waits for it — with `anyio.sleep`, so the event
+loop keeps answering everything else — for at most
+`TOOL_CALL_WARM_UP_WAIT_SECONDS`, then gets a retryable `WARMING_UP`
+tool error carrying an estimate; a warm-up that failed turns every
+retrieval call into `WARM_UP_FAILED` naming the cause, so a process that
+came back up with half its models loaded says so instead of serving.
+Both are ordinary tool errors (`isError: true` with the machine code on
+the first line), and both keep their own code in `mcp_audit` rather than
+collapsing to `INTERNAL` — `imsg.mcp.audit.ALLOWED_ERROR_CODES` lists
+them. Restarts are the normal case here, not the exception: the launchd
+agent is `KeepAlive`, so every crash is followed by another cold load.
+
+That the warm-up wait sits *outside* `gate.dispatch` — the one thing in
+this module that is ordered differently from the security layers above —
+is deliberate and costs nothing: `TransportGuardASGIApp` has already
+authorized this very HTTP request before the session manager could route
+it here, so no unauthenticated caller can reach the wait, let alone park
+a request on it. Putting the wait inside `dispatch` would mean blocking
+the event-loop thread (dispatch is synchronous), which is the one thing
+a bounded wait must not do.
 """
 
 from __future__ import annotations
@@ -50,6 +75,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import anyio
 import jsonschema
 import mcp.types as types
 from mcp.server.context import ServerRequestContext
@@ -80,12 +106,49 @@ from imsg.retrieval.errors import RetrievalError
 if TYPE_CHECKING:
     from starlette.routing import Route
 
+    from imsg.retrieval.background_warm_up import BackgroundWarmUp, WarmUpStatus
     from imsg.retrieval.service import RetrievalService
 
 logger = logging.getLogger(__name__)
 
 SERVER_NAME = "imsg-public"
 DEFAULT_STREAMABLE_HTTP_PATH = "/mcp"
+
+TOOL_CALL_WARM_UP_WAIT_SECONDS = 20.0
+"""How long a retrieval call that arrives during warm-up waits for the
+models before answering `WARMING_UP`.
+
+Much shorter than the local surface's 90 s
+(`imsg.mcp.tools.local_server.TOOL_CALL_WARM_UP_WAIT_SECONDS`), because
+a public call is an HTTP request held open across a Cloudflare tunnel
+rather than a stdio exchange with no clock on it:
+
+- **A documented hard ceiling at 125 s.** Cloudflare's Proxy Read Timeout
+  — how long the edge waits for the origin's response before returning
+  524 — is 125 s, and is configurable only on Enterprise zones
+  (developers.cloudflare.com/fundamentals/reference/connection-limits/,
+  read 2026-09-18). No `cloudflared` `originRequest` setting moves it:
+  `connectTimeout`/`tlsTimeout` bound connection setup and
+  `keepAliveTimeout`/`tcpKeepAlive` bound idle connections; none of them
+  is a response-read timeout. Past 125 s the client gets an HTML error
+  page instead of JSON-RPC, i.e. a transport failure rather than a tool
+  error it can act on — strictly worse than answering early.
+- **An undocumented client timeout.** Whether Gemini Enterprise gives up
+  sooner than the edge does is not published: none of the custom-MCP,
+  workflow-builder, or quota pages names a per-tool-call timeout (read
+  2026-09-18). With no number to design against, the bound has to be
+  small enough that no plausible one binds first.
+- **Room left for the answer.** 20 s of waiting plus a warm query
+  (2.1-2.3 s on the M2 Ultra host, 2026-09-17) leaves about 100 s of the
+  edge's budget unused, so a call that *does* catch the end of a warm-up
+  still returns inside it comfortably.
+
+Waiting at all is what makes a request arriving in the last seconds of a
+warm-up succeed instead of bouncing; waiting longer than this trades
+that small win for the risk of no structured answer at all."""
+
+WARM_UP_POLL_SECONDS = 0.1
+"""How often a waiting tool call re-checks the warm-up."""
 
 _RETRIEVAL_HANDLERS: dict[
     str, Callable[[RetrievalService, AccessContext, dict[str, Any]], dict[str, Any]]
@@ -109,6 +172,27 @@ def _to_mcp_tool(definition: ToolDefinition) -> types.Tool:
             open_world_hint=definition.annotations["openWorldHint"],
         ),
     )
+
+
+def _invalid_argument(name: str, arguments: dict[str, Any]) -> str | None:
+    """The SPEC §10.1 `INVALID_ARGUMENT` message for this call, or `None`
+    if the tool exists and its arguments satisfy its hand-authored JSON
+    Schema (`imsg.mcp.tools.schemas`).
+
+    Called twice per request on purpose: once by `on_call_tool`, so a
+    malformed call is answered at once instead of waiting out a warm-up
+    it could never use, and once inside `_run_tool`, which stays correct
+    on its own rather than trusting a caller to have checked. Validating
+    a handful of keys against a small schema costs far less than either
+    a wrong answer or the wait it skips."""
+    definition = PUBLIC_TOOL_DEFINITIONS_BY_NAME.get(name)
+    if definition is None:
+        return f"unknown tool {name!r}"
+    try:
+        jsonschema.validate(arguments, definition.input_schema)
+    except jsonschema.ValidationError as exc:
+        return exc.message
+    return None
 
 
 def _result_count(payload: dict[str, Any] | None) -> int | None:
@@ -176,6 +260,14 @@ class PublicMcpServer:
     Every `AccessContext` this server ever constructs uses exactly this
     value; there is no per-request or per-tool override."""
 
+    warm_up: BackgroundWarmUp
+    """The background model load every retrieval tool is gated on.
+    Required, with no default: a `PublicMcpServer` built without one
+    would answer its first query on cold models, which is the gap this
+    field exists to close."""
+
+    warm_up_wait_seconds: float = TOOL_CALL_WARM_UP_WAIT_SECONDS
+
     async def on_list_tools(
         self,
         context: ServerRequestContext[None],
@@ -184,19 +276,32 @@ class PublicMcpServer:
         del context, params  # no pagination; listing tools needs no auth beyond the transport gate
         return types.ListToolsResult(tools=[_to_mcp_tool(d) for d in PUBLIC_TOOL_DEFINITIONS])
 
+    async def _settled_warm_up(self) -> WarmUpStatus:
+        """The warm-up's status once it is ready or failed, or after this
+        call has waited `warm_up_wait_seconds` for it. Polls with
+        `anyio.sleep` rather than blocking on the warm-up's own
+        condition, so the event loop keeps serving other requests
+        meanwhile and a client that hangs up stops the wait at once."""
+        deadline = anyio.current_time() + self.warm_up_wait_seconds
+        while True:
+            status = self.warm_up.status()
+            left = deadline - anyio.current_time()
+            if status.settled or left <= 0:
+                return status
+            await anyio.sleep(min(WARM_UP_POLL_SECONDS, left))
+
     def _run_tool(
-        self, authorized: AuthorizedRequest, name: str, arguments: dict[str, Any]
+        self,
+        authorized: AuthorizedRequest,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        warm_up: WarmUpStatus | None = None,
     ) -> _ToolCallOutcome:
-        definition = PUBLIC_TOOL_DEFINITIONS_BY_NAME.get(name)
-        if definition is None:
+        violation = _invalid_argument(name, arguments)
+        if violation is not None:
             return _ToolCallOutcome(
-                payload=None, error_code="INVALID_ARGUMENT", error_message=f"unknown tool {name!r}"
-            )
-        try:
-            jsonschema.validate(arguments, definition.input_schema)
-        except jsonschema.ValidationError as exc:
-            return _ToolCallOutcome(
-                payload=None, error_code="INVALID_ARGUMENT", error_message=exc.message
+                payload=None, error_code="INVALID_ARGUMENT", error_message=violation
             )
 
         # SPEC §10.3a: the single place the effective AccessContext is
@@ -208,6 +313,12 @@ class PublicMcpServer:
         context = AccessContext(surface="public", scope=self.scope, subject=authorized.subject)
         tool_fn = _RETRIEVAL_HANDLERS[name]
         try:
+            if warm_up is not None:
+                # `WARMING_UP` / `WARM_UP_FAILED` are `RetrievalError`s, so
+                # they take the same route out as any other SPEC §10.1
+                # outcome: their own machine code in the tool error and in
+                # the audit row, never `INTERNAL`.
+                warm_up.raise_unless_ready(wait_bound_seconds=self.warm_up_wait_seconds)
             payload = tool_fn(self.service, context, arguments)
         except RetrievalError as exc:
             return _ToolCallOutcome(payload=None, error_code=exc.code, error_message=str(exc))
@@ -220,8 +331,16 @@ class PublicMcpServer:
         arguments = dict(params.arguments or {})
         authorization = _authorization_header(context)
 
+        # A call that can never run — unknown tool, arguments that fail the
+        # schema — is answered without waiting: no amount of warming makes
+        # it valid. Everything else needs the models, so it waits for them
+        # here, off the event loop, before the (synchronous) dispatch.
+        warm_up: WarmUpStatus | None = None
+        if _invalid_argument(name, arguments) is None:
+            warm_up = await self._settled_warm_up()
+
         def handler(authorized: AuthorizedRequest) -> ToolOutcome[_ToolCallOutcome]:
-            outcome = self._run_tool(authorized, name, arguments)
+            outcome = self._run_tool(authorized, name, arguments, warm_up=warm_up)
             return ToolOutcome(
                 payload=outcome,
                 result_count=_result_count(outcome.payload),
@@ -541,6 +660,7 @@ __all__ = [
     "GOOGLE_OAUTH_ISSUER",
     "PUBLIC_OAUTH_SCOPES",
     "SERVER_NAME",
+    "TOOL_CALL_WARM_UP_WAIT_SECONDS",
     "WELL_KNOWN_METADATA_PATH",
     "PublicMcpServer",
     "TransportGuardASGIApp",

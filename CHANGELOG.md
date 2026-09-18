@@ -10,6 +10,62 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-18 — The public MCP surface warms its models at start, instead of loading them inside the first request
+
+`imsg mcp local` has warmed in the background since 2026-09-17;
+`imsg mcp public` built the same providers and then served with them
+cold, so the first request after every restart paid the whole model
+load. Restarts are the normal case, not the exception — the launchd
+agent is `KeepAlive`, so every crash is followed by another cold load —
+and the point of this surface is that a hosted assistant asks it a
+question and integrates the answer, which a first response measured in
+half-minutes does not support. Measured here on the Studio, against the
+live config with the surface on loopback and no tunnel: an unwarmed
+first query took **29.1 s** (then 0.93 s, 0.75 s); with the warm-up the
+transport accepted connections **1.17 s** after process start, reported
+ready at **37.3 s**, and the first query then took **1.87 s** (then
+1.18 s, 0.96 s). The load did not get faster — it moved off the request.
+
+- **Warmed at process start, on the model thread.** `mcp public` now
+  builds a `ModelThread` and hands it to both `RetrievalService` and a
+  `BackgroundWarmUp` it starts just before `uvicorn.run`. The shared
+  thread is not optional: MLX gives each OS thread its own default GPU
+  stream, so a model prepared on the warm-up's thread cannot be
+  evaluated on the event loop's — warming in the background without it
+  would have made queries fail rather than fast.
+- **A request that arrives first waits, then gets a retryable error.**
+  The four retrieval tools wait for the warm-up with `anyio.sleep` (the
+  event loop keeps serving meanwhile) for at most 20 s, then answer
+  `WARMING_UP` with an estimate; a failed warm-up answers
+  `WARM_UP_FAILED` on every call, so a process that came back up with
+  half its models loaded says so instead of serving. Both keep their own
+  code in `mcp_audit` rather than collapsing to `INTERNAL`. Unknown
+  tools and schema violations are still answered without waiting.
+- **20 s, not the local surface's 90 s.** A public call is an HTTP
+  request held open across a Cloudflare tunnel: the edge's Proxy Read
+  Timeout is a documented 125 s and is configurable only on Enterprise
+  zones, and no `cloudflared` `originRequest` setting is a response-read
+  timeout. Gemini Enterprise's own per-tool-call timeout is not
+  documented anywhere, so the bound has to be small enough that no
+  plausible one binds first. Past the edge's limit the client gets an
+  HTML error page instead of JSON-RPC — a transport failure rather than
+  a tool error it can act on.
+- **Readiness without an unauthenticated endpoint.** The transport
+  requires a bearer token on every request including `initialize` and
+  `tools/list`, and a health route would be the one hole in the only
+  access control this project has — so none was added. Instead the
+  warm-up's phase goes to stderr (launchd captures it to
+  `logs/imsgindex-mcp-public.err.log`) and to
+  `run/mcp-public-warm-up.json`, which `imsg status` reports as
+  `mcp_public_warm_up`. The file records the publishing pid and the
+  reader checks it is still alive, so a `ready` left behind by a process
+  that died reads as `not_running`, never as a warm server.
+- **`BackgroundWarmUp` gained an optional `on_status` callback** (the
+  readiness publisher), invoked at every phase and step change and — at
+  the two terminal transitions — before `notify_all`, so anything that
+  can observe `ready` finds the file already saying so. Like the log
+  callback it can never change the outcome.
+
 ## 2026-09-18 — A re-segmentation run now has an end, and stops rewriting segments that did not change
 
 Measured on the live instance: 1,582 genuinely changed messages caused
