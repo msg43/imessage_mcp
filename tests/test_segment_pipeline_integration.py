@@ -21,9 +21,11 @@ from imsg.db.migrations import PostgresMigrationRunner
 from imsg.segment.boundaries import FakeBoundaryProvider
 from imsg.segment.pipeline import (
     REBUILD_ALL_SENTINEL,
+    fetch_persisted_sessions,
     find_dirty_chats,
     run_segment_for_chat,
 )
+from imsg.segment.sessionize import compute_recompute_start
 
 TEST_PG_HOST = os.environ.get("IMSG_TEST_PG_HOST", "/tmp/imsgpg1")
 TEST_PG_PORT = os.environ.get("IMSG_TEST_PG_PORT", "55432")
@@ -445,3 +447,131 @@ def test_boundary_provider_splits_a_large_session_into_multiple_segments(
         (linked,) = cur.fetchone()  # type: ignore[misc]
     assert total == 20
     assert linked == 20
+
+
+def test_messages_arriving_in_a_hole_between_sessions_are_segmented(
+    scratch_db: psycopg.Connection, dm_chat: tuple[int, int, int], config: Config
+) -> None:
+    """Messages can land in the *hole* between two persisted sessions:
+    after one the session gap already sealed, and before the next one
+    starts. The incremental frontier must not jump over them.
+
+    Before the clamp, `compute_recompute_start` returned the next
+    session's `started_at` unconditionally, which here is *after* the
+    new messages — so `_fetch_messages_from` never fetched them, they
+    were never segmented, the chat stayed dirty, and no re-run ever
+    recovered them.
+    """
+    chat_id, owner_id, alice_id = dm_chat
+    gap_hours = config.segmentation.session_gap_hours  # 3.0 by default
+
+    # Session A, then session B 30h later — far beyond the gap, so A is
+    # sealed and the two never merge.
+    for i in range(3):
+        _insert_message(
+            scratch_db,
+            chat_id=chat_id,
+            sender_person_id=owner_id,
+            is_from_me=True,
+            sent_at=_BASE + timedelta(minutes=i),
+            text=f"early {i}",
+        )
+    for i in range(2):
+        _insert_message(
+            scratch_db,
+            chat_id=chat_id,
+            sender_person_id=alice_id,
+            is_from_me=False,
+            sent_at=_BASE + timedelta(hours=30, minutes=i),
+            text=f"late {i}",
+        )
+    scratch_db.commit()
+
+    provider = FakeBoundaryProvider()
+    run_segment_for_chat(
+        scratch_db, chat_id, config, provider, PROMPT_BYTES, earliest_changed_at=REBUILD_ALL_SENTINEL
+    )
+    scratch_db.commit()
+
+    with scratch_db.cursor() as cur:
+        cur.execute(
+            "SELECT s.segment_id FROM segment s JOIN session sess USING (session_id) "
+            "WHERE s.chat_id = %s ORDER BY sess.started_at",
+            (chat_id,),
+        )
+        segment_ids_before = [r[0] for r in cur.fetchall()]
+    assert len(segment_ids_before) == 2  # one per session
+    first_segment_id = segment_ids_before[0]
+
+    # Now two messages land in the hole: 20h after A ended (sealed, >gap)
+    # and 10h before B starts (>gap), so they are their own session.
+    hole_ids = [
+        _insert_message(
+            scratch_db,
+            chat_id=chat_id,
+            sender_person_id=alice_id,
+            is_from_me=False,
+            sent_at=_BASE + timedelta(hours=20, minutes=offset),
+            text=f"recovered message {offset}",
+        )
+        for offset in (0, 10)
+    ]
+    scratch_db.commit()
+
+    dirty = find_dirty_chats(scratch_db, index_unsent=config.policy.index_unsent)
+    assert chat_id in dirty
+    earliest_changed_at = dirty[chat_id]
+
+    # The frontier is where re-fetching starts, so it must not be later
+    # than the earliest changed message — otherwise the rows below are
+    # unreachable by `_fetch_messages_from` for good.
+    spans = fetch_persisted_sessions(scratch_db, chat_id)
+    frontier = compute_recompute_start(spans, earliest_changed_at, gap_hours)
+    with scratch_db.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM message WHERE chat_id = %s AND sent_at >= %s AND sent_at < %s "
+            "AND sender_person_id IS NOT NULL AND NOT is_unsent",
+            (chat_id, earliest_changed_at, frontier),
+        )
+        (skipped,) = cur.fetchone()  # type: ignore[misc]
+    assert frontier <= earliest_changed_at, (
+        f"frontier {frontier} is after the earliest changed message "
+        f"{earliest_changed_at}: {skipped} eligible message(s) in the hole between "
+        f"two persisted sessions will never be fetched by _fetch_messages_from, so "
+        f"they can never be segmented and the chat stays dirty forever"
+    )
+
+    run_segment_for_chat(
+        scratch_db,
+        chat_id,
+        config,
+        provider,
+        PROMPT_BYTES,
+        earliest_changed_at=earliest_changed_at,
+    )
+    scratch_db.commit()
+
+    # Both hole messages are now in exactly one segment — the same one.
+    with scratch_db.cursor() as cur:
+        cur.execute(
+            "SELECT message_id, count(*) FROM segment_message WHERE message_id = ANY(%s) "
+            "GROUP BY message_id",
+            (hole_ids,),
+        )
+        membership = dict(cur.fetchall())
+        cur.execute(
+            "SELECT DISTINCT segment_id FROM segment_message WHERE message_id = ANY(%s)",
+            (hole_ids,),
+        )
+        hole_segment_ids = [r[0] for r in cur.fetchall()]
+    assert membership == dict.fromkeys(hole_ids, 1)
+    assert len(hole_segment_ids) == 1
+
+    # The sealed session before the hole was left alone (this is still an
+    # incremental run, not a full rebuild), and the chat is clean again.
+    with scratch_db.cursor() as cur:
+        cur.execute("SELECT count(*) FROM session WHERE chat_id = %s", (chat_id,))
+        assert cur.fetchone() == (3,)
+        cur.execute("SELECT count(*) FROM segment WHERE segment_id = %s", (first_segment_id,))
+        assert cur.fetchone() == (1,)
+    assert chat_id not in find_dirty_chats(scratch_db, index_unsent=config.policy.index_unsent)

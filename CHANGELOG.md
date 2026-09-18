@@ -10,6 +10,52 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-18 — The incremental frontier could jump over new messages, making them permanently unsegmentable
+
+`compute_recompute_start` returns the timestamp a re-segmentation run
+re-fetches from (`_fetch_messages_from` uses `sent_at >= T`), and two of
+its three return paths could return a `T` *later* than the earliest
+changed message. When that happens the changed rows are not merely
+skipped on that run — they are unreachable forever: they never enter a
+segment, so `find_dirty_chats` keeps reporting the chat, and the next run
+computes the same overshooting frontier. No retry, no `--rebuild` of
+another chat, and no amount of waiting recovers them.
+
+- **The hole between two sessions.** After a sealed session and before
+  the next persisted one, the function returned
+  `existing_sessions[i + 1].started_at` unconditionally. Messages that
+  arrive in that hole — a backfill or a recovered-history import lands
+  them routinely — sit before that timestamp and behind the fetch.
+  Observed on the production instance: one chat, 8 eligible messages with
+  real text and resolved senders, `earliest_changed_at` 43m46s *before*
+  the frontier the function returned, the chat dirty and staying dirty.
+- **A change predating all history** hit the same shape through the
+  fall-through `return existing_sessions[0].started_at`.
+- **The fix is a clamp, and the function now has a single exit** so a
+  future return path cannot miss it: `min(frontier, earliest_changed_at)`.
+  The candidate the gap scan produces is only ever the relaxation "you
+  may safely skip everything before this persisted session" — it says
+  nothing about where the changed rows are. Re-fetching earlier than
+  strictly necessary costs work; re-fetching too late loses messages.
+  Behaviour for a change inside or after the last session is unchanged
+  (the candidate is already <= the change there), so today's incremental
+  scoping does not regress — the five pre-existing frontier tests pass
+  untouched.
+- **Tested at both levels.** A Postgres integration test builds the hole
+  from fixtures (sealed session, gap, later session, two messages landing
+  between) and asserts they end up in exactly one segment while the
+  sealed session's segment is left alone; against the unfixed function it
+  failed with the mechanism named — the messages were never fetched, and
+  `segment_message` held nothing for them. Unit tests cover the hole, the
+  predates-everything path, a change inside a middle session, and a
+  property sweep asserting the frontier is never later than the change
+  across every arrangement of 0-4 sessions and three gap settings.
+
+**Still open (not in this change):** the rebuild's *end* is the end of
+the chat, not the last affected session — `_fetch_messages_from` takes no
+upper bound — so a change early in a long chat re-segments everything
+after it. Tracked separately; this commit only stops messages being lost.
+
 ## 2026-09-17 — The nightly enrichment window: one copy of the shared 35B, one PE-Core tower per process, bounded MLX caches, and enrichment that yields to searches
 
 Enrichment runs 01:00–07:00 while the MCP server is `KeepAlive`, and the
