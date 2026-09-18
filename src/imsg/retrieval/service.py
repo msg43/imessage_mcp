@@ -10,11 +10,42 @@ same) rather than a narrower bespoke settings type, and an
 already-open `psycopg.Connection` / `apsw.Connection` pair it never
 owns the lifecycle of, matching every other DB-touching module in this
 codebase.
+
+**One call at a time per service.** Both connections are single
+objects shared by every method, and neither driver tolerates two
+threads using one connection at once — this is a measured property of
+the drivers, not a precaution:
+
+- `psycopg.Connection` (3.3.4) serializes individual operations behind
+  its own lock, but `Connection.transaction()` — which every query here
+  goes through — keeps one *connection-global* savepoint stack. Two
+  threads of different durations therefore exit out of order and both
+  raise `OutOfOrderTransactionNesting`, leaving the connection
+  mid-transaction and unusable for every later request. Before that
+  point they also share one transaction, so the `SET LOCAL
+  hnsw.ef_search` / `enable_seqscan` settings
+  `imsg.retrieval.vector_search` relies on leak between queries: a probe
+  that set 400 in one thread read back 40, the other thread's value,
+  which is a silently wrong recall rather than an error.
+- `apsw.Connection` (3.53.4) refuses outright, with
+  `ThreadingViolationError: Cursor couldn't run because the Connection
+  is busy in another thread`.
+
+So every public method below holds `_connections` for its whole
+duration. A lock rather than a connection pool because the ceiling on
+any parallelism here is `imsg.retrieval.model_thread`, which is single
+by construction (MLX gives each OS thread its own default GPU stream):
+the embedding and reranking stages, ~0.62 s p50 of a 0.96-1.87 s query
+on the production host (2026-09-17/18), are serialized whatever the
+database does. Pooling would overlap the remainder — worth revisiting
+with a measured per-stage split, and it would need a pool for the
+SQLite side too, since that connection is equally exclusive.
 """
 
 from __future__ import annotations
 
 import contextlib
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -124,6 +155,20 @@ class RetrievalService:
         self._multimodal_provider = multimodal_provider
         self._model_thread = model_thread
         self._query_marker = query_marker
+        self._connections = threading.RLock()
+
+    def _exclusive(self) -> AbstractContextManager[object]:
+        """Hold the connections for the caller's whole scope — the module
+        docstring has the two driver errors this prevents.
+
+        Re-entrant because `get_conversation` reaches the database both
+        directly and through `_assert_chat_authorized`; making that a
+        deadlock would be a worse failure than the one being fixed. It is
+        held across `_run_model` too, so a query keeps the connections
+        while it waits on the model thread: that is the cost of the lock,
+        and it is bounded by the model thread already being the serial
+        stage."""
+        return self._connections
 
     def _marking(self) -> AbstractContextManager[object]:
         """Publish "a query is in flight" for this scope, when a marker
@@ -183,7 +228,8 @@ class RetrievalService:
         steps.append(WarmUpStep(RERANKER_STEP, estimate[RERANKER_STEP], reranker))
 
         def buffer_pool() -> str:
-            return prewarm_query_path(self._pg).summary
+            with self._exclusive():
+                return prewarm_query_path(self._pg).summary
 
         steps.append(WarmUpStep(BUFFER_POOL_STEP, estimate[BUFFER_POOL_STEP], buffer_pool))
         return tuple(steps)
@@ -228,7 +274,7 @@ class RetrievalService:
         marker, so an enrichment worker that checks between tasks sees the
         gap between this search's embedding and its rerank as busy rather
         than idle."""
-        with self._marking():
+        with self._marking(), self._exclusive():
             return self._search_messages(
                 context,
                 query=query,
@@ -422,24 +468,25 @@ class RetrievalService:
         if not (1 <= window <= MAX_CONVERSATION_WINDOW):
             raise InvalidArgumentError(f"'window' must be between 1 and {MAX_CONVERSATION_WINDOW}")
 
-        resolution = segments.resolve_thread(self._pg, thread_id)
-        scope = resolve_request_scope(self._pg, context, among_chat_ids=[resolution.chat_id])
-        if not scope.admits_chat(resolution.chat_id):
-            # The same error, word for word, as an identifier that matches
-            # nothing (segments.THREAD_NOT_FOUND_MESSAGE).
-            raise NotFoundError(segments.THREAD_NOT_FOUND_MESSAGE)
-        anchor_dt = segments.resolve_anchor(self._pg, resolution, anchor)
-        messages = segments.fetch_conversation_window(
-            self._pg,
-            resolution,
-            anchor_dt,
-            window,
-            scope=scope,
-            index_unsent=self._config.policy.index_unsent,
-            include_edit_history=self._config.policy.index_edit_history,
-            timezone=self._config.render.timezone,
-            attachment_snippet_chars=self._config.render.attachment_snippet_chars,
-        )
+        with self._exclusive():
+            resolution = segments.resolve_thread(self._pg, thread_id)
+            scope = resolve_request_scope(self._pg, context, among_chat_ids=[resolution.chat_id])
+            if not scope.admits_chat(resolution.chat_id):
+                # The same error, word for word, as an identifier that matches
+                # nothing (segments.THREAD_NOT_FOUND_MESSAGE).
+                raise NotFoundError(segments.THREAD_NOT_FOUND_MESSAGE)
+            anchor_dt = segments.resolve_anchor(self._pg, resolution, anchor)
+            messages = segments.fetch_conversation_window(
+                self._pg,
+                resolution,
+                anchor_dt,
+                window,
+                scope=scope,
+                index_unsent=self._config.policy.index_unsent,
+                include_edit_history=self._config.policy.index_edit_history,
+                timezone=self._config.render.timezone,
+                attachment_snippet_chars=self._config.render.attachment_snippet_chars,
+            )
         return {"thread_key": resolution.thread_key, "messages": messages}
 
     # -- list_people ------------------------------------------------------
@@ -459,10 +506,11 @@ class RetrievalService:
             # public schema omits the property; this holds even if a
             # caller reaches the service some other way.
             raise InvalidArgumentError("'include_handles' is available on the local surface only")
-        scope = resolve_request_scope(self._pg, context)
-        listings = directory.list_people(
-            self._pg, scope, query=query, limit=limit, include_handles=include_handles
-        )
+        with self._exclusive():
+            scope = resolve_request_scope(self._pg, context)
+            listings = directory.list_people(
+                self._pg, scope, query=query, limit=limit, include_handles=include_handles
+            )
         people: list[dict[str, object]] = []
         for p in listings:
             entry: dict[str, object] = {
@@ -487,7 +535,8 @@ class RetrievalService:
             raise InvalidArgumentError(
                 "'attachment_key' must be between 16 and 128 characters"
             )
-        result = directory.get_attachment_text(self._pg, context, attachment_key)
+        with self._exclusive():
+            result = directory.get_attachment_text(self._pg, context, attachment_key)
         return {
             "attachment_key": result.attachment_key,
             "filename": result.filename,

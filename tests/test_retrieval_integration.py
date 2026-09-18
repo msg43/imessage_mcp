@@ -26,8 +26,9 @@ from __future__ import annotations
 import math
 import os
 import random
+import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -1065,3 +1066,116 @@ def test_get_attachment_text_allowlist_scope_unauthorized_is_not_found(
     allowlist_ctx = AccessContext(surface="public", scope="allowlist", subject="12345")
     with pytest.raises(NotFoundError):
         service.get_attachment_text(allowlist_ctx, attachment_key=attachment_key)
+
+
+# ==========================================================================
+# Two threads, one service (the public MCP surface's worker threads)
+# ==========================================================================
+
+
+CONCURRENT_SEARCH_THREADS = 4
+SEARCHES_PER_THREAD = 3
+
+
+def test_concurrent_searches_never_touch_a_connection_from_two_threads(
+    scratch_db: psycopg.Connection, fts_conn: apsw.Connection, service: RetrievalService
+) -> None:
+    """`imsg.mcp.tools.public_server` dispatches each tool call on a
+    worker thread, so several can reach one `RetrievalService` at once.
+    Neither connection it holds tolerates that, and both say so loudly:
+    psycopg raises `OutOfOrderTransactionNesting` when two
+    `conn.transaction()` blocks of different lengths exit out of order
+    (and leaves the connection mid-transaction, breaking every request
+    after it), and apsw raises `ThreadingViolationError` outright. The
+    service serializes calls for exactly this reason.
+
+    Written against the real drivers rather than fakes because both
+    failures are driver behaviour: a fake connection would only assert
+    what this test already assumes."""
+    owner_id, _ = _insert_person(scratch_db, "Owner", is_owner=True)
+    alice_id, _ = _insert_person(scratch_db, "Alice Example")
+    chat_id, _ = _insert_chat(scratch_db, participants=[owner_id, alice_id])
+    for day in range(6):
+        _make_segment(
+            scratch_db,
+            fts_conn,
+            chat_id=chat_id,
+            rendered_text=f"the kite festival on the ridge, day {day}",
+            started_at=datetime(2024, 5, 1 + day, 12, 0, tzinfo=UTC),
+            person_id=alice_id,
+        )
+
+    failures: list[str] = []
+    hit_counts: list[int] = []
+    start = threading.Barrier(CONCURRENT_SEARCH_THREADS, timeout=30)
+
+    def search_repeatedly() -> None:
+        try:
+            start.wait()
+            for _ in range(SEARCHES_PER_THREAD):
+                result = service.search_messages(LOCAL_FULL_ACCESS, query="kite festival")
+                hit_counts.append(len(result.results))
+        except BaseException as exc:  # the failure *is* the finding
+            failures.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=search_repeatedly) for _ in range(CONCURRENT_SEARCH_THREADS)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+
+    assert failures == []
+    assert len(hit_counts) == CONCURRENT_SEARCH_THREADS * SEARCHES_PER_THREAD
+    # Every search saw the whole corpus: a query that ran with another
+    # thread's transaction (or its `SET LOCAL` settings) underneath it
+    # would not have to.
+    assert set(hit_counts) == {6}
+    # And nothing was left mid-transaction for the next request to trip on.
+    assert scratch_db.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+
+
+def test_concurrent_calls_across_different_tools_are_serialized(
+    scratch_db: psycopg.Connection, fts_conn: apsw.Connection, service: RetrievalService
+) -> None:
+    """The lock covers every entry point, not just `search_messages` —
+    a `list_people` running against the same connection as a search is
+    the same violation."""
+    owner_id, _ = _insert_person(scratch_db, "Owner", is_owner=True)
+    alice_id, _ = _insert_person(scratch_db, "Alice Example")
+    chat_id, _ = _insert_chat(scratch_db, participants=[owner_id, alice_id])
+    _make_segment(
+        scratch_db,
+        fts_conn,
+        chat_id=chat_id,
+        rendered_text="the kite festival on the ridge",
+        started_at=datetime(2024, 5, 1, 12, 0, tzinfo=UTC),
+        person_id=alice_id,
+    )
+
+    failures: list[str] = []
+    start = threading.Barrier(2, timeout=30)
+
+    def run(call: Callable[[], object]) -> Callable[[], None]:
+        def go() -> None:
+            try:
+                start.wait()
+                for _ in range(SEARCHES_PER_THREAD):
+                    call()
+            except BaseException as exc:  # the failure *is* the finding
+                failures.append(f"{type(exc).__name__}: {exc}")
+
+        return go
+
+    threads = [
+        threading.Thread(
+            target=run(lambda: service.search_messages(LOCAL_FULL_ACCESS, query="kite festival"))
+        ),
+        threading.Thread(target=run(lambda: service.list_people(LOCAL_FULL_ACCESS, limit=10))),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+
+    assert failures == []
+    assert scratch_db.info.transaction_status == psycopg.pq.TransactionStatus.IDLE

@@ -70,9 +70,28 @@ this module that is ordered differently from the security layers above —
 is deliberate and costs nothing: `TransportGuardASGIApp` has already
 authorized this very HTTP request before the session manager could route
 it here, so no unauthenticated caller can reach the wait, let alone park
-a request on it. Putting the wait inside `dispatch` would mean blocking
-the event-loop thread (dispatch is synchronous), which is the one thing
-a bounded wait must not do.
+a request on it. It also keeps a request that is only waiting for the
+models out of the worker threads below, which are for work that actually
+runs.
+
+**`gate.dispatch` runs on a worker thread, never on the event loop.**
+Everything from the gate inward is synchronous — validation, then the
+retrieval query itself: FTS, vector search, embedding, reranking — and
+one query measured 0.96-1.87 s against the live corpus (2026-09-18).
+Run inside the coroutine, that is 0.96-1.87 s in which uvicorn's loop
+cannot progress *anything* else: no second tool call, no `tools/list`,
+no `ping`, not even another request's warm-up poll. The local surface
+never showed this (stdio, one client, one call at a time); this surface
+serves a hosted assistant over StreamableHTTP, where concurrent tool
+calls are ordinary. `anyio.to_thread.run_sync` moves it off.
+
+Note what that does *not* buy. `imsg.retrieval.service.RetrievalService`
+holds one `psycopg.Connection` and one `apsw.Connection`, neither of
+which tolerates two threads at once (that module's docstring has the two
+driver errors), so it serializes whole calls behind its own lock —
+concurrent queries queue there rather than overlapping. What the worker
+thread fixes is the event loop, which is what everything *other* than a
+second query needs.
 """
 
 from __future__ import annotations
@@ -85,6 +104,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import anyio
+import anyio.to_thread
 import jsonschema
 import mcp.types as types
 from mcp.server.context import ServerRequestContext
@@ -159,6 +179,32 @@ that small win for the risk of no structured answer at all."""
 
 WARM_UP_POLL_SECONDS = 0.1
 """How often a waiting tool call re-checks the warm-up."""
+
+MAX_CONCURRENT_TOOL_CALLS = 4
+"""How many tool calls may occupy a worker thread at once.
+
+Not a throughput knob — `imsg.retrieval.service.RetrievalService`
+serializes queries behind its connection lock, so calls past the first
+are queueing whatever this number is. It bounds two other things:
+
+- **Threads.** Without a limiter of our own, `anyio.to_thread.run_sync`
+  draws on anyio's default limiter, which is 40 tokens and shared with
+  every other user of `to_thread` in the process. A private limiter
+  keeps this surface from taking all of it, and keeps the thread count
+  a number written down here rather than a library default.
+- **How long a queued request is held.** Each waiting call is an HTTP
+  request held open across a tunnel whose edge gives up at 125 s
+  (`TOOL_CALL_WARM_UP_WAIT_SECONDS` has the citation). At the measured
+  0.96-1.87 s per query, a queue four deep is answered in about 7.5 s
+  at worst; a deeper one mostly converts into client timeouts, and
+  arrival rate is already bounded by `mcp.public.rate_limit_per_minute`.
+
+Memory is *not* what this bounds, despite being the obvious candidate:
+`models.query_cache_limit_bytes` caps a process-wide MLX buffer cache,
+and every model call in this process runs on the single
+`imsg.retrieval.model_thread.ModelThread`, so concurrent tool calls do
+not multiply it. What they multiply is the Python-side working set of a
+query, and the connection lock already admits one of those at a time."""
 
 _RETRIEVAL_HANDLERS: dict[
     str, Callable[[RetrievalService, AccessContext, dict[str, Any]], dict[str, Any]]
@@ -284,6 +330,20 @@ class PublicMcpServer:
     reload outlasts this surface's 20 s warm-up wait, so the first call
     after an unload answers `WARMING_UP`). `None` keeps them loaded."""
 
+    max_concurrent_tool_calls: int = MAX_CONCURRENT_TOOL_CALLS
+
+    _tool_call_limiter: anyio.CapacityLimiter | None = None
+    """Created on this server's first tool call, not at construction:
+    an `anyio.CapacityLimiter` belongs to the event loop that first uses
+    it, and a `PublicMcpServer` is built before `uvicorn.run` starts
+    one. Assigned without an `await` in between, so the loop cannot
+    interleave two initialisations."""
+
+    def _limiter(self) -> anyio.CapacityLimiter:
+        if self._tool_call_limiter is None:
+            self._tool_call_limiter = anyio.CapacityLimiter(self.max_concurrent_tool_calls)
+        return self._tool_call_limiter
+
     def _retrieval_call(self) -> contextlib.AbstractContextManager[None]:
         if self.idle_unloader is None:
             return contextlib.nullcontext()
@@ -378,8 +438,18 @@ class PublicMcpServer:
                 )
 
             try:
-                result = self.gate.dispatch(
-                    authorization, tool=name, params=arguments, handler=handler
+                # On a worker thread, never on the event loop: `dispatch` and
+                # everything it calls is synchronous, and a query holds it for
+                # ~1-2 s (module docstring). Not `abandon_on_cancel=True` —
+                # a client that hangs up must not leave a thread running
+                # inside `RetrievalService`'s lock with nothing observing how
+                # it ended, since this call's audit row is written on that
+                # thread.
+                result = await anyio.to_thread.run_sync(
+                    lambda: self.gate.dispatch(
+                        authorization, tool=name, params=arguments, handler=handler
+                    ),
+                    limiter=self._limiter(),
                 )
             except Exception:
                 # `gate.dispatch` already wrote an INTERNAL audit row and

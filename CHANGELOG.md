@@ -1145,6 +1145,87 @@ every week from the day the agents were installed.
   needs two live OAuth tokens, so it was left unwired rather than
   half-wired.
 
+## 2026-09-18 — One query no longer stops the public MCP surface answering anything else
+
+`PublicMcpServer.on_call_tool` was `async` but did the whole tool call
+synchronously on the event loop: `PublicAuthGate.dispatch` is a plain
+`def`, and the handler it invokes runs the entire retrieval query — FTS,
+vector search, embedding, reranking. For the 0.96-1.87 s that takes
+(measured on the Studio against the live corpus at `full` scope), uvicorn
+could not progress anything: no second query, no `tools/list`, no `ping`,
+no other request's warm-up wait. The local surface never showed it —
+stdio, one client, one call at a time — but this surface exists to serve
+a hosted assistant over StreamableHTTP, where concurrent tool calls are
+ordinary.
+
+Measured end to end through real uvicorn with a 1.5 s stand-in query,
+two concurrent `tools/call` requests: **3.02 s before, 1.52 s after**.
+Before, *both* clients waited 3.02 s — the second request was not read
+off the socket until the first had finished, so blocking the loop cost
+the first caller nothing and the second caller everything.
+
+The model thread did not fix this and was never going to. `imsg mcp
+public` hands a `ModelThread` to `RetrievalService`, but `_run_model`
+blocks the calling thread on `Future.result()`; that thread exists for
+MLX's per-thread GPU stream requirement, not for concurrency.
+
+- **`gate.dispatch` runs on a worker thread** (`anyio.to_thread.run_sync`),
+  bounded by a private `anyio.CapacityLimiter` of
+  `MAX_CONCURRENT_TOOL_CALLS` (4). Private because the alternative is
+  anyio's process-wide default of 40, shared with every other user of
+  `to_thread`; 4 because a queued call is an HTTP request held open
+  across a tunnel that gives up at 125 s, and at ~2 s a query a deeper
+  queue mostly converts into client timeouts. The warm-up wait stays
+  outside `dispatch`, where it already used `anyio.sleep` and blocked
+  nothing — and where it does not occupy a worker thread.
+- **`RetrievalService` serializes its own calls, because its two
+  connections cannot be shared.** This is the part that made the change
+  more than a one-liner, and both failures were reproduced before being
+  designed around:
+  - `psycopg.Connection` (3.3.4) keeps one *connection-global* savepoint
+    stack behind `Connection.transaction()`, which every query here goes
+    through. Two threads whose queries differ in length exit out of
+    order, both raise `OutOfOrderTransactionNesting`, and the connection
+    is left mid-transaction — broken for every request after. Before
+    that point they also share one transaction, so the `SET LOCAL
+    hnsw.ef_search` / `enable_seqscan` settings the vector channels rely
+    on leak between queries: a probe that set 400 in one thread read back
+    40, the other thread's value. That one is worse than the crash,
+    because it is a silently wrong recall rather than an error.
+  - `apsw.Connection` (3.53.4) refuses outright —
+    `ThreadingViolationError: Cursor couldn't run because the Connection
+    is busy in another thread`.
+
+  A lock rather than a pool: the ceiling on parallelism here is the
+  single `ModelThread`, and the model stages are ~0.62 s p50 of a
+  0.96-1.87 s query, so pooling would overlap the remainder only — and
+  would need a pool on the SQLite side too, plus `psycopg_pool`, which is
+  not a dependency. Worth revisiting with a measured per-stage split; the
+  numbers to beat are recorded here.
+- **Everything else that now runs off the event loop was checked, and
+  needed no change.** `PublicAuthGate`'s mutable state is all lock-guarded
+  (verdict cache, both `SlidingWindowLimiter`s, the tokeninfo breaker's
+  cooldown); `QueryInFlightMarker` was already built for this and says so.
+  `PostgresAuditSink` opens a connection per row from its factory, and
+  `imsg mcp public` passes one that connects afresh, so concurrent writers
+  share nothing — its docstring now states that the factory must hand out
+  a connection the call may close, which was always true (the `with` block
+  closes it) and is now load-bearing from several threads at once.
+- **Tests.** `tests/test_mcp_public_server_concurrency.py`: a held query
+  no longer stops `tools/list` or a second tool call (fails on the old
+  code, in ordering rather than by hanging — a blocked loop cannot fire
+  `anyio.fail_after`, so every hold is released from an OS thread); the
+  capacity bound is the number that binds; and the per-subject rate limit
+  is not bypassable by concurrency — 20 concurrent calls against a limit
+  of 5 admit exactly 5, with all 20 audited.
+  `tests/test_retrieval_integration.py` runs four threads of real
+  searches against real Postgres and real SQLite, and reproduces
+  `OutOfOrderTransactionNesting` when the lock is removed.
+  `tests/test_mcp_audit_concurrency_integration.py` writes `mcp_audit`
+  rows from six threads and pins the factory contract.
+
+Suite: 1,718 passed with a scratch database.
+
 ## 2026-09-18 — The public MCP surface warms its models at start, instead of loading them inside the first request
 
 `imsg mcp local` has warmed in the background since 2026-09-17;

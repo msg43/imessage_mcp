@@ -183,6 +183,19 @@ class PostgresAuditSink:
     AuditWriteError, which the gate converts into a 503 denial — an
     unauditable request is never served (SPEC §12 step 4 depends on the
     audit trail being complete).
+
+    **The factory must hand out a connection this call may close.** The
+    write below is a `with` block over the factory's return value, and
+    psycopg closes a connection on leaving one, so a factory returning
+    one shared `psycopg.Connection` writes the first row and then answers
+    `the connection is closed` for every row after it. That has always
+    been true and is not a threading matter; what threading adds is that
+    the factory is now *called* from several threads at once, since the
+    public surface dispatches tool calls on worker threads
+    (`imsg.mcp.tools.public_server`). `imsg mcp public` passes `lambda:
+    connect(cfg.database, autocommit=True)` — a fresh connection per
+    row, and `psycopg.connect` is safe to call concurrently. A pooled
+    factory works too, provided what it checks out may be closed.
     """
 
     def __init__(self, connection_factory: Callable[[], psycopg.Connection]) -> None:
