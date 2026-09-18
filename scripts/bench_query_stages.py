@@ -114,7 +114,7 @@ from typing import Any, TextIO
 
 import structlog
 
-from imsg import constants
+from imsg import constants, mlx_runtime
 from imsg.config.schema import RetrievalConfig
 from imsg.embed.batching import plan_batches
 from imsg.embed.mlx_text import MlxTextEmbeddingProvider, format_query_text
@@ -912,6 +912,7 @@ def make_reranker(args: argparse.Namespace) -> MlxRerankerProvider:
         max_batch_tokens=args.reranker_max_batch_tokens,
         doc_max_tokens=args.rerank_doc_max_tokens,
         model_id=f"{directory.name}@{args.reranker_revision}" if directory else None,
+        cache_limit_bytes=int(args.query_cache_limit_gib * 2**30),
     )
 
 
@@ -970,11 +971,13 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     memory: dict[str, Any] = {"before_load": memory_state(None, None)}
     report["memory"] = memory
 
+    cache_limit_bytes = int(args.query_cache_limit_gib * 2**30)
     embedder = MlxTextEmbeddingProvider(
         str(embedder_dir) if embedder_dir else args.embedder,
         None if embedder_dir else args.embedder_revision,
         constants.PRIMARY_EMBEDDING_DIM,
         model_id=f"{embedder_dir.name}@{args.embedder_revision}" if embedder_dir else None,
+        cache_limit_bytes=cache_limit_bytes,
     )
     reranker = make_reranker(args)
     pe_core = PeCoreMultimodalEmbeddingProvider(
@@ -989,7 +992,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         ("embedder", embedder.load),
         ("reranker", reranker.load),
         # PE-Core's loader runs one text-tower forward to prove the width.
-        ("pe_core", pe_core._load),
+        # "text" is the tower a query process uses; the vision tower is
+        # dropped (D10.3 defect 2), which is what this script then measures.
+        ("pe_core", lambda: pe_core._load("text")),
     ):
         seconds = time_call(load)
         loads[name] = {"seconds": round(seconds, 2), **mlx_memory(mx, include_peak=True)}
@@ -1018,7 +1023,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             extra={"query_tokens": query_tokens[1 + args.warmup :]},
         )
     )
-    pe_runtime = pe_core._load()
+    pe_runtime = pe_core._load("text")  # the query side uses the text tower only
     pe_context = getattr(pe_runtime.tokenizer, "context_length", None)
     stages.append(
         measure(
@@ -1505,6 +1510,16 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--pe-core-revision", default=constants.MULTIMODAL_EMBEDDING_MODEL_REVISION)
     parser.add_argument(
         "--pe-core-cache-dir", type=Path, help="huggingface_hub cache (default: its own)"
+    )
+    parser.add_argument(
+        "--query-cache-limit-gib",
+        type=float,
+        default=mlx_runtime.DEFAULT_CACHE_LIMIT_BYTES / 2**30,
+        help="MLX buffer-cache bound for the query-side providers, in GiB (config "
+        "models.query_cache_limit_bytes). The query process is ~18.7 GiB right after "
+        "load and ~27.5 GiB in steady state; the difference is this cache filling to "
+        "its bound, so lowering it trades footprint during the nightly window for "
+        "whatever re-allocation costs — which is what this flag exists to measure",
     )
     parser.add_argument("--query-instruction", default=DEFAULT_QUERY_INSTRUCTION)
     parser.add_argument("--seed", type=int, default=20260916)

@@ -24,6 +24,11 @@ lifetime (one queue worker captions thousands of images against one
 multi-gigabyte model). The runtime is imported on first use (see
 `imsg.enrich.model_runtime`); constructing the provider needs nothing
 installed.
+
+Loading goes through an `imsg.shared_vlm_runtime.SharedVlmRuntime`, so a
+process that also runs boundary detection against the same pin holds one
+copy of the weights rather than two (D10.3 defect 1). Passed no runtime,
+the provider makes its own private one and behaves exactly as before.
 """
 
 from __future__ import annotations
@@ -32,16 +37,18 @@ import re
 from pathlib import Path
 from typing import Any
 
-from imsg.enrich.model_runtime import (
-    ModelRuntimeUnavailableError,
-    import_runtime_module,
-    resolve_model_snapshot,
-)
+from imsg.enrich.model_runtime import import_runtime_module
 from imsg.errors import ConfigError, EnrichmentError
 from imsg.hashing import sha256_text
+from imsg.shared_vlm_runtime import (
+    DEFAULT_ENRICHMENT_CACHE_LIMIT_BYTES,
+    MLX_VLM_INSTALL_HINT,
+    LoadedVlm,
+    SharedVlmRuntime,
+)
 from imsg.textnorm import strip_nul
 
-_INSTALL_HINT = "install `mlx-vlm` (Apple silicon only)"
+_INSTALL_HINT = MLX_VLM_INSTALL_HINT
 
 DEFAULT_CAPTION_PROMPT_PATH = Path("prompts/caption.txt")
 """Where the fixed captioning prompt lives, relative to
@@ -82,6 +89,13 @@ class MlxVlmCaptionProvider:
     `imsg.enrich.model_runtime.resolve_model_snapshot`) and is part of
     `model_id` (`<repo>@<revision or 'main'>`). `prompt` is the fixed
     captioning prompt, hashed verbatim into `prompt_sha256`.
+
+    `shared_runtime` is where the weights come from. Hand the *same*
+    `SharedVlmRuntime` to this provider and to
+    `imsg.segment.mlx_boundaries.MlxBoundaryProvider` and a process
+    running both roles against one pin loads one copy of the weights.
+    Left `None`, the provider builds a private runtime bounded at
+    `cache_limit_bytes`, which is the single-role behaviour.
     """
 
     def __init__(
@@ -91,6 +105,8 @@ class MlxVlmCaptionProvider:
         prompt: str,
         *,
         max_tokens: int = 256,
+        shared_runtime: SharedVlmRuntime | None = None,
+        cache_limit_bytes: int | None = DEFAULT_ENRICHMENT_CACHE_LIMIT_BYTES,
     ) -> None:
         if not prompt.strip():
             raise ConfigError(
@@ -105,43 +121,29 @@ class MlxVlmCaptionProvider:
         self.prompt_sha256 = sha256_text(prompt)
         self.max_tokens = max_tokens
         self.model_id = f"{model_repo}@{revision or 'main'}"
-        self._model_path: str | None = None
-        self._loaded: tuple[Any, Any, Any] | None = None
+        self._runtime = shared_runtime or SharedVlmRuntime(cache_limit_bytes=cache_limit_bytes)
 
-    def _resolved_model_path(self) -> str:
-        model_path = self._model_path
-        if model_path is None:
-            model_path = resolve_model_snapshot(self.model_repo, self.revision)
-            self._model_path = model_path
-        return model_path
+    @property
+    def shared_runtime(self) -> SharedVlmRuntime:
+        """The runtime this provider loads from — the one passed in, or
+        the private one it made. Exposed so a caller can hand the same
+        object to the boundary provider after the fact, and so tests can
+        assert on what is resident."""
+        return self._runtime
 
-    def _load(self) -> tuple[Any, Any, Any]:
-        """`(model, processor, config)`, loaded once on first use. A load
+    def _load(self) -> LoadedVlm:
+        """The shared model, loaded once per pin per runtime. A load
         failure is an environment problem (missing or corrupt weights,
         not enough memory for the model at all), so it is a
         `ModelRuntimeUnavailableError`, not a per-task failure."""
-        loaded = self._loaded
-        if loaded is None:
-            mlx_vlm = import_runtime_module("mlx_vlm", install_hint=_INSTALL_HINT)
-            vlm_utils = import_runtime_module("mlx_vlm.utils", install_hint=_INSTALL_HINT)
-            model_path = self._resolved_model_path()
-            try:
-                model, processor = mlx_vlm.load(model_path)
-                config = vlm_utils.load_config(model_path)
-            except Exception as exc:
-                raise ModelRuntimeUnavailableError(
-                    f"could not load the caption model {self.model_id}: {exc}"
-                ) from exc
-            loaded = (model, processor, config)
-            self._loaded = loaded
-        return loaded
+        return self._runtime.acquire(self.model_repo, self.revision)
 
     def caption(self, image_path: Path) -> str:
         if not image_path.is_file():
             raise EnrichmentError(f"caption input is not a file: '{image_path}'")
         mlx_vlm = import_runtime_module("mlx_vlm", install_hint=_INSTALL_HINT)
         prompt_utils = import_runtime_module("mlx_vlm.prompt_utils", install_hint=_INSTALL_HINT)
-        model, processor, config = self._load()
+        loaded = self._load()
         try:
             # `enable_thinking=False`: rendered against the pinned Qwen3.5
             # repo's chat_template.jinja (2026-09-14) it closes an empty
@@ -152,11 +154,11 @@ class MlxVlmCaptionProvider:
             # (temperature 0, the budget spent on the caption) must not rest
             # on a third-party default.
             formatted_prompt = prompt_utils.apply_chat_template(
-                processor, config, self.prompt, num_images=1, enable_thinking=False
+                loaded.processor, loaded.config, self.prompt, num_images=1, enable_thinking=False
             )
             output = mlx_vlm.generate(
-                model,
-                processor,
+                loaded.model,
+                loaded.processor,
                 formatted_prompt,
                 image=[str(image_path)],
                 max_tokens=self.max_tokens,

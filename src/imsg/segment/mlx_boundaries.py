@@ -31,6 +31,21 @@ Timeouts: MLX generation cannot be interrupted mid-kernel, so the
 deadline is enforced between streamed tokens — generation is abandoned
 (and :class:`BoundaryDetectionError` raised) at the first token that
 arrives past ``timeout_seconds``.
+
+Two loaders, one computation (D10.3 defect 1). The pinned boundary model
+*is* the pinned captioning model (``imsg.constants`` sets
+``CAPTION_MODEL_REPO = BOUNDARY_MODEL_REPO``), and loading it twice —
+once through ``mlx_lm``, once through ``mlx_vlm`` — cost 18 GiB of
+duplicate weights on the production host. Given a
+:class:`~imsg.shared_vlm_runtime.SharedVlmRuntime` this provider runs
+text-only generation through the already-loaded vision-language model
+instead; given none it keeps the ``mlx_lm`` path, which is 0.83 GiB
+lighter for a process that only detects boundaries. The two paths are
+the same computation on the same weights, checked rather than assumed
+(2026-09-17, development host, the pinned 4-bit 35B): the rendered chat
+prompt is byte-identical, and the last-position logit row for a fixed
+probe is bit-identical across all 248,320 float32 values. See
+``imsg.shared_vlm_runtime`` for the evidence in full.
 """
 
 from __future__ import annotations
@@ -42,13 +57,17 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+from imsg.enrich.model_runtime import import_runtime_module
 from imsg.errors import BoundaryDetectionError, SegmentationError
 from imsg.mlx_runtime import (
+    DEFAULT_CACHE_LIMIT_BYTES,
+    bound_buffer_cache,
     format_model_id,
     import_mlx_lm,
     load_model_and_tokenizer,
 )
 from imsg.segment.models import MessageForSegmentation
+from imsg.shared_vlm_runtime import MLX_VLM_INSTALL_HINT, LoadedVlm, SharedVlmRuntime
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _CODE_FENCE_RE = re.compile(r"```[A-Za-z0-9_-]*[ \t]*\r?\n?(.*?)```", re.DOTALL)
@@ -182,6 +201,15 @@ class MlxBoundaryProvider:
     explicitly via :meth:`load`; either way a load failure is the
     underlying ``MlxRuntimeError`` (see the module docstring on why it
     is never downgraded to ``BoundaryDetectionError``).
+
+    ``shared_runtime`` selects the loader. Given a
+    :class:`~imsg.shared_vlm_runtime.SharedVlmRuntime` — the same
+    instance the captioner was handed — this provider generates through
+    the already-loaded vision-language model and no second copy of the
+    weights is created. Given ``None`` it loads its own through
+    ``mlx_lm``, bounding MLX's buffer cache at ``cache_limit_bytes``
+    the way every other MLX provider in this codebase does (D10.2:
+    unbounded, the pool reached 37.25 GiB in one enrichment process).
     """
 
     def __init__(
@@ -192,6 +220,8 @@ class MlxBoundaryProvider:
         *,
         max_tokens: int = 512,
         timeout_seconds: float = 120.0,
+        shared_runtime: SharedVlmRuntime | None = None,
+        cache_limit_bytes: int | None = DEFAULT_CACHE_LIMIT_BYTES,
     ) -> None:
         if not model_repo:
             raise ValueError("model_repo must be a non-empty repo id or local path")
@@ -199,24 +229,43 @@ class MlxBoundaryProvider:
             raise ValueError(f"max_tokens must be >= 1, got {max_tokens}")
         if timeout_seconds <= 0:
             raise ValueError(f"timeout_seconds must be > 0, got {timeout_seconds}")
+        if cache_limit_bytes is not None and cache_limit_bytes < 0:
+            raise ValueError(f"cache_limit_bytes must be >= 0 or None, got {cache_limit_bytes}")
         self.model_id = format_model_id(model_repo, revision)
         self.prompt_template = _coerce_template(prompt_template)
         self._model_repo = model_repo
         self._revision = revision
         self._max_tokens = max_tokens
         self._timeout_seconds = timeout_seconds
+        self._shared_runtime = shared_runtime
+        self._cache_limit_bytes = cache_limit_bytes
         self._model: Any = None
         self._tokenizer: Any = None
+        self._vlm: LoadedVlm | None = None
 
     @property
     def is_loaded(self) -> bool:
-        return self._model is not None
+        return self._model is not None or self._vlm is not None
+
+    @property
+    def shares_vlm_weights(self) -> bool:
+        """Whether this provider generates through a shared
+        vision-language model rather than loading its own copy. Exposed so
+        a caller (and the tests) can tell which of the two paths in the
+        module docstring a given instance took, without reaching into
+        private state."""
+        return self._shared_runtime is not None
 
     def load(self) -> None:
         """Load weights + tokenizer now (idempotent)."""
-        if self._model is not None:
+        if self.is_loaded:
+            return
+        if self._shared_runtime is not None:
+            self._vlm = self._shared_runtime.acquire(self._model_repo, self._revision)
             return
         model, tokenizer = load_model_and_tokenizer(self._model_repo, self._revision)
+        if self._cache_limit_bytes is not None:
+            bound_buffer_cache(self._cache_limit_bytes)
         self._model = model
         self._tokenizer = tokenizer
 
@@ -237,6 +286,8 @@ class MlxBoundaryProvider:
         """Wrap the rendered prompt in the tokenizer's chat template with
         thinking disabled; a tokenizer without a chat template (a base
         model) gets the raw text."""
+        if self._vlm is not None:
+            return self._vlm_chat_prompt(self._vlm, user_text)
         tokenizer = self._tokenizer
         if not getattr(tokenizer, "chat_template", None):
             return user_text
@@ -253,10 +304,31 @@ class MlxBoundaryProvider:
             ) from exc
         return str(rendered)
 
+    def _vlm_chat_prompt(self, vlm: LoadedVlm, user_text: str) -> str:
+        """The same wrapping through ``mlx_vlm``'s own chat-template
+        helper, with no image placeholders (``num_images=0``): this is a
+        text-only turn through a vision-language model. Checked to render
+        byte-identically to the ``mlx_lm`` branch above for the pinned
+        model (module docstring)."""
+        prompt_utils = import_runtime_module(
+            "mlx_vlm.prompt_utils", install_hint=MLX_VLM_INSTALL_HINT
+        )
+        try:
+            rendered = prompt_utils.apply_chat_template(
+                vlm.processor, vlm.config, user_text, num_images=0, enable_thinking=False
+            )
+        except Exception as exc:
+            raise BoundaryDetectionError(
+                f"boundary model {self.model_id}: chat template failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        return str(rendered)
+
     def _generate(self, prompt: str) -> str:
         """Greedy generation with the between-token deadline described in
         the module docstring. Every runtime failure becomes
         :class:`BoundaryDetectionError`."""
+        if self._vlm is not None:
+            return self._generate_through_vlm(self._vlm, prompt)
         mlx_lm = import_mlx_lm()
         try:
             sample_utils = importlib.import_module("mlx_lm.sample_utils")
@@ -275,6 +347,40 @@ class MlxBoundaryProvider:
                 prompt,
                 max_tokens=self._max_tokens,
                 sampler=sampler,
+            ):
+                pieces.append(str(response.text))
+                if _monotonic() > deadline:
+                    raise BoundaryDetectionError(
+                        f"boundary model {self.model_id} exceeded {self._timeout_seconds:g}s "
+                        f"after {len(pieces)} generated tokens"
+                    )
+        except BoundaryDetectionError:
+            raise
+        except Exception as exc:
+            raise BoundaryDetectionError(
+                f"boundary model {self.model_id} generation failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        return "".join(pieces)
+
+    def _generate_through_vlm(self, vlm: LoadedVlm, prompt: str) -> str:
+        """Text-only greedy generation through the shared
+        vision-language model (``image=None``), under the same
+        between-token deadline and the same error contract as the
+        ``mlx_lm`` branch. ``temperature=0.0`` is the greedy sampler
+        ``mlx_vlm`` builds for itself — the counterpart of
+        ``make_sampler(temp=0)`` above, and the same value the captioner
+        passes."""
+        mlx_vlm = import_runtime_module("mlx_vlm", install_hint=MLX_VLM_INSTALL_HINT)
+        deadline = _monotonic() + self._timeout_seconds
+        pieces: list[str] = []
+        try:
+            for response in mlx_vlm.stream_generate(
+                vlm.model,
+                vlm.processor,
+                prompt,
+                image=None,
+                max_tokens=self._max_tokens,
+                temperature=0.0,
             ):
                 pieces.append(str(response.text))
                 if _monotonic() > deadline:

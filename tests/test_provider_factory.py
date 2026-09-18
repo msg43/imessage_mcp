@@ -33,10 +33,12 @@ from imsg.providers.factory import (
     REAL_PROVIDERS,
     RealProviderSpec,
     backend_status_line,
+    boundary_and_caption_share_weights,
     build_boundary_provider,
     build_enrichment_providers,
     build_multimodal_provider,
     build_reranker,
+    build_shared_vlm_runtime,
     build_text_provider,
     local_model_id,
     resolve_local_model_dir,
@@ -167,7 +169,11 @@ def test_real_backend_resolves_each_class_by_dotted_path(
     assert calls["text_embedding"] == [
         (
             (e.model, e.revision, e.dim),
-            {"batch_size": e.batch_size, "max_batch_tokens": e.max_batch_tokens},
+            {
+                "batch_size": e.batch_size,
+                "max_batch_tokens": e.max_batch_tokens,
+                "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
+            },
         )
     ]
 
@@ -179,12 +185,26 @@ def test_real_backend_resolves_each_class_by_dotted_path(
 
     boundary = build_boundary_provider(cfg, "PROMPT TEMPLATE")
     assert type(boundary).__name__ == REAL_PROVIDERS["boundary"].class_name
-    assert calls["boundary"] == [((s.boundary_model, s.boundary_revision, "PROMPT TEMPLATE"), {})]
+    assert calls["boundary"] == [
+        (
+            (s.boundary_model, s.boundary_revision, "PROMPT TEMPLATE"),
+            {
+                "shared_runtime": None,
+                "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
+            },
+        )
+    ]
 
     reranker = build_reranker(cfg)
     assert type(reranker).__name__ == REAL_PROVIDERS["reranker"].class_name
     assert calls["reranker"] == [
-        ((r.reranker_model, r.reranker_revision), {"doc_max_tokens": r.rerank_doc_max_tokens})
+        (
+            (r.reranker_model, r.reranker_revision),
+            {
+                "doc_max_tokens": r.rerank_doc_max_tokens,
+                "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
+            },
+        )
     ]
 
     providers = build_enrichment_providers(cfg, caption_prompt="CAPTION PROMPT")
@@ -203,10 +223,21 @@ def test_real_backend_resolves_each_class_by_dotted_path(
     assert calls["transcription"] == [
         (
             (en.transcription_model, en.transcription_revision),
-            {"language": en.transcription_language},
+            {
+                "language": en.transcription_language,
+                "cache_limit_bytes": cfg.models.enrichment_cache_limit_bytes,
+            },
         )
     ]
-    assert calls["caption"] == [((en.caption_model, en.caption_revision, "CAPTION PROMPT"), {})]
+    assert calls["caption"] == [
+        (
+            (en.caption_model, en.caption_revision, "CAPTION PROMPT"),
+            {
+                "shared_runtime": None,
+                "cache_limit_bytes": cfg.models.enrichment_cache_limit_bytes,
+            },
+        )
+    ]
 
 
 def test_real_backend_passes_operator_settings_through(
@@ -226,13 +257,20 @@ def test_real_backend_passes_operator_settings_through(
     build_text_provider(cfg)
     build_multimodal_provider(cfg)
     build_enrichment_providers(cfg, caption_prompt="p")
-    assert calls["text_embedding"][0][1] == {"batch_size": 8, "max_batch_tokens": 4096}
+    assert calls["text_embedding"][0][1] == {
+        "batch_size": 8,
+        "max_batch_tokens": 4096,
+        "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
+    }
     assert calls["multimodal_embedding"][0][1] == {"batch_size": 4}
     assert calls["ocr"][0][1] == {
         "recognition_languages": ["en-US", "fr-FR"],
         "minimum_text_height": 0.05,
     }
-    assert calls["transcription"][0][1] == {"language": "en"}
+    assert calls["transcription"][0][1] == {
+        "language": "en",
+        "cache_limit_bytes": cfg.models.enrichment_cache_limit_bytes,
+    }
 
 
 def test_real_backend_reads_the_caption_prompt_from_data_root(
@@ -565,6 +603,7 @@ def test_reranker_directory_under_data_root_builds_with_revision_none_and_a_rela
             {
                 "model_id": f"{LOCAL_DIR}@{UPSTREAM_SHA}",
                 "doc_max_tokens": cfg.retrieval.rerank_doc_max_tokens,
+                "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
             },
         )
     ]
@@ -594,7 +633,10 @@ def test_reranker_repo_id_stays_a_hub_pin_when_no_such_directory_exists(
     assert calls["reranker"] == [
         (
             ("example-org/Example-Reranker-8bit", UPSTREAM_SHA),
-            {"doc_max_tokens": cfg.retrieval.rerank_doc_max_tokens},
+            {
+                "doc_max_tokens": cfg.retrieval.rerank_doc_max_tokens,
+                "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
+            },
         )
     ]
 
@@ -668,6 +710,7 @@ def test_embedding_directory_under_data_root_builds_with_revision_none_and_a_rel
                 "model_id": f"{EMBED_LOCAL_DIR}@{UPSTREAM_SHA}",
                 "batch_size": cfg.embedding.batch_size,
                 "max_batch_tokens": cfg.embedding.max_batch_tokens,
+                "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
             },
         )
     ]
@@ -682,7 +725,11 @@ def test_embedding_repo_id_stays_a_hub_pin_when_no_such_directory_exists(
     assert calls["text_embedding"] == [
         (
             ("example-org/Example-Embedding-8bit", UPSTREAM_SHA, cfg.embedding.dim),
-            {"batch_size": cfg.embedding.batch_size, "max_batch_tokens": cfg.embedding.max_batch_tokens},
+            {
+                "batch_size": cfg.embedding.batch_size,
+                "max_batch_tokens": cfg.embedding.max_batch_tokens,
+                "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
+            },
         )
     ]
 
@@ -699,3 +746,100 @@ def test_embedding_missing_models_directory_is_one_clear_error_not_a_hub_lookup(
     assert "does not exist" in message
     assert "models/manifest.lock.yaml" in message and "command" in message
     assert calls["text_embedding"] == []
+
+
+# --------------------------------------------------------------------------
+# one copy of the shared 35B (D10.3 defect 1)
+# --------------------------------------------------------------------------
+
+
+def _config_with_shipped_pins(config_dict_factory: Any) -> Config:
+    """The real backend with both model fields left at their schema
+    defaults — the conftest fixture overrides `boundary_model` with a
+    placeholder, which would hide the fact that the shipped pins name one
+    checkpoint for both roles."""
+    raw = config_dict_factory()
+    del raw["models"]
+    del raw["segmentation"]["boundary_model"]
+    return load_config_dict(raw)
+
+
+def test_the_pins_ship_naming_the_same_checkpoint_for_both_roles(
+    config_dict_factory: Any,
+) -> None:
+    """Sharing is only worth anything because the defaults really do
+    point both roles at one model — `imsg.constants` sets
+    `CAPTION_MODEL_REPO = BOUNDARY_MODEL_REPO`, and the manifest records
+    one entry with both roles."""
+    cfg = _config_with_shipped_pins(config_dict_factory)
+    assert cfg.segmentation.boundary_model == cfg.enrichment.caption_model
+    assert cfg.segmentation.boundary_revision == cfg.enrichment.caption_revision
+    assert boundary_and_caption_share_weights(cfg) is True
+
+
+def test_a_shared_runtime_is_built_for_the_real_backend(config_dict_factory: Any) -> None:
+    cfg = _config_with_shipped_pins(config_dict_factory)
+    runtime = build_shared_vlm_runtime(cfg)
+    assert runtime is not None
+    assert runtime.loaded_model_ids == ()  # nothing loads until a provider asks
+    assert runtime.cache_limit_bytes == cfg.models.enrichment_cache_limit_bytes
+
+
+def test_no_shared_runtime_for_the_fake_backend(config_dict_factory: Any) -> None:
+    assert build_shared_vlm_runtime(_config(config_dict_factory, "fake")) is None
+
+
+def test_no_shared_runtime_when_the_operator_turns_sharing_off(
+    config_dict_factory: Any,
+) -> None:
+    raw = config_dict_factory()
+    del raw["models"]["backend"]
+    del raw["segmentation"]["boundary_model"]
+    raw["models"]["share_boundary_and_caption_weights"] = False
+    cfg = load_config_dict(raw)
+    assert boundary_and_caption_share_weights(cfg) is False
+    assert build_shared_vlm_runtime(cfg) is None
+
+
+def test_no_shared_runtime_when_the_two_roles_name_different_pins(
+    config_dict_factory: Any,
+) -> None:
+    """Nothing to share, and pretending otherwise would silently run
+    boundary detection on the captioning model's weights."""
+    raw = config_dict_factory()
+    del raw["models"]
+    raw["segmentation"]["boundary_model"] = "example-org/Boundary-Model-4bit"
+    raw["segmentation"]["boundary_revision"] = UPSTREAM_SHA
+    cfg = load_config_dict(raw)
+    assert boundary_and_caption_share_weights(cfg) is False
+    assert build_shared_vlm_runtime(cfg) is None
+
+
+def test_a_shared_runtime_reaches_both_builders(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _install_stub_modules(monkeypatch)
+    cfg = _config_with_shipped_pins(config_dict_factory)
+    runtime = build_shared_vlm_runtime(cfg)
+
+    build_boundary_provider(cfg, "PROMPT TEMPLATE", shared_runtime=runtime)
+    build_enrichment_providers(cfg, caption_prompt="p", shared_runtime=runtime)
+
+    assert calls["boundary"][0][1]["shared_runtime"] is runtime
+    assert calls["caption"][0][1]["shared_runtime"] is runtime
+    # A shared boundary provider is an enrichment-side consumer, so it
+    # gets the enrichment bound rather than the query-side one.
+    assert calls["boundary"][0][1]["cache_limit_bytes"] == cfg.models.enrichment_cache_limit_bytes
+    assert calls["caption"][0][1]["cache_limit_bytes"] == cfg.models.enrichment_cache_limit_bytes
+
+
+def test_an_unshared_boundary_provider_gets_the_query_side_bound(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`imsg segment` and `imsg sync` build boundary detection alone, in
+    a process that also holds query-shaped models."""
+    calls = _install_stub_modules(monkeypatch)
+    cfg = _config(config_dict_factory, None)
+    build_boundary_provider(cfg, "PROMPT TEMPLATE")
+    assert calls["boundary"][0][1]["shared_runtime"] is None
+    assert calls["boundary"][0][1]["cache_limit_bytes"] == cfg.models.query_cache_limit_bytes

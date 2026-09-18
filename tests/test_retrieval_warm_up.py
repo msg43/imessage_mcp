@@ -6,6 +6,7 @@ index pages from disk."""
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -72,6 +73,7 @@ class _Text:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
         self.threads: list[threading.Thread] = []
+        self.on_call: Callable[[str], None] | None = None
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         raise AssertionError("warm_up embeds a query, not documents")
@@ -79,6 +81,8 @@ class _Text:
     def embed_query(self, text: str, *, instruction: str) -> list[float]:
         self.calls.append((text, instruction))
         self.threads.append(threading.current_thread())
+        if self.on_call is not None:
+            self.on_call(text)
         return [0.5] * 4
 
 
@@ -135,6 +139,7 @@ def _service(
     mm: _Multimodal | None,
     model_thread: ModelThread | None = None,
     pg_conn: Any = None,
+    query_marker: Any = None,
 ) -> RetrievalService:
     return RetrievalService(
         pg_conn=cast(Any, pg_conn if pg_conn is not None else _BufferPool()),
@@ -144,6 +149,7 @@ def _service(
         reranker=reranker,
         multimodal_provider=mm,
         model_thread=model_thread,
+        query_marker=query_marker,
     )
 
 
@@ -284,3 +290,56 @@ def _search_without_a_database(service: RetrievalService) -> None:
     finally:
         patch.undo()
     assert [r["segment_key"] for r in result.results] == ["seg_fictional"]
+
+
+# --------------------------------------------------------------------------
+# the query-in-flight marker (D10.3): enrichment has to be able to see that
+# the GPU is busy on someone's behalf
+# --------------------------------------------------------------------------
+
+
+class _RecordingMarker:
+    """Stands in for `imsg.db.enrichment_yield_locks.QueryInFlightMarker`,
+    recording when the service considers a query to be in flight."""
+
+    def __init__(self) -> None:
+        self.depth = 0
+        self.entries = 0
+        self.max_depth = 0
+        self.model_calls_while_marked = 0
+
+    def __enter__(self) -> _RecordingMarker:
+        self.depth += 1
+        self.entries += 1
+        self.max_depth = max(self.max_depth, self.depth)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.depth -= 1
+
+
+def test_every_warm_up_model_call_runs_inside_the_query_marker() -> None:
+    """Warm-up is the same GPU work a query does, so an enrichment worker
+    must see it as busy — otherwise it starts a batch against a server
+    that is still loading weights."""
+    marker = _RecordingMarker()
+    text, mm, reranker = _Text(), _Multimodal(), _Reranker()
+
+    def _note(_: object) -> None:
+        assert marker.depth > 0, "a model ran with no query-in-flight marker held"
+        marker.model_calls_while_marked += 1
+
+    text.on_call = _note
+    _service(True, reranker, text, mm, query_marker=marker).warm_up()
+
+    assert marker.model_calls_while_marked == 1
+    assert marker.depth == 0  # balanced: every enter had its exit
+    assert marker.entries >= 3  # embedder, multimodal tower, reranker
+
+
+def test_a_service_without_a_marker_still_warms_up() -> None:
+    """The marker is optional wiring; nothing about answering queries may
+    depend on it."""
+    text, mm, reranker = _Text(), _Multimodal(), _Reranker()
+    _service(True, reranker, text, mm, query_marker=None).warm_up()
+    assert text.calls == [(WARM_UP_QUERY, "find the conversation")]

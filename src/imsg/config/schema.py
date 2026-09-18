@@ -34,7 +34,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import phonenumbers
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from imsg import constants
+from imsg import constants, mlx_runtime, shared_vlm_runtime
 from imsg.config.secrets import SecretRef
 from imsg.embed.batching import DEFAULT_MAX_BATCH_TOKENS
 from imsg.paths import is_contained_in, join_under_root, resolve_path
@@ -265,6 +265,33 @@ class EnrichmentConfig(StrictModel):
     """Vision's `minimumTextHeight` as a fraction of image height;
     `null` keeps the framework default."""
 
+    # --- yielding to in-flight queries (D10.3's ratified remedy) ---
+    yield_to_queries: bool = True
+    """Pause between units of work while an MCP server is answering a
+    query (`imsg.db.enrichment_yield_locks`). The nightly window overlaps
+    the always-on query server on one GPU, and with a single copy of the
+    35B resident — no swap, pressure never critical — query p95 still
+    trebled while enrichment ran; that residue is GPU contention. The
+    asymmetry is deliberate: enrichment is restartable batch work with a
+    queue, the MCP server is the externally visible surface with a 2.0 s
+    budget. Set false to keep enrichment throughput at the query side's
+    expense."""
+
+    yield_poll_interval_seconds: float = Field(
+        default=constants.ENRICHMENT_YIELD_POLL_INTERVAL_SECONDS, gt=0
+    )
+    """How often a paused worker re-checks. Only reached while a query is
+    actually in flight — when none is, the check is one round trip and no
+    sleep — so this sets how promptly the worker resumes, not what
+    yielding costs."""
+
+    yield_max_pause_seconds: float = Field(default=constants.ENRICHMENT_YIELD_MAX_PAUSE_SECONDS, ge=0)
+    """How long the worker waits for one unit of work before proceeding
+    regardless. This is NOT the crash backstop — a killed MCP server's
+    advisory lock dies with its database session, so nothing can wedge
+    enrichment paused — it is the "someone is searching continuously and
+    the queue still has to drain overnight" backstop."""
+
     @field_validator("window", mode="after")
     @classmethod
     def _window_must_be_hh_mm_range(cls, v: str) -> str:
@@ -469,9 +496,47 @@ class ModelsConfig(StrictModel):
     the deterministic test stand-ins and is explicit opt-in only: every
     command that builds providers prints `models: backend=fake` so such
     a run can never be mistaken for a real one.
+
+    The three memory fields exist because the nightly enrichment window
+    overlaps the always-on query server, and the overlap was measured not
+    to fit (docs D10.3): 80.4 GiB of demand on a 64 GB host, critical
+    memory pressure, search p95 at 8.73 s against a 2.0 s budget. Each
+    field is the configurable form of one fix, defaulted to the value the
+    measurements support.
     """
 
     backend: Literal["real", "fake"] = "real"
+
+    share_boundary_and_caption_weights: bool = True
+    """Load one copy of the weights when `segmentation.boundary_model`
+    and `enrichment.caption_model` name the same repo and revision
+    (`imsg.shared_vlm_runtime`). The pins do name the same checkpoint by
+    default, and loading it twice — once through `mlx_lm`, once through
+    `mlx_vlm` — was measured at 18.99 -> 37.15 GiB of MLX active memory
+    in one process. Boundary detection then runs text-only through the
+    vision-language model, which is the same computation on the same
+    weights (bit-identical logits, checked 2026-09-17). Set false to go
+    back to two independent loaders."""
+
+    query_cache_limit_bytes: int = Field(default=mlx_runtime.DEFAULT_CACHE_LIMIT_BYTES, ge=0)
+    """MLX buffer-cache bound for the query-side providers — the text
+    embedder and the reranker, so the `mcp public`/`mcp local` process
+    (SPEC §10.4). MLX pools freed GPU buffers rather than returning them
+    to the OS and its default limit is its memory limit (60.8 GiB on the
+    production host), so this is what keeps a months-long server's
+    footprint flat. The 8 GiB default held exactly across 755 searches
+    and three runs; the process is 18.7 GiB right after load and ~27.5
+    GiB in steady state, and the difference is this cache filling to its
+    bound."""
+
+    enrichment_cache_limit_bytes: int = Field(
+        default=shared_vlm_runtime.DEFAULT_ENRICHMENT_CACHE_LIMIT_BYTES, ge=0
+    )
+    """MLX buffer-cache bound for the enrichment-side providers — the
+    captioner, boundary detection and (via the process-wide effect of
+    the same call) `mlx_whisper` transcription. These called nothing
+    before, so their limit sat at the runtime default and one enrichment
+    process was observed holding 37.25 GiB of pooled freed buffers."""
 
 
 # --------------------------------------------------------------------------

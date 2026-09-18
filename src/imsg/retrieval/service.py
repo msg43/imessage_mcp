@@ -14,11 +14,13 @@ codebase.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from imsg.db.enrichment_yield_locks import QueryInFlightMarker
 from imsg.db.prewarm import prewarm_query_path
 from imsg.embed.provider import MultimodalEmbeddingProvider, TextEmbeddingProvider
 from imsg.retrieval import directory, fts_search, segments, vector_search
@@ -31,6 +33,8 @@ from imsg.retrieval.query import analyze_query
 from imsg.retrieval.reranker import RerankerProvider
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
     import apsw
     import psycopg
 
@@ -96,11 +100,20 @@ class RetrievalService:
         reranker: RerankerProvider,
         multimodal_provider: MultimodalEmbeddingProvider | None = None,
         model_thread: ModelThread | None = None,
+        query_marker: QueryInFlightMarker | None = None,
     ) -> None:
         """`model_thread`, when given, is where every model call runs —
         the warm-up and every query alike (`imsg.retrieval.model_thread`
         explains why a server that warms up in the background needs
-        that). Without one, models run on the calling thread."""
+        that). Without one, models run on the calling thread.
+
+        `query_marker`, when given, publishes "a query is in flight" for
+        the span of every search and every model call, so the nightly
+        enrichment worker pauses between its units of work
+        (`imsg.db.enrichment_yield_locks`). It is re-entrant, so the
+        overlapping `search_messages` and `_run_model` scopes below take
+        it once. Nothing about a query depends on it: the marker never
+        blocks and never raises."""
         self._pg = pg_conn
         self._fts = fts_conn
         self._config = config
@@ -108,12 +121,21 @@ class RetrievalService:
         self._reranker = reranker
         self._multimodal_provider = multimodal_provider
         self._model_thread = model_thread
+        self._query_marker = query_marker
+
+    def _marking(self) -> AbstractContextManager[object]:
+        """Publish "a query is in flight" for this scope, when a marker
+        was wired; otherwise do nothing at all."""
+        if self._query_marker is None:
+            return contextlib.nullcontext()
+        return self._query_marker
 
     def _run_model[T](self, call: Callable[[], T]) -> T:
         """The one way this class invokes a model provider."""
-        if self._model_thread is None:
-            return call()
-        return self._model_thread.run(call)
+        with self._marking():
+            if self._model_thread is None:
+                return call()
+            return self._model_thread.run(call)
 
     # -- warm-up ------------------------------------------------------------
 
@@ -177,6 +199,33 @@ class RetrievalService:
     # -- search_messages ----------------------------------------------------
 
     def search_messages(
+        self,
+        context: AccessContext,
+        *,
+        query: str,
+        people: list[str] | None = None,
+        after: str | None = None,
+        before: str | None = None,
+        has_attachment: bool | None = None,
+        limit: int | None = None,
+    ) -> SearchMessagesResult:
+        """SPEC §9.4's hybrid search. The whole request — model calls and
+        the database work between them — runs inside the query-in-flight
+        marker, so an enrichment worker that checks between tasks sees the
+        gap between this search's embedding and its rerank as busy rather
+        than idle."""
+        with self._marking():
+            return self._search_messages(
+                context,
+                query=query,
+                people=people,
+                after=after,
+                before=before,
+                has_attachment=has_attachment,
+                limit=limit,
+            )
+
+    def _search_messages(
         self,
         context: AccessContext,
         *,
