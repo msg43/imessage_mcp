@@ -341,7 +341,13 @@ def test_new_message_within_gap_extends_the_tail_session(
     assert chat_id in dirty
 
     run_segment_for_chat(
-        scratch_db, chat_id, config, provider, PROMPT_BYTES, earliest_changed_at=dirty[chat_id]
+        scratch_db,
+        chat_id,
+        config,
+        provider,
+        PROMPT_BYTES,
+        earliest_changed_at=dirty[chat_id].earliest_changed_at,
+        latest_changed_at=dirty[chat_id].latest_changed_at,
     )
     scratch_db.commit()
 
@@ -397,7 +403,13 @@ def test_edited_message_is_detected_dirty_and_reflected_after_rerun(
     assert chat_id in dirty
 
     run_segment_for_chat(
-        scratch_db, chat_id, config, provider, PROMPT_BYTES, earliest_changed_at=dirty[chat_id]
+        scratch_db,
+        chat_id,
+        config,
+        provider,
+        PROMPT_BYTES,
+        earliest_changed_at=dirty[chat_id].earliest_changed_at,
+        latest_changed_at=dirty[chat_id].latest_changed_at,
     )
     scratch_db.commit()
 
@@ -520,7 +532,7 @@ def test_messages_arriving_in_a_hole_between_sessions_are_segmented(
 
     dirty = find_dirty_chats(scratch_db, index_unsent=config.policy.index_unsent)
     assert chat_id in dirty
-    earliest_changed_at = dirty[chat_id]
+    earliest_changed_at = dirty[chat_id].earliest_changed_at
 
     # The frontier is where re-fetching starts, so it must not be later
     # than the earliest changed message — otherwise the rows below are
@@ -548,6 +560,7 @@ def test_messages_arriving_in_a_hole_between_sessions_are_segmented(
         provider,
         PROMPT_BYTES,
         earliest_changed_at=earliest_changed_at,
+        latest_changed_at=dirty[chat_id].latest_changed_at,
     )
     scratch_db.commit()
 

@@ -10,6 +10,69 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-18 — A re-segmentation run now has an end, and stops rewriting segments that did not change
+
+Measured on the live instance: 1,582 genuinely changed messages caused
+236,300 messages to be re-segmented and 32,473 segments to be deleted
+and re-inserted. Every re-inserted segment is a *new* `segment_id`, so
+its `segment_embedding` row went with the old one by FK cascade and S6
+re-embedded all 32,473 — a multi-hour stage for a few thousand edits.
+Two independent causes, both fixed here.
+
+- **The rebuild had no end.** `find_dirty_chats` reported only the
+  *earliest* changed point, so one edit rebuilt every session from there
+  to the end of the chat. It now reports a `DirtyChatSpan` (earliest and
+  latest), and `compute_recompute_end` stops the run at the first
+  persisted session starting more than one `session_gap_hours` after the
+  last change. That session and every later one are provably unaffected:
+  edits and identity changes never move `sent_at`, deletions only widen
+  gaps, and every added message is at or before the latest change, so
+  nothing can reach across a gap wider than the threshold. The function
+  carries the full argument. On the live corpus the currently-dirty chat
+  goes from 10 sessions/10 segments rebuilt to 1 and 1.
+- **The span's end deliberately overshoots the specified fix.** The
+  `changed` arm takes `GREATEST(m.sent_at, session.ended_at)` rather
+  than the message's own `sent_at`, so the range always reaches the end
+  of the session *currently* holding a changed message. `message.sent_at`
+  is `Merge.ASSERTED` in extract — a second source can rewrite it — and a
+  timestamp that moved backwards would otherwise leave its old session
+  beyond the bound and stale forever.
+- **Identical segments are left alone.** `SegmentationRunReport.
+  skipped_unchanged` existed as a field and was never assigned. A
+  recomputed segment that reproduces the stored row — `stable_key`,
+  `seg_config_hash`, `rendered_sha256`, span, `message_count`,
+  `token_count`, `topic_label`, `seq_in_session`, and the exact ordered
+  `segment_message` membership — is now skipped entirely: no DELETE, no
+  INSERT, no `search_index_event`, and the `segment_id` survives, so its
+  embedding and any `export_document` pointing at it survive too. A
+  session row whose `started_at` still matches is reused (its `ended_at`
+  UPDATEd if the tail grew), so per-segment reuse works inside a session
+  that changed.
+- **Reuse cannot defeat D4's freeze.** `seg_config_hash` is an input to
+  every `stable_key` *and* is compared on its own, so a config change
+  matches nothing and rewrites every segment — and because a session
+  with no surviving segment is deleted and re-inserted whole,
+  `session.gap_hours` can never be left describing a threshold its
+  segments no longer use.
+- **Reuse cannot stall the run, either.** A segment holding a message
+  with `updated_at > segment.created_at` is never reused even when it
+  re-renders identically. Reuse keeps the old `created_at`, which is
+  exactly what `find_dirty_chats` compares against, so skipping such a
+  segment would leave the chat dirty forever and re-run the recompute
+  every night without ever clearing it.
+- **Consequence worth knowing:** `imsg segment --rebuild --chat <id>`
+  under an unchanged config is now a no-op rather than a full rewrite.
+  It still repairs any row that disagrees with what the config says it
+  should be; it no longer repairs a `rendered_text` corrupted out-of-band
+  in a way that left `rendered_sha256` matching.
+- **Tested against the pre-fix revision first.** Seven of the ten new
+  database-gated tests fail on `main` for the stated reason (segments
+  rewritten, the boundary provider shown sessions past the bound,
+  `skipped_unchanged == 0`); the other two assert behaviour that must
+  *not* change. On a 2,400-message / 50-session / 400-segment fixture
+  with one early edit: 2,304 -> 48 messages recomputed, 384 -> 1 segments
+  rebuilt, 768 -> 2 index events.
+
 ## 2026-09-18 — The incremental frontier could jump over new messages, making them permanently unsegmentable
 
 `compute_recompute_start` returns the timestamp a re-segmentation run

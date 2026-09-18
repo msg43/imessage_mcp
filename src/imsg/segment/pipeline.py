@@ -9,6 +9,31 @@ lifecycle, per the foundation's DB convention. Honors D1's
 `policy.index_unsent` / `policy.index_edit_history` flags and stamps
 `seg_config_hash` (D4's freeze mechanism) on every segment it writes.
 
+**How little a re-segmentation run is allowed to touch (2026-09-18).**
+A run used to rebuild every session from the earliest change to the end
+of the chat, deleting and re-inserting each one. On the live corpus
+1,582 genuinely changed messages re-segmented 236,300 messages and
+re-wrote 32,473 segments; every re-inserted segment is a new
+`segment_id`, so its `segment_embedding` row cascaded away and S6
+re-embedded all of them — a multi-hour stage for a few thousand edits.
+Two bounds now hold, and both are load-bearing:
+
+1. **The range has an end.** `find_dirty_chats` reports the last
+   changed point as well as the first, and the rebuild stops at the
+   first persisted session that starts more than one session gap after
+   it (`imsg.segment.sessionize.compute_recompute_end`, which carries
+   the safety argument).
+2. **Inside the range, identical rows are left alone.** A recomputed
+   segment that reproduces the stored row exactly — `_segment_is_
+   unchanged` says what "exactly" has to mean — is not deleted, not
+   re-inserted, emits no `search_index_event`, and keeps its
+   `segment_id`, so nothing downstream (`segment_embedding`,
+   `export_document.segment_id`) is disturbed.
+
+Neither bound may weaken D4's freeze: `seg_config_hash` is an input to
+every `stable_key` *and* is compared on its own, so a config change
+matches nothing and rewrites everything.
+
 **Cross-stage dependency:** dirty-chat detection below assumes S2
 (edits/retractions) and S3 (identity curation) bump
 `message.updated_at` on any change to what a segment renders. Migration
@@ -39,6 +64,7 @@ from imsg.segment.boundaries import BoundaryProvider, segment_session
 from imsg.segment.hashing import compute_seg_config_hash, compute_stable_key
 from imsg.segment.models import (
     AttachmentSnippet,
+    DirtyChatSpan,
     EditVersion,
     MessageForSegmentation,
     PersistedSessionSpan,
@@ -48,7 +74,7 @@ from imsg.segment.models import (
     Session,
 )
 from imsg.segment.render import render_segment
-from imsg.segment.sessionize import compute_recompute_start, sessionize
+from imsg.segment.sessionize import compute_recompute_end, compute_recompute_start, sessionize
 from imsg.tokens import estimate_tokens
 
 if TYPE_CHECKING:
@@ -153,17 +179,37 @@ def fetch_persisted_sessions(
 
 def find_dirty_chats(
     conn: psycopg.Connection, *, index_unsent: bool
-) -> dict[int, datetime]:
-    """`{chat_id: earliest_changed_at}` for every chat with segmentation
-    work pending: messages not yet in any segment, or messages whose
+) -> dict[int, DirtyChatSpan]:
+    """`{chat_id: DirtyChatSpan}` for every chat with segmentation work
+    pending: messages not yet in any segment, or messages whose
     `updated_at` moved past their current segment's `created_at` (edits,
     retractions, identity-merge sender reassignment — see the module
-    docstring's cross-stage note)."""
+    docstring's cross-stage note).
+
+    The span's `earliest_changed_at` is where the rebuild must start;
+    `latest_changed_at` is the last point it must reach, and lets
+    `run_segment_for_chat` stop at the first sealed session past it
+    instead of rebuilding to the end of the chat.
+
+    The `changed` arm takes `GREATEST(m.sent_at, sess.ended_at)` rather
+    than the message's own `sent_at`, so the span always reaches the end
+    of the session that *currently* holds the changed message. That
+    costs nothing in the ordinary case (an in-place edit sits inside its
+    own session), and it removes the end bound's dependence on
+    `message.sent_at` never moving: `sent_at` is `Merge.ASSERTED` in
+    `imsg.stages.extract`, so a re-extraction from a second source *can*
+    rewrite it. Were the span keyed on the new `sent_at` alone, a
+    timestamp that moved **backwards** would leave the session still
+    holding the message beyond the bound, never rebuilt and permanently
+    stale. Reaching the holding session's end closes that.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
             WITH unsegmented AS (
-                SELECT m.chat_id, MIN(m.sent_at) AS earliest
+                SELECT m.chat_id,
+                       MIN(m.sent_at) AS earliest,
+                       MAX(m.sent_at) AS latest
                 FROM message m
                 LEFT JOIN segment_message sm ON sm.message_id = m.message_id
                 WHERE sm.message_id IS NULL
@@ -172,14 +218,17 @@ def find_dirty_chats(
                 GROUP BY m.chat_id
             ),
             changed AS (
-                SELECT m.chat_id, MIN(m.sent_at) AS earliest
+                SELECT m.chat_id,
+                       MIN(m.sent_at) AS earliest,
+                       MAX(GREATEST(m.sent_at, sess.ended_at)) AS latest
                 FROM message m
                 JOIN segment_message sm ON sm.message_id = m.message_id
                 JOIN segment s ON s.segment_id = sm.segment_id
+                JOIN session sess ON sess.session_id = s.session_id
                 WHERE m.updated_at > s.created_at
                 GROUP BY m.chat_id
             )
-            SELECT chat_id, MIN(earliest) FROM (
+            SELECT chat_id, MIN(earliest), MAX(latest) FROM (
                 SELECT * FROM unsegmented
                 UNION ALL
                 SELECT * FROM changed
@@ -188,7 +237,10 @@ def find_dirty_chats(
             """,
             {"index_unsent": index_unsent},
         )
-        return dict(cur.fetchall())
+        return {
+            chat_id: DirtyChatSpan(earliest_changed_at=earliest, latest_changed_at=latest)
+            for chat_id, earliest, latest in cur.fetchall()
+        }
 
 
 def find_config_stale_chat_ids(
@@ -278,9 +330,15 @@ def _fetch_messages_from(
     chat_id: int,
     from_ts: datetime,
     *,
+    to_ts: datetime | None = None,
     index_unsent: bool,
     include_edit_history: bool,
 ) -> list[MessageForSegmentation]:
+    """`[from_ts, to_ts)` — `to_ts` is exclusive, because it is the
+    `started_at` of the first persisted session the rebuild must leave
+    alone (`compute_recompute_end`), and that session's own first
+    message must not be pulled into the rebuilt range. `to_ts=None`
+    means no upper bound (rebuild to the end of the chat)."""
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -289,10 +347,16 @@ def _fetch_messages_from(
             LEFT JOIN person p ON p.person_id = m.sender_person_id
             WHERE m.chat_id = %(chat_id)s
               AND m.sent_at >= %(from_ts)s
+              AND (%(to_ts)s::timestamptz IS NULL OR m.sent_at < %(to_ts)s)
               AND (%(index_unsent)s OR NOT m.is_unsent)
             ORDER BY m.sent_at, m.message_id
             """,
-            {"chat_id": chat_id, "from_ts": from_ts, "index_unsent": index_unsent},
+            {
+                "chat_id": chat_id,
+                "from_ts": from_ts,
+                "to_ts": to_ts,
+                "index_unsent": index_unsent,
+            },
         )
         rows = cur.fetchall()
         return _rows_to_messages(cur, chat_id, rows, include_edit_history=include_edit_history)
@@ -430,46 +494,278 @@ def _fetch_edit_history(
     return result
 
 
-def _count_segments_for_sessions(conn: psycopg.Connection, session_ids: list[int]) -> int:
-    """Read-only count of how many `segment` rows `session_ids` would
-    delete — the dry-run counterpart to
-    `_delete_stale_and_emit_delete_events`'s own count, without the
-    DELETE (SPEC §8: "takes --dry-run where writes leave the
-    machine")."""
+@dataclass(frozen=True, slots=True)
+class _StoredSegment:
+    """One persisted `segment` row as the reuse check sees it: every
+    column `_insert_segments` would write, plus its ordered
+    `segment_message` membership and whether any of those messages is
+    itself flagged changed."""
+
+    segment_id: int
+    seq_in_session: int
+    stable_key: str
+    started_at: datetime
+    ended_at: datetime
+    message_count: int
+    token_count: int | None
+    rendered_sha256: str
+    topic_label: str | None
+    seg_config_hash: str
+    message_ids: tuple[int, ...]
+    holds_a_changed_message: bool
+    """True when some message in this segment satisfies `updated_at >
+    segment.created_at` — exactly `find_dirty_chats`'s `changed`
+    predicate. Such a segment is never reused even when it re-renders
+    identically, because reuse keeps the old `created_at` and the chat
+    would stay dirty forever: every later run would recompute it, skip
+    it again, and never clear the flag."""
+
+
+def _fetch_stored_segments(
+    conn: psycopg.Connection, session_ids: list[int]
+) -> dict[int, list[_StoredSegment]]:
+    """`{session_id: [segments ordered by seq_in_session]}` for the
+    sessions inside the rebuild range."""
     if not session_ids:
-        return 0
+        return {}
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT count(*) FROM segment WHERE session_id = ANY(%s)",
+            """
+            SELECT s.session_id, s.segment_id, s.seq_in_session, s.stable_key,
+                   s.started_at, s.ended_at, s.message_count, s.token_count,
+                   s.rendered_sha256, s.topic_label, s.seg_config_hash,
+                   array_agg(sm.message_id ORDER BY m.sent_at, m.message_id),
+                   bool_or(m.updated_at > s.created_at)
+            FROM segment s
+            JOIN segment_message sm ON sm.segment_id = s.segment_id
+            JOIN message m ON m.message_id = sm.message_id
+            WHERE s.session_id = ANY(%s)
+            GROUP BY s.segment_id
+            ORDER BY s.session_id, s.seq_in_session
+            """,
             (session_ids,),
         )
-        row = cur.fetchone()
-        return int(row[0]) if row else 0
+        stored: dict[int, list[_StoredSegment]] = {sid: [] for sid in session_ids}
+        for row in cur.fetchall():
+            stored[row[0]].append(
+                _StoredSegment(
+                    segment_id=row[1],
+                    seq_in_session=row[2],
+                    stable_key=row[3],
+                    started_at=row[4],
+                    ended_at=row[5],
+                    message_count=row[6],
+                    token_count=row[7],
+                    rendered_sha256=row[8],
+                    topic_label=row[9],
+                    seg_config_hash=row[10],
+                    message_ids=tuple(row[11]),
+                    holds_a_changed_message=bool(row[12]),
+                )
+            )
+    return stored
+
+
+def _segment_is_unchanged(
+    stored: _StoredSegment, recomputed: RenderedSegment, *, seq_in_session: int
+) -> bool:
+    """**What "unchanged" has to mean.** Every column `_insert_segments`
+    would write must already hold the value it would write, and the
+    stored `segment_message` membership must be the exact ordered set
+    the recompute produced. Anything less leaves a stored row that
+    disagrees with what the current config says it should be, which is
+    the same defect the rebuild exists to repair.
+
+    Why each part carries its own weight:
+
+    - `stable_key` pins the chat, the **first and last** message guid,
+      and `seg_config_hash`. It is the coarse boundary check and,
+      because `seg_config_hash` is one of its inputs, it alone is
+      already enough to force a full rebuild on a config change.
+    - `seg_config_hash` is compared anyway, so the config-change
+      guarantee does not silently depend on `compute_stable_key`
+      continuing to fold it in.
+    - `rendered_sha256` covers everything the renderer emits: bodies,
+      short names, the participant header, timestamps, attachment
+      snippets, tapbacks, edit history.
+    - `message_ids` is the one thing neither of the above can see. The
+      key pins only the endpoints and the render is text, so a message
+      appearing or vanishing in the **middle** could in principle leave
+      both untouched — and `segment_message` is what
+      `find_dirty_chats` and `find_segment_ids_for_attachment` join on,
+      so a wrong membership is silently wrong forever. Comparing the
+      ordered tuple also covers ordering and `message_count`, which are
+      checked separately only because they are stored columns.
+    - `started_at` / `ended_at` are the span; they follow from the
+      endpoints given that `sent_at` does not move, but `sent_at` is
+      `Merge.ASSERTED` in extract and *can* be rewritten by a second
+      source, so they are compared rather than assumed.
+    - `token_count` is derived from the rendered text by
+      `imsg.tokens.estimate_tokens`, which is **not** an input to
+      `seg_config_hash`. Without this comparison a change to the
+      estimator would leave every stored `token_count` stale forever.
+    - `seq_in_session` is positional: the recomputed segment list of a
+      session is compared to the stored one element by element, so a
+      segment only survives if it is still the same segment in the same
+      place.
+    - `holds_a_changed_message` is not about equality at all — see its
+      docstring above. It is what guarantees the run makes progress.
+    """
+    return (
+        not stored.holds_a_changed_message
+        and stored.seq_in_session == seq_in_session
+        and recomputed.draft.seq_in_session == seq_in_session
+        and stored.stable_key == recomputed.stable_key
+        and stored.seg_config_hash == recomputed.seg_config_hash
+        and stored.rendered_sha256 == recomputed.rendered_sha256
+        and stored.started_at == recomputed.draft.started_at
+        and stored.ended_at == recomputed.draft.ended_at
+        and stored.message_count == recomputed.draft.message_count
+        and stored.token_count == recomputed.token_count
+        and stored.topic_label == recomputed.draft.topic_label
+        and stored.message_ids == tuple(m.message_id for m in recomputed.draft.messages)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _WritePlan:
+    """What a run would do, decided before `dry_run` branches so the
+    preview and the real run report the same numbers."""
+
+    sessions_to_delete: tuple[int, ...]
+    segments_to_delete: tuple[int, ...]
+    """Segments dropped individually out of a session that is being
+    kept — disjoint from the segments that cascade off
+    `sessions_to_delete`."""
+    reused_session_ids: dict[datetime, int]
+    ended_at_updates: tuple[tuple[int, datetime], ...]
+    sessions_to_insert: tuple[Session, ...]
+    segments_to_insert: dict[datetime, tuple[RenderedSegment, ...]]
+    segments_deleted: int
+    """Every segment row that disappears, cascades included."""
+    segments_written: int
+    skipped_unchanged: int
+
+
+def _plan_writes(
+    conn: psycopg.Connection,
+    *,
+    stale_sessions: list[PersistedSessionSpan],
+    recomputed_sessions: list[Session],
+    rendered_by_session_start: dict[datetime, list[RenderedSegment]],
+) -> _WritePlan:
+    """Diff the recomputed sessions/segments against what is already
+    stored in the rebuild range.
+
+    A persisted session is matched by `started_at` — `session` has a
+    `UNIQUE (chat_id, started_at)`, so within one chat that is a real
+    natural key — and its row is **reused** when at least one of its
+    segments survives the comparison above. Its `ended_at` is UPDATEd if
+    the session grew or shrank (the nightly steady state: new messages
+    landing in the still-open tail session), which is a plain column
+    write: no `search_index_event`, no `segment_id` churn, so the
+    segments that did not change are not re-embedded either.
+
+    A session where *nothing* survives is deleted and re-inserted whole.
+    That is also what keeps `session.gap_hours` honest without comparing
+    it here: `session_gap_hours` is an input to `seg_config_hash`, which
+    is an input to every `stable_key`, so a changed gap invalidates
+    every segment of every session, and every session is therefore
+    rewritten.
+    """
+    stored_by_session = _fetch_stored_segments(conn, [s.session_id for s in stale_sessions])
+    stale_by_start = {s.started_at: s for s in stale_sessions}
+    recomputed_by_start = {s.started_at: s for s in recomputed_sessions}
+
+    sessions_to_delete: list[int] = []
+    segments_to_delete: list[int] = []
+    reused_session_ids: dict[datetime, int] = {}
+    ended_at_updates: list[tuple[int, datetime]] = []
+    segments_to_insert: dict[datetime, tuple[RenderedSegment, ...]] = {}
+    skipped_unchanged = 0
+    cascaded_deletions = 0
+
+    for start, stale in stale_by_start.items():
+        stored = stored_by_session.get(stale.session_id, [])
+        recomputed = recomputed_by_start.get(start)
+        if recomputed is None:
+            sessions_to_delete.append(stale.session_id)
+            cascaded_deletions += len(stored)
+            continue
+
+        rendered = rendered_by_session_start.get(start, [])
+        keep: list[bool] = [
+            i < len(rendered) and _segment_is_unchanged(st, rendered[i], seq_in_session=i)
+            for i, st in enumerate(stored)
+        ]
+        if not any(keep):
+            sessions_to_delete.append(stale.session_id)
+            cascaded_deletions += len(stored)
+            continue
+
+        reused_session_ids[start] = stale.session_id
+        if stale.ended_at != recomputed.ended_at:
+            ended_at_updates.append((stale.session_id, recomputed.ended_at))
+        segments_to_delete.extend(
+            st.segment_id for st, kept in zip(stored, keep, strict=True) if not kept
+        )
+        skipped_unchanged += sum(keep)
+        segments_to_insert[start] = tuple(
+            r for i, r in enumerate(rendered) if not (i < len(keep) and keep[i])
+        )
+
+    sessions_to_insert = [s for s in recomputed_sessions if s.started_at not in reused_session_ids]
+    for s in sessions_to_insert:
+        segments_to_insert[s.started_at] = tuple(rendered_by_session_start.get(s.started_at, []))
+
+    return _WritePlan(
+        sessions_to_delete=tuple(sessions_to_delete),
+        segments_to_delete=tuple(segments_to_delete),
+        reused_session_ids=reused_session_ids,
+        ended_at_updates=tuple(ended_at_updates),
+        sessions_to_insert=tuple(sessions_to_insert),
+        segments_to_insert=segments_to_insert,
+        segments_deleted=cascaded_deletions + len(segments_to_delete),
+        segments_written=sum(len(v) for v in segments_to_insert.values()),
+        skipped_unchanged=skipped_unchanged,
+    )
 
 
 def _delete_stale_and_emit_delete_events(
-    conn: psycopg.Connection, stale_session_ids: list[int]
+    conn: psycopg.Connection, *, session_ids: tuple[int, ...], segment_ids: tuple[int, ...]
 ) -> int:
-    if not stale_session_ids:
+    """Emit one `delete` outbox row per segment about to disappear, then
+    drop the rows. `session_ids` take their segments with them (ON
+    DELETE CASCADE covers segment / segment_message /
+    segment_embedding); `segment_ids` are dropped individually out of
+    sessions that are being kept, and cascade the same way one level
+    down."""
+    if not session_ids and not segment_ids:
         return 0
+    doomed: list[int] = list(segment_ids)
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT segment_id FROM segment WHERE session_id = ANY(%s)",
-            (stale_session_ids,),
-        )
-        stale_segment_ids = [row[0] for row in cur.fetchall()]
-        if stale_segment_ids:
+        if session_ids:
+            cur.execute(
+                "SELECT segment_id FROM segment WHERE session_id = ANY(%s)",
+                (list(session_ids),),
+            )
+            doomed.extend(row[0] for row in cur.fetchall())
+        if doomed:
             cur.executemany(
                 "INSERT INTO search_index_event (entity_kind, entity_id, operation, content_sha256) "
                 "VALUES ('segment', %s, 'delete', NULL)",
-                [(sid,) for sid in stale_segment_ids],
+                [(sid,) for sid in doomed],
             )
-        # ON DELETE CASCADE takes care of segment / segment_message / segment_embedding.
-        cur.execute("DELETE FROM session WHERE session_id = ANY(%s)", (stale_session_ids,))
-    return len(stale_segment_ids)
+        if segment_ids:
+            cur.execute("DELETE FROM segment WHERE segment_id = ANY(%s)", (list(segment_ids),))
+        if session_ids:
+            cur.execute("DELETE FROM session WHERE session_id = ANY(%s)", (list(session_ids),))
+    return len(doomed)
 
 
-def _insert_sessions(conn: psycopg.Connection, sessions: list[Session]) -> dict[datetime, int]:
+def _insert_sessions(
+    conn: psycopg.Connection, sessions: tuple[Session, ...]
+) -> dict[datetime, int]:
     ids: dict[datetime, int] = {}
     with conn.cursor() as cur:
         for s in sessions:
@@ -485,18 +781,32 @@ def _insert_sessions(conn: psycopg.Connection, sessions: list[Session]) -> dict[
     return ids
 
 
+def _update_session_spans(
+    conn: psycopg.Connection, ended_at_updates: tuple[tuple[int, datetime], ...]
+) -> None:
+    """A reused session whose tail grew or shrank. Deliberately not an
+    outbox event: `session` is not an indexed entity, and its segments
+    carry their own events when they change."""
+    if not ended_at_updates:
+        return
+    with conn.cursor() as cur:
+        cur.executemany(
+            "UPDATE session SET ended_at = %s WHERE session_id = %s",
+            [(ended_at, session_id) for session_id, ended_at in ended_at_updates],
+        )
+
+
 def _insert_segments(
     conn: psycopg.Connection,
     chat_id: int,
-    sessions: list[Session],
-    rendered_by_session_start: dict[datetime, list[RenderedSegment]],
+    segments_to_insert: dict[datetime, tuple[RenderedSegment, ...]],
     session_ids: dict[datetime, int],
 ) -> int:
     written = 0
     with conn.cursor() as cur:
-        for s in sessions:
-            session_id = session_ids[s.started_at]
-            for r in rendered_by_session_start.get(s.started_at, []):
+        for session_started_at, rendered in sorted(segments_to_insert.items()):
+            session_id = session_ids[session_started_at]
+            for r in rendered:
                 cur.execute(
                     """
                     INSERT INTO segment (
@@ -633,25 +943,38 @@ def run_segment_for_chat(
     boundary_prompt_bytes: bytes,
     *,
     earliest_changed_at: datetime,
+    latest_changed_at: datetime | None = None,
     dry_run: bool = False,
 ) -> SegmentationRunReport:
-    """Re-segment one chat from the point the incremental frontier
-    (`imsg.segment.sessionize.compute_recompute_start`) says is safe,
-    in one Postgres transaction. Pass `earliest_changed_at=
-    REBUILD_ALL_SENTINEL` to force a full rebuild (config change).
+    """Re-segment one chat over the range the incremental frontier says
+    is affected, in one Postgres transaction. Pass
+    `earliest_changed_at=REBUILD_ALL_SENTINEL` to force a full rebuild
+    (config change).
+
+    The range is `[compute_recompute_start(...), compute_recompute_end(
+    ...))`. `latest_changed_at` — `find_dirty_chats`'s
+    `DirtyChatSpan.latest_changed_at` — supplies the end bound; `None`
+    (the default, and what `REBUILD_ALL_SENTINEL` forces) means no
+    bound, i.e. rebuild to the end of the chat, which is what every run
+    did before the bound existed. See `compute_recompute_end` for why
+    the first persisted session starting more than one session gap
+    after the last change, and everything after it, is provably
+    unaffected.
+
+    Inside the range, a recomputed segment that reproduces the stored
+    row exactly (`_segment_is_unchanged`) is left alone: no DELETE, no
+    INSERT, no `search_index_event`, and the `segment_id` survives — so
+    its `segment_embedding` row is not cascaded away and S6 does not
+    re-embed it. Those are counted in `skipped_unchanged`.
 
     `dry_run=True` (SPEC §8: "takes --dry-run where writes leave the
     machine") runs the exact same sessionize/boundary-detection/render
-    computation as a real run — `boundary_provider` still runs, since
-    it is a scoring call, not a write, and dry-run should report
-    accurate segment counts — but skips the final `with
-    conn.transaction():` write block entirely: no session/segment rows
-    are inserted or deleted, and no `search_index_event` rows are
-    emitted. `segments_written` reuses the count already computed
-    during the per-session loop above (`segments_written_count`);
-    `segments_deleted` comes from a read-only count
-    (`_count_segments_for_sessions`) of the same `stale_session_ids`
-    the real path would delete.
+    computation *and the same diff against what is stored* —
+    `boundary_provider` still runs, since it is a scoring call, not a
+    write — but skips the `with conn.transaction():` write block
+    entirely. Every count it reports comes from the same `_WritePlan`
+    the real path executes, so the preview and the run agree by
+    construction.
     """
     seg_cfg = config.segmentation
     policy = config.policy
@@ -674,12 +997,24 @@ def run_segment_for_chat(
         existing_sessions, earliest_changed_at, seg_cfg.session_gap_hours
     )
 
-    stale_session_ids = [s.session_id for s in existing_sessions if s.started_at >= recompute_start]
+    recompute_end = (
+        None
+        if latest_changed_at is None or earliest_changed_at == REBUILD_ALL_SENTINEL
+        else compute_recompute_end(existing_sessions, latest_changed_at, seg_cfg.session_gap_hours)
+    )
+
+    stale_sessions = [
+        s
+        for s in existing_sessions
+        if s.started_at >= recompute_start
+        and (recompute_end is None or s.started_at < recompute_end)
+    ]
 
     messages = _fetch_messages_from(
         conn,
         chat_id,
         recompute_start,
+        to_ts=recompute_end,
         index_unsent=policy.index_unsent,
         include_edit_history=policy.index_edit_history,
     )
@@ -688,7 +1023,6 @@ def run_segment_for_chat(
 
     rendered_by_session_start: dict[datetime, list[RenderedSegment]] = {}
     fallback_count = 0
-    segments_written_count = 0
     for session in sessions:
         drafts, used_fallback = segment_session(
             session,
@@ -727,31 +1061,59 @@ def run_segment_for_chat(
                 )
             )
         rendered_by_session_start[session.started_at] = segment_list
-        segments_written_count += len(segment_list)
+
+    plan = _plan_writes(
+        conn,
+        stale_sessions=stale_sessions,
+        recomputed_sessions=sessions,
+        rendered_by_session_start=rendered_by_session_start,
+    )
 
     if dry_run:
-        deleted = _count_segments_for_sessions(conn, stale_session_ids)
         return SegmentationRunReport(
             chat_id=chat_id,
-            sessions_written=len(sessions),
-            segments_written=segments_written_count,
-            segments_deleted=deleted,
+            sessions_written=len(plan.sessions_to_insert),
+            segments_written=plan.segments_written,
+            segments_deleted=plan.segments_deleted,
             fallback_sessions=fallback_count,
+            skipped_unchanged=plan.skipped_unchanged,
             dry_run=True,
             notes=("dry run — no sessions/segments were written or deleted",),
         )
 
-    with conn.transaction():
-        deleted = _delete_stale_and_emit_delete_events(conn, stale_session_ids)
-        session_ids = _insert_sessions(conn, sessions)
-        written = _insert_segments(conn, chat_id, sessions, rendered_by_session_start, session_ids)
+    written = 0
+    deleted = 0
+    if (
+        plan.sessions_to_delete
+        or plan.segments_to_delete
+        or plan.sessions_to_insert
+        or plan.ended_at_updates
+        or plan.segments_written
+    ):
+        # Deletes first, inside the same transaction: `segment_message`
+        # has a UNIQUE index on `message_id` alone, so a message moving
+        # between segments would collide if the new row went in before
+        # the old one came out.
+        with conn.transaction():
+            deleted = _delete_stale_and_emit_delete_events(
+                conn,
+                session_ids=plan.sessions_to_delete,
+                segment_ids=plan.segments_to_delete,
+            )
+            _update_session_spans(conn, plan.ended_at_updates)
+            session_ids = {
+                **plan.reused_session_ids,
+                **_insert_sessions(conn, plan.sessions_to_insert),
+            }
+            written = _insert_segments(conn, chat_id, plan.segments_to_insert, session_ids)
 
     return SegmentationRunReport(
         chat_id=chat_id,
-        sessions_written=len(sessions),
+        sessions_written=len(plan.sessions_to_insert),
         segments_written=written,
         segments_deleted=deleted,
         fallback_sessions=fallback_count,
+        skipped_unchanged=plan.skipped_unchanged,
     )
 
 
@@ -778,7 +1140,7 @@ def run_segment(
         dirty = {cid: ts for cid, ts in dirty.items() if cid in chat_ids}
 
     reports = []
-    for chat_id, earliest in dirty.items():
+    for chat_id, span in dirty.items():
         reports.append(
             run_segment_for_chat(
                 conn,
@@ -786,7 +1148,8 @@ def run_segment(
                 config,
                 boundary_provider,
                 boundary_prompt_bytes,
-                earliest_changed_at=earliest,
+                earliest_changed_at=span.earliest_changed_at,
+                latest_changed_at=span.latest_changed_at,
                 dry_run=dry_run,
             )
         )
