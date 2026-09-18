@@ -212,3 +212,17 @@ class ModelManifestError(ImsgError):
     be re-verified against the Hugging Face API (SPEC model-manifest
     requirement: exact repo, immutable revision, license, dimension,
     runtime floors — "a build MUST NOT silently advance a model")."""
+
+
+class BackupError(ImsgError):
+    """The nightly local recovery copy (SPEC §5.3/§14) refused to run or
+    could not finish a verifiable set.
+
+    Every failure mode of `imsg backup` is one of these: the destination
+    is missing/unwritable/short of space, `pg_dump` is absent or older
+    than the server it is pointed at, the dump or the FTS copy failed
+    its post-write verification, or the live FTS sidecar is itself
+    corrupt. A partial set is never promoted — the staging directory is
+    removed and this is raised, so `backups/` only ever holds sets that
+    passed verification.
+    """

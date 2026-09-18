@@ -10,6 +10,137 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-18 — the last two command surfaces: `imsg backup`, and the AT-1 probe's CLI
+
+Both were found the same way — by reading what the deployment guide and
+the rendered LaunchAgents *invoke* and checking it against what the CLI
+*provides*. `install-agents` rendered a `com.imsgindex.backup` job
+running `imsg backup --config <path>` at 04:00 daily, and the command
+did not exist: installing the agents would have created a job that
+failed every night, silently, forever. The deployment guide makes
+`imsg mcp public --probe` the gate that must pass before any corpus is
+reachable from the internet, and `run_auth_probe` was written and tested
+with no way to run it. Every command an installed agent invokes now
+exists.
+
+- **`imsg backup` — scope decided explicitly, not by default.** In:
+  the Postgres dump (everything the pipeline derived lives only there,
+  and it is the one component that can suffer *logical* corruption,
+  which is the only thing same-device copies defend against) and the
+  FTS5 sidecar (SPEC §5.5 names it; §14 allows copying it only after a
+  checkpoint + integrity check, so those are enforced). Out: the
+  **attachment cache (~147 GB)** — 14 nightly copies is over two
+  terabytes on the same volume as the original, it is a content-addressed
+  cache `imsg backfill-attachments` rebuilds, and a blob store does not
+  rot the way a schema does; the **model directory**, whose contents are
+  public weights already pinned by repo + immutable revision in
+  `models/manifest.lock.yaml`; and `ops/`, which is small and
+  irreplaceable but outside what §5.5 scopes to this job — flagged in
+  the command's output rather than silently added. The honest caveat
+  ships with the decision and is printed on every run: anything iCloud
+  has purged exists **only** in `attachments/`, and excluding it is not
+  a claim that it is safe.
+- **A dump, not a copy of a running data directory.** `pg_dump -Fc`
+  against the live instance; a running cluster's files are a process
+  mid-flight, not a backup.
+- **Verification reads the whole archive, because the obvious check
+  cannot fail.** Measured 2026-09-18: a custom-format dump **cut in
+  half** still lists every one of its TOC entries under `pg_restore
+  --list` and exits 0 — the table of contents precedes the data blocks.
+  `pg_restore -f /dev/null` decompresses every block and caught a half
+  truncation, a **one-byte** truncation, and a flipped byte 2 kB from
+  the end. Both run; the TOC listing is kept only for what it is good
+  for, naming the expected tables. An integration test performs a real
+  dump, truncates it, and asserts the refusal — and a second test
+  restores a real dump into a fresh database and counts the tables that
+  arrived, rather than trusting an exit status.
+- **A refusal the build machine already needed.** `pg_dump` aborts
+  against a newer server *after* creating its output file, leaving zero
+  bytes that look like a backup. Homebrew puts `postgresql@16`'s
+  `pg_dump` first on `PATH` while SPEC §5.3 pins the instance at
+  `pg17/` — measured on this machine, 16.13 against 17.9 does exactly
+  that. Major versions are now compared before the subprocess starts and
+  the error names both versions and the fix.
+- **Retention deletes only what it can prove, and the rule is written
+  down.** A directory under `backups/` is a candidate only if it is a
+  real (non-symlink) direct child, its name matches the exact set
+  pattern, it holds a `MANIFEST.json` that parses, declares the current
+  format and says `"complete": true` — written **last**, so its presence
+  *is* the completeness evidence — and it is not among the newest 14.
+  `keep` is clamped to ≥ 1, so the newest set can never be a candidate
+  even with `--keep 0`. Everything else (a half-written set, a
+  `.incomplete-*` staging directory, an operator's own file, a symlink)
+  is counted, reported and left alone. Twenty-seven tests pin the
+  boundaries, including exactly-14, 14+1, and a symlink pointed at a
+  directory elsewhere on the volume.
+- **Nothing partial is ever promoted.** Each run writes into
+  `backups/.incomplete-<uuid4>/` and promotes it with one `rename` after
+  the manifest lands. The cleanup catches `BaseException`, not
+  `Exception`: launchd killing the 04:00 job is the likeliest failure
+  there is, and a bare `except Exception` would leak a directory on
+  precisely that path. Two runs in one day produce two sets and neither
+  can write into the other's directory.
+- **Fixed while testing it:** a sidecar that is not a SQLite database at
+  all escaped as a raw `apsw.NotADBError` traceback rather than one
+  `imsg: …` line — `apsw` is lazy and does not touch the file until the
+  first statement, so the failure surfaced at the integrity check, not
+  at open.
+
+- **`imsg mcp public --probe` — token handling first, because that is
+  where this goes wrong.** AT-1 step 5 says the tokens are never written
+  to disk. `--owner-token <value>` would have broken that twice over:
+  shell history, and `argv` readable by every process on the host via
+  `ps -ww` — on a machine that by design has a public tunnel attached.
+  The command therefore takes `--owner-token-ref` / `--foreign-token-ref`
+  holding `keychain:<item>` or `env:<VAR>`, parsed by the existing
+  `imsg.config.secrets.SecretRef` rather than a new convention, so a
+  literal is refused *structurally*. The refusal prints the
+  `security add-generic-password … -w` form that prompts instead of
+  taking the value on the command line. No refusal message ever contains
+  a token, and `ProbeTokens.__repr__` is overridden so a traceback
+  cannot leak one either; a test asserts both.
+- **Wired, not run.** The probe needs live OAuth tokens and a live gate,
+  so nothing here has been executed against Google, and nothing in the
+  test suite can be: every refusal is raised by
+  `check_probe_preconditions`, a pure function over config and two
+  reference strings that runs to completion *before* the audit sink,
+  the gate or `GoogleTokeninfoIntrospector` is constructed. The CLI tests
+  drive each refusal with `build_public_gate`, `PostgresAuditSink`,
+  `run_auth_probe` and `connect` replaced by landmines, and one test
+  replaces `socket.socket` itself.
+- **The verdict is unambiguous, because of what it gates.** Distinct
+  exit codes: `0` pass, `1` fail (a breach), `2` invalid, `78`
+  (`EX_CONFIG`) the probe never ran. `INVALID` is deliberately not
+  folded into either neighbour — "proved nothing" and "is safe" are the
+  confusion AT-1 exists to prevent, and the rendered output says *NOT a
+  pass* in those words. Each verdict prints the D6 next action: pass
+  permits `scope: full` with an ops record, anything else pins
+  `allowlist` and requires a fresh owner decision. `--probe` does not
+  require `mcp.public.enabled`, since AT-1 step 0 runs while the real
+  server stays disabled.
+
+- **`imsg status` now reports the unclassified-thread count (SPEC
+  §11.5).** A previous pass declined this because `status` "never opens
+  a query connection". That premise was simply false — `check_postgres`,
+  `check_buffer_pool` and `check_enrichment_yield` each already open one
+  and each already reports failure as a reason string rather than
+  raising. The real hazard was different: unlike those three, this query
+  aggregates over `message`, so a large corpus under contention could
+  make a health check slow rather than wrong. It runs under a 5-second
+  `statement_timeout` on its own connection, gated on reachability, with
+  every failure mode returning `None` plus a reason. Proved with a real
+  `ACCESS EXCLUSIVE` lock held from a second session: `status` still
+  exits 0, still answers every other field, and reports the count as
+  unreadable. The stale note claiming the field was unwired is gone.
+
+- **Tests: 111 new (1850 total, 0 skipped against a scratch
+  PostgreSQL).** Weighted toward refusals by design — 27 retention
+  boundary tests, 26 backup refusals, 12 backup integration tests, 40
+  probe tests, 6 status tests. A session-scoped tripwire confirmed none
+  of them opens a connection to port 5433: a real `imsgindex` instance
+  listens there on a deployment host, and one draft test reached it
+  before the tripwire caught it.
+
 ## 2026-09-18 — `imsg export` is a real command surface, and cannot reach Google without a credential you named
 
 The export gate has been complete as a library since Phase 7 groundwork
