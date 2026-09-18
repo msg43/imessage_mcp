@@ -67,6 +67,12 @@ def compute_approval_requirements(
     happens to contain deletes still requires approval, because an
     unexpected delete in a routine run is a signal worth a human look
     rather than a deliberate retraction.
+
+    `"purge"` is the ONLY value of `mode` that changes the answer; every
+    other value — including `plan_export`'s `"reconcile"` and this
+    parameter's own `"normal"` default — takes the full delta path. Both
+    callers pass the mode the run was planned in, so the report and the
+    push agree about which gate applies.
     """
     if mode == "purge":
         return ()
@@ -181,8 +187,23 @@ def build_review_report(
         f"Upserts: {len(upserts)}   Deletes: {len(deletes)}   Unchanged: {unchanged_count}",
         "",
     ]
+    # The banner must describe the mode the plan was actually planned in.
+    # It said "OWNER APPROVAL REQUIRED" on purge plans until 2026-09-18,
+    # because `plan_export` called `compute_approval_requirements` without
+    # its `mode` argument and so always got the non-purge answer, while
+    # `push_export` — which does pass the stored mode — correctly exempted
+    # the same run (D9.3). Conservative, but wrong: a report that demands a
+    # ceremony the push then waives teaches the operator to disbelieve the
+    # report, which is the one artifact §11.4 calls "the actual control".
+    mode = str(manifest.get("mode", "reconcile"))
     if approval_reasons:
         out.append("OWNER APPROVAL REQUIRED before push — reasons: " + ", ".join(approval_reasons))
+    elif mode == "purge":
+        out.append(
+            "PURGE plan — exempt from the owner-approval gate (D9.3): retraction "
+            "only ever narrows scope. Every drift check still applies at push, "
+            "and the run is recorded in full — unapproved does not mean unlogged."
+        )
     else:
         out.append("No new scope: push may proceed without fresh approval (§11.4).")
     out.append("")

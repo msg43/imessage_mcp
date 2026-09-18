@@ -152,6 +152,38 @@ class PlanResult:
 
 
 @dataclass(frozen=True, slots=True)
+class PlanPreview:
+    """What a plan WOULD contain, computed without staging anything —
+    the shape `imsg export plan --dry-run` reports. Deliberately carries
+    no rendered text: a dry run must not put message content anywhere,
+    not even in memory it then hands to a caller."""
+
+    upsert_count: int
+    delete_count: int
+    unchanged_count: int
+    chat_ids: tuple[int, ...]
+    delete_document_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PushPreflight:
+    """The verdict of every pre-push check, with nothing executed — what
+    `imsg export push --dry-run` reports. Reaching this without an
+    exception means the plan is pushable RIGHT NOW: pins intact,
+    approval satisfied (or waived per D9.3), and eligibility re-derived
+    live and unchanged."""
+
+    run_id: int
+    mode: str
+    manifest_sha256: str
+    staging_dir: str
+    upsert_count: int
+    delete_count: int
+    already_done_count: int
+    approval_reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ApprovalResult:
     run_id: int
     approval_id: str

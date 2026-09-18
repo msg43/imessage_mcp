@@ -33,9 +33,9 @@ from imsg.config.loader import load_config_dict
 from imsg.config.schema import Config
 from imsg.export.documents import segment_document_id
 from imsg.export.errors import ExportDriftError, ExportPushError
-from imsg.export.planner import plan_export
-from imsg.export.purge import purge_person
-from imsg.export.push import push_export
+from imsg.export.planner import plan_export, preview_plan
+from imsg.export.purge import preview_purge, purge_person
+from imsg.export.push import push_export, verify_push_preconditions
 from imsg.export.review import (
     APPROVAL_CONFIG_CHANGED,
     APPROVAL_DELETES,
@@ -551,10 +551,13 @@ def test_purge_person_deletes_and_verifies_absence(
     db.commit()
     assert plan.mode == "purge"
     assert plan.delete_count == 1  # the group segment doc
-    assert APPROVAL_DELETES in plan.approval_reasons
+    # D9.3: a purge is exempt from the approval gate, so the plan says so
+    # rather than demanding a ceremony the push then waives.
+    assert plan.approval_required is False
+    assert plan.approval_reasons == ()
+    assert APPROVAL_DELETES not in plan.approval_reasons
 
-    approve_run(db, config, plan.run_id)
-    db.commit()
+    # ...and the push really does proceed with no approval recorded.
     result = push_export(db, config, plan.run_id, transport)
     db.commit()
 
@@ -590,8 +593,6 @@ def test_purge_with_lingering_document_stays_failed_not_falsely_purged(
 
     transport.linger_after_delete_ids.add(corpus.group_doc_id)
     plan = purge_person(db, config, "bob")
-    db.commit()
-    approve_run(db, config, plan.run_id)
     db.commit()
     result = push_export(db, config, plan.run_id, transport)
     db.commit()
@@ -675,3 +676,135 @@ def test_push_of_unknown_or_finished_run_refuses(
     db.commit()
     with pytest.raises(ExportPushError, match="'ok'"):
         push_export(db, config, plan.run_id, transport)
+
+
+# ---------------------------------------------------------------------------
+# The purge banner, and the two read-only previews `--dry-run` reports
+# ---------------------------------------------------------------------------
+
+
+def test_purge_plan_report_says_exempt_not_approval_required(
+    db: psycopg.Connection, config: Config, corpus: Corpus
+) -> None:
+    """The review report is the artifact §11.4 calls the actual control,
+    so it has to describe the gate that will actually apply. Until
+    2026-09-18 a purge plan printed "OWNER APPROVAL REQUIRED" while the
+    push correctly waived it (D9.3) — conservative, and wrong: a report
+    that demands a ceremony the push then skips teaches the operator to
+    stop believing the report."""
+    _happy_path(db, config, FakeTransport())
+
+    purge_plan = purge_person(db, config, "bob")
+    db.commit()
+    purge_report = Path(purge_plan.report_path).read_text(encoding="utf-8")
+    assert "OWNER APPROVAL REQUIRED" not in purge_report
+    assert "PURGE plan" in purge_report
+    assert "D9.3" in purge_report
+    assert "Every drift check still applies" in purge_report
+
+    # A normal reconcile that merely CONTAINS deletes is NOT exempt — the
+    # exemption is for deliberate retraction, not for any plan with a
+    # delete in it (D9.3's "deliberately narrow").
+    with db.cursor() as cur:
+        cur.execute(
+            "UPDATE allowlist_person SET text_allowed = false WHERE person_id = %s",
+            (corpus.alice_id,),
+        )
+    db.commit()
+    normal_plan = plan_export(db, config)
+    db.commit()
+    assert normal_plan.delete_count > 0
+    normal_report = Path(normal_plan.report_path).read_text(encoding="utf-8")
+    assert "OWNER APPROVAL REQUIRED" in normal_report
+    assert APPROVAL_DELETES in normal_plan.approval_reasons
+
+
+def test_preview_plan_matches_the_plan_it_previews_and_writes_nothing(
+    db: psycopg.Connection, config: Config, corpus: Corpus
+) -> None:
+    """A preview that disagreed with the plan would be worse than none."""
+    staging_root = config.paths.data_root / "export" / "staging"
+
+    preview = preview_plan(db, config)
+    db.commit()
+    assert not staging_root.exists()
+    with db.cursor() as cur:
+        cur.execute("SELECT count(*) FROM export_run")
+        assert cur.fetchone() == (0,)
+
+    plan = plan_export(db, config)
+    db.commit()
+    assert (preview.upsert_count, preview.delete_count, preview.unchanged_count) == (
+        plan.upsert_count,
+        plan.delete_count,
+        plan.unchanged_count,
+    )
+    assert preview.chat_ids == (corpus.dm_chat_id, corpus.group_chat_id)
+
+
+def test_preview_purge_reports_the_deletes_and_leaves_the_allowlist_intact(
+    db: psycopg.Connection, config: Config, corpus: Corpus
+) -> None:
+    """The preview applies the real revocation and reconciles against it,
+    then rolls the whole thing back — so the numbers come from the code
+    that would run, and the allowlist ends exactly as it started."""
+    _happy_path(db, config, FakeTransport())
+
+    preview = preview_purge(db, config, "bob")
+    db.commit()
+    assert preview.delete_count == 1
+    assert preview.delete_document_ids == (corpus.group_doc_id,)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT text_allowed, attachments_allowed FROM allowlist_person "
+            "WHERE person_id = %s",
+            (corpus.bob_id,),
+        )
+        assert cur.fetchone() == (True, False)  # untouched by the preview
+        cur.execute("SELECT count(*) FROM export_run WHERE mode = 'purge'")
+        assert cur.fetchone() == (0,)
+
+    # ...and the real purge then reports exactly what the preview said.
+    real = purge_person(db, config, "bob")
+    db.commit()
+    assert real.delete_count == preview.delete_count
+
+
+def test_verify_push_preconditions_refuses_exactly_what_push_refuses(
+    db: psycopg.Connection, config: Config, corpus: Corpus
+) -> None:
+    """`push --dry-run` is a rehearsal only if it runs the same checks."""
+    plan = plan_export(db, config)
+    db.commit()
+
+    # Unapproved first push: the rehearsal refuses too.
+    with pytest.raises(ExportPushError, match="requires owner approval"):
+        verify_push_preconditions(db, config, plan.run_id)
+
+    approve_run(db, config, plan.run_id)
+    db.commit()
+    preflight = verify_push_preconditions(db, config, plan.run_id)
+    assert preflight.run_id == plan.run_id
+    assert preflight.mode == "reconcile"
+    assert preflight.upsert_count == plan.upsert_count
+    assert preflight.already_done_count == 0
+    # Verifying is not pushing: the run is still 'planned' afterwards.
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT status FROM export_run WHERE export_run_id = %s", (plan.run_id,)
+        )
+        assert cur.fetchone() == ("planned",)
+
+    # Live drift (TOCTOU, D9): the rehearsal aborts on it as well.
+    add_participant(db, corpus.dm_chat_id, corpus.bob_id)
+    with db.cursor() as cur:
+        cur.execute(
+            "UPDATE allowlist_person SET text_allowed = false WHERE person_id = %s",
+            (corpus.bob_id,),
+        )
+    db.commit()
+    with pytest.raises(ExportDriftError):
+        verify_push_preconditions(db, config, plan.run_id)
+
+    with pytest.raises(ExportPushError, match="does not exist"):
+        verify_push_preconditions(db, config, 424242)

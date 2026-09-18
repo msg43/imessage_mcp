@@ -3,9 +3,16 @@
 Wired up for real: `migrate`, `check-permissions`, `status`,
 `guard-mount`, `snapshot`, `extract`, `identity`, `segment`, `embed`,
 `sync`, `enrich`, `backfill-attachments`, `mcp local`, `mcp public`,
-`models verify`, `install-agents`. `export` remains a
-`StageNotImplementedError` stub — it is a parallel agent's scope
-(SPEC §11, `src/imsg/export/`, untouched here).
+`models verify`, `install-agents`, and `export` (`plan`, `approve`,
+`push`, `purge-person`, `unclassified-report` — SPEC §11,
+`src/imsg/export/`). No CLI stub remains.
+
+**`imsg backup` does not exist.** The LaunchAgent generator renders a
+daily `…backup` job that invokes it (SPEC §5.3/§14: nightly local
+recovery copies, 14 kept), so installing the agents schedules a job
+that fails every night at 04:00 until that stage is built. It is the
+one command an installed agent references and this CLI does not
+provide.
 
 **Model providers** come from `imsg.providers.factory` — the only place
 a model-backed command (`segment`, `embed`, `sync`, `enrich`, `mcp
@@ -71,8 +78,21 @@ from imsg.embed.fts.sync import sync_fts
 from imsg.embed.pipeline import run_embed
 from imsg.enrich.pipeline import process_one_task
 from imsg.enrich.queue import claim_tasks, preview_claimable_tasks
-from imsg.errors import AgentInstallError, ImsgError, StageNotImplementedError
+from imsg.errors import AgentInstallError, ImsgError
 from imsg.eval.cli import eval_app
+from imsg.export import (
+    ExportPlanError,
+    ExportPushError,
+    approve_run,
+    plan_export,
+    preview_plan,
+    preview_purge,
+    purge_person,
+    push_export,
+    unclassified_summary,
+    verify_push_preconditions,
+    write_unclassified_report,
+)
 from imsg.mcp.audit import PostgresAuditSink
 from imsg.mcp.auth import build_public_gate
 from imsg.mcp.tools.local_server import LocalMcpServer, run_local_server
@@ -126,6 +146,7 @@ if TYPE_CHECKING:
     import psycopg
 
     from imsg.config.schema import Config
+    from imsg.export.transport import ExportTransport
 
 app = typer.Typer(
     name="imsg",
@@ -1894,22 +1915,412 @@ def mcp_public(config: ConfigOption = None) -> None:
 
 
 # --------------------------------------------------------------------------
-# Pipeline-stage stubs still pending (SPEC §8/§5.5) — not this build's scope
+# export (S8, SPEC §11) — the allowlisted export gate
+#
+# The only path by which message content can leave this machine, so the
+# shape of every command here is "refuse, unless". Each one loads config,
+# runs the mount gate, connects, and turns any `ImsgError` into one clean
+# line — an operator who sees a traceback from this surface cannot tell
+# whether something was uploaded.
+#
+# `push` is the only command that can reach the network, and it cannot do
+# so without `export.gcp_credentials` naming a credential: see
+# `_export_transport_or_die`, which refuses BEFORE importing a Google
+# client library. `push --dry-run` runs every verification the real push
+# runs and builds no transport at all, so rehearsing the gate is provably
+# network-free.
 # --------------------------------------------------------------------------
 
+export_app = typer.Typer(
+    name="export",
+    help="S8 — the default-deny export gate to GCS / Discovery Engine (SPEC §11).",
+    no_args_is_help=True,
+)
+app.add_typer(export_app, name="export")
 
-def _stub(stage: str) -> None:
+RunIdArgument = Annotated[
+    int,
+    typer.Argument(
+        metavar="RUN-ID",
+        help="The export run id printed by `imsg export plan`.",
+    ),
+]
+
+
+def _allowlist_person_count(conn: psycopg.Connection) -> int:
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM allowlist_person")
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+
+def _resolve_export_person_or_die(conn: psycopg.Connection, token: str) -> tuple[int, str]:
+    """`<id-or-name>` -> (person_id, short_name).
+
+    `short_name` is tried first and a numeric `person_id` only as a
+    fallback, so a person whose short_name happens to be digits is still
+    reachable by the name the operator sees in the review report. A token
+    matching neither is a refusal, never a no-op: a purge that silently
+    revoked nobody would read as success.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT person_id, short_name FROM person WHERE short_name = %s", (token,)
+        )
+        row = cur.fetchone()
+        if row is None and token.isdigit():
+            cur.execute(
+                "SELECT person_id, short_name FROM person WHERE person_id = %s",
+                (int(token),),
+            )
+            row = cur.fetchone()
+    if row is None:
+        raise ExportPlanError(
+            f"no person matches '{token}' — pass the short_name shown in the export "
+            f"review report (or a numeric person_id). Nothing was revoked."
+        )
+    return int(row[0]), str(row[1])
+
+
+def _export_transport_or_die(cfg: Config) -> ExportTransport:
+    """Build the real GCS / Discovery Engine transport, or refuse.
+
+    The credential check comes first and the Google client libraries are
+    imported only after it passes. That ordering is the mechanism, not a
+    style choice: with `export.gcp_credentials` unset, this process never
+    loads a Google client at all, so there is no code path from a stock
+    checkout to a network call. There is deliberately no flag that
+    substitutes a stand-in transport here — the fake one exists for tests,
+    which construct it themselves.
+    """
+    ref = cfg.export.gcp_credentials
+    if ref is None:
+        raise ExportPushError(
+            "export.gcp_credentials is not set — `imsg export push` has no credential "
+            "to authenticate with and refuses rather than trying. Set it to a "
+            "'keychain:<item>' or 'env:<VAR>' reference naming a GCP service-account "
+            "key (SPEC §6; secrets never live in config.yaml itself). Nothing was "
+            "uploaded, and no plan state changed."
+        )
+    from imsg.export.gcp_transport import (
+        build_gcs_discovery_engine_transport,
+        resolve_gcp_credentials,
+    )
+    from imsg.export.transport import TransportError
+
     try:
-        raise StageNotImplementedError(stage)
-    except StageNotImplementedError as exc:
+        credentials = resolve_gcp_credentials(ref)
+    except TransportError as exc:
+        # Never interpolate the resolved value — only the reference.
+        raise ExportPushError(
+            f"export.gcp_credentials ('{ref.raw}') did not resolve to a usable GCP "
+            f"service-account key: {exc}"
+        ) from exc
+    return build_gcs_discovery_engine_transport(
+        gcp_project=cfg.export.gcp_project,
+        gcs_bucket=cfg.export.gcs_bucket,
+        data_store_id=cfg.export.data_store_id,
+        credentials=credentials,
+    )
+
+
+@export_app.command("plan")
+def export_plan(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
+    """Compute eligibility, stage the documents, write the review report (SPEC §11.1).
+
+    Stages immutable bytes under `$DATA_ROOT/export/staging/<run>/` and
+    records the run; nothing leaves the machine. Read the report it names
+    before approving — §11.4 calls that review the actual control.
+    """
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        if _allowlist_person_count(conn) == 0:
+            # Not merely "an empty plan": with nobody classified, a reconcile
+            # would also schedule the deletion of everything previously
+            # pushed. Refuse and say which of the two directions the operator
+            # probably wants.
+            raise ExportPlanError(
+                "allowlist_person is empty — every thread is denied by default "
+                "(hard requirement 5), so this plan would stage nothing and would "
+                "schedule the deletion of any document already pushed. Classify at "
+                "least one person before planning; to retract one person, use "
+                "`imsg export purge-person`."
+            )
+        if dry_run:
+            preview = preview_plan(conn, cfg)
+            typer.echo(
+                f"export plan: would stage {preview.upsert_count} document(s) across "
+                f"{len(preview.chat_ids)} thread(s), delete {preview.delete_count}, "
+                f"leave {preview.unchanged_count} unchanged"
+            )
+            for document_id in preview.delete_document_ids:
+                typer.echo(f"export plan: would delete {document_id}")
+            typer.echo(DRY_RUN_MARKER)
+            return
+        with conn.transaction():
+            result = plan_export(conn, cfg)
+    except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    typer.echo(
+        f"export plan: run {result.run_id} (mode={result.mode}) — "
+        f"{result.upsert_count} upsert(s), {result.delete_count} delete(s), "
+        f"{result.unchanged_count} unchanged"
+    )
+    typer.echo(f"export plan: staged under {result.staging_dir}")
+    typer.echo(f"export plan: review report {result.report_path}")
+    if result.approval_required:
+        typer.echo(
+            "export plan: OWNER APPROVAL REQUIRED before push — reasons: "
+            + ", ".join(result.approval_reasons)
+        )
+        typer.echo(
+            f"export plan: read the report, then `imsg export approve {result.run_id}`"
+        )
+    else:
+        typer.echo(
+            f"export plan: no new scope — `imsg export push {result.run_id}` may "
+            f"proceed without fresh approval (SPEC §11.4)"
+        )
 
 
-@app.command()
-def export() -> None:
-    """S8 — allowlisted export to GCS / Discovery Engine. Not implemented yet (parallel agent's scope this wave)."""
-    _stub("export")
+@export_app.command("approve")
+def export_approve(
+    run_id: RunIdArgument,
+    config: ConfigOption = None,
+    approval_id: Annotated[
+        str | None,
+        typer.Option(
+            help="Record this approval id instead of a generated one (audit trails).",
+        ),
+    ] = None,
+) -> None:
+    """Record owner approval of a planned run, pinning its exact bytes (SPEC §11.4).
+
+    Re-reads the staged manifest and re-hashes every staged file first:
+    an approval can never be minted for bytes the owner did not stage.
+    Refuses an unknown run id, a run that is not in 'planned' state, and
+    any staging that changed since the plan.
+    """
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        with conn.transaction():
+            result = approve_run(conn, cfg, run_id, approval_id=approval_id)
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    typer.echo(f"export approve: run {result.run_id} approved as {result.approval_id}")
+    typer.echo(
+        f"export approve: pinned manifest sha256 {result.approved_manifest_sha256}"
+    )
+    typer.echo(
+        f"export approve: `imsg export push {result.run_id}` may now promote exactly "
+        f"those bytes — any later change voids this approval"
+    )
+
+
+@export_app.command("push")
+def export_push(
+    run_id: RunIdArgument,
+    config: ConfigOption = None,
+    dry_run: DryRunOption = False,
+) -> None:
+    """Promote one approved plan to GCS / Discovery Engine, or refuse (SPEC §11.1).
+
+    Re-verifies every hash pin AND re-derives eligibility from the live
+    database before the first byte leaves: the pins prove the bytes did
+    not change, not that the world did not (D9). Any drift aborts and
+    requires a new plan. `--dry-run` runs all of that and stops — it
+    builds no transport, so it cannot reach the network even with a
+    credential configured.
+    """
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    if dry_run:
+        _export_push_rehearse(cfg, run_id)
+        return
+    # The credential gate runs BEFORE the database is opened, so a push with
+    # nothing configured refuses having touched nothing at all — and no
+    # Google client library is ever imported into the process.
+    try:
+        transport = _export_transport_or_die(cfg)
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    _export_push_execute(cfg, run_id, transport)
+
+
+def _export_push_rehearse(cfg: Config, run_id: int) -> None:
+    """`push --dry-run`: every check the real push runs, then stop. Builds
+    no transport, so it needs no credential and cannot reach the network."""
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        preflight = verify_push_preconditions(conn, cfg, run_id)
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    typer.echo(
+        f"export push: run {preflight.run_id} (mode={preflight.mode}) verifies — "
+        f"would push {preflight.upsert_count} upsert(s) and "
+        f"{preflight.delete_count} delete(s), "
+        f"{preflight.already_done_count} item(s) already done"
+    )
+    typer.echo(
+        "export push: approval "
+        + (
+            "satisfied for: " + ", ".join(preflight.approval_reasons)
+            if preflight.approval_reasons
+            else "not required for this run (SPEC §11.4)"
+        )
+    )
+    typer.echo(DRY_RUN_MARKER)
+
+
+def _export_push_execute(cfg: Config, run_id: int, transport: ExportTransport) -> None:
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        # Deliberately NOT wrapped in `conn.transaction()`: the connection is
+        # autocommit, so each item's recorded outcome lands as it happens.
+        # Wrapping would mean a crash after a successful upload rolls back
+        # the `export_document` row that records it — leaving a document in
+        # the corporate store that this system's reconciler cannot see and
+        # `purge-person` therefore cannot delete. Redundant re-uploads on a
+        # retry are cheap and idempotent; an invisible document is not.
+        result = push_export(conn, cfg, run_id, transport)
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    typer.echo(
+        f"export push: run {result.run_id} {result.status} — pushed={result.pushed} "
+        f"deleted={result.deleted} failed={result.failed} "
+        f"skipped_already_done={result.skipped_already_done}"
+    )
+    for note in result.notes:
+        typer.echo(f"export push: {note}", err=True)
+    if result.status != "ok":
+        typer.echo(
+            f"export push: run {result.run_id} has failed items and stays retryable — "
+            f"re-run `imsg export push {result.run_id}` (it re-verifies every pin and "
+            f"re-derives eligibility first)",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
+@export_app.command("purge-person")
+def export_purge_person(
+    person: Annotated[
+        str,
+        typer.Argument(
+            metavar="ID-OR-NAME",
+            help="short_name (preferred) or numeric person_id of the person to revoke.",
+        ),
+    ],
+    config: ConfigOption = None,
+    dry_run: DryRunOption = False,
+) -> None:
+    """Revoke one person and plan the deletion of everything they touched (SPEC §11.4).
+
+    Flags their allowlist row to deny — the row is kept, so the record
+    that they were ever allowed survives — then plans the removal of every
+    now-ineligible document. The resulting run is exempt from the approval
+    gate (D9.3: retraction only narrows scope), and is recorded in full;
+    unapproved does not mean unlogged. Push it to execute the deletions,
+    which are verified absent by document id.
+
+    Honest limit: this reaches the Discovery Engine index and the GCS
+    bucket. Copies already in organizational retention, backups, or
+    another person's hands are beyond it.
+    """
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        person_id, short_name = _resolve_export_person_or_die(conn, person)
+        if dry_run:
+            preview = preview_purge(conn, cfg, short_name)
+            typer.echo(
+                f"export purge-person: would revoke {short_name} (person {person_id}) "
+                f"and delete {preview.delete_count} document(s)"
+            )
+            for document_id in preview.delete_document_ids:
+                typer.echo(f"export purge-person: would delete {document_id}")
+            typer.echo(DRY_RUN_MARKER)
+            return
+        with conn.transaction():
+            result = purge_person(conn, cfg, short_name)
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    typer.echo(
+        f"export purge-person: revoked {short_name} (person {person_id}) — "
+        f"text_allowed and attachments_allowed are now false; the row is retained "
+        f"for audit"
+    )
+    typer.echo(
+        f"export purge-person: run {result.run_id} plans {result.delete_count} "
+        f"deletion(s) and {result.upsert_count} upsert(s)"
+    )
+    typer.echo(f"export purge-person: review report {result.report_path}")
+    typer.echo(
+        f"export purge-person: purges are exempt from the approval gate (D9.3) — "
+        f"run `imsg export push {result.run_id}` to execute the deletions"
+    )
+
+
+@export_app.command("unclassified-report")
+def export_unclassified_report(
+    config: ConfigOption = None, dry_run: DryRunOption = False
+) -> None:
+    """Write the weekly unclassified-threads report (SPEC §11.5).
+
+    Active chats whose participants have never been classified for
+    export, so a static allowlist does not quietly rot as people join and
+    leave. Identities and counts only, never message content, and written
+    outside `export/staging/` so no push can ever select it. This is the
+    command the weekly LaunchAgent invokes.
+    """
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        count = unclassified_summary(conn)
+        if dry_run:
+            typer.echo(
+                f"export unclassified-report: {count} unclassified active thread(s)"
+            )
+            typer.echo(DRY_RUN_MARKER)
+            return
+        report_path = write_unclassified_report(conn, cfg)
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    typer.echo(
+        f"export unclassified-report: {count} unclassified active thread(s) — "
+        f"wrote {report_path}"
+    )
 
 
 # --------------------------------------------------------------------------

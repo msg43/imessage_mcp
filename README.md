@@ -49,7 +49,7 @@ already made and documented the non-obvious decisions, read on.
 | Hybrid retrieval (BM25 + text vector + multimodal vector, RRF-fused, reranked) | Implemented |
 | Local MCP surface (stdio) | Implemented |
 | Public MCP surface (StreamableHTTP + OAuth) | Implemented; never exposed |
-| Export gate (default-deny, plan/approve/push) | Implemented; transport never wired to a live API |
+| Export gate (default-deny, plan/approve/push/purge) | Implemented and wired to the CLI; **the GCS + Discovery Engine transport has never run against a live API** |
 | Eval harness (nDCG@k, recall@k, MRR) | Implemented; metrics verified against hand-computed fixtures |
 | Real model providers (MLX text/reranker/boundary LLM, Apple Vision OCR, mlx-whisper, mlx-vlm captions, PE-Core) | Implemented behind `models.backend: real` (the default); every pinned model smoke-run once on a synthetic input (2026-09-14/15, results in the lock); **never run on the pipeline end to end** |
 | Runs against real data | Snapshot → extract → identity: yes. Segment / embed / enrich with the pinned models: **never** |
@@ -97,6 +97,53 @@ Four choices that shaped everything else:
 
 ---
 
+## The export gate
+
+The one path by which message content can leave the machine, so every
+command on it is shaped to refuse. Default deny: a thread exports only
+if *every* participant — and every message and tapback sender, the owner
+included — is explicitly allowlisted. Attachments are gated separately
+from text bodies.
+
+```bash
+uv run imsg export plan                  # eligibility → staged bytes → review report
+uv run imsg export approve <run-id>      # pins the exact bytes you reviewed
+uv run imsg export push <run-id>         # re-verifies, then promotes
+uv run imsg export purge-person <who>    # revocation; exempt from the approval gate
+uv run imsg export unclassified-report   # weekly: whose threads are still unclassified
+```
+
+`plan` writes the review report the whole design rests on — per thread:
+participants, message count, date range, sample lines. `approve` pins
+the manifest hash and every staged file hash. `push` re-checks all of
+that **and re-derives eligibility from the live database**, because the
+hashes prove the bytes did not change, not that the world did not: a
+participant added to a group between approval and push leaves every hash
+green while changing who is in the export. Any drift aborts the push and
+requires a new plan.
+
+Revocation is deliberately faster than export — it only ever narrows
+scope — so a purge needs no approval, though every drift check still
+applies and the run is recorded in full.
+
+`plan`, `push`, `purge-person` and `unclassified-report` all take
+`--dry-run`. `push --dry-run` runs every verification the real push runs
+and builds no transport at all, so rehearsing the gate cannot reach the
+network.
+
+**Nothing can reach Google without a credential you named.**
+`export.gcp_credentials` is a `keychain:` / `env:` secret reference with
+**no default**; with it unset, `push` refuses before it opens the
+database or imports a Google client library. Leave it out until you mean
+it.
+
+**Honest limit.** A purge reaches the Discovery Engine index and the GCS
+bucket. Copies already swept into organizational retention, backups, or
+another person's hands are beyond it. The gate at export time is the
+actual protection, which is why it denies by default.
+
+---
+
 ## Requirements
 
 - **macOS on Apple Silicon.** The pipeline depends on macOS-only APIs:
@@ -121,7 +168,8 @@ test suite.
 cargo build --release --manifest-path tools/imsg-dump/Cargo.toml
 ```
 ```bash
-uv run pytest        # 990 passed, 198 skipped (integration tests need a live DB) — 2026-09-14
+uv run pytest        # 1430 passed, 309 skipped without a database;
+                     # 1739 passed, 0 skipped against a scratch PostgreSQL — 2026-09-18
 ```
 
 Copy `config.example.yaml`, fill it in, and point the CLI at it:

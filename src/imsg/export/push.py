@@ -28,6 +28,7 @@ verification above first, so a stale retry cannot outlive drift.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from imsg.export.documents import (
@@ -42,7 +43,7 @@ from imsg.export.eligibility import (
     snapshot_allowlist,
 )
 from imsg.export.errors import ExportDriftError, ExportPushError
-from imsg.export.models import PushResult
+from imsg.export.models import PushPreflight, PushResult
 from imsg.export.planner import export_config_sha256, load_manifest, staging_dir_for
 from imsg.export.review import allowlist_matches_snapshot, compute_approval_requirements
 from imsg.export.transport import ExportTransport, ImportEntry, TransportError
@@ -50,6 +51,8 @@ from imsg.hashing import sha256_file
 from imsg.paths import is_contained_in
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import psycopg
 
     from imsg.config.schema import Config
@@ -180,16 +183,34 @@ def _verify_eligibility_unchanged(
                 )
 
 
-def push_export(
-    conn: psycopg.Connection,
-    config: Config,
-    run_id: int,
-    transport: ExportTransport,
-) -> PushResult:
-    """Verify every pin, then promote the plan through `transport`.
-    The caller commits (and should commit promptly after return: the
-    external side effects have already happened; re-pushing after a
-    crash is idempotent but works from the recorded item states)."""
+@dataclass(frozen=True, slots=True)
+class _VerifiedPlan:
+    """Everything the verification pass established, handed to whoever
+    asked for it. Its existence is the proof: a caller holding one of
+    these has passed every check in this module's docstring."""
+
+    run_id: int
+    mode: str
+    staging_dir: Path
+    manifest: dict[str, Any]
+    manifest_sha256: str
+    upserts: list[dict[str, Any]]
+    deletes: list[dict[str, Any]]
+    approval_reasons: tuple[str, ...]
+
+
+def _verify_pushable(
+    conn: psycopg.Connection, config: Config, run_id: int
+) -> _VerifiedPlan:
+    """Steps (1)-(6) of this module's docstring, and nothing else — no
+    upload, no status change, no row written.
+
+    Split out so `verify_push_preconditions` (the `--dry-run` rehearsal)
+    and `push_export` (the real thing) run the SAME checks rather than
+    two implementations that agree until one of them is edited. A dry
+    run that verified less than the push would be a rehearsal for a
+    different performance.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -273,6 +294,66 @@ def push_export(
 
     # (6) eligibility re-verification against the live database
     _verify_eligibility_unchanged(conn, upserts)
+
+    return _VerifiedPlan(
+        run_id=run_id,
+        mode=str(mode),
+        staging_dir=staging_dir,
+        manifest=manifest,
+        manifest_sha256=manifest_sha_disk,
+        upserts=upserts,
+        deletes=deletes,
+        approval_reasons=approval_reasons,
+    )
+
+
+def verify_push_preconditions(
+    conn: psycopg.Connection, config: Config, run_id: int
+) -> PushPreflight:
+    """Run every pre-push check and report the verdict without pushing
+    (SPEC §8's `--dry-run`, applied to the one command where writes
+    leave the machine).
+
+    This needs no transport and therefore no credential: rehearsing the
+    gate is provably network-free, which is the point — the operator can
+    confirm a plan is still pushable without anything being able to
+    reach Google. Raises exactly what `push_export` would have raised.
+    """
+    verified = _verify_pushable(conn, config, run_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM export_run_item WHERE export_run_id = %s "
+            "AND result_state IN ('pushed', 'deleted')",
+            (run_id,),
+        )
+        row = cur.fetchone()
+        already_done = int(row[0]) if row else 0
+    return PushPreflight(
+        run_id=verified.run_id,
+        mode=verified.mode,
+        manifest_sha256=verified.manifest_sha256,
+        staging_dir=str(verified.staging_dir),
+        upsert_count=len(verified.upserts),
+        delete_count=len(verified.deletes),
+        already_done_count=already_done,
+        approval_reasons=verified.approval_reasons,
+    )
+
+
+def push_export(
+    conn: psycopg.Connection,
+    config: Config,
+    run_id: int,
+    transport: ExportTransport,
+) -> PushResult:
+    """Verify every pin, then promote the plan through `transport`.
+    The caller commits (and should commit promptly after return: the
+    external side effects have already happened; re-pushing after a
+    crash is idempotent but works from the recorded item states)."""
+    verified = _verify_pushable(conn, config, run_id)
+    staging_dir = verified.staging_dir
+    upserts = verified.upserts
+    deletes = verified.deletes
 
     # --- verification complete; execute ------------------------------------
     with conn.cursor() as cur:
@@ -446,4 +527,4 @@ def _upsert_export_document(
         )
 
 
-__all__ = ["push_export"]
+__all__ = ["push_export", "verify_push_preconditions"]

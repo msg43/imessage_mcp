@@ -82,19 +82,44 @@ def cli_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 # --------------------------------------------------------------------------
-# Stub pipeline-stage commands
+# No stubs left
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("command", ["export"])
-def test_stub_stage_exits_nonzero_and_names_the_stage(command: str) -> None:
-    """`export` (a parallel agent's scope this wave) remains a stub;
-    `install-agents` is now real (exercised below), and every other
-    stage this build wires up is exercised elsewhere in this file."""
-    result = runner.invoke(app, [command])
-    assert result.exit_code == 1
-    assert command.replace("-", "-") in result.output  # the stage name appears
-    assert "not implemented" in result.output
+def test_no_cli_command_is_a_stage_stub() -> None:
+    """`export` was the last `StageNotImplementedError` stub and is now
+    wired (see tests/test_export_cli_integration.py). This asserts the
+    class of failure is gone rather than one instance of it: no command
+    anywhere in the tree may answer "not implemented".
+
+    `imsg backup` — which the daily LaunchAgent invokes — is a different
+    thing: it is ABSENT, not stubbed, and is tracked in the cli module
+    docstring. A stub would at least name itself when run; an absent
+    command is why that note exists.
+
+    The tree is walked through click's own command objects rather than by
+    parsing rendered help, because help text wraps and a parser of it
+    finds words like "Engine" and calls them commands.
+    """
+    import typer.main
+
+    def walk(command: Any, path: tuple[str, ...]) -> list[tuple[str, ...]]:
+        assert "not implemented" not in (command.help or "").lower(), path
+        found = [path]
+        # Duck-typed on `.commands` rather than `isinstance(_, click.Group)`:
+        # typer's TyperGroup does not satisfy that isinstance check under
+        # click 8.4, which silently made an earlier version of this walk
+        # visit exactly one node and pass.
+        for name, child in getattr(command, "commands", {}).items():
+            found.extend(walk(child, (*path, name)))
+        return found
+
+    root = typer.main.get_command(app)
+    paths = walk(root, ())
+    assert len(paths) > 20, paths  # the walk actually walked something
+    # And the one that used to be a stub really runs now.
+    assert ("export", "plan") in paths
+    assert ("export", "unclassified-report") in paths
 
 
 def test_help_lists_every_stage() -> None:
