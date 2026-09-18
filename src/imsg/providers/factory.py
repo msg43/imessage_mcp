@@ -61,6 +61,7 @@ from imsg.errors import ImsgError, ProviderUnavailableError
 from imsg.paths import is_contained_in, join_under_root, resolve_path
 from imsg.retrieval.reranker import FakeRerankerProvider, RerankerProvider
 from imsg.segment.boundaries import BoundaryProvider, FakeBoundaryProvider
+from imsg.shared_vlm_runtime import SharedVlmRuntime
 
 if TYPE_CHECKING:
     from imsg.config.schema import Config
@@ -114,13 +115,16 @@ below rely on (positional required args, keyword-only options):
 - multimodal_embedding: (model_repo, revision, dim, *, device="mps", batch_size=16,
                          allow_cpu_fallback=False)
 - boundary:             (model_repo, revision, prompt_template: str, *, max_tokens=512,
-                         timeout_seconds=120.0)
+                         timeout_seconds=120.0, shared_runtime=None,
+                         cache_limit_bytes=8 GiB)
 - reranker:             (model_repo, revision, *, instruction=None, batch_size=32,
                          max_length=8192, max_batch_tokens=1024, doc_max_tokens=None,
                          cache_limit_bytes=8 GiB, model_id=None)
 - ocr:                  (*, recognition_languages=None, minimum_text_height=None)
-- transcription:        (model_repo, revision, *, language=None)
-- caption:              (model_repo, revision, prompt: str, *, max_tokens=256)
+- transcription:        (model_repo, revision, *, language=None, temperature=...,
+                         cache_limit_bytes=None)
+- caption:              (model_repo, revision, prompt: str, *, max_tokens=256,
+                         shared_runtime=None, cache_limit_bytes=4 GiB)
 """
 
 
@@ -333,6 +337,41 @@ def resolve_caption_prompt(cfg: Config) -> ResolvedPrompt:
 # --------------------------------------------------------------------------
 
 
+def boundary_and_caption_share_weights(cfg: Config) -> bool:
+    """Whether `segmentation.boundary_*` and `enrichment.caption_*` name
+    the same checkpoint, so one loaded copy can serve both roles. True by
+    default — `imsg.constants` sets `CAPTION_MODEL_REPO =
+    BOUNDARY_MODEL_REPO` and the model manifest records one entry with
+    both roles — but an operator may point them at different models, and
+    then there is nothing to share."""
+    return (
+        cfg.models.share_boundary_and_caption_weights
+        and cfg.segmentation.boundary_model == cfg.enrichment.caption_model
+        and cfg.segmentation.boundary_revision == cfg.enrichment.caption_revision
+    )
+
+
+def build_shared_vlm_runtime(cfg: Config) -> SharedVlmRuntime | None:
+    """One runtime for a process that will build **both** the captioner
+    and the boundary provider, so the shared checkpoint loads once
+    (`imsg.shared_vlm_runtime`; D10.3 defect 1 — two independent copies
+    cost 18 GiB on a 64 GB host).
+
+    `None` when there is nothing to share: the fake backend, an operator
+    who turned sharing off, or two different pins. Callers pass whatever
+    they get straight to both builders, which treat `None` as "load the
+    way you always did".
+
+    A process that builds only one of the two should pass `None` — the
+    boundary provider's own `mlx_lm` loader is 0.83 GiB lighter than the
+    vision-language object, and the captioner makes its own private
+    runtime regardless.
+    """
+    if cfg.models.backend == "fake" or not boundary_and_caption_share_weights(cfg):
+        return None
+    return SharedVlmRuntime(cache_limit_bytes=cfg.models.enrichment_cache_limit_bytes)
+
+
 def build_text_provider(cfg: Config) -> TextEmbeddingProvider:
     """S6's primary text embedder / the retrieval service's query
     embedder (SPEC §4.1: Qwen3-Embedding-8B, 2048-dim MRL). `embedding.
@@ -348,6 +387,7 @@ def build_text_provider(cfg: Config) -> TextEmbeddingProvider:
     options: dict[str, object] = {
         "batch_size": cfg.embedding.batch_size,
         "max_batch_tokens": cfg.embedding.max_batch_tokens,
+        "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
     }
     local_dir = resolve_local_model_dir(cfg.paths.data_root, model)
     if local_dir is not None:
@@ -388,16 +428,30 @@ def build_multimodal_provider(cfg: Config) -> MultimodalEmbeddingProvider | None
     return cast("MultimodalEmbeddingProvider", provider)
 
 
-def build_boundary_provider(cfg: Config, prompt_template: str) -> BoundaryProvider:
+def build_boundary_provider(
+    cfg: Config, prompt_template: str, *, shared_runtime: SharedVlmRuntime | None = None
+) -> BoundaryProvider:
     """S4's topical-boundary LLM (SPEC §4.1/D4). `prompt_template` is
     the decoded `segmentation.boundary_prompt` file — the caller reads
     it (and hashes the raw bytes into `seg_config_hash`), so the same
-    bytes drive both the hash and the model."""
+    bytes drive both the hash and the model.
+
+    `shared_runtime` (from `build_shared_vlm_runtime`) makes this
+    provider generate through an already-loaded vision-language model
+    instead of loading its own copy. Same weights, same computation —
+    see `imsg.segment.mlx_boundaries` for the equivalence evidence."""
     if cfg.models.backend == "fake":
         return FakeBoundaryProvider()
     spec = REAL_PROVIDERS["boundary"]
     provider = _construct(
-        spec, cfg.segmentation.boundary_model, cfg.segmentation.boundary_revision, prompt_template
+        spec,
+        cfg.segmentation.boundary_model,
+        cfg.segmentation.boundary_revision,
+        prompt_template,
+        shared_runtime=shared_runtime,
+        cache_limit_bytes=cfg.models.query_cache_limit_bytes
+        if shared_runtime is None
+        else cfg.models.enrichment_cache_limit_bytes,
     )
     return cast("BoundaryProvider", provider)
 
@@ -415,7 +469,10 @@ def build_reranker(cfg: Config) -> RerankerProvider:
         return FakeRerankerProvider()
     spec = REAL_PROVIDERS["reranker"]
     model, revision = cfg.retrieval.reranker_model, cfg.retrieval.reranker_revision
-    options: dict[str, object] = {"doc_max_tokens": cfg.retrieval.rerank_doc_max_tokens}
+    options: dict[str, object] = {
+        "doc_max_tokens": cfg.retrieval.rerank_doc_max_tokens,
+        "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
+    }
     local_dir = resolve_local_model_dir(cfg.paths.data_root, model)
     if local_dir is not None:
         provider = _construct(
@@ -445,12 +502,21 @@ def read_caption_prompt(cfg: Config) -> str:
 
 
 def build_enrichment_providers(
-    cfg: Config, *, caption_prompt: str | None = None
+    cfg: Config,
+    *,
+    caption_prompt: str | None = None,
+    shared_runtime: SharedVlmRuntime | None = None,
 ) -> EnrichmentProviders:
     """S5b's three model-backed steps (SPEC §4.1): Apple Vision OCR,
     the local captioning VLM, and Whisper transcription. `caption_prompt`
     may be supplied by a caller that already read it; otherwise the real
-    backend reads `enrichment.caption_prompt` itself."""
+    backend reads `enrichment.caption_prompt` itself.
+
+    `shared_runtime` (from `build_shared_vlm_runtime`) is where the
+    captioner's weights come from, so a process that also builds the
+    boundary provider holds one copy. Left `None`, the captioner makes
+    its own runtime — bounded either way, which is also what bounds
+    MLX's process-wide buffer cache for Whisper (D10.2)."""
     if cfg.models.backend == "fake":
         return EnrichmentProviders(
             ocr=FakeOcrProvider(),
@@ -468,10 +534,19 @@ def build_enrichment_providers(
         enrichment.transcription_model,
         enrichment.transcription_revision,
         language=enrichment.transcription_language,
+        # Same bound as the captioner. MLX's cache limit is process-wide,
+        # so whichever of the two runs first sets it — and a batch that is
+        # all audio never loads the captioner at all (D10.2).
+        cache_limit_bytes=cfg.models.enrichment_cache_limit_bytes,
     )
     prompt = caption_prompt if caption_prompt is not None else read_caption_prompt(cfg)
     caption = _construct(
-        REAL_PROVIDERS["caption"], enrichment.caption_model, enrichment.caption_revision, prompt
+        REAL_PROVIDERS["caption"],
+        enrichment.caption_model,
+        enrichment.caption_revision,
+        prompt,
+        shared_runtime=shared_runtime,
+        cache_limit_bytes=cfg.models.enrichment_cache_limit_bytes,
     )
     return EnrichmentProviders(
         ocr=cast("OcrProvider", ocr),
@@ -488,10 +563,12 @@ __all__ = [
     "RealProviderSpec",
     "ResolvedPrompt",
     "backend_status_line",
+    "boundary_and_caption_share_weights",
     "build_boundary_provider",
     "build_enrichment_providers",
     "build_multimodal_provider",
     "build_reranker",
+    "build_shared_vlm_runtime",
     "build_text_provider",
     "default_prompt_root",
     "local_model_id",

@@ -44,6 +44,14 @@ models:
   backend: real                  # real | fake. `fake` = deterministic test stand-ins, explicit
                                  # opt-in only; every command prints `models: backend=<...>` so a
                                  # fake run (meaningless search results) is never mistaken for real.
+  # Memory, for the nightly window where enrichment overlaps the query server.
+  share_boundary_and_caption_weights: true  # segmentation.boundary_* and enrichment.caption_* name the
+                                 # same checkpoint by default; without this each loads its own copy
+                                 # (measured: MLX active 18.99 -> 37.15 GiB in one process)
+  query_cache_limit_bytes: 8589934592   # 8 GiB. MLX buffer-cache bound for the embedder + reranker;
+                                 # MLX's own default is its memory limit (60.8 GiB on a 64 GB host)
+  enrichment_cache_limit_bytes: 4294967296  # 4 GiB, same bound for the captioner/boundary/whisper
+                                 # process — unbounded, one was seen holding 37.25 GiB of freed buffers
 
 segmentation:
   session_gap_hours: 3.0
@@ -76,6 +84,12 @@ enrichment:
   caption_prompt: prompts/caption.txt                           # relative to data_root, like boundary_prompt
   ocr_languages: null            # e.g. ["en-US"]; null = Apple Vision automatic language detection (macOS 13+)
   ocr_minimum_text_height: null  # Vision minimumTextHeight, fraction of image height; null = framework default
+  # Enrichment stands aside for in-flight searches (never the reverse): the MCP server holds a
+  # Postgres session advisory lock while it answers, and this worker pauses BETWEEN tasks while
+  # it is held. A killed server releases the lock with its session, so nothing can wedge paused.
+  yield_to_queries: true
+  yield_poll_interval_seconds: 0.25   # only reached while a query is actually running
+  yield_max_pause_seconds: 300        # then proceed anyway, so the queue still drains overnight
 
 embedding:
   model: mlx-community/Qwen3-Embedding-8B-mxfp8

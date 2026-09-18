@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 import imsg.cli as cli_module
 import imsg.providers.factory as factory_module
 from imsg.cli import app
+from imsg.db.enrichment_yield_locks import YieldReport, YieldState
 from imsg.db.migrations import AppliedMigration, MigrationFile, MigrationPlan
 from imsg.diagnostics import AtRestPosture, BufferPoolCheck, MountCheck, PostgresCheck
 from imsg.mount.guard import MountInfo
@@ -297,6 +298,7 @@ class _FakePgConn:
         self.committed = 0
         self.rolled_back = 0
         self.closed = False
+        self.statements: list[str] = []
         # Model psycopg's transaction status. The CLI asserts the connection is
         # IDLE after the fingerprint check; a double left this unmodelled and
         # the suite could not see the difference between a committed run and a
@@ -318,10 +320,19 @@ class _FakePgConn:
         self.closed = True
 
     def cursor(self) -> Any:
-        """Enough of a cursor for the warm-up's buffer-pool step, which
-        asks whether the `pg_prewarm` function exists (migration 0004) before it does
-        anything: this database has no extensions, so the answer is no and
-        the step reports that instead of prewarming."""
+        """Enough of a cursor for the two things the CLI asks this fake
+        database on the paths these tests drive:
+
+        - the warm-up's buffer-pool step, which asks whether the
+          `pg_prewarm` function exists (migration 0004) before it does
+          anything — this database has no extensions, so the answer is no
+          and the step reports that instead of prewarming;
+        - the enrichment worker's yield gate, which probes the advisory
+          lock the MCP server holds while answering a query
+          (`imsg.db.enrichment_yield_locks`). `True` means nobody holds
+          it, which is the no-query-running case these tests are in.
+        """
+        statements = self.statements
 
         class _Cursor:
             def __enter__(self) -> Any:
@@ -331,10 +342,14 @@ class _FakePgConn:
                 return None
 
             def execute(self, sql: str, params: Any = None) -> None:
-                assert "proname = 'pg_prewarm'" in sql, f"unexpected statement: {sql}"
+                statements.append(sql)
+                allowed = ("proname = 'pg_prewarm'", "pg_try_advisory_lock", "pg_advisory_unlock")
+                assert any(fragment in sql for fragment in allowed), (
+                    f"unexpected statement: {sql}"
+                )
 
             def fetchone(self) -> tuple[Any, ...]:
-                return (False,)
+                return (True,) if "advisory" in statements[-1] else (False,)
 
         return _Cursor()
 
@@ -1157,6 +1172,11 @@ def test_enrich_retry_failed_resets_rows_before_claiming(
         def execute(self, sql: str, *a: object) -> None:
             executed.append(sql)
 
+        def fetchone(self) -> tuple[object, ...]:
+            # The yield gate's advisory-lock probe: True means nobody
+            # holds the query-in-flight lock, which is this test's world.
+            return (True,)
+
     class _FakeTxnConn(_FakePgConn):
         def transaction(self) -> Any:
             from contextlib import contextmanager
@@ -1896,6 +1916,11 @@ def _patch_status_probes(monkeypatch: pytest.MonkeyPatch) -> None:
         "check_buffer_pool",
         lambda config: BufferPoolCheck(3 * 2**30, 1_250_557_952, None),
     )
+    monkeypatch.setattr(
+        cli_module,
+        "check_enrichment_yield",
+        lambda config: YieldState(query_in_flight=False, enrichment_paused=False),
+    )
 
 
 def _strip_models_section(config_path: Path) -> None:
@@ -2083,8 +2108,11 @@ def test_enrich_real_backend_prints_the_caption_prompt_it_used(
     shipped = factory_module.default_prompt_root() / "prompts" / "caption.txt"
     captured: dict[str, Any] = {}
 
-    def fake_build(cfg: Any, *, caption_prompt: str | None = None) -> EnrichmentProviders:
+    def fake_build(
+        cfg: Any, *, caption_prompt: str | None = None, shared_runtime: Any = None
+    ) -> EnrichmentProviders:
         captured["caption_prompt"] = caption_prompt
+        captured["shared_runtime"] = shared_runtime
         return EnrichmentProviders(
             ocr=FakeOcrProvider(), caption=FakeCaptionProvider(), transcription=FakeTranscriptionProvider()
         )
@@ -2262,3 +2290,126 @@ def test_help_lists_the_models_command_group() -> None:
     result = runner.invoke(app, ["models", "--help"])
     assert result.exit_code == 0
     assert "verify" in result.output
+
+
+# --------------------------------------------------------------------------
+# enrichment yields to in-flight queries (D10.3)
+# --------------------------------------------------------------------------
+
+
+def test_status_reports_whether_enrichment_is_yielding_right_now(
+    cli_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_status_probes(monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "check_enrichment_yield",
+        lambda config: YieldState(query_in_flight=True, enrichment_paused=True),
+    )
+    payload = json.loads(
+        runner.invoke(app, ["status", "--config", str(cli_config), "--json"]).output
+    )
+    assert payload["enrichment_yield_enabled"] is True  # the schema default
+    assert payload["enrichment_yielding_now"] is True
+    assert payload["query_in_flight"] is True
+    assert payload["enrichment_yield_reason"] is None
+
+
+def test_status_does_not_ask_an_unreachable_database_about_advisory_locks(
+    cli_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_status_probes(monkeypatch)
+    monkeypatch.setattr(
+        cli_module,
+        "check_postgres",
+        lambda config: PostgresCheck(reachable=False, cluster_fingerprint_ok=None, reason="down"),
+    )
+
+    def _must_not_run(config: Any) -> YieldState:
+        raise AssertionError("check_enrichment_yield ran against an unreachable database")
+
+    monkeypatch.setattr(cli_module, "check_enrichment_yield", _must_not_run)
+    payload = json.loads(
+        runner.invoke(app, ["status", "--config", str(cli_config), "--json"]).output
+    )
+    assert payload["enrichment_yielding_now"] is None
+    assert payload["query_in_flight"] is None
+
+
+def test_enrich_checks_the_yield_gate_before_claiming_and_between_tasks(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claimed task holds a lease and cannot be abandoned half-run, so
+    the gate is consulted before the claim and between units of work —
+    never during one."""
+    from imsg.enrich.queue import EnrichmentTask
+
+    order: list[str] = []
+    tasks = [
+        EnrichmentTask(attachment_id=1, kind="ocr", attempts=0),
+        EnrichmentTask(attachment_id=2, kind="ocr", attempts=0),
+        EnrichmentTask(attachment_id=3, kind="ocr", attempts=0),
+    ]
+
+    class _Gate:
+        def __init__(self, conn: Any, **kwargs: Any) -> None:
+            captured["gate_kwargs"] = kwargs
+
+        def wait_until_clear(self) -> Any:
+            order.append("gate")
+            return YieldReport(paused=False, waited_seconds=0.0)
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli_module, "EnrichmentYieldGate", _Gate)
+
+    def _claim(conn: Any, **kw: Any) -> list[EnrichmentTask]:
+        order.append("claim")
+        return tasks
+
+    monkeypatch.setattr(cli_module, "claim_tasks", _claim)
+    monkeypatch.setattr(
+        cli_module,
+        "process_one_task",
+        lambda conn, cfg, providers, task: order.append(f"task{task.attachment_id}") or "done",
+    )
+
+    result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert order == ["gate", "claim", "task1", "gate", "task2", "gate", "task3"]
+    assert captured["gate_kwargs"]["enabled"] is True  # the schema default
+
+
+def test_enrich_reports_the_time_it_spent_yielding(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.enrich.queue import EnrichmentTask
+
+    class _Gate:
+        def __init__(self, conn: Any, **kwargs: Any) -> None:
+            pass
+
+        def wait_until_clear(self) -> Any:
+            return YieldReport(paused=True, waited_seconds=1.5)
+
+    monkeypatch.setattr(cli_module, "EnrichmentYieldGate", _Gate)
+    monkeypatch.setattr(
+        cli_module,
+        "claim_tasks",
+        lambda conn, **kw: [EnrichmentTask(attachment_id=1, kind="ocr", attempts=0)],
+    )
+    monkeypatch.setattr(cli_module, "process_one_task", lambda *a: "done")
+
+    result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert "yielded to in-flight queries 1 time(s), 1.5s total" in result.output
+
+
+def test_enrich_says_nothing_about_yielding_when_it_never_paused(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The overnight common case: nobody is searching, so the gate is one
+    round trip per unit of work and the run reads exactly as before."""
+    monkeypatch.setattr(cli_module, "claim_tasks", lambda conn, **kw: [])
+    result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert "yielded" not in result.output

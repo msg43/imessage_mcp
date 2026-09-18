@@ -332,6 +332,59 @@ Learned the expensive way; written down so you don't have to.
   `pg_prewarm.autoprewarm` — and `imsg status`, which prints
   `shared_buffers` against the total HNSW index size and warns when the
   pool is the smaller of the two.
+- **Two providers pinned to the same checkpoint still load it twice
+  unless something makes them share.** Captioning goes through `mlx-vlm`
+  and topical boundary detection through `mlx-lm`; both name the same
+  35B repo and revision, and each used to build its own model object.
+  Measured: MLX active memory 18.99 → 37.15 GiB as the second one
+  loaded, in one process, for one set of weights. The fix is
+  `imsg.shared_vlm_runtime.SharedVlmRuntime`, an object a caller passes
+  to both providers — boundary detection then runs text-only through the
+  already-loaded vision-language model, which is the *same* computation
+  (the rendered chat prompt is byte-identical and the last-position logit
+  row is bit-identical across all 248,320 float32 values). It is
+  explicit rather than a module-level cache precisely so the sharing is
+  visible at the call site; `models.share_boundary_and_caption_weights`
+  turns it off.
+- **A CLIP-style model loads both towers whether or not you use both.**
+  PE-Core is 9.01 GiB at fp32, of which the vision tower is 7.01 and the
+  text tower 2.00 — and the query server only ever calls `embed_text`
+  while the embedding pipeline only ever calls `embed_images`. The
+  provider now decides on first use and releases the other tower;
+  `scripts/verify_pe_core_tower_selection.py` proves the vectors are
+  identical bit for bit before and after, because "it cannot change the
+  answer" is an argument, not a measurement. A process that does use both
+  rebuilds once and keeps both.
+- **MLX's buffer cache defaults to its memory limit, which is not a
+  bound.** It pools freed GPU buffers rather than returning them, and on
+  a 64 GB host the default limit probes at 60.8 GiB; one enrichment
+  process was seen holding 37.25 GiB of freed buffers, which is
+  indistinguishable from a leak and hides real regressions. Every MLX
+  provider now calls `imsg.mlx_runtime.bound_buffer_cache` at load
+  (`models.query_cache_limit_bytes` / `models.enrichment_cache_limit_bytes`).
+  The call is process-wide, so one provider bounding it covers the rest
+  — including `mlx_whisper`, which has no load hook of its own.
+- **Two GPU-heavy jobs on one machine need an arbiter, and it has to
+  survive a crash.** The nightly enrichment window overlaps the
+  always-on MCP server; with the duplicate weights gone and no swap at
+  all, query p95 still trebled purely from GPU contention. Enrichment
+  now stands aside for in-flight queries
+  (`imsg.db.enrichment_yield_locks`, `enrichment.yield_to_queries`), and
+  the signal is a **Postgres session-level advisory lock** specifically
+  because the server releases it when the session ends, however it ends
+  — a killed MCP server cannot leave enrichment paused, with no timeout
+  to tune and no stale marker to reap. It is checked between units of
+  work, never during one, so no claimed task is ever abandoned;
+  `imsg status` reports whether it is yielding right now. **What it
+  cannot do** is help when the unit of work is long relative to the
+  query rate: measured with it on and off, search p95 during the window
+  was 3.00 s versus 3.06 s — one caption takes 14 s on that host and a
+  search arrives every 2 s, so a worker that resumes between tasks
+  resumes straight into another 14-second caption. The memory fixes
+  above are what closed the gap; this is kept because it costs one round
+  trip when nobody is searching and it will matter wherever the batch is
+  finer-grained than the traffic — not because it earned its place on
+  this workload.
 - **The planner can abandon an HNSW index at some `ef_search` values, and
   that is not a monotonic effect.** pgvector's own cost estimate bounds
   layer-0 tuples by `ef_search` while its selectivity term carries

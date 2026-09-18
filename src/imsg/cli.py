@@ -50,12 +50,17 @@ from imsg.agents.plists import render_agent_plists
 from imsg.backfill.pipeline import DEFAULT_RATE_PER_MINUTE, run_backfill
 from imsg.config.loader import default_config_path, load_config
 from imsg.db.connection import connect
+from imsg.db.enrichment_yield_locks import (
+    EnrichmentYieldGate,
+    QueryInFlightMarker,
+)
 from imsg.db.fingerprint import ensure_cluster_fingerprint, verify_data_directory
 from imsg.db.migrations import PostgresMigrationRunner, format_mismatches
 from imsg.diagnostics import (
     BufferPoolCheck,
     check_at_rest_posture,
     check_buffer_pool,
+    check_enrichment_yield,
     check_full_disk_access,
     check_mount,
     check_postgres,
@@ -81,6 +86,7 @@ from imsg.providers.factory import (
     build_enrichment_providers,
     build_multimodal_provider,
     build_reranker,
+    build_shared_vlm_runtime,
     build_text_provider,
     read_prompt_text,
     resolve_caption_prompt,
@@ -294,6 +300,22 @@ def _build_or_die[T](build: Callable[[], T]) -> T:
         raise typer.Exit(code=1) from exc
 
 
+def _query_marker(cfg: Config) -> QueryInFlightMarker:
+    """The "a query is in flight" publisher an MCP server holds while it
+    answers (`imsg.db.enrichment_yield_locks`), so the nightly enrichment
+    worker pauses between its units of work.
+
+    On its own connection, opened lazily on the first query: a
+    session-level advisory lock has to live on a session that lasts as
+    long as the marker, and the retrieval connection is busy answering the
+    query being marked. `enrichment.yield_to_queries` turns the whole
+    mechanism off on both sides at once."""
+    return QueryInFlightMarker(
+        lambda: connect(cfg.database, autocommit=True),
+        enabled=cfg.enrichment.yield_to_queries,
+    )
+
+
 def _decode_prompt(prompt_bytes: bytes) -> str:
     # Same decode the segmentation config hash applies to these bytes
     # (imsg.segment.hashing), so the model sees exactly what was hashed.
@@ -442,6 +464,7 @@ def status(
     posture = check_at_rest_posture(cfg.paths.data_root)
     pg = check_postgres(cfg)
     pool = check_buffer_pool(cfg) if pg.reachable else BufferPoolCheck(None, None, None)
+    yield_state = check_enrichment_yield(cfg) if pg.reachable else None
     free_bytes = disk_free_bytes(cfg.paths.data_root)
 
     report = {
@@ -458,6 +481,11 @@ def status(
         "at_rest_posture": posture.label,
         "at_rest_posture_caveat": posture.caveat,
         "disk_free_bytes": free_bytes,
+        # D10.3: is enrichment standing aside for the query side right now?
+        "enrichment_yield_enabled": cfg.enrichment.yield_to_queries,
+        "enrichment_yielding_now": yield_state.enrichment_paused if yield_state else None,
+        "query_in_flight": yield_state.query_in_flight if yield_state else None,
+        "enrichment_yield_reason": yield_state.reason if yield_state else None,
         "watermarks_per_source": None,
         "enrichment_queue_depths": None,
         "fts_applied_event_id": None,
@@ -1527,8 +1555,18 @@ def enrich(
     providers = None
     if not dry_run:
         caption_prompt = _caption_prompt_or_die(cfg)
+        # One runtime for every vision-language role this process builds,
+        # so a composition that captions *and* detects boundaries against
+        # the same pin loads one copy of the weights rather than two
+        # (D10.3 defect 1; `imsg.shared_vlm_runtime`). This process ships
+        # with only the captioner, so today it holds one either way — but
+        # the runtime is what makes that a property of the code rather
+        # than of which providers happen to be wired here.
+        shared_vlm = build_shared_vlm_runtime(cfg)
         providers = _build_or_die(
-            lambda: build_enrichment_providers(cfg, caption_prompt=caption_prompt)
+            lambda: build_enrichment_providers(
+                cfg, caption_prompt=caption_prompt, shared_runtime=shared_vlm
+            )
         )
 
     conn = _connect_and_verify_or_die(cfg)
@@ -1550,6 +1588,19 @@ def enrich(
         return
 
     assert providers is not None  # built above for every non-dry run
+    # Enrichment yields to the MCP server, never the reverse (D10.3).
+    # Checked BEFORE claiming and BEFORE each task, never during one: a
+    # claimed task holds a lease and a half-run model call cannot be
+    # represented in the queue, so pausing between units of work is the
+    # only point at which nothing can be abandoned or corrupted.
+    gate = EnrichmentYieldGate(
+        conn,
+        enabled=cfg.enrichment.yield_to_queries,
+        poll_interval_seconds=cfg.enrichment.yield_poll_interval_seconds,
+        max_pause_seconds=cfg.enrichment.yield_max_pause_seconds,
+    )
+    yielded_seconds = 0.0
+    yield_pauses = 0
     try:
         if retry_failed:
             with conn.transaction(), conn.cursor() as cur:
@@ -1558,9 +1609,16 @@ def enrich(
                     "next_attempt_at = now(), last_error = NULL WHERE state = 'failed'"
                 )
 
+        report = gate.wait_until_clear()
+        yielded_seconds += report.waited_seconds
+        yield_pauses += int(report.paused)
         tasks = claim_tasks(conn, worker_id=worker_id, limit=limit)
         outcomes: dict[str, int] = {}
-        for task in tasks:
+        for index, task in enumerate(tasks):
+            if index:  # the check before the first task already ran, above
+                report = gate.wait_until_clear()
+                yielded_seconds += report.waited_seconds
+                yield_pauses += int(report.paused)
             outcome = process_one_task(conn, cfg, providers, task)
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
     except ImsgError as exc:
@@ -1571,6 +1629,11 @@ def enrich(
 
     summary = " ".join(f"{k}={v}" for k, v in sorted(outcomes.items())) or "none"
     typer.echo(f"enrich: claimed={len(tasks)} {summary}")
+    if yield_pauses:
+        typer.echo(
+            f"enrich: yielded to in-flight queries {yield_pauses} time(s), "
+            f"{yielded_seconds:.1f}s total"
+        )
 
 
 @app.command("backfill-attachments")
@@ -1669,6 +1732,7 @@ def mcp_local(config: ConfigOption = None) -> None:
     # Every model call — the background warm-up and every query — runs on
     # this one thread (imsg.retrieval.model_thread explains why).
     model_thread = ModelThread()
+    query_marker = _query_marker(cfg)
     service = RetrievalService(
         pg_conn=conn,
         fts_conn=fts_conn,
@@ -1677,6 +1741,7 @@ def mcp_local(config: ConfigOption = None) -> None:
         reranker=reranker,
         multimodal_provider=multimodal_provider,
         model_thread=model_thread,
+        query_marker=query_marker,
     )
     # Not warmed here: the server answers the MCP handshake first and
     # run_local_server starts this once it is serving. Tool calls wait for
@@ -1692,6 +1757,7 @@ def mcp_local(config: ConfigOption = None) -> None:
         anyio.run(run_local_server, local)
     finally:
         model_thread.close()
+        query_marker.close()
         fts_conn.close()
         conn.close()
 
@@ -1736,6 +1802,7 @@ def mcp_public(config: ConfigOption = None) -> None:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
+    query_marker = _query_marker(cfg)
     service = RetrievalService(
         pg_conn=conn,
         fts_conn=fts_conn,
@@ -1743,6 +1810,7 @@ def mcp_public(config: ConfigOption = None) -> None:
         text_provider=text_provider,
         reranker=reranker,
         multimodal_provider=multimodal_provider,
+        query_marker=query_marker,
     )
     audit = PostgresAuditSink(lambda: connect(cfg.database, autocommit=True))
     try:
@@ -1771,6 +1839,7 @@ def mcp_public(config: ConfigOption = None) -> None:
     try:
         uvicorn.run(asgi_app, host=host, port=port, log_level="info")
     finally:
+        query_marker.close()
         fts_conn.close()
         conn.close()
 

@@ -20,6 +20,7 @@ from pathlib import Path
 
 from imsg.config.schema import Config
 from imsg.db.connection import connect
+from imsg.db.enrichment_yield_locks import YieldState, read_yield_state
 from imsg.db.fingerprint import verify_data_directory
 from imsg.db.prewarm import hnsw_index_bytes, shared_buffers_bytes
 from imsg.errors import ClusterFingerprintError, MountGateError, SecretResolutionError
@@ -237,6 +238,29 @@ def check_buffer_pool(config: Config) -> BufferPoolCheck:
     return BufferPoolCheck(pool, indexes, warning)
 
 
+def check_enrichment_yield(config: Config) -> YieldState:
+    """Whether a query is in flight and whether an enrichment worker is
+    currently standing aside for it (D10.3's ratified remedy;
+    `imsg.db.enrichment_yield_locks`).
+
+    Read from `pg_locks` on a connection of its own, taking no lock — a
+    status command must be able to observe the contention it reports on
+    without joining it. An unreachable database comes back as a `reason`,
+    not an exception: `check_postgres` already says it is down."""
+    try:
+        conn = connect(config.database, autocommit=True)
+    except Exception as exc:
+        return YieldState(
+            query_in_flight=False,
+            enrichment_paused=False,
+            reason=f"advisory locks not read: {type(exc).__name__}: {exc}",
+        )
+    try:
+        return read_yield_state(conn)
+    finally:
+        conn.close()
+
+
 def disk_free_bytes(path: Path) -> int | None:
     """`shutil.disk_usage` on the nearest existing ancestor of `path`."""
     candidate = path
@@ -259,6 +283,7 @@ __all__ = [
     "PostgresCheck",
     "check_at_rest_posture",
     "check_buffer_pool",
+    "check_enrichment_yield",
     "check_full_disk_access",
     "check_mount",
     "check_postgres",
