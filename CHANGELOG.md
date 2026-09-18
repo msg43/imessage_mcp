@@ -10,6 +10,170 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-17 — The nightly enrichment window: one copy of the shared 35B, one PE-Core tower per process, bounded MLX caches, and enrichment that yields to searches
+
+Enrichment runs 01:00–07:00 while the MCP server is `KeepAlive`, and the
+overlap was measured on the production host and does not fit: 80.4 GiB of
+demand on a 64 GB box, critical memory pressure, 37.6 GiB of swap, 218 GiB
+paged in eleven minutes, and search p95 at **8.73 s** against a 2.0 s
+budget. Four changes, in the order the measurements said they mattered.
+
+- **One copy of the 35B, not two.** `segmentation.boundary_model` and
+  `enrichment.caption_model` are the same pinned checkpoint, but
+  captioning went through `mlx-vlm` and boundary detection through
+  `mlx-lm`, and each built its own model object: MLX active memory
+  18.99 → 37.15 GiB across the second load, in one process, reproduced on
+  the development host. `imsg.shared_vlm_runtime.SharedVlmRuntime` now
+  loads at most one model per `(repo, revision)` and hands it to both
+  providers; boundary detection runs text-only through the
+  vision-language model (`mlx_vlm.stream_generate(..., image=None)`).
+  **That is the same computation, checked rather than argued:** the
+  rendered chat prompt is byte-identical between the two paths (same
+  SHA-256), the last-position logit row for a fixed probe is
+  bit-identical across all 248,320 float32 values (same SHA-256 over the
+  raw bytes), and both produce the same boundaries for the same window.
+  The sharing is an object a caller passes in, not a module-level cache,
+  so it is visible at the call site and a test can assert on
+  `loaded_model_ids`; `models.share_boundary_and_caption_weights` turns
+  it off. **The shipped agents are still two processes** —
+  `…enrich` builds the captioner and `…sync`'s segment step builds the
+  boundary provider — so this removes the duplicate within a process, not
+  across them; both load lazily and `…sync` exits between runs, which is
+  what keeps that bounded. Recorded where the LaunchAgents are rendered
+  (`imsg.agents.plists`), not only here.
+- **Only the PE-Core tower a process uses.** `CustomTextCLIP` is
+  1,882,033,920 vision parameters (7.011 GiB at fp32) plus 537,233,920
+  text parameters (2.001 GiB), and open_clip builds both whichever one
+  you intend to run — 9.07 GiB on the query side, which calls only
+  `embed_text`, and again on any process that embeds images and calls
+  only `embed_images`. The provider now decides on first use and releases
+  the other tower. **Numerically free, and proved rather than asserted:**
+  `scripts/verify_pe_core_tower_selection.py` embeds the same fixed
+  synthetic inputs through the whole model and through the selected tower
+  in separate processes and compares the vectors as exact IEEE-754 bit
+  patterns — identical, not close — while torch's MPS allocation goes
+  9.071 → 2.010 GiB (text) and 9.071 → 7.061 GiB (vision). A process that
+  uses both rebuilds once and keeps both, so nothing that worked stops
+  working. Precision is untouched; fp16 is a separate question with its
+  own evidence to gather.
+- **The enrichment MLX buffer cache is bounded.** MLX pools freed GPU
+  buffers and its default limit is its memory limit — 60.8 GiB on the
+  production host, where one enrichment process was seen holding 37.25
+  GiB of freed buffers, which is indistinguishable from a leak. The
+  query-side providers had called `bound_buffer_cache` since 2026-09-15
+  and held their 8 GiB exactly; the captioner, the boundary provider and
+  Whisper called nothing. All three now do
+  (`models.enrichment_cache_limit_bytes`, 4 GiB — one prompt at a time
+  against one resident model, not a 64-row padded embedding batch), and
+  the query side's own bound became `models.query_cache_limit_bytes`
+  rather than a constructor default. Whisper gets its own because the
+  limit is process-wide and a batch that happens to be all audio loads
+  neither of the other two.
+- **Enrichment yields to in-flight queries, never the reverse**
+  (`imsg.db.enrichment_yield_locks`, `enrichment.yield_to_queries`,
+  default on). With a single 35B copy resident — no swap, pressure never
+  critical — query p95 still trebled while enrichment ran, so what
+  remained was GPU contention on 20 cores. The MCP server now holds a
+  **Postgres session-level advisory lock** for the span of each search
+  and each warm-up step, and the worker probes it between units of work.
+  The mechanism is chosen for its failure mode: a session lock is
+  released by the server when the session ends, **however it ends**, so a
+  killed or jetsammed MCP server cannot leave enrichment paused — no
+  timeout to tune, no stale marker to reap, which is exactly what a lock
+  file or a status row would get wrong. The asymmetry is total: the
+  server's own acquisition is a `try` that proceeds unmarked rather than
+  wait, and an unreachable database degrades the marker to a no-op rather
+  than fail a query. The check is between tasks, never during one, so no
+  claimed task is abandoned or corrupted; when nobody is searching it is
+  one round trip to a local socket and no sleep. `imsg status` reports
+  `enrichment_yield_enabled`, `query_in_flight` and
+  `enrichment_yielding_now`, read from `pg_locks` without taking a lock.
+  Tests cover the crash case and the no-query case explicitly, the crash
+  one against a real Postgres because it is a property of the server, not
+  of our code.
+
+**Re-measured on the production host, the same concurrent case that
+failed** (`scripts/bench_nightly_window.py`, new here: the query side
+serving a search every 2 s while one enrichment worker captions
+back-to-back, three phases in one run so recovery is observed rather than
+inferred; synthetic queries and generated images throughout, nothing read
+from the corpus).
+
+| | before (D10, 2026-09-17) | after |
+|---|---|---|
+| query process, footprint | 27.5 GiB | **16.1 GiB** (17.2 peak-sampled) |
+| query process, MLX active / peak / cache | — / — / 8.0 | 7.84 / 8.70 / **4.55** |
+| query process, torch MPS | 9.07 | **2.01** |
+| enrichment process, footprint | 53.8 GiB (measured alone) | **28.2 GiB** |
+| enrichment, MLX active / peak / cache | 37.15 / — / **37.25** | **19.00** / 20.88 / **0.20** |
+| enrichment, torch MPS | 9.07–9.11 | **7.06** |
+| both, total demand | **80.4 GiB** | **44.3 GiB** |
+| memory pressure during the overlap | **critical** | **normal** (131 of 133 samples; `warn` twice, never critical) |
+| swap used, peak during the overlap | 37.6 GiB | **8.0 GiB** (1.2 GiB before it, 1.1 GiB after) |
+| paged in | **218 GiB / 11 min** | **39.6 GiB / 19 min** |
+| swapped out, whole run | — | 9.2 GiB |
+| query model stages p50 / p95, baseline | — / 1.21 s | 1.075 / 1.087 s |
+| query model stages p50 / p95, **overlap** | — / **8.73 s** | 2.194 / **3.003 s** |
+| query model stages p50 / p95, recovery | baseline within one sample | 1.088 / 1.102 s |
+| enrichment throughput | — | 36 captions across the overlap (3.75/min, p50 14.2 s each) |
+
+**The overlap fits now; search does not stay inside its 2.0 s budget
+during the window.** 44.3 GiB of 64 GB, pressure normal, swap a tenth of
+what it was, and recovery immediate — the memory problem is gone. Search
+p95 during the window is 3.00 s against a 2.0 s budget: down from 4.4x
+over it to 1.5x over it, and still over it.
+
+**The yielding did not cause that improvement, and this is the honest
+negative result.** Running the identical case with `--no-yield` gives
+overlap p50/p95 of 2.255/3.063 s against 2.194/3.003 s with it on — a
+2% difference with the maxima ordered the other way, which is noise —
+while the worker recorded 29 genuine pauses totalling 29.4 s and gave up
+9.6% of its throughput (3.75 vs 3.84 captions/min). The mechanism works
+exactly as designed and the design cannot help here: one caption takes
+14 s on this host and a search arrives every 2 s, so a worker that can
+only pause *between* units of work resumes into a fresh 14-second caption
+that the next seven searches contend with. It is kept — it costs one
+round trip when nobody is searching, it is what the decision ratified,
+and it will matter at a lower query rate or a shorter unit of work — but
+what closed the memory gap was the three residency fixes, not this.
+Getting search inside 2.0 s during the window needs something that acts
+*within* a unit of work, and that is a new question rather than a
+tightening of this one.
+
+**The harness reproduces the "before" configuration, which is why the
+"after" column can be trusted.** Run on the development host with every
+fix turned off — `--no-share-weights --pe-core-both-towers
+--enrich-cache-limit-gib 0 --no-yield` — it measured a 25.06 GiB query
+process (torch 9.07) beside a 55.35 GiB enrichment process (MLX active
+37.15, torch 9.07): **80.4 GiB of total demand**, and search p95 during
+the overlap of **8.92 s**. Those are D10's 80.4 GiB and 8.73 s, on
+different hardware, from a harness that knew nothing of them. A benchmark
+that could not reproduce the failure would be no evidence that the fixes
+removed it.
+
+**Not measured, and honest about it:** the 80.4 GiB configuration was not
+re-run *on the production host* — the "before" column is D10's, and
+putting that box back into critical pressure and 200+ GiB of paging would
+have told us nothing the flags above did not.
+
+The batch is captioning plus image embedding plus a boundary call every
+fourth task; Whisper and Apple Vision are not in it, and
+neither is the Photos intake session. Database time is excluded from
+every latency figure, as it was before. The images are generated rather
+than real attachments, so decode cost is representative of size but not
+of format variety.
+
+**On lowering the query-side cache bound during the window** (D10.2's
+open question): measured, and the answer is not to. 8 GiB versus 2 GiB on
+the development host moved the process footprint 20.65 -> 14.66 GiB —
+exactly the 6 GiB of cache — with MLX active and peak identical (7.84 and
+9.56 GiB) and the three query stages' p50s within run-to-run noise
+(0.644 s versus 0.616 s in total). But under the real window workload the
+cache only reached 4.55 GiB against its 8 GiB bound, so the bound is not
+binding there, and the overlap now has ~20 GiB of headroom it would be
+buying nothing with. `models.query_cache_limit_bytes` is the lever if
+that changes; `scripts/bench_query_stages.py --query-cache-limit-gib`
+re-measures it.
 ## 2026-09-17 — A source that has nothing to say no longer overwrites what another source knew
 
 **Invariant:** a source that carries no evidence for a column must never

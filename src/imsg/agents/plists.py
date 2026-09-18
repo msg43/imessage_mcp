@@ -182,7 +182,38 @@ def _enrich_plist(
 ) -> dict[str, object]:
     """`…enrich` — nightly window (default `01:00-07:00`), periodic
     `StartCalendarInterval` array via `calendar_intervals_for_window`;
-    `imsg enrich` gates itself the same way `imsg sync` does."""
+    `imsg enrich` gates itself the same way `imsg sync` does.
+
+    **Residency constraint this agent shares with `…sync` (D10.3).** The
+    pinned captioning model and the pinned boundary-detection model are
+    the same checkpoint (`imsg.constants` sets `CAPTION_MODEL_REPO =
+    BOUNDARY_MODEL_REPO`), ~19 GiB resident. Within one process they now
+    load once, through `imsg.shared_vlm_runtime.SharedVlmRuntime`. Across
+    processes nothing can share them, and these are two processes: this
+    agent builds the captioner, while boundary detection lives in
+    `…sync`'s segment step, and `…sync` fires every
+    `sync.interval_seconds` (900 s by default) straight through this
+    window.
+
+    What keeps that bounded, and what does not:
+
+    - Both providers load their weights **lazily, on first use**. A
+      `…sync` run with no chat needing topical boundaries never loads
+      the model at all, and `…sync` is a `StartInterval` agent that
+      exits when its run finishes — so the second copy is resident only
+      while a sync run is actually detecting boundaries, not for the
+      whole window.
+    - Nothing prevents that overlap when a sync run *does* segment. On a
+      64 GB host two copies plus the query side measured 80.4 GiB of
+      demand, critical memory pressure and search p95 at 8.73 s against
+      a 2.0 s budget. The mitigations that apply are the shared runtime
+      above (when one process builds both roles) and enrichment yielding
+      to in-flight queries (`imsg.db.enrichment_yield_locks`, config
+      `enrichment.yield_to_queries`), not this schedule.
+    - Moving the window away from `…sync`'s interval is not an option:
+      `StartInterval` has no window, and pausing sync for six hours
+      would stall extraction of everything that arrives overnight.
+    """
     plist = _base_plist(
         f"{LABEL_PREFIX}enrich",
         program_arguments=[str(imsg_binary), "enrich", "--config", str(config_path)],

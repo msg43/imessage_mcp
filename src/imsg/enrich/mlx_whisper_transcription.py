@@ -21,6 +21,15 @@ ever wanted.
 once. The runtime is imported on first use (see
 `imsg.enrich.model_runtime`); constructing the provider needs nothing
 installed.
+
+`cache_limit_bytes` exists because MLX's buffer-cache bound is
+*process-wide* and this provider can be the first MLX consumer an
+enrichment process reaches (D10.2). The captioner and the boundary
+provider bound it when their weights load, but a batch that happens to
+be all audio never loads either, and the cache would sit at MLX's
+default — its memory limit, 60.8 GiB on the production host. There is no
+load hook to hang it on here, since `mlx_whisper.transcribe` loads
+internally, so it is applied on the first transcription.
 """
 
 from __future__ import annotations
@@ -31,6 +40,7 @@ from typing import Any
 
 from imsg.enrich.model_runtime import import_runtime_module, resolve_model_snapshot
 from imsg.errors import EnrichmentError
+from imsg.mlx_runtime import bound_buffer_cache
 from imsg.textnorm import strip_nul
 
 _INSTALL_HINT = "install `mlx-whisper` (Apple silicon only)"
@@ -67,6 +77,9 @@ class MlxWhisperTranscriptionProvider:
     `imsg.enrich.model_runtime.resolve_model_snapshot`) and is part of
     `model_id` (`<repo>@<revision or 'main'>`). `language` is a Whisper
     language code; `None` lets Whisper detect it per file.
+    `cache_limit_bytes` bounds MLX's process-wide buffer cache on the
+    first transcription (`None` leaves it alone) — see the module
+    docstring for why this provider needs its own.
     """
 
     def __init__(
@@ -76,13 +89,18 @@ class MlxWhisperTranscriptionProvider:
         *,
         language: str | None = None,
         temperature: float | tuple[float, ...] = WHISPER_TEMPERATURE_SCHEDULE,
+        cache_limit_bytes: int | None = None,
     ) -> None:
+        if cache_limit_bytes is not None and cache_limit_bytes < 0:
+            raise ValueError(f"cache_limit_bytes must be >= 0 or None, got {cache_limit_bytes}")
         self.model_repo = model_repo
         self.revision = revision
         self.language = language
         self.temperature = temperature
         self.model_id = f"{model_repo}@{revision or 'main'}"
         self._model_path: str | None = None
+        self._cache_limit_bytes = cache_limit_bytes
+        self._cache_bounded = False
 
     def _resolved_model_path(self) -> str:
         model_path = self._model_path
@@ -95,6 +113,9 @@ class MlxWhisperTranscriptionProvider:
         if not audio_wav_path.is_file():
             raise EnrichmentError(f"transcription input is not a file: '{audio_wav_path}'")
         mlx_whisper = import_runtime_module("mlx_whisper", install_hint=_INSTALL_HINT)
+        if self._cache_limit_bytes is not None and not self._cache_bounded:
+            bound_buffer_cache(self._cache_limit_bytes)
+            self._cache_bounded = True
         model_path = self._resolved_model_path()
         try:
             result = mlx_whisper.transcribe(

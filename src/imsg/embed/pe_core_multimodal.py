@@ -77,10 +77,38 @@ Everything heavy is imported lazily inside `_load()` — via
 passes whether or not the `models` extra is installed — and importing
 this module never needs torch. Every test in this build stubs the
 runtime in `sys.modules`.
+
+Only the tower a process uses stays resident (D10.3 defect 2)
+--------------------------------------------------------------
+
+`CustomTextCLIP` is two independent towers that share only a projection
+width. Measured on the development host at the pinned revision
+(2026-09-17): 2,419,267,841 parameters at fp32 = 9.012 GiB, of which the
+vision tower is 1,882,033,920 (7.011 GiB) and the text tower 537,233,920
+(2.001 GiB), plus 0.0008 GiB of buffers. That matches the 9.07 GiB seen
+on the production host — on **both** sides of the nightly window, where
+SPEC §4.1 budgeted ~1 GiB for the query side's text tower and ~4 GiB for
+the enrichment side's vision tower.
+
+Almost every process uses one tower. The MCP server calls only
+`embed_text` (channel C query embedding); the S6 embedding pipeline calls
+only `embed_images`. So the first call decides which tower is needed and
+the other is dropped, in the same breath as the load. What is dropped is
+an `nn.Module` that the remaining tower never reads — the two towers do
+not share parameters — so this is numerically free by construction, and
+`scripts/verify_pe_core_tower_selection.py` proves it by embedding fixed
+synthetic inputs through the whole model and through the selected tower
+and asserting the vectors are **identical**, not close.
+
+Deciding on first use (not at construction) is what keeps a process that
+does both working: asking for a tower that was dropped rebuilds the model
+and keeps both, logging that it did. Nothing about precision changes here
+— fp16 is a separate question with its own accuracy evidence to gather.
 """
 
 from __future__ import annotations
 
+import gc
 import importlib
 import json
 import math
@@ -88,7 +116,7 @@ import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 
@@ -211,6 +239,22 @@ def _l2_normalize(vec: Sequence[float]) -> list[float] | None:
     return [v / norm for v in vec]
 
 
+Tower = Literal["text", "image"]
+
+TOWER_ATTRIBUTES: dict[Tower, str] = {"text": "text", "image": "visual"}
+"""Which `CustomTextCLIP` attribute holds each tower. open_clip's
+`CustomTextCLIP` (the `custom_text: true` class PE-Core's config selects)
+names them `.text` and `.visual`; its `encode_text`/`encode_image` read
+exactly these."""
+
+WIDTH_CHECK_TEXT = "a photo"
+WIDTH_CHECK_IMAGE_SIZE = 64
+"""The fixed, content-free inputs the load-time width check runs — one
+short phrase, and a small synthetic grey square. They prove the *loaded*
+model's output width rather than trusting the config, and the image one
+also proves the vision tower survived the drop."""
+
+
 @dataclass(frozen=True, slots=True)
 class _Runtime:
     torch: Any
@@ -220,6 +264,9 @@ class _Runtime:
     pil_image: Any
     pil_image_ops: Any
     device: str
+    towers: frozenset[Tower]
+    """Which towers are resident. A call needing one that is not forces a
+    rebuild that keeps both (`PeCoreMultimodalEmbeddingProvider._load`)."""
 
 
 class PeCoreMultimodalEmbeddingProvider:
@@ -277,15 +324,51 @@ class PeCoreMultimodalEmbeddingProvider:
     # loading
     # ------------------------------------------------------------------
 
-    def _load(self) -> _Runtime:
-        if self._runtime is not None:
-            return self._runtime
+    def _load(self, tower: Tower) -> _Runtime:
+        """The runtime, with at least `tower` resident.
+
+        The first call decides which tower a process needs and drops the
+        other; a later call for the tower that was dropped rebuilds with
+        both, so a process that embeds text *and* images still works — it
+        just pays the full 9 GiB it actually uses.
+        """
+        runtime = self._runtime
+        if runtime is not None and tower in runtime.towers:
+            return runtime
         with self._load_lock:
-            if self._runtime is None:
-                self._runtime = self._bring_up()
+            current = self._runtime
+            if current is not None and tower in current.towers:
+                return current
+            if current is None:
+                self._runtime = self._bring_up(frozenset({tower}))
+            else:
+                logger.info(
+                    "pe_core.reloading_with_both_towers",
+                    model_id=self.model_id,
+                    had=sorted(current.towers),
+                    now_needs=tower,
+                    note="this process embeds both text and images, so neither tower "
+                    "can be dropped; residency returns to the full model",
+                )
+                # Both references to the superseded runtime have to go
+                # before the replacement is built, or the process holds
+                # two models at once for the length of a load. `current`
+                # is a local binding and `del` is the only thing that
+                # drops it; assigning `None` to the attribute alone is
+                # not enough.
+                self._runtime = None
+                del current
+                self._release_freed_memory()
+                self._runtime = self._bring_up(frozenset({"text", "image"}))
             return self._runtime
 
-    def _bring_up(self) -> _Runtime:
+    def _release_freed_memory(self) -> None:
+        """Give the allocator a chance to hand back what is now
+        unreachable — a collection plus the backend's own cache hint."""
+        gc.collect()
+        self._empty_device_cache()
+
+    def _bring_up(self, towers: frozenset[Tower]) -> _Runtime:
         torch = _import_runtime("torch")
         open_clip = _import_runtime("open_clip")
         hf_hub = _import_runtime("huggingface_hub")
@@ -314,6 +397,7 @@ class PeCoreMultimodalEmbeddingProvider:
                 f"{type(exc).__name__}: {exc}"
             ) from exc
         model.eval()
+        self._drop_unused_towers(model, towers)
 
         runtime = _Runtime(
             torch=torch,
@@ -323,18 +407,87 @@ class PeCoreMultimodalEmbeddingProvider:
             pil_image=pil_image,
             pil_image_ops=pil_image_ops,
             device=device,
+            towers=towers,
         )
-        # One cheap forward through the text tower proves the *loaded*
-        # model's width, not just what its config claimed.
-        self._embed_text_with(runtime, "a photo")
+        # One cheap forward through each resident tower proves the
+        # *loaded* model's width, not just what its config claimed — and,
+        # for the vision tower, that dropping the other one left it
+        # working.
+        if "text" in towers:
+            self._embed_text_with(runtime, WIDTH_CHECK_TEXT)
+        if "image" in towers:
+            self._check_image_tower(runtime)
         logger.info(
             "pe_core.loaded",
             model_id=self.model_id,
             weights_repo=self.weights_repo,
             device=device,
             dim=self.dim,
+            towers=sorted(towers),
         )
         return runtime
+
+    def _drop_unused_towers(self, model: Any, towers: frozenset[Tower]) -> None:
+        """Release the towers this process will not use.
+
+        open_clip builds both towers whichever one you intend to run;
+        there is no supported way to ask it for half a checkpoint. So the
+        model is built whole and the unused half released immediately —
+        the process pays the full 9.01 GiB for the seconds around the
+        load and the tower it uses thereafter (2.00 GiB for text, 7.01
+        GiB for vision; measured at the pinned revision, 2026-09-17).
+
+        Assigning `None` over a registered submodule is how `nn.Module`
+        de-registers one: it stays in `_modules` as `None`, so
+        `named_children`/`eval`/`to` skip it and its parameters become
+        unreachable. Nothing the remaining tower computes reads them —
+        the towers share no parameters — so no output changes.
+        """
+        dropped: list[str] = []
+        for tower, attribute in TOWER_ATTRIBUTES.items():
+            if tower in towers:
+                continue
+            if getattr(model, attribute, None) is None:
+                continue
+            setattr(model, attribute, None)
+            dropped.append(attribute)
+        if not dropped:
+            return
+        self._release_freed_memory()
+        logger.info("pe_core.dropped_unused_towers", model_id=self.model_id, dropped=dropped)
+
+    def _empty_device_cache(self) -> None:
+        """Ask torch to return freed blocks to the OS. Best-effort by
+        nature — it is an allocator hint, and a runtime without the
+        backend module simply has no cache to empty — so a failure here
+        is logged and never raised: the towers are already unreachable,
+        which is the part that matters."""
+        try:
+            torch = importlib.import_module("torch")
+            for backend in ("mps", "cuda"):
+                module = getattr(torch, backend, None)
+                empty_cache = getattr(module, "empty_cache", None)
+                if callable(empty_cache):
+                    empty_cache()
+        except Exception as exc:  # an allocator hint is never worth failing a load
+            logger.debug("pe_core.empty_cache_failed", error=f"{type(exc).__name__}: {exc}")
+
+    def _check_image_tower(self, runtime: _Runtime) -> None:
+        """One forward pass of a fixed synthetic grey square through the
+        vision tower, for the same reason the text check exists."""
+        size = WIDTH_CHECK_IMAGE_SIZE
+        try:
+            probe = runtime.pil_image.new("RGB", (size, size), (128, 128, 128))
+            tensor = runtime.preprocess(probe)
+            rows = self._run_image_tower(runtime, [tensor])
+        except Exception as exc:
+            raise PeCoreRuntimeError(
+                f"{self.model_id} vision tower failed its load-time check: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if len(rows) != 1:
+            raise PeCoreRuntimeError(f"{self.model_id} returned {len(rows)} vectors for 1 image")
+        self._check_width(rows[0], "image")
 
     def _resolve_device(self, torch: Any) -> str:
         requested = self._device
@@ -429,7 +582,7 @@ class PeCoreMultimodalEmbeddingProvider:
     def embed_images(self, image_paths: list[Path]) -> list[list[float]]:
         if not image_paths:
             return []
-        runtime = self._load()
+        runtime = self._load("image")
         out: list[list[float]] = []
         for start in range(0, len(image_paths), self._batch_size):
             out.extend(
@@ -517,7 +670,7 @@ class PeCoreMultimodalEmbeddingProvider:
         asymmetric scheme). Input beyond the model's 72-token BPE
         context is truncated by the tokenizer, which is fine for the
         short channel-C queries this serves."""
-        return self._embed_text_with(self._load(), text)
+        return self._embed_text_with(self._load("text"), text)
 
     def _embed_text_with(self, runtime: _Runtime, text: str) -> list[float]:
         torch = runtime.torch
@@ -552,6 +705,7 @@ __all__ = [
     "OPEN_CLIP_MIRRORS",
     "OPEN_CLIP_PYTORCH_BIN_FILENAME",
     "OPEN_CLIP_SAFETENSORS_FILENAME",
+    "TOWER_ATTRIBUTES",
     "ImageEmbeddingError",
     "PeCoreMultimodalEmbeddingProvider",
     "PeCoreRuntimeError",

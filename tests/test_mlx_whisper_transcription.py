@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from _mlx_fakes import make_mx_module
 from _model_runtime_stubs import block_module, install_hub_stub
 from imsg.enrich.mlx_whisper_transcription import (
     WHISPER_TEMPERATURE_SCHEDULE,
@@ -202,3 +203,47 @@ def test_missing_runtime_is_a_clear_error_naming_the_package(
 def test_satisfies_the_transcription_provider_protocol() -> None:
     provider: TranscriptionProvider = MlxWhisperTranscriptionProvider(REPO, None)
     assert provider.model_id == f"{REPO}@main"
+
+
+# --------------------------------------------------------------------------
+# the MLX buffer-cache bound (D10.2)
+# --------------------------------------------------------------------------
+
+
+def test_the_first_transcription_bounds_the_process_wide_buffer_cache(
+    whisper: WhisperStub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The captioner and the boundary provider bound MLX's cache when
+    their weights load — but a batch that is all audio loads neither, and
+    this is then the only MLX consumer in the process."""
+    mx = make_mx_module()
+    monkeypatch.setitem(sys.modules, "mlx", types.ModuleType("mlx"))
+    monkeypatch.setitem(sys.modules, "mlx.core", mx)
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"RIFF")
+
+    provider = MlxWhisperTranscriptionProvider(REPO, None, cache_limit_bytes=3 * 2**30)
+    provider.transcribe(wav)
+    provider.transcribe(wav)
+
+    # Applied once, not on every task: the limit is process-wide and
+    # re-setting it each time would be a round trip per transcript.
+    assert mx.cache_limit_calls == [3 * 2**30]
+
+
+def test_no_bound_is_applied_when_none_is_configured(
+    whisper: WhisperStub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mx = make_mx_module()
+    monkeypatch.setitem(sys.modules, "mlx", types.ModuleType("mlx"))
+    monkeypatch.setitem(sys.modules, "mlx.core", mx)
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"RIFF")
+
+    MlxWhisperTranscriptionProvider(REPO, None).transcribe(wav)
+    assert mx.cache_limit_calls == []
+
+
+def test_a_negative_bound_is_rejected_at_construction() -> None:
+    with pytest.raises(ValueError, match="cache_limit_bytes"):
+        MlxWhisperTranscriptionProvider(REPO, None, cache_limit_bytes=-1)
