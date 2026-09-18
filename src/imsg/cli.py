@@ -1347,16 +1347,19 @@ def segment(
             )
             typer.echo(
                 f"segment: chat {chat} rebuilt — segments_written={report.segments_written} "
-                f"segments_deleted={report.segments_deleted}"
+                f"segments_deleted={report.segments_deleted} "
+                f"segments_unchanged={report.skipped_unchanged}"
             )
         else:
             chat_ids = {chat} if chat is not None else None
             reports = run_segment(conn, cfg, provider, prompt_bytes, chat_ids=chat_ids, dry_run=dry_run)
             total_written = sum(r.segments_written for r in reports)
             total_fallback = sum(r.fallback_sessions for r in reports)
+            total_unchanged = sum(r.skipped_unchanged for r in reports)
             typer.echo(
                 f"segment: {len(reports)} chat(s) processed, {total_written} segment(s) "
-                f"written, {total_fallback} fallback session(s)"
+                f"written, {total_unchanged} left unchanged, "
+                f"{total_fallback} fallback session(s)"
             )
         if dry_run:
             typer.echo(DRY_RUN_MARKER)

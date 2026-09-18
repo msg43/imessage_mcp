@@ -119,17 +119,41 @@ class PersistedSessionSpan:
 
 
 @dataclass(frozen=True, slots=True)
+class DirtyChatSpan:
+    """The time range of a chat that segmentation has work to do in, as
+    reported by `imsg.segment.pipeline.find_dirty_chats`.
+
+    Both ends are needed: `earliest_changed_at` decides where the
+    rebuild may safely *start* (`compute_recompute_start`) and
+    `latest_changed_at` decides where it may safely *stop*
+    (`compute_recompute_end`). Before the end bound existed, one
+    changed message rebuilt every session from the change to the end of
+    the chat.
+    """
+
+    earliest_changed_at: datetime
+    latest_changed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class SegmentationRunReport:
     """Summary of one `run_segment_for_chat` call, for logging/CLI output."""
 
     chat_id: int
     sessions_written: int = 0
+    """Sessions actually INSERTed. A persisted session whose row is
+    reused (`skipped_unchanged` below) is not counted here, so this is
+    smaller than the number of sessions the run covered."""
     segments_written: int = 0
     segments_deleted: int = 0
     fallback_sessions: int = 0
     """Sessions that fell back to session-as-segment because the
     boundary model failed or returned malformed output (SPEC §8 S4)."""
     skipped_unchanged: int = 0
+    """Segments the recompute reproduced byte-for-byte, left in place:
+    no DELETE, no INSERT, no `search_index_event`, and — because the
+    `segment_id` survives — no `segment_embedding` cascade, so S6 never
+    re-embeds them."""
     notes: tuple[str, ...] = field(default_factory=tuple)
     dry_run: bool = False
     """True when this report came from `run_segment_for_chat(dry_run=

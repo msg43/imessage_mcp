@@ -5,7 +5,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from imsg.segment.models import MessageForSegmentation, PersistedSessionSpan
-from imsg.segment.sessionize import compute_recompute_start, sessionize
+from imsg.segment.sessionize import (
+    compute_recompute_end,
+    compute_recompute_start,
+    sessionize,
+)
 
 _BASE = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
 
@@ -188,3 +192,55 @@ def test_recompute_start_is_never_later_than_the_change() -> None:
                         f"frontier {start} is after the change {changed_at} "
                         f"(gap={gap_hours}h, sessions={[(s.started_at, s.ended_at) for s in sessions]})"
                     )
+
+
+# --- compute_recompute_end -------------------------------------------
+
+
+def test_recompute_end_stops_at_the_first_session_beyond_the_gap() -> None:
+    """Four sealed sessions a day apart, the last change inside the
+    first: the rebuild stops at the second session, so the third and
+    fourth are never fetched, never deleted and never re-embedded."""
+    day = 24 * 60
+    sessions = [_span(i + 1, i * day, i * day + 60) for i in range(4)]
+    latest_changed_at = _BASE + timedelta(minutes=30)  # inside session 1
+    assert compute_recompute_end(sessions, latest_changed_at, 3.0) == sessions[1].started_at
+
+
+def test_recompute_end_is_none_when_every_session_is_within_the_gap() -> None:
+    """A change in the tail session: nothing after it starts a full gap
+    later, so there is no bound and the run behaves exactly as it did
+    before the bound existed."""
+    sessions = [_span(1, 0, 60), _span(2, 300, 360)]
+    latest_changed_at = _BASE + timedelta(minutes=350)
+    assert compute_recompute_end(sessions, latest_changed_at, 3.0) is None
+
+
+def test_recompute_end_is_none_with_no_history() -> None:
+    assert compute_recompute_end([], _BASE, 3.0) is None
+
+
+def test_recompute_end_gap_exactly_at_the_threshold_does_not_bound() -> None:
+    """`sessionize` splits on `> gap`, not `>=`, so a session starting
+    exactly one gap after the change could still absorb a message at the
+    change. The bound uses the same strict comparison."""
+    sessions = [_span(1, 0, 60), _span(2, 180, 240)]
+    latest_changed_at = _BASE  # session 2 starts exactly 3h later
+    assert compute_recompute_end(sessions, latest_changed_at, 3.0) is None
+    assert compute_recompute_end(
+        sessions, latest_changed_at - timedelta(seconds=1), 3.0
+    ) == sessions[1].started_at
+
+
+def test_recompute_end_is_always_after_the_recompute_start() -> None:
+    """The two bounds must never cross: `compute_recompute_start` clamps
+    to the earliest change, the earliest change is at or before the
+    latest, and the end is strictly more than a gap after the latest."""
+    day = 24 * 60
+    sessions = [_span(i + 1, i * day, i * day + 60) for i in range(5)]
+    earliest = _BASE + timedelta(minutes=day + 10)
+    latest = _BASE + timedelta(minutes=day + 50)
+    start = compute_recompute_start(sessions, earliest, 3.0)
+    end = compute_recompute_end(sessions, latest, 3.0)
+    assert end is not None
+    assert start < end

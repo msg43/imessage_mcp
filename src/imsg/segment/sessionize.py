@@ -133,4 +133,65 @@ def compute_recompute_start(
     return min(frontier, earliest_changed_at)
 
 
-__all__ = ["compute_recompute_start", "sessionize"]
+def compute_recompute_end(
+    existing_sessions: Sequence[PersistedSessionSpan],
+    latest_changed_at: datetime,
+    session_gap_hours: float,
+) -> datetime | None:
+    """Where a re-segmentation run for this chat may stop, given that
+    `latest_changed_at` is the last point in time anything changed.
+
+    Returns the `started_at` of the first persisted session that begins
+    more than `session_gap_hours` after `latest_changed_at`, or `None`
+    when no persisted session does (rebuild to the end of the chat, the
+    behaviour before this bound existed). `existing_sessions` must be
+    sorted by `started_at` ascending, same as
+    `compute_recompute_start`.
+
+    The caller treats the result as an *exclusive* upper bound: it
+    fetches messages with `sent_at < T` and rebuilds only persisted
+    sessions with `started_at < T`.
+
+    **Why that session and everything after it is provably unaffected.**
+    Let `B` be the returned bound and `P` the latest `sent_at` strictly
+    before it. A session boundary sits at `B` exactly when
+    `B - P > gap`, so the only way to destroy it is to move `P` later.
+    Three things can change, and none of them can:
+
+    - **An edit or an identity change never moves `sent_at`.** It
+      rewrites a body or a `sender_person_id` and bumps `updated_at`;
+      the timestamp a message is ordered and gap-split by is untouched.
+      So no existing message moves closer to `B`.
+    - **A deletion (or a retraction filtered out by
+      `policy.index_unsent`) only ever removes a message**, which moves
+      `P` *earlier* and widens the gap. A boundary cannot be destroyed
+      by widening the gap in front of it.
+    - **Every added message is at or before `latest_changed_at`.** A
+      message that is not yet in any segment is reported by
+      `find_dirty_chats` with its own `sent_at`, and the span it
+      returns takes `MAX` over exactly those rows — so an added message
+      later than `latest_changed_at` cannot exist without having moved
+      `latest_changed_at` to itself. Since `B - latest_changed_at >
+      gap`, any added message is at least a full `gap` before `B` and
+      cannot pull `P` into reach.
+
+    The same argument covers every persisted session after `B`: they
+    start later still, so they too begin more than `gap` after the last
+    change.
+
+    The one case this cannot see is a `message` row that is *hard
+    deleted* from Postgres rather than retracted — there is no
+    `updated_at` left to observe, so `find_dirty_chats` cannot report
+    it and the span above never widens to cover it. That predates this
+    bound (`find_dirty_chats` would not even report the chat), and
+    nothing in the extract stage deletes `message` rows; `imsg segment
+    --rebuild --chat <id>` is the repair path if one ever does.
+    """
+    gap = timedelta(hours=session_gap_hours)
+    for span in existing_sessions:
+        if span.started_at - latest_changed_at > gap:
+            return span.started_at
+    return None
+
+
+__all__ = ["compute_recompute_end", "compute_recompute_start", "sessionize"]

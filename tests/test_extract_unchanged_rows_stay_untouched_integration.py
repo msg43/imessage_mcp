@@ -700,4 +700,6 @@ def test_identity_curation_still_bumps_every_message_in_the_chat(
 
     dirty = find_dirty_chats(pg_conn, index_unsent=config.policy.index_unsent)
     assert set(dirty) == {chat_ids["chat-alice"]}
-    assert dirty[chat_ids["chat-alice"]] == _BASE, "dirty from the chat's first message"
+    assert dirty[chat_ids["chat-alice"]].earliest_changed_at == _BASE, (
+        "dirty from the chat's first message"
+    )

@@ -122,7 +122,8 @@ def _resegment_dirty(conn: psycopg.Connection, chat_id: int, config: Config) -> 
         config,
         FakeBoundaryProvider(),
         PROMPT_BYTES,
-        earliest_changed_at=dirty[chat_id],
+        earliest_changed_at=dirty[chat_id].earliest_changed_at,
+        latest_changed_at=dirty[chat_id].latest_changed_at,
     )
     conn.commit()
 
@@ -210,7 +211,9 @@ def test_rename_after_segmentation_re_renders_and_re_embeds_the_chat(
 
     dirty = find_dirty_chats(scratch_db, index_unsent=config.policy.index_unsent)
     assert set(dirty) == {chat_id}
-    assert dirty[chat_id] == _BASE, "the whole chat is dirty from its first message"
+    assert dirty[chat_id].earliest_changed_at == _BASE, (
+        "the whole chat is dirty from its first message"
+    )
 
     _resegment_dirty(scratch_db, chat_id, config)
 
