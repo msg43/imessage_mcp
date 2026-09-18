@@ -10,6 +10,23 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-24 — Re-landed: S2 refuses a run whose shim went quiet
+
+- The 2026-09-17 fix of that name (entry below) was dropped from `main`
+  by the 2026-09-24 history rewrite. It is re-applied with its six tests.
+- Conflicts with D12 (merges only add) and D13 (filing messages with no
+  chat link) are resolved so both hold. `run_extract` takes both
+  `merge_mode` and `max_missing_body_fraction`. The missing-record check
+  still runs before the one write transaction and after D13's planning
+  step, which only reads, so a refused run still commits nothing.
+- Checked on the current code: `text_original` now follows D12's
+  `Merge.BODY` rule, which keeps a stored body but cannot fill a first
+  extraction, the same gap as before; `fetch_target_messages` still
+  re-targets an older row only on an edit or retraction; and `imsg-dump`
+  returns a record for a message with no chat link (its query reads the
+  link through a subquery), so D13's rescanned rows are not counted as
+  missing.
+
 ## 2026-09-24 — Public repo made usable and safe for a non-expert
 
 **Why.** A non-expert could not get from a clone to "Claude searches my
@@ -1033,6 +1050,53 @@ another chat, and no amount of waiting recovers them.
 the chat, not the last affected session — `_fetch_messages_from` takes no
 upper bound — so a change early in a long chat re-segments everything
 after it. Tracked separately; this commit only stops messages being lost.
+
+## 2026-09-17 — S2 refuses a run whose shim went quiet, because a body missed on a message's first extraction is missed for good
+
+The merge policy landed earlier today (`text_original` is
+`Merge.PRESENT`) stops a silent `imsg-dump` from blanking a body an
+earlier run stored. It cannot reach the case where the message is new:
+there is no stored value to keep, so the row is inserted bodiless.
+
+**What makes that permanent, measured on a two-message fixture rather
+than argued:** run 1 omits one guid and reports `bodies_missing=1`; run
+2 over the same snapshot with a complete dump targets zero messages,
+reports `bodies_missing=0`, and leaves the body NULL. The watermark
+advances to the snapshot's max ROWID whether or not a body arrived, and
+`fetch_target_messages` re-selects an older row only when its
+`date_edited`/`date_retracted` moved — a merely bodiless message has
+neither. So the corpus keeps a hole that no later run closes, and the
+one counter pointing at it reads clean on exactly the run that could
+have healed it.
+
+- **Too many missing records now fails the run** (`_count_missing_bodies`),
+  and failing is what makes it recoverable: every write in `_do_extract`
+  shares one transaction, so nothing is committed and the next run
+  re-targets the same range. Retrying a whole run is affordable only
+  because the state-idempotence fix stopped unchanged rows from being
+  rewritten — the two changes are load-bearing for each other.
+- **A fraction with a floor, not a flat count**: over
+  `MAX_MISSING_BODY_FRACTION` (10%) of the messages the run targeted, and
+  at least `MIN_MISSING_BODIES_TO_FAIL` (5) of them. The fraction
+  separates a broken shim from one undecodable blob; the floor keeps a
+  small incremental run — a measured nightly targeted 972 of 673,113
+  rows — from tripping on the fraction alone, and stops a permanently
+  undecodable typedstream blob from failing every run forever.
+  **Both numbers are policy, not measurements**: no observed
+  distribution of `bodies_missing` on the real corpus informed them, and
+  the first real run that trips the bound should be read as evidence
+  about the number as much as about the shim. `run_extract` takes
+  `max_missing_body_fraction`; `1.0` disables it.
+- **`is_unsent`/`is_edited` needed no change.** They fall back to the
+  SQL-derived values when the dump record is missing, and those columns
+  are explicitly not authoritative (module docstring, "Correction"), but
+  the fallback is `False` — which `Merge.POSITIVE` already refuses to
+  write over a stored `True`. Now asserted on the missing-record branch
+  specifically, which is a different path than the one the existing
+  retraction test covers.
+
+Six database-gated tests, each checked to fail against the unfixed code.
+No schema change.
 
 ## 2026-09-17 — The nightly enrichment window: one copy of the shared 35B, one PE-Core tower per process, bounded MLX caches, and enrichment that yields to searches
 

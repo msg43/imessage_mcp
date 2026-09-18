@@ -114,6 +114,16 @@ ROWID watermark, so each run also re-reads the snapshot's unlinked rows
 that still need filing. The rules, the rescan and its measured cost are
 in `imsg.stages.unlinked_filing`.
 
+**A run with too few bodies is not committed at all (2026-09-17)**:
+the merge policy above stops a missing `imsg-dump` record from blanking
+a body an earlier run stored, but it cannot help a message being
+extracted for the FIRST time — there is no stored value to keep, so the
+row is inserted bodiless, the watermark advances past it, and
+`fetch_target_messages` never selects it again. `_count_missing_bodies`
+therefore fails the whole run when too large a share of the targeted
+messages came back with no record, so nothing is committed and the next
+run retries the same range.
+
 **System/group-action messages**: chat.db also carries non-conversational
 rows (member added/removed, group name changed, ...) via a nonzero
 `item_type` column. Migration 0001 has no dedicated table for these —
@@ -184,6 +194,22 @@ OBJECT_REPLACEMENT_CHAR = "￼"
 attachment-only message with no caption. Verbatim in `text_original`
 (lossless storage), stripped from the text handed to `normalize_text`
 for the indexed copy (it carries no search value)."""
+
+MAX_MISSING_BODY_FRACTION = 0.10
+"""Fail the run when more than this share of the messages it targeted
+came back with no `imsg-dump` record at all. See
+`_count_missing_bodies` for why a missing record cannot be left to
+degrade, and why the bound is a fraction rather than a count."""
+
+MIN_MISSING_BODIES_TO_FAIL = 5
+"""...but never fail under this many, whatever the fraction. A run that
+targets three messages and cannot decode one of them is at 33%, and a
+single permanently-undecodable typedstream blob must not fail every run
+forever — it is a row to warn about, not a reason to stop extracting.
+Both numbers are policy, not measurements: no observed distribution of
+`bodies_missing` on the real corpus informed them, and the first real
+run that trips the bound should be read as evidence about the number as
+much as about the shim."""
 
 # chat.db's `chat.style` column (widely documented across independent
 # iMessage-forensics tooling, not verified against a real chat.db in
@@ -1059,6 +1085,7 @@ def _do_extract_dry_run(
     imsg_dump_binary: Path,
     run_imsg_dump_fn: RunImsgDumpFn,
     merge_mode: MergeMode,
+    max_missing_body_fraction: float,
 ) -> ExtractResult:
     """SPEC §8 dry-run for S2: `_begin_extraction_run` and `_do_extract`
     each already open their own `conn.transaction()`; calling both from
@@ -1094,6 +1121,7 @@ def _do_extract_dry_run(
                 imsg_dump_binary=imsg_dump_binary,
                 run_imsg_dump_fn=run_imsg_dump_fn,
                 merge_mode=merge_mode,
+                max_missing_body_fraction=max_missing_body_fraction,
             )
             raise _DryRunRollback(result)
     except _DryRunRollback as sentinel:
@@ -1109,6 +1137,7 @@ def run_extract(
     imsg_dump_binary: Path,
     open_snapshot: OpenSnapshotFn = _default_open_snapshot,
     run_imsg_dump_fn: RunImsgDumpFn = _default_run_imsg_dump,
+    max_missing_body_fraction: float = MAX_MISSING_BODY_FRACTION,
     dry_run: bool = False,
     merge_mode: MergeMode = MergeMode.SEED,
 ) -> ExtractResult:
@@ -1119,7 +1148,13 @@ def run_extract(
     `chat.db`. Raises `ExtractionError` for boundary failures (the
     snapshot does not open as SQLite, `imsg-dump` fails to run); a
     single message's decode failure inside `imsg-dump` degrades to a
-    null body there and is *not* an `ExtractionError` here.
+    null body there and is *not* an `ExtractionError` here. Enough of
+    them together is: see `_count_missing_bodies`, which fails the run
+    — committing nothing, so the same range is retried — once the share
+    of targeted messages with no dump record at all passes
+    `max_missing_body_fraction`. Pass `1.0` to disable that bound (no
+    count can exceed every targeted message), which is what a caller
+    knowingly seeding from a partial shim would do.
 
     `merge_mode` is the D12 rule for rows the index already holds.
     Only a caller that knows this snapshot is S1's copy of this
@@ -1171,6 +1206,7 @@ def run_extract(
                 imsg_dump_binary=imsg_dump_binary,
                 run_imsg_dump_fn=run_imsg_dump_fn,
                 merge_mode=merge_mode,
+                max_missing_body_fraction=max_missing_body_fraction,
             )
 
         run_id = _begin_extraction_run(
@@ -1195,6 +1231,7 @@ def run_extract(
                 imsg_dump_binary=imsg_dump_binary,
                 run_imsg_dump_fn=run_imsg_dump_fn,
                 merge_mode=merge_mode,
+                max_missing_body_fraction=max_missing_body_fraction,
             )
         except Exception as exc:
             _fail_extraction_run(conn, run_id)
@@ -1245,6 +1282,74 @@ def _fail_extraction_run(conn: psycopg.Connection, run_id: int) -> None:
         )
 
 
+def _count_missing_bodies(
+    target_messages: Sequence[MessageRow],
+    dump_by_guid: dict[str, ImsgDumpMessage],
+    *,
+    max_missing_body_fraction: float,
+) -> int:
+    """Count the targeted messages `imsg-dump` returned no record for,
+    log one warning each, and fail the whole run when there are too
+    many.
+
+    **Why this cannot simply degrade.** A missing record is not a
+    message with no text — an attachment-only message comes back as the
+    object-replacement character, not as an absent record — so the
+    stored body is left alone for a row that already has one
+    (`text_original` is `Merge.BODY`, D12). That protects re-extraction,
+    and it is the whole protection: on a row's FIRST extraction there is
+    nothing to leave alone, so the message is inserted with a NULL body,
+    and nothing ever comes back for it. The watermark advances to the
+    snapshot's max ROWID at the end of the run whether or not a body
+    arrived, and `fetch_target_messages` re-selects an older row only
+    when its `date_edited`/`date_retracted` moved. A message that is
+    merely bodiless is below the watermark with unmoved timestamps, so
+    no later run — including one whose shim decodes it perfectly —
+    looks at it again. Measured on a two-message fixture: run 1 omits
+    one guid and reports `bodies_missing=1`; run 2 over the same
+    snapshot with a complete dump targets zero messages, reports
+    `bodies_missing=0`, and leaves the body NULL. The counter goes quiet
+    on exactly the run that could have healed the gap.
+
+    So the corpus acquires a permanent, and after one run invisible,
+    hole. `bodies_missing` was already counted and printed, but nothing
+    acted on it. Raising is what makes it recoverable: every write in
+    `_do_extract` — the upserts, the watermark, the run status — is
+    inside one transaction, so an `ExtractionError` rolls all of it back
+    and the next run re-targets exactly the same range. Since the
+    2026-09-17 state-idempotence fix an unchanged row is not rewritten,
+    which is what makes retrying a whole run cheap enough to be the
+    normal response.
+
+    **Why a fraction with a floor** rather than a flat count: the two
+    failures this separates are a broken shim (crashed early, wrong
+    arguments, output truncated — most of the run is missing, and none
+    of it should be committed) and a genuinely undecodable typedstream
+    blob (one row, permanently, on every future run). A flat count
+    cannot tell a thousand missing bodies in a thousand-message
+    incremental run from a thousand in a 670,000-message seed. The floor
+    then keeps a small run from tripping on the fraction alone.
+    """
+    missing = [msg for msg in target_messages if msg.guid not in dump_by_guid]
+    for msg in missing:
+        logger.warning("extract.body_missing_from_dump", guid=msg.guid, rowid=msg.rowid)
+
+    if (
+        len(missing) >= MIN_MISSING_BODIES_TO_FAIL
+        and len(missing) > max_missing_body_fraction * len(target_messages)
+    ):
+        raise ExtractionError(
+            f"imsg-dump returned no record for {len(missing)} of {len(target_messages)} "
+            f"targeted messages "
+            f"(over the {max_missing_body_fraction:.0%} bound, and at or over the "
+            f"{MIN_MISSING_BODIES_TO_FAIL}-message floor) — refusing to commit, because a "
+            "message first extracted without a body keeps that NULL permanently: the "
+            "watermark advances past it and no later run re-targets it. Nothing was "
+            "written; fix the shim and re-run to retry the same range."
+        )
+    return len(missing)
+
+
 def _do_extract(
     *,
     conn: psycopg.Connection,
@@ -1258,6 +1363,7 @@ def _do_extract(
     imsg_dump_binary: Path,
     run_imsg_dump_fn: RunImsgDumpFn,
     merge_mode: MergeMode,
+    max_missing_body_fraction: float,
 ) -> ExtractResult:
     chats = reader.fetch_chats()
     handles = reader.fetch_handles()
@@ -1284,6 +1390,12 @@ def _do_extract(
 
     dump_run = run_imsg_dump_fn(imsg_dump_binary, snapshot_path, dump_since_rowid)
     dump_by_guid: dict[str, ImsgDumpMessage] = {m.guid: m for m in dump_run.messages}
+
+    # Before any write: a run too full of holes must not be committed at all,
+    # and the rows it would have written must stay re-targetable.
+    bodies_missing = _count_missing_bodies(
+        target_messages, dump_by_guid, max_missing_body_fraction=max_missing_body_fraction
+    )
 
     attachments, attachments_by_message = reader.fetch_attachments_for_messages(target_rowids)
 
@@ -1361,7 +1473,6 @@ def _do_extract(
         tapbacks_upserted = 0
         system_messages_skipped = 0
         link_previews_upserted = 0
-        bodies_missing = 0
         bodies_kept_as_history = 0
 
         # D13: where the index already has each unlinked target, and every
@@ -1386,9 +1497,6 @@ def _do_extract(
 
         for msg in target_messages:
             dump_msg = dump_by_guid.get(msg.guid)
-            if dump_msg is None:
-                bodies_missing += 1
-                logger.warning("extract.body_missing_from_dump", guid=msg.guid, rowid=msg.rowid)
 
             if dump_msg is not None and dump_msg.tapback is not None:
                 tapback_row, target_message_id = _upsert_tapback(
