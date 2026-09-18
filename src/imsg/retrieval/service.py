@@ -32,14 +32,23 @@ the drivers, not a precaution:
   is busy in another thread`.
 
 So every public method below holds `_connections` for its whole
-duration. A lock rather than a connection pool because the ceiling on
-any parallelism here is `imsg.retrieval.model_thread`, which is single
-by construction (MLX gives each OS thread its own default GPU stream):
-the embedding and reranking stages, ~0.62 s p50 of a 0.96-1.87 s query
-on the production host (2026-09-17/18), are serialized whatever the
-database does. Pooling would overlap the remainder — worth revisiting
-with a measured per-stage split, and it would need a pool for the
-SQLite side too, since that connection is equally exclusive.
+duration. A lock rather than a connection pool, and the per-stage split
+says by how much: `scripts/bench_retrieval_latency.py --configs
+new:20:256` on the production host (2026-09-18, 20 queries x 2 passes
+against the real index, warm) puts **89 % of a search in the models and
+10 % in the databases** — rerank 611 ms, query embedding 54 ms, PE-Core
+text 20 ms, against 74 ms for every Postgres and SQLite stage together,
+of a 767 ms call.
+
+Every one of those model milliseconds runs on
+`imsg.retrieval.model_thread`, which is single by construction (MLX
+gives each OS thread its own default GPU stream). So a pool could
+overlap one query's 74 ms of database work with another's model work
+and nothing else: about 5 % on two concurrent queries, for a Postgres
+pool plus a SQLite one, since that connection is equally exclusive. The
+lock costs almost exactly what the reranker already costs. If that
+changes — a cheaper reranker, a bigger corpus moving vector search up —
+re-run that command before reopening this.
 """
 
 from __future__ import annotations

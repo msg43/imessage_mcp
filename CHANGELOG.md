@@ -1196,12 +1196,21 @@ MLX's per-thread GPU stream requirement, not for concurrency.
     `ThreadingViolationError: Cursor couldn't run because the Connection
     is busy in another thread`.
 
-  A lock rather than a pool: the ceiling on parallelism here is the
-  single `ModelThread`, and the model stages are ~0.62 s p50 of a
-  0.96-1.87 s query, so pooling would overlap the remainder only — and
-  would need a pool on the SQLite side too, plus `psycopg_pool`, which is
-  not a dependency. Worth revisiting with a measured per-stage split; the
-  numbers to beat are recorded here.
+  A lock rather than a pool, and the per-stage split settles how much
+  that costs. `scripts/bench_retrieval_latency.py --configs new:20:256`
+  on the production host (20 queries x 2 passes against the real index,
+  warm, at the shipped `rerank_top` 20 / doc cap 256 / `ef_search`
+  1000): **89 % of a search is model time and 10 % is database time** —
+  rerank 611 ms, query embedding 54 ms, PE-Core text 20 ms, against
+  74 ms for every Postgres and SQLite stage together (largest:
+  `segment_vector` 42 ms), of a 767 ms call. All of the model time runs
+  on the one `ModelThread`, so a pool could overlap one query's 74 ms of
+  database work with another's model work and nothing else: **about 5 %
+  on two concurrent queries**, in exchange for a Postgres pool, a SQLite
+  pool, and `psycopg_pool` as a new dependency. Not worth it at this
+  ratio. Re-run that command before reopening the question — a cheaper
+  reranker or a corpus large enough to move vector search would change
+  it.
 - **Everything else that now runs off the event loop was checked, and
   needed no change.** `PublicAuthGate`'s mutable state is all lock-guarded
   (verdict cache, both `SlidingWindowLimiter`s, the tokeninfo breaker's
