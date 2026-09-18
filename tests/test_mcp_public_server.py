@@ -43,7 +43,9 @@ from imsg.mcp.tools.public_server import (
     parse_bind_address,
 )
 from imsg.retrieval.access import AccessContext
+from imsg.retrieval.background_warm_up import BackgroundWarmUp, WarmUpPhase
 from imsg.retrieval.errors import NotFoundError, PersonAmbiguousError, PersonCandidate
+from imsg.retrieval.model_thread import ModelThread
 from imsg.retrieval.service import SearchMessagesResult
 
 OWNER_SUB = "300000000000000000003"
@@ -445,12 +447,35 @@ class FakeRetrievalService:
         }
 
 
+def already_warm() -> BackgroundWarmUp:
+    """A warm-up that is already `ready`, so these tests exercise the
+    paths they are about rather than the warm-up gate — which
+    `tests/test_mcp_public_server_warm_up.py` covers on its own.
+
+    A zero-step warm-up settles the moment the model thread picks it up,
+    and needs no thread afterwards, so the thread is closed here rather
+    than left running once per test."""
+    thread = ModelThread(name="test-public-already-warm")
+    try:
+        warm_up = BackgroundWarmUp([], model_thread=thread, log=lambda line: None)
+        warm_up.start()
+        assert warm_up.wait(timeout=5).phase is WarmUpPhase.READY
+        return warm_up
+    finally:
+        thread.close()
+
+
 def make_server(
     *, scope: str = "allowlist", gate: PublicAuthGate | None = None
 ) -> tuple[PublicMcpServer, FakeRetrievalService, PublicAuthGate]:
     g = gate if gate is not None else make_gate()[0]
     service = FakeRetrievalService()
-    server = PublicMcpServer(service=service, gate=g, scope=scope)  # type: ignore[arg-type]
+    server = PublicMcpServer(
+        service=service,  # type: ignore[arg-type]
+        gate=g,
+        scope=scope,  # type: ignore[arg-type]
+        warm_up=already_warm(),
+    )
     return server, service, g
 
 

@@ -77,6 +77,11 @@ from imsg.mcp.audit import PostgresAuditSink
 from imsg.mcp.auth import build_public_gate
 from imsg.mcp.tools.local_server import LocalMcpServer, run_local_server
 from imsg.mcp.tools.public_server import PublicMcpServer, build_public_asgi_app, parse_bind_address
+from imsg.mcp.warm_up_readiness import (
+    WarmUpReadinessFile,
+    read_warm_up_readiness,
+    readiness_path,
+)
 from imsg.mount.guard import run_guard_mount_or_exit
 from imsg.paths import is_contained_in, is_same_file, resolve_path
 from imsg.providers.factory import (
@@ -466,6 +471,12 @@ def status(
     pool = check_buffer_pool(cfg) if pg.reachable else BufferPoolCheck(None, None, None)
     yield_state = check_enrichment_yield(cfg) if pg.reachable else None
     free_bytes = disk_free_bytes(cfg.paths.data_root)
+    # The public MCP surface's own readiness. Read from a file the server
+    # publishes rather than from the server itself: its transport requires
+    # a bearer token on every request by design (SPEC §10.4 hard
+    # requirement 4), and an unauthenticated readiness endpoint would be
+    # the one way past the only access control this project has.
+    public_warm_up = read_warm_up_readiness(cfg.paths.data_root)
 
     report = {
         "models_backend": cfg.models.backend,
@@ -486,6 +497,9 @@ def status(
         "enrichment_yielding_now": yield_state.enrichment_paused if yield_state else None,
         "query_in_flight": yield_state.query_in_flight if yield_state else None,
         "enrichment_yield_reason": yield_state.reason if yield_state else None,
+        "mcp_public_warm_up": public_warm_up.state,
+        "mcp_public_warm_up_detail": public_warm_up.detail,
+        "mcp_public_pid": public_warm_up.pid,
         "watermarks_per_source": None,
         "enrichment_queue_depths": None,
         "fts_applied_event_id": None,
@@ -1805,6 +1819,14 @@ def mcp_public(config: ConfigOption = None) -> None:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
+    # Every model call — the background warm-up and every query — runs on
+    # this one thread, exactly as on the local surface
+    # (imsg.retrieval.model_thread explains why: MLX gives each OS thread
+    # its own default GPU stream, so an array whose computation was set up
+    # on the warm-up's thread cannot be evaluated on the event loop's).
+    # Without it, warming in the background would make queries fail rather
+    # than fast.
+    model_thread = ModelThread()
     query_marker = _query_marker(cfg)
     service = RetrievalService(
         pg_conn=conn,
@@ -1813,6 +1835,7 @@ def mcp_public(config: ConfigOption = None) -> None:
         text_provider=text_provider,
         reranker=reranker,
         multimodal_provider=multimodal_provider,
+        model_thread=model_thread,
         query_marker=query_marker,
     )
     audit = PostgresAuditSink(lambda: connect(cfg.database, autocommit=True))
@@ -1827,7 +1850,22 @@ def mcp_public(config: ConfigOption = None) -> None:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
-    public = PublicMcpServer(service=service, gate=gate, scope=cfg.mcp.public.scope)
+    # The models load in the background while the transport serves. There
+    # is no unauthenticated readiness endpoint to ask — adding one would
+    # be the single hole in the only access control this project has — so
+    # progress goes to stderr (launchd captures it to
+    # <data_root>/logs/imsgindex-mcp-public.err.log) and to a readiness
+    # file `imsg status` reads (imsg.mcp.warm_up_readiness).
+    readiness = WarmUpReadinessFile(readiness_path(cfg.paths.data_root))
+    warm_up = BackgroundWarmUp(
+        service.warm_up_steps(),
+        model_thread=model_thread,
+        log=lambda line: typer.echo(f"mcp public: {line}", err=True),
+        on_status=readiness.publish,
+    )
+    public = PublicMcpServer(
+        service=service, gate=gate, scope=cfg.mcp.public.scope, warm_up=warm_up
+    )
     asgi_app = build_public_asgi_app(
         public,
         allowed_hosts=cfg.mcp.public.allowed_hosts,
@@ -1837,11 +1875,19 @@ def mcp_public(config: ConfigOption = None) -> None:
 
     typer.echo(
         f"mcp public: listening on {host}:{port}, scope={cfg.mcp.public.scope}, "
-        f"external_url={cfg.mcp.public.external_url}"
+        f"external_url={cfg.mcp.public.external_url}",
+        err=True,
     )
+    # Started before the listener binds, and off this thread: the agent is
+    # KeepAlive, so every relaunch is a cold load, and warming only once a
+    # request arrives would put the whole load inside that request. Nothing
+    # here blocks — `start()` hands the steps to the model thread and
+    # returns, so uvicorn binds and serves while the weights load.
+    warm_up.start()
     try:
         uvicorn.run(asgi_app, host=host, port=port, log_level="info")
     finally:
+        model_thread.close()
         query_marker.close()
         fts_conn.close()
         conn.close()
