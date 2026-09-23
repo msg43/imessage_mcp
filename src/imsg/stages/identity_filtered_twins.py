@@ -11,9 +11,11 @@ at a review stub of its own. No later run looks at them again.
 
 Measured read-only on the production index on 2026-09-23: 3,448 such
 canonical handles on 3,448 persons, every person created by the first
-identity import on 2026-08-15, hours before the fix. 2,938 of the handles
-have an untagged twin on a different person. A person-scoped question about
-any of those senders finds only part of what they sent.
+identity import on 2026-08-15, hours before the fix. About 2,940 of the
+handles have an untagged twin on a different person (estimated with SQL
+that imitates the phone parser; the dry run gives the exact count). A
+person-scoped question about any of those senders finds only part of what
+they sent.
 
 What the repair does
 --------------------
