@@ -142,6 +142,7 @@ from imsg.stages.identity import (
     rename_person,
     run_identity,
 )
+from imsg.stages.identity_filtered_twins import run_merge_filtered_twins
 from imsg.stages.identity_overrides import (
     apply_overrides,
     export_overrides,
@@ -1367,6 +1368,106 @@ def identity_apply_overrides(
             err=True,
         )
     typer.echo(f"identity: {result.summary}")
+    _echo_chats_marked_dirty(result.chats_marked_dirty)
+    if dry_run:
+        typer.echo(DRY_RUN_MARKER)
+
+
+@identity_app.command("merge-filtered-twins")
+def identity_merge_filtered_twins(
+    config: ConfigOption = None,
+    dry_run: DryRunOption = False,
+    show_names: Annotated[
+        bool,
+        typer.Option(
+            "--show-names",
+            help="Also print the names and the handle value of each refused pair. Without it, "
+            "refused pairs are listed by person_id only.",
+        ),
+    ] = False,
+) -> None:
+    """Merge the persons an early import split on iOS filter tags ("(filtered)", "(smsft…)").
+
+    Source handles resolved before the filter-tag fix of 2026-08-15 still
+    point at a canonical handle that carries the tag, owned by a person of
+    its own, so one sender appears as two persons. This repoints them to the
+    clean handle and merges the two persons (keeping a curated name), and
+    gives a tagged handle with no clean twin its clean value. Two persons
+    with different curated names, and the owner, are never merged: those
+    pairs are listed and left as they are. Messages, chats and raw source
+    handles are never deleted. Run with --dry-run first: it reports the same
+    counts and writes nothing.
+
+    Every merge and stub rename marks the chats whose segments name the
+    persons involved for re-segmentation, and the last line reports how
+    many. Run `imsg segment` and then `imsg embed` afterwards; until then
+    the index keeps the old names in those chats' segments, embeddings and
+    FTS rows.
+    """
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        result = run_merge_filtered_twins(
+            conn=conn, default_region=cfg.identity.default_region, dry_run=dry_run
+        )
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    typer.echo(
+        f"identity: tagged_source_handles={result.tagged_source_handles} "
+        f"legacy_source_handles={result.legacy_source_handles}"
+    )
+    typer.echo(f"identity: {result.summary}")
+    for pair in result.refused:
+        why = (
+            "both carry curated names that differ"
+            if pair.reason == "curated_conflict"
+            else "one of them is the owner person"
+        )
+        line = (
+            f"identity: refused person {pair.legacy_person_id} (tagged handle) and person "
+            f"{pair.target_person_id} (clean handle): {why}"
+        )
+        if show_names:
+            line += (
+                f" — {pair.legacy_display_name!r} / {pair.target_display_name!r}, "
+                f"{pair.clean_kind} {pair.clean_value!r}"
+            )
+        typer.echo(line, err=True)
+    if result.refused:
+        typer.echo(
+            "identity: refused pairs were left unchanged; decide them by hand with "
+            "`imsg identity merge` or `imsg identity rename`, then run this again",
+            err=True,
+        )
+    typer.echo(
+        f"identity: allowlist rows removed with merged-away persons="
+        f"{result.allowlist_rows_absorbed} kept persons narrowed={result.allowlist_rows_narrowed}"
+    )
+    if result.other_stale_source_handles:
+        typer.echo(
+            f"identity: WARNING {result.other_stale_source_handles} untagged source handle(s) "
+            "resolve to a canonical handle that today's normalizer would not produce; this "
+            "command does not repair them",
+            err=True,
+        )
+    typer.echo(
+        "identity: invariant "
+        f"unresolved_message_senders={result.invariant.unresolved_message_senders} "
+        f"unresolved_tapback_senders={result.invariant.unresolved_tapback_senders} "
+        f"unresolved_chat_participants={result.invariant.unresolved_chat_participants} "
+        f"ok={result.invariant.ok}"
+    )
+    if not result.invariant.ok:
+        typer.echo(
+            "identity: invariant NOT satisfied — segmentation (S4) must not run "
+            "until this is clean (SPEC §8 S3)",
+            err=True,
+        )
     _echo_chats_marked_dirty(result.chats_marked_dirty)
     if dry_run:
         typer.echo(DRY_RUN_MARKER)

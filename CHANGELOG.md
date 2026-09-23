@@ -10,6 +10,50 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-23 — One person per sender again: `imsg identity merge-filtered-twins`
+
+Owner decision D13, item 4. iOS tags a filtered sender's handle `(filtered)`
+or `(smsft…)`. `normalize_handle` has stripped the tag since 2026-08-15
+(`4122c51`), but S3 resolves only source handles that have no resolution
+row, so every source handle resolved before that fix kept a tag-carrying
+canonical handle and a stub person of its own. Measured read-only on the
+production index: 3,448 such handles on 3,448 persons, every person created
+by the first identity import on 2026-08-15, about four hours before the fix;
+3,357 persons reached only through `(filtered)` handles. A person-scoped
+search found only part of what those senders sent.
+
+- **`imsg identity merge-filtered-twins [--dry-run] [--show-names]`**
+  (`imsg.stages.identity_filtered_twins`). For each tagged source handle
+  whose canonical handle is not what `normalize_handle` gives it today, it
+  repoints the source handle to the clean twin handle and merges the two
+  persons with `merge_persons`. Where no twin exists, it rewrites the tagged
+  handle to its clean value and renames a stub still named after the tagged
+  value. The emptied tagged handle is then removed. Left on the kept person
+  it would stop `rematch-stubs` naming that stub, and `export-overrides`
+  would take it for a hand merge. The twin's person is kept unless only the
+  tagged side carries a curated name. Two different curated names, and the
+  owner, are refused and listed, never merged. No message, tapback, chat or
+  source handle is deleted. Every merge and rename marks its chats for
+  re-segmentation. It runs as one transaction, and `--dry-run` rolls it back.
+- **`merge_persons` no longer copies the absorbed person's allowlist row**
+  onto a kept person that has none. That allowlisted everything the kept
+  person ever sent. The kept row now stands, narrowed by the absorbed row
+  when both exist.
+- **The tag pattern also accepts whitespace inside and between tags and any
+  `smsft_` suffix, and never strips a value down to nothing.** None of these
+  forms is in the production index today: its 3,414 `(filtered)` and 113
+  `(smsft…)` source handles all match the old pattern.
+- **Forecast for the production dry run** (read-only SQL that imitates the
+  phone parser, so approximate): 2,944 persons merged, 494 handles
+  rewritten, 3 pairs refused for different curated names, none involving the
+  owner.
+- **Tests:** 33 new. Of those, 20 failed on the old code: 13 because the
+  command or a helper did not exist, 7 on assertions (4 tag forms left
+  unstripped, a bare tag emptied, and the 2 allowlist rules). The other 13
+  pin behavior that was already right. The repair tests also caught six
+  deliberate breaks of the new code. Full suite 1,952 passed. A synthetic run
+  at production size (627,500 messages, 3,000 merges) took 35 s.
+
 ## 2026-09-23 — Corpus merges only add: a seed inserts and fills, and never replaces a value
 
 Owner decision D12: "Always want to merge and maintain the fullest corpus

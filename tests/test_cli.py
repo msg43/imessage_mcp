@@ -974,6 +974,76 @@ def test_identity_apply_overrides_rejects_a_bad_file_before_touching_the_databas
     assert "Traceback" not in result.output
 
 
+def test_identity_merge_filtered_twins_wires_the_repair_and_prints_counts(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.stages.identity_filtered_twins import FilteredTwinsResult, RefusedPair
+
+    captured: dict[str, Any] = {}
+
+    def fake_repair(*, conn: Any, default_region: str, dry_run: bool = False) -> FilteredTwinsResult:
+        captured.update(default_region=default_region, dry_run=dry_run)
+        return FilteredTwinsResult(
+            tagged_source_handles=9,
+            legacy_source_handles=8,
+            legacy_handles=7,
+            source_handles_repointed=5,
+            handles_rewritten=1,
+            legacy_handles_merged=5,
+            persons_merged=4,
+            stubs_renamed=1,
+            refused=(
+                RefusedPair(
+                    reason="curated_conflict", clean_value="bob@example.com", clean_kind="email",
+                    legacy_person_id=21, legacy_display_name="Robert Builder",
+                    target_person_id=12, target_display_name="Bob Builder",
+                ),
+            ),
+            allowlist_rows_absorbed=0,
+            allowlist_rows_narrowed=0,
+            other_stale_source_handles=2,
+            invariant=_clean_invariant(),
+            chats_marked_dirty=6,
+            dry_run=dry_run,
+        )
+
+    monkeypatch.setattr(cli_module, "run_merge_filtered_twins", fake_repair)
+
+    result = runner.invoke(
+        app, ["identity", "merge-filtered-twins", "--config", str(mocked_pg_env), "--dry-run"]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured == {"default_region": "US", "dry_run": True}
+    assert "identity: tagged_source_handles=9 legacy_source_handles=8" in result.output
+    assert (
+        "identity: legacy_handles=7 persons_merged=4 handles_rewritten=1 legacy_handles_merged=5 "
+        "source_handles_repointed=5 stubs_renamed=1 refused_curated=1 refused_owner=0"
+    ) in result.output
+    assert (
+        "identity: refused person 21 (tagged handle) and person 12 (clean handle): "
+        "both carry curated names that differ"
+    ) in result.output
+    assert "Robert Builder" not in result.output  # names only with --show-names
+    assert "WARNING 2 untagged source handle(s)" in result.output
+    assert "identity: invariant" in result.output and "ok=True" in result.output
+    assert "identity: chats marked for re-segmentation: 6" in result.output
+    assert "run `imsg segment` and then `imsg embed`" in result.output
+    assert "DRY RUN — nothing was written" in result.output
+
+    result = runner.invoke(
+        app,
+        ["identity", "merge-filtered-twins", "--config", str(mocked_pg_env), "--show-names"],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["dry_run"] is False
+    assert "'Robert Builder' / 'Bob Builder', email 'bob@example.com'" in result.output
+    assert "DRY RUN" not in result.output
+
+    result = runner.invoke(app, ["identity", "merge-filtered-twins", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "imsg segment" in result.output and "imsg embed" in result.output
+
+
 def test_identity_export_overrides_refuses_a_path_outside_data_root(
     mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

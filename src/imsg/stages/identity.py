@@ -75,7 +75,9 @@ class ContactsAccessDeniedError(IdentityError):
 # --------------------------------------------------------------------------
 
 
-_IOS_FILTER_SUFFIX_RE = re.compile(r"(?:\((?:filtered|smsft(?:_[a-z]{2})?)\))+$", re.IGNORECASE)
+_IOS_FILTER_SUFFIX_RE = re.compile(
+    r"(?:\s*\(\s*(?:filtered|smsft(?:_[a-z]+)?)\s*\))+\s*$", re.IGNORECASE
+)
 
 
 def strip_ios_filter_suffix(raw_value: str) -> str:
@@ -91,13 +93,27 @@ def strip_ios_filter_suffix(raw_value: str) -> str:
     Measured on the real corpus (2026-08-15): 3,448 tagged handles and
     **2,803 persons that collapse once this is stripped** — the single
     largest source of person fragmentation in the index, far larger than
-    every Contacts ambiguity combined.
+    every Contacts ambiguity combined. Re-measured on the production index
+    2026-09-23: 3,414 `(filtered)` and 113 `(smsft…)` source handles, every
+    one of them already matched by this pattern.
 
     Deliberately anchored and allowlisted rather than "cut at the first
     paren": real corpora contain genuine handles like `(800) 555-0199`, and a
-    naive strip would corrupt it.
+    naive strip would corrupt it. Whitespace is tolerated around the tags,
+    between stacked tags and inside the parentheses, and an `smsft` suffix
+    may be any run of letters; none of those forms occurs in the measured
+    corpus, and each would otherwise have split a sender again. A value that
+    is nothing but a tag is returned unchanged rather than emptied: an empty
+    identifier would fuse every such sender into one handle.
     """
-    return _IOS_FILTER_SUFFIX_RE.sub("", raw_value).strip()
+    stripped = _IOS_FILTER_SUFFIX_RE.sub("", raw_value).strip()
+    return stripped or raw_value.strip()
+
+
+def has_ios_filter_suffix(raw_value: str) -> bool:
+    """Whether `raw_value` carries an iOS filtering tag that
+    `strip_ios_filter_suffix` would remove."""
+    return strip_ios_filter_suffix(raw_value) != raw_value.strip()
 
 
 def normalize_handle(raw_value: str, default_region: str) -> tuple[str, str]:
@@ -890,10 +906,25 @@ def _mark_chats_dirty_for_persons(
 def merge_persons(
     conn: psycopg.Connection, *, keep_person_id: int, absorb_person_id: int
 ) -> frozenset[int]:
-    """Repoint every handle/message/tapback/participant/allowlist row
-    from `absorb_person_id` onto `keep_person_id` in one transaction,
-    then delete the absorbed person (SPEC §8 S3: "merges repoint
+    """Repoint every handle/message/tapback/participant row from
+    `absorb_person_id` onto `keep_person_id` in one transaction, then
+    delete the absorbed person (SPEC §8 S3: "merges repoint
     handles/messages/participants in one transaction").
+
+    **The absorbed person's allowlist flags never widen access
+    (2026-09-23).** Eligibility denies a chat unless every participant and
+    sender is `text_allowed` (`imsg.export.eligibility`), so a flag that
+    moves from one person to another can open chats nobody allowlisted.
+    Before this date the absorbed person's `allowlist_person` row was copied
+    onto a kept person that had none, which did exactly that: allowlisting a
+    fragment and merging it into a named person allowlisted everything the
+    named person ever sent. Now the kept person's row, or its absence,
+    stands; when both persons have a row, each flag stays on only if both
+    rows had it on, so an explicit revocation on either side survives the
+    merge; and the absorbed person's row is deleted with the person. The
+    merged person can only end up with the same or less access than the
+    kept person had. The absorbed person's former chats are judged by that
+    row from then on, since their messages are now the kept person's.
 
     Returns the chats marked for re-segmentation
     (`_mark_chats_dirty_for_persons`): the absorbed person's chats, whose
@@ -935,9 +966,11 @@ def merge_persons(
         cur.execute("DELETE FROM chat_participant WHERE person_id = %s", (absorb_person_id,))
         cur.execute(
             """
-            INSERT INTO allowlist_person (person_id, text_allowed, attachments_allowed, note)
-            SELECT %s, text_allowed, attachments_allowed, note FROM allowlist_person WHERE person_id = %s
-            ON CONFLICT (person_id) DO NOTHING
+            UPDATE allowlist_person kept
+            SET text_allowed = kept.text_allowed AND absorbed.text_allowed,
+                attachments_allowed = kept.attachments_allowed AND absorbed.attachments_allowed
+            FROM allowlist_person absorbed
+            WHERE kept.person_id = %s AND absorbed.person_id = %s
             """,
             (keep_person_id, absorb_person_id),
         )
@@ -1099,8 +1132,10 @@ __all__ = [
     "assert_invariant_or_raise",
     "assign_handle",
     "compute_invariant_report",
+    "has_ios_filter_suffix",
     "merge_persons",
     "normalize_handle",
     "rename_person",
     "run_identity",
+    "strip_ios_filter_suffix",
 ]
