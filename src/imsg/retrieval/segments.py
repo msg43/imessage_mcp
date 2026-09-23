@@ -16,11 +16,13 @@ small, acceptable duplication in the build report.
 
 **Under `allowlist` scope nothing here returns stored text.** A
 conversation window hides unsent messages and edit history whatever
-`policy.*` says, and shows an attachment's content only where the
-request's `imsg.retrieval.access.AttachmentGate` allows it.
-`render_segment_texts` re-renders search results under the same rules,
-because `segment.rendered_text` was rendered with every attachment's text
-and with `policy.*` as it stood at segmentation time.
+`policy.*` says, hides messages in Apple's "Recently Deleted" (D13), and
+shows an attachment's content only where the request's
+`imsg.retrieval.access.AttachmentGate` allows it. `render_segment_texts`
+re-renders search results under the same rules, because
+`segment.rendered_text` was rendered with every attachment's text, every
+deleted message, and `policy.*` as it stood at segmentation time. Under
+`full` scope a deleted message is shown, labelled `[deleted]`.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
+from imsg.export.eligibility import exportable_message_sql
 from imsg.retrieval.access import AttachmentGate, RequestScope, attachment_gate
 from imsg.retrieval.errors import InvalidArgumentError, NotFoundError
 from imsg.segment.models import (
@@ -262,7 +265,7 @@ def resolve_anchor(
 _MESSAGE_COLUMNS = """
     m.message_id, m.message_key, m.source_guid, m.sent_at, m.is_from_me,
     m.text_original, m.is_unsent, m.is_edited, m.has_attachments,
-    m.sender_person_id, p.short_name
+    m.sender_person_id, p.short_name, m.deleted_at
 """
 
 
@@ -294,6 +297,7 @@ def _rows_to_messages(
         is_edited: bool = row[7]
         has_attachments: bool = row[8]
         short_name: str | None = row[10]
+        is_deleted = row[11] is not None
         sender_short_name = "owner" if is_from_me else (short_name or "unknown")
         messages.append(
             MessageForSegmentation(
@@ -310,6 +314,7 @@ def _rows_to_messages(
                 attachments=tuple(attachments_by_message.get(message_id, ())),
                 tapback_suffixes=tuple(tapbacks_by_message.get(message_id, ())),
                 edit_history=tuple(edit_history_by_message.get(message_id, ())),
+                is_deleted=is_deleted,
             )
         )
     return messages
@@ -473,11 +478,13 @@ def fetch_conversation_window(
     of silently consuming one of the `window` after-anchor slots.
 
     `index_unsent` / `include_edit_history` are the `policy.*` values;
-    `scope` decides whether they apply (never under `allowlist`) and
-    which attachments show their content. The caller has already
-    authorized `resolution.chat_id` under `scope`."""
+    `scope` decides whether they apply (never under `allowlist`), whether
+    deleted messages show (labelled, under `full` only) and which
+    attachments show their content. The caller has already authorized
+    `resolution.chat_id` under `scope`."""
     index_unsent = scope.shows_unsent(index_unsent)
     include_edit_history = scope.shows_edit_history(include_edit_history)
+    show_deleted = scope.shows_deleted
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -486,6 +493,7 @@ def fetch_conversation_window(
             LEFT JOIN person p ON p.person_id = m.sender_person_id
             WHERE m.chat_id = %(chat_id)s AND m.sent_at < %(anchor)s
               AND (%(index_unsent)s OR NOT m.is_unsent)
+              AND (%(show_deleted)s OR m.deleted_at IS NULL)
             ORDER BY m.sent_at DESC, m.message_id DESC
             LIMIT %(window)s
             """,
@@ -493,6 +501,7 @@ def fetch_conversation_window(
                 "chat_id": resolution.chat_id,
                 "anchor": anchor_dt,
                 "index_unsent": index_unsent,
+                "show_deleted": show_deleted,
                 "window": window,
             },
         )
@@ -505,6 +514,7 @@ def fetch_conversation_window(
             LEFT JOIN person p ON p.person_id = m.sender_person_id
             WHERE m.chat_id = %(chat_id)s AND m.sent_at >= %(anchor)s
               AND (%(index_unsent)s OR NOT m.is_unsent)
+              AND (%(show_deleted)s OR m.deleted_at IS NULL)
             ORDER BY m.sent_at ASC, m.message_id ASC
             LIMIT %(limit)s
             """,
@@ -512,6 +522,7 @@ def fetch_conversation_window(
                 "chat_id": resolution.chat_id,
                 "anchor": anchor_dt,
                 "index_unsent": index_unsent,
+                "show_deleted": show_deleted,
                 "limit": window + 1,  # +1 for the anchor message itself
             },
         )
@@ -545,6 +556,7 @@ def fetch_conversation_window(
                 "is_from_me": message.is_from_me,
                 "is_unsent": message.is_unsent,
                 "is_edited": message.is_edited,
+                "is_deleted": message.is_deleted,
                 "text": line,
                 "untrusted_content": True,
             }
@@ -569,6 +581,7 @@ class _ChatHeader:
     kind: str
     display_name: str | None
     other_participant_display_names: tuple[str, ...]
+    unfiled: bool = False
 
 
 def _chat_headers(cur: psycopg.Cursor, chat_ids: list[int]) -> dict[int, _ChatHeader]:
@@ -580,10 +593,14 @@ def _chat_headers(cur: psycopg.Cursor, chat_ids: list[int]) -> dict[int, _ChatHe
     if not chat_ids:
         return {}
     cur.execute(
-        "SELECT chat_id, kind, display_name FROM chat WHERE chat_id = ANY(%(ids)s::bigint[])",
+        "SELECT chat_id, kind, display_name, unfiled_key IS NOT NULL FROM chat "
+        "WHERE chat_id = ANY(%(ids)s::bigint[])",
         {"ids": chat_ids},
     )
-    base = {int(chat_id): (str(kind), display_name) for chat_id, kind, display_name in cur.fetchall()}
+    base = {
+        int(chat_id): (str(kind), display_name, bool(unfiled))
+        for chat_id, kind, display_name, unfiled in cur.fetchall()
+    }
     cur.execute(
         """
         SELECT cp.chat_id, p.display_name
@@ -602,8 +619,9 @@ def _chat_headers(cur: psycopg.Cursor, chat_ids: list[int]) -> dict[int, _ChatHe
             kind=kind,
             display_name=display_name,
             other_participant_display_names=tuple(others.get(chat_id, ())),
+            unfiled=unfiled,
         )
-        for chat_id, (kind, display_name) in base.items()
+        for chat_id, (kind, display_name, unfiled) in base.items()
     }
 
 
@@ -617,9 +635,10 @@ def render_segment_texts(
 ) -> dict[int, str]:
     """Each segment's §9.1 text rendered now, from its rows, under
     `scope`: only segments whose chat `scope` admits, each attachment
-    through the request's `AttachmentGate`, and never an unsent message
-    or an edit history — this is the renderer for scopes that withhold
-    content, so it applies D1 unconditionally rather than reading
+    through the request's `AttachmentGate`, and never an unsent message,
+    a deleted one or an edit history — this is the renderer for scopes
+    that withhold content, so it applies D1 and D13's exclusions
+    (`exportable_message_sql`) unconditionally rather than reading
     `policy.*`. Used in place of the stored `segment.rendered_text`
     whenever `scope.withholds_ineligible_content` (module docstring). A
     segment with no message left to show is absent from the result, as
@@ -651,7 +670,7 @@ def render_segment_texts(
             JOIN message m ON m.message_id = sm.message_id
             LEFT JOIN person p ON p.person_id = m.sender_person_id
             WHERE sm.segment_id = ANY(%(ids)s::bigint[])
-              AND NOT m.is_unsent
+              AND {exportable_message_sql('m')}
             ORDER BY sm.segment_id, m.sent_at, m.message_id
             """,
             {"ids": admitted},
@@ -690,6 +709,7 @@ def render_segment_texts(
                 chat_display_name=header.display_name,
                 timezone=timezone,
                 attachment_snippet_chars=attachment_snippet_chars,
+                unfiled=header.unfiled,
             )
     return texts
 

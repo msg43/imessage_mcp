@@ -115,7 +115,8 @@ def test_apply_pending_creates_every_table_and_hnsw_index(
         )
         row = cur.fetchone()
     assert row is not None
-    assert row[0] == 36  # 35 from 0001 + attachment_mm_embedding from 0002
+    # 35 from 0001 + attachment_mm_embedding from 0002 + chat_group_id from 0007
+    assert row[0] == 37
 
 
 def test_apply_pending_is_idempotent(scratch_db: psycopg.Connection) -> None:

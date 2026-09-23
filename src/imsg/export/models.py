@@ -22,6 +22,10 @@ DENY_SOURCE_PERSON_NOT_ALLOWLISTED = "resolved-source-person-not-allowlisted"
 DENY_UNRESOLVED_SENDER = "unresolved-message-sender"
 DENY_SENDER_NOT_ALLOWLISTED = "sender-not-allowlisted"
 DENY_TAPBACK_SENDER = "tapback-sender-unresolved-or-not-allowlisted"
+DENY_HOLDING_CHAT = "holding-chat"
+"""A holding chat (`chat.unfiled_key` set, D13): messages no real chat
+could be named for. Nobody allowlisted its thread, because it is not
+one; it is served under `full` scope only."""
 
 
 @dataclass(frozen=True, slots=True)

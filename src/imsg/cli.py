@@ -761,6 +761,19 @@ def _extract_report_lines(result: ExtractResult) -> list[str]:
         f"bodies_kept_as_history={result.bodies_kept_as_history} "
         f"tapback_targets_resolved={result.tapback_targets_resolved}"
     )
+    # D13: messages with no chat link. `rescanned` rows came from below the
+    # watermark; the next five say which rule placed each message this run
+    # inserted or moved out of a holding chat.
+    u = result.unlinked
+    lines.append(
+        f"unlinked: rescanned={u.rescanned} recoverable_join={u.recoverable_join} "
+        f"ck_1to1={u.ck_1to1} ck_group_match={u.ck_group_match} "
+        f"holding_lost_group={u.holding_lost_group} holding_sender={u.holding_sender} "
+        f"moved_from_holding={u.moved_from_holding} evidence_raised={u.evidence_raised} "
+        f"in_recently_deleted={u.in_recently_deleted} chats_created={u.chats_created} "
+        f"holding_chats_created={u.holding_chats_created} "
+        f"skipped_without_date={u.skipped_without_date}"
+    )
     return lines
 
 

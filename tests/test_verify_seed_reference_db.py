@@ -44,11 +44,12 @@ def _apple_ns(dt: datetime) -> int:
 
 
 def _build_fixture(path: Path) -> None:
-    """Six rows: two the extractor keeps, four it routes elsewhere."""
+    """Seven rows: three the extractor keeps, four it routes elsewhere or
+    cannot file."""
     conn = sqlite3.connect(str(path))
     try:
         conn.executescript(_SCHEMA)
-        rows = [
+        rows: list[tuple[int, str, datetime | None, str | None, bytes | None, int, int, bool]] = [
             # (rowid, guid, date, text, attributedBody, item_type, assoc_type, joined)
             (1, "keep-2023", datetime(2023, 6, 1, tzinfo=UTC), "hello", None, 0, 0, True),
             # No text and no attributedBody — the body-decode-null proxy.
@@ -59,14 +60,17 @@ def _build_fixture(path: Path) -> None:
             (4, "drop-sticker", datetime(2024, 3, 4, tzinfo=UTC), None, b"\x01", 0, 1000, True),
             # A system row (someone named the group).
             (5, "drop-system", datetime(2024, 3, 5, tzinfo=UTC), None, None, 2, 0, True),
-            # Orphan: no chat_message_join row at all.
-            (6, "drop-nochat", datetime(2024, 3, 6, tzinfo=UTC), "orphan", None, 0, 0, False),
+            # No chat_message_join row at all. Filed since D13 (2026-09-23),
+            # so the reference must count it.
+            (6, "keep-nochat", datetime(2024, 3, 6, tzinfo=UTC), "orphan", None, 0, 0, False),
+            # No chat link and no date: `sent_at` is NOT NULL, so it cannot be filed.
+            (7, "drop-nochat-nodate", None, "undated", None, 0, 0, False),
         ]
         for rowid, guid, when, text, body, item_type, assoc, joined in rows:
             conn.execute(
                 "INSERT INTO message (ROWID, guid, date, text, attributedBody, item_type, "
                 "associated_message_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (rowid, guid, _apple_ns(when), text, body, item_type, assoc),
+                (rowid, guid, None if when is None else _apple_ns(when), text, body, item_type, assoc),
             )
             if joined:
                 conn.execute(
@@ -90,7 +94,7 @@ def chat_db(tmp_path: Path) -> Path:
 
 def test_guid_set_is_only_what_the_extractor_lands_in_message(chat_db: Path) -> None:
     snap = build_seed_snapshot_from_chat_db(chat_db, source_label="corpus")
-    assert snap.guids == {"keep-2023", "keep-2024-nobody"}
+    assert snap.guids == {"keep-2023", "keep-2024-nobody", "keep-nochat"}
 
 
 def test_stickers_are_excluded_like_reactions(chat_db: Path) -> None:
@@ -101,18 +105,28 @@ def test_stickers_are_excluded_like_reactions(chat_db: Path) -> None:
     assert "drop-tapback" not in snap.guids
 
 
-def test_system_rows_and_chatless_rows_are_excluded(chat_db: Path) -> None:
+def test_system_rows_and_undated_chatless_rows_are_excluded(chat_db: Path) -> None:
     snap = build_seed_snapshot_from_chat_db(chat_db, source_label="corpus")
     assert "drop-system" not in snap.guids
-    assert "drop-nochat" not in snap.guids
+    assert "drop-nochat-nodate" not in snap.guids
+
+
+def test_chatless_rows_count_because_extraction_files_them(chat_db: Path) -> None:
+    """D13 (2026-09-23): a row with no `chat_message_join` is filed into a
+    chat by its evidence, or a holding chat, instead of being dropped. A
+    reference that still left it out would report every such message the
+    index now holds as an extra, and could never catch one that went
+    missing."""
+    snap = build_seed_snapshot_from_chat_db(chat_db, source_label="corpus")
+    assert "keep-nochat" in snap.guids
 
 
 def test_diagnostics(chat_db: Path) -> None:
     snap = build_seed_snapshot_from_chat_db(chat_db, source_label="corpus")
     assert snap.source_label == "corpus"
-    assert snap.per_year_counts == {"2023": 1, "2024": 1}
+    assert snap.per_year_counts == {"2023": 1, "2024": 2}
     assert snap.min_sent_at is not None and snap.min_sent_at.startswith("2023-06-01T00:00:00")
-    assert snap.max_sent_at is not None and snap.max_sent_at.startswith("2024-03-02T00:00:00")
+    assert snap.max_sent_at is not None and snap.max_sent_at.startswith("2024-03-06T00:00:00")
     # Only the kept row with neither text nor attributedBody.
     assert snap.body_decode_null_count == 1
     # The attachment on the excluded system row must not be counted.

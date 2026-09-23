@@ -46,7 +46,18 @@ Design rules this module enforces mechanically:
 
 Unsent messages: excluded from *documents* unconditionally (D1), but
 their senders still count as deny evidence here — an outsider's
-retracted message is still an outsider in the thread.
+retracted message is still an outsider in the thread. Messages in
+Apple's "Recently Deleted" (`message.deleted_at`, D13) are excluded the
+same way and count the same way: `exportable_message_sql` is the one
+statement of the content rule, used by export and the allowlist scope
+alike.
+
+**Holding chats are denied outright** (D13, 2026-09-23). Extraction files
+a message whose chat cannot be named into a holding chat
+(`chat.unfiled_key`): one per lost group, per sender, or for the owner.
+Its participants are whoever happened to be filed there, not the members
+of a conversation anyone allowlisted, so no allowlist can make one
+eligible. The rule reads only `chat`, so it runs in the first pass.
 
 **Two ways to evaluate the same rules.** `compute_chat_eligibility` runs
 every rule over every chat and keeps each chat's reasons, for the export
@@ -72,6 +83,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from imsg.export.models import (
+    DENY_HOLDING_CHAT,
     DENY_PARTICIPANT_NOT_ALLOWLISTED,
     DENY_SENDER_NOT_ALLOWLISTED,
     DENY_SOURCE_PERSON_NOT_ALLOWLISTED,
@@ -98,6 +110,16 @@ def effective_sender_sql(alias: str) -> str:
 
 _EFFECTIVE_SENDER = effective_sender_sql("m")
 _EFFECTIVE_TAPBACK_SENDER = effective_sender_sql("t")
+
+
+def exportable_message_sql(alias: str) -> str:
+    """True for a `message` row (aliased `alias`) whose content may appear
+    in an export document or under `allowlist` scope: never an unsent
+    message (D1) and never one in Apple's "Recently Deleted" (D13). Not a
+    parameter anywhere, so no caller can switch it off; under `full`
+    scope the retrieval service shows deleted messages, labelled, by not
+    applying it."""
+    return f"(NOT {alias}.is_unsent AND {alias}.deleted_at IS NULL)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +153,13 @@ class _DenyRule:
 # can only shrink the eligible set; removing one can only widen it —
 # treat deletions here as security-relevant.
 _DENY_RULES: tuple[_DenyRule, ...] = (
+    _DenyRule(
+        reason=DENY_HOLDING_CHAT,
+        chat_column="c.chat_id",
+        source="chat c",
+        evidence="c.unfiled_key IS NOT NULL",
+        reads_messages=False,
+    ),
     _DenyRule(
         reason=DENY_PARTICIPANT_NOT_ALLOWLISTED,
         chat_column="cp.chat_id",
@@ -292,18 +321,19 @@ def compute_attachment_eligibility(
 ) -> dict[tuple[int, int], bool]:
     """The separate attachment gate: `(segment_id, attachment_id) ->
     content may export`, for attachments linked into the given segments
-    by at least one non-unsent message.
+    by at least one exportable message (`exportable_message_sql`: not
+    unsent, not deleted).
 
-    True requires EVERY non-unsent message link inside that segment to
+    True requires EVERY exportable message link inside that segment to
     have a resolvable effective sender with `attachments_allowed =
     true` (SPEC §11.2 "via every message link through which it enters
     the document"). `bool_and` over `coalesce(..., false)` means a
     single unresolvable sender or missing allowlist row flips the whole
     pair to deny.
 
-    Pairs absent from the result (e.g. linked only via unsent messages)
-    must be treated as denied by callers — the attachment then simply
-    never enters any document.
+    Pairs absent from the result (e.g. linked only via unsent or deleted
+    messages) must be treated as denied by callers — the attachment then
+    simply never enters any document.
     """
     if not segment_ids:
         return {}
@@ -321,7 +351,7 @@ def compute_attachment_eligibility(
             JOIN message_attachment ma ON ma.message_id = m.message_id
             LEFT JOIN allowlist_person al ON al.person_id = {_EFFECTIVE_SENDER}
             WHERE sm.segment_id = ANY(%(segment_ids)s)
-              AND NOT m.is_unsent
+              AND {exportable_message_sql('m')}
             GROUP BY sm.segment_id, ma.attachment_id
             """,
             {"segment_ids": segment_ids, "owner": owner},
@@ -362,6 +392,7 @@ __all__ = [
     "compute_chat_eligibility",
     "effective_sender_sql",
     "eligible_chat_ids",
+    "exportable_message_sql",
     "owner_person_id",
     "snapshot_allowlist",
 ]

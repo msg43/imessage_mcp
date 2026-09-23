@@ -32,10 +32,12 @@ the other side is a host running this software. A *recovered* or
 *merged* corpus has no such host — it is just a `chat.db`-shaped file —
 which left AT-2 unrunnable for exactly the kind of seed it was written
 to check. `build_seed_snapshot_from_chat_db` builds the same
-`SeedSnapshot` straight from that file, applying in SQL the same three
+`SeedSnapshot` straight from that file, applying in SQL the same
 inclusion filters `imsg.stages.extract._do_extract` applies in Python,
 so the verdict keeps its meaning: a missing GUID is a message the
-extractor should have landed and did not.
+extractor should have landed and did not. Since owner decision D13
+(2026-09-23) that includes messages with no `chat_message_join` row,
+which extraction now files instead of dropping.
 
 Duplicate messages across sources are expected and are not a
 completeness gap (SPEC §12 AT-2: "duplicates across sources are
@@ -54,6 +56,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from imsg.stages.unlinked_filing import CHAT_DB_TAPBACK_TYPES_SQL
 
 if TYPE_CHECKING:
     import psycopg
@@ -133,38 +137,28 @@ APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=UTC)
 APPLE_EPOCH_UNIX_OFFSET = 978_307_200
 """Seconds from the Unix epoch to `APPLE_EPOCH`, for SQLite's `unixepoch`."""
 
-CHAT_DB_TAPBACK_TYPES_SQL = (
-    "COALESCE(m.associated_message_type, 0) = 1000 "
-    "OR COALESCE(m.associated_message_type, 0) BETWEEN 2000 AND 3999"
-)
-"""Which `chat.db` rows the extractor routes to `tapback` instead of
-`message`.
-
-`imsg.stages.extract._do_extract` does not decide this from SQL at all
-— it asks `imsg-dump` (the typedstream decoder) and `continue`s on any
-row that comes back with a `tapback`. This clause is the SQL-only
-restatement of that decision, needed because a reference built from a
-bare SQLite file has no decoder to ask. The `2000..3999` half is the
-documented reaction range; the `1000` half (stickers) is the part that
-is easy to get wrong, and is included on evidence, not on inference:
-in the 2026-08-20 merged corpus all 17 `associated_message_type = 1000`
-rows are present in Postgres's `tapback` table and absent from
-`message`, so the live extractor did treat them as tapbacks.
-
-Getting this wrong does not corrupt anything — it makes AT-2 report
-tapbacks as "missing messages" — but it makes the verdict useless, so
-it is stated here once rather than re-derived per call site."""
+# `CHAT_DB_TAPBACK_TYPES_SQL` (imported above) is which `chat.db` rows the
+# extractor routes to `tapback` instead of `message`, restated in SQL
+# because a reference built from a bare SQLite file has no decoder to ask.
+# It is defined once, in `imsg.stages.unlinked_filing`, which uses it for
+# the same decision before `imsg-dump` runs. Getting it wrong corrupts
+# nothing, but it makes AT-2 report tapbacks as "missing messages".
 
 _ELIGIBLE_MESSAGE_WHERE = f"""
     m.guid IS NOT NULL
     AND NOT ({CHAT_DB_TAPBACK_TYPES_SQL})
     AND COALESCE(m.item_type, 0) = 0
-    AND EXISTS (SELECT 1 FROM chat_message_join j WHERE j.message_id = m.ROWID)
+    AND (EXISTS (SELECT 1 FROM chat_message_join j WHERE j.message_id = m.ROWID)
+         OR COALESCE(m.date, 0) <> 0)
 """
-"""The three filters `_do_extract` applies before it upserts a `message`
-row, in the same order: tapbacks go to `tapback`, `item_type != 0` is a
-skipped system row, and a row with no `chat_message_join` is logged as
-`extract.message_without_chat` and dropped."""
+"""The filters `_do_extract` applies before it upserts a `message` row,
+in the same order: tapbacks go to `tapback`, and `item_type != 0` is a
+skipped system row. A row with no `chat_message_join` is filed like any
+other since D13 (2026-09-23) and counts, unless it has no date: those
+cannot be filed (`message.sent_at` is NOT NULL), and the extractor
+counts them as `skipped_without_date`. Before D13 every unlinked row was
+dropped here, and a reference built this way reported every one the
+extractor now lands as an extra local message."""
 
 
 def _open_chat_db_read_only(db_path: Path) -> sqlite3.Connection:

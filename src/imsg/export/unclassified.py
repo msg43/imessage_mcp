@@ -51,8 +51,12 @@ _UNCLASSIFIED_SQL = """
     JOIN unlisted u ON u.chat_id = c.chat_id
     LEFT JOIN thread_classification tc ON tc.chat_id = c.chat_id
     WHERE coalesce(tc.state, 'unreviewed') = 'unreviewed'
+      AND c.unfiled_key IS NULL
     ORDER BY r.last_activity DESC
 """
+"""Holding chats (`chat.unfiled_key`, D13) are left out: eligibility
+denies them whoever is allowlisted, so classifying one could never make
+it export, and listing it would suggest otherwise."""
 
 
 def _participants_line(conn: psycopg.Connection, chat_id: int) -> str:

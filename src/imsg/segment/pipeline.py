@@ -128,18 +128,21 @@ class ChatContext:
     """Every chat participant's `display_name` except the owner (SPEC
     §9.1's rendered header never lists the owner in their own "Chat:
     ..." line)."""
+    is_unfiled: bool = False
+    """A holding chat (`chat.unfiled_key` set, D13): its header says so."""
 
 
 def fetch_chat_context(conn: psycopg.Connection, chat_id: int) -> ChatContext:
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT source_guid, kind, display_name FROM chat WHERE chat_id = %s",
+            "SELECT source_guid, kind, display_name, unfiled_key IS NOT NULL "
+            "FROM chat WHERE chat_id = %s",
             (chat_id,),
         )
         row = cur.fetchone()
         if row is None:
             raise SegmentationError(f"chat_id {chat_id} not found")
-        source_guid, kind, display_name = row
+        source_guid, kind, display_name, is_unfiled = row
 
         cur.execute(
             """
@@ -159,6 +162,7 @@ def fetch_chat_context(conn: psycopg.Connection, chat_id: int) -> ChatContext:
         kind=kind,
         display_name=display_name,
         other_participant_display_names=others,
+        is_unfiled=bool(is_unfiled),
     )
 
 
@@ -202,6 +206,17 @@ def find_dirty_chats(
     timestamp that moved **backwards** would leave the session still
     holding the message beyond the bound, never rebuilt and permanently
     stale. Reaching the holding session's end closes that.
+
+    **A message that changed chat (D13, 2026-09-23)** makes two chats
+    dirty. Extraction moves a message out of a holding chat when stronger
+    evidence names its chat (`imsg.stages.unlinked_filing`), and the move
+    is an UPDATE, so the message is a `changed` row: the chat it joined is
+    reported from its `sent_at`, and the chat whose segment still holds it
+    (`s.chat_id`) is reported over that segment's session, so the stale
+    segment is rebuilt without it. `run_segment_for_chat` also drops such
+    a segment itself before inserting the message anywhere
+    (`segment_message` allows each message in one segment only), so the
+    order the two chats run in does not matter.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -217,21 +232,39 @@ def find_dirty_chats(
                   AND (%(index_unsent)s OR NOT m.is_unsent)
                 GROUP BY m.chat_id
             ),
-            changed AS (
-                SELECT m.chat_id,
-                       MIN(m.sent_at) AS earliest,
-                       MAX(GREATEST(m.sent_at, sess.ended_at)) AS latest
+            changed_rows AS (
+                SELECT m.chat_id, s.chat_id AS segment_chat_id, m.sent_at,
+                       sess.started_at AS session_started_at,
+                       sess.ended_at AS session_ended_at
                 FROM message m
                 JOIN segment_message sm ON sm.message_id = m.message_id
                 JOIN segment s ON s.segment_id = sm.segment_id
                 JOIN session sess ON sess.session_id = s.session_id
                 WHERE m.updated_at > s.created_at
-                GROUP BY m.chat_id
+            ),
+            changed AS (
+                SELECT chat_id,
+                       MIN(sent_at) AS earliest,
+                       MAX(CASE WHEN segment_chat_id = chat_id
+                                THEN GREATEST(sent_at, session_ended_at)
+                                ELSE sent_at END) AS latest
+                FROM changed_rows
+                GROUP BY chat_id
+            ),
+            moved_out AS (
+                SELECT segment_chat_id AS chat_id,
+                       MIN(session_started_at) AS earliest,
+                       MAX(session_ended_at) AS latest
+                FROM changed_rows
+                WHERE segment_chat_id <> chat_id
+                GROUP BY segment_chat_id
             )
             SELECT chat_id, MIN(earliest), MAX(latest) FROM (
                 SELECT * FROM unsegmented
                 UNION ALL
                 SELECT * FROM changed
+                UNION ALL
+                SELECT * FROM moved_out
             ) combined
             GROUP BY chat_id
             """,
@@ -290,6 +323,7 @@ def _rows_to_messages(
         has_attachments,
         sender_person_id,
         short_name,
+        deleted_at,
     ) in rows:
         if not is_from_me and sender_person_id is None:
             raise SegmentationError(
@@ -313,6 +347,7 @@ def _rows_to_messages(
                 attachments=tuple(attachments_by_message.get(message_id, ())),
                 tapback_suffixes=tuple(tapbacks_by_message.get(message_id, ())),
                 edit_history=tuple(edit_history_by_message.get(message_id, ())),
+                is_deleted=deleted_at is not None,
             )
         )
     return messages
@@ -321,7 +356,7 @@ def _rows_to_messages(
 _MESSAGE_SELECT_COLUMNS = """
     m.message_id, m.source_guid, m.sent_at, m.is_from_me,
     m.text_original, m.is_unsent, m.is_edited, m.has_attachments,
-    m.sender_person_id, p.short_name
+    m.sender_person_id, p.short_name, m.deleted_at
 """
 
 
@@ -636,7 +671,9 @@ class _WritePlan:
     segments_to_delete: tuple[int, ...]
     """Segments dropped individually out of a session that is being
     kept — disjoint from the segments that cascade off
-    `sessions_to_delete`."""
+    `sessions_to_delete` — plus any segment of *another* chat that still
+    holds a message now filed in this one (D13: a message moved out of a
+    holding chat), which has to go before this chat can place it."""
     reused_session_ids: dict[datetime, int]
     ended_at_updates: tuple[tuple[int, datetime], ...]
     sessions_to_insert: tuple[Session, ...]
@@ -653,9 +690,14 @@ def _plan_writes(
     stale_sessions: list[PersistedSessionSpan],
     recomputed_sessions: list[Session],
     rendered_by_session_start: dict[datetime, list[RenderedSegment]],
+    foreign_segment_ids: tuple[int, ...] = (),
 ) -> _WritePlan:
     """Diff the recomputed sessions/segments against what is already
     stored in the rebuild range.
+
+    `foreign_segment_ids` are other chats' segments that still hold a
+    message this chat is about to place (`_foreign_segments_holding`);
+    they are deleted with this chat's stale segments.
 
     A persisted session is matched by `started_at` — `session` has a
     `UNIQUE (chat_id, started_at)`, so within one chat that is a real
@@ -718,6 +760,8 @@ def _plan_writes(
     for s in sessions_to_insert:
         segments_to_insert[s.started_at] = tuple(rendered_by_session_start.get(s.started_at, []))
 
+    segments_to_delete.extend(foreign_segment_ids)
+
     return _WritePlan(
         sessions_to_delete=tuple(sessions_to_delete),
         segments_to_delete=tuple(segments_to_delete),
@@ -729,6 +773,33 @@ def _plan_writes(
         segments_written=sum(len(v) for v in segments_to_insert.values()),
         skipped_unchanged=skipped_unchanged,
     )
+
+
+def _foreign_segments_holding(
+    conn: psycopg.Connection, chat_id: int, message_ids: list[int]
+) -> tuple[int, ...]:
+    """Segments of other chats that still hold one of `message_ids`, all
+    of which are filed in `chat_id` now. Only a D13 move out of a holding
+    chat makes one (`imsg.stages.unlinked_filing.refile_message`): the
+    message's `chat_id` changed while its old segment stood. Dropping that
+    segment here, in the same transaction that places the message, is what
+    keeps `segment_message`'s one-segment-per-message index from refusing
+    the insert when this chat is rebuilt before the one the message left.
+    The chat it left is re-segmented on its own (`find_dirty_chats`)."""
+    if not message_ids:
+        return ()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT sm.segment_id
+            FROM segment_message sm
+            JOIN segment s ON s.segment_id = sm.segment_id
+            WHERE sm.message_id = ANY(%(ids)s::bigint[]) AND s.chat_id <> %(chat_id)s
+            ORDER BY sm.segment_id
+            """,
+            {"ids": message_ids, "chat_id": chat_id},
+        )
+        return tuple(int(row[0]) for row in cur.fetchall())
 
 
 def _delete_stale_and_emit_delete_events(
@@ -905,6 +976,7 @@ def refresh_segment_rendering(
         chat_display_name=chat_ctx.display_name,
         timezone=config.render.timezone,
         attachment_snippet_chars=config.render.attachment_snippet_chars,
+        unfiled=chat_ctx.is_unfiled,
     )
     rendered_sha = sha256_text(text)
     with conn.cursor() as cur:
@@ -1042,6 +1114,7 @@ def run_segment_for_chat(
                 chat_display_name=chat_ctx.display_name,
                 timezone=config.render.timezone,
                 attachment_snippet_chars=config.render.attachment_snippet_chars,
+                unfiled=chat_ctx.is_unfiled,
             )
             rendered_sha = sha256_text(text)
             stable_key = compute_stable_key(
@@ -1067,6 +1140,9 @@ def run_segment_for_chat(
         stale_sessions=stale_sessions,
         recomputed_sessions=sessions,
         rendered_by_session_start=rendered_by_session_start,
+        foreign_segment_ids=_foreign_segments_holding(
+            conn, chat_id, [m.message_id for m in messages]
+        ),
     )
 
     if dry_run:

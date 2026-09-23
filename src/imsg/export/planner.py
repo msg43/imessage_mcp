@@ -37,6 +37,7 @@ from imsg.export.documents import (
 from imsg.export.eligibility import (
     compute_attachment_eligibility,
     eligible_chat_ids,
+    exportable_message_sql,
     owner_person_id,
     snapshot_allowlist,
 )
@@ -314,9 +315,10 @@ def _fetch_export_segments(
         # D1 is enforced structurally here: `NOT m.is_unsent` is not a
         # parameter, and only `text_original` (the latest text) is
         # selected — there is no code path that could include a
-        # `message_version` row in an export document.
+        # `message_version` row in an export document. D13 adds deleted
+        # messages to the same fixed exclusion (`exportable_message_sql`).
         cur.execute(
-            """
+            f"""
             SELECT sm.segment_id, m.message_id, m.sent_at, m.text_original,
                    p.short_name
             FROM segment_message sm
@@ -324,7 +326,7 @@ def _fetch_export_segments(
             LEFT JOIN person p ON p.person_id =
                 coalesce(m.sender_person_id, CASE WHEN m.is_from_me THEN %(owner)s::bigint END)
             WHERE sm.segment_id = ANY(%(segment_ids)s)
-              AND NOT m.is_unsent
+              AND {exportable_message_sql('m')}
             ORDER BY m.sent_at, m.message_id
             """,
             {"segment_ids": segment_ids, "owner": owner},

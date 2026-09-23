@@ -16,13 +16,16 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 Every buildable component of the governing spec is implemented: 8
 pipeline stages, hybrid retrieval, both MCP surfaces, the export gate,
 the eval harness, 34 CLI commands (counting subcommands), migrations
-0001–0006. 1,952 tests, all passing against a scratch Postgres (measured
+0001–0007. 2,002 tests, all passing against a scratch Postgres (measured
 2026-09-23); ruff and mypy strict clean; DDL lint clean. Since 2026-09-23
 extraction merges only add (D12): a seed inserts rows and fills empty
 values, and only this machine's own live `chat.db` may replace a value.
 `imsg identity merge-filtered-twins` (2026-09-23) merges the persons that
 the pre-fix import split on iOS filter tags; it has not yet run on the
-production index.
+production index. Also since 2026-09-23 every message is filed (D13),
+including rows with no chat link: into the chat their evidence names, or
+a holding chat that `allowlist` scope and export deny; each seed source
+picks its rows up on its next extraction, and none has run yet.
 
 **This status previously read "code complete, unrun" and stayed that way
 for three weeks after it stopped being true** — see `CHANGELOG.md`

@@ -19,7 +19,19 @@ from imsg.segment.models import AttachmentSnippet, MessageForSegmentation, Segme
 
 RENDERER_VERSION = "1"
 """Unchanged by `WITHHELD_ATTACHMENT`: segmentation never renders a
-withheld attachment, so no stored text renders differently."""
+withheld attachment, so no stored text renders differently.
+
+Unchanged by `DELETED_LABEL` and the holding-chat header (D13,
+2026-09-23) for the same reason: both render only for rows that did not
+exist before migration 0007 (a message with `deleted_at`, a chat with
+`unfiled_key`), and every other input renders byte for byte as before.
+A message that gains `deleted_at` moves its own `updated_at`, so its
+chat is re-segmented and picks up the label then. Bumping the version
+would instead re-render and re-embed the whole corpus for nothing."""
+
+DELETED_LABEL = "[deleted]"
+"""Leads the body of a message in Apple's "Recently Deleted" (D13:
+deleted messages are searchable, labelled, and not hidden)."""
 
 _EMPTY_SNIPPET = "—"  # em dash, matches the SPEC §9.1 example's "ocr \"—\""
 
@@ -79,6 +91,8 @@ def _format_message(message: MessageForSegmentation, *, tz: ZoneInfo, snippet_ch
         body = f"{body} [edited from: {history}]" if body else f"[edited from: {history}]"
     for suffix in message.tapback_suffixes:
         body = f"{body} {suffix}" if body else suffix
+    if message.is_deleted:
+        body = f"{DELETED_LABEL} {body}" if body else DELETED_LABEL
     return f"[{local_time:%H:%M}] {message.sender_short_name}: {body}"
 
 
@@ -105,8 +119,15 @@ def render_segment(
     chat_display_name: str | None,
     timezone: str,
     attachment_snippet_chars: int,
+    unfiled: bool = False,
 ) -> str:
     """SPEC §9.1: build the rendered/indexed/returned text for one segment.
+
+    `unfiled` marks a holding chat (D13: messages no real chat could be
+    named for). Its name says so (`Unfiled: ...`) and is shown in the
+    header whatever the chat's kind, so a reader never takes a holding
+    chat for a real 1:1 conversation. A real chat renders exactly as
+    before.
 
     `participants` are the chat's *other* participants' `display_name`s
     (the owner is never listed in their own "Chat: ..." header, matching
@@ -124,6 +145,8 @@ def render_segment(
     header_people = ", ".join(participants)
     if chat_kind == "group":
         title = f' (group "{chat_display_name}")' if chat_display_name else " (group)"
+    elif unfiled and chat_display_name:
+        title = f" ({chat_display_name})"
     else:
         title = ""
     chat_line = f"Chat: {header_people}{title}"
@@ -143,4 +166,10 @@ def render_segment(
     return "\n".join(lines)
 
 
-__all__ = ["RENDERER_VERSION", "WITHHELD_ATTACHMENT", "render_message_line", "render_segment"]
+__all__ = [
+    "DELETED_LABEL",
+    "RENDERER_VERSION",
+    "WITHHELD_ATTACHMENT",
+    "render_message_line",
+    "render_segment",
+]

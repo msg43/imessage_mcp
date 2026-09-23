@@ -31,7 +31,11 @@ defines eligibility for export, and §10.3a says the public surface uses
   with `attachments_allowed`. Anything else shows a content-free
   placeholder (`AttachmentSnippet.withheld`);
 - no unsent messages and no prior edit versions, whatever `policy.*` says
-  (D1, the same unconditional exclusions §11.2 imposes on export);
+  (D1, the same unconditional exclusions §11.2 imposes on export), and no
+  messages in Apple's "Recently Deleted" (D13; `imsg.export.eligibility.
+  exportable_message_sql` states both content rules once);
+- no holding chats (D13: messages no real chat could be named for), which
+  the chat rule denies outright;
 - only people who appear in an eligible chat, in `list_people` and in
   person-filter resolution and its near-match suggestions (D6).
 
@@ -57,6 +61,7 @@ from imsg.export.eligibility import (
     compute_attachment_eligibility,
     effective_sender_sql,
     eligible_chat_ids,
+    exportable_message_sql,
     owner_person_id,
 )
 
@@ -175,6 +180,13 @@ class RequestScope:
         `allowlist` (D1)."""
         return policy_index_edit_history and self.is_full
 
+    @property
+    def shows_deleted(self) -> bool:
+        """Messages in Apple's "Recently Deleted": always under `full`
+        scope, labelled `[deleted]` (D13: searchable, not hidden); never
+        under `allowlist`, which serves what export would ship."""
+        return self.is_full
+
 
 def resolve_request_scope(
     conn: psycopg.Connection | None,
@@ -203,7 +215,8 @@ def resolve_request_scope(
 def visible_person_ids(conn: psycopg.Connection, scope: RequestScope) -> frozenset[int] | None:
     """The people a request may see by name: `None` (everyone) under
     `full` scope; under `allowlist`, every participant of an eligible
-    chat and every effective sender of a non-unsent message in one. The
+    chat and every effective sender of an exportable message (not unsent,
+    not deleted) in one. The
     chat rule has already required each of them to be `text_allowed`, so
     this set is the allowlisted people the caller can find content from —
     an allowlisted person with no eligible chat is not in it."""
@@ -220,7 +233,7 @@ def visible_person_ids(conn: psycopg.Connection, scope: RequestScope) -> frozens
             UNION
             SELECT {sender} FROM message m
             WHERE m.chat_id = ANY(%(chats)s::bigint[])
-              AND NOT m.is_unsent
+              AND {exportable_message_sql('m')}
               AND {sender} IS NOT NULL
             """,
             {"chats": sorted(scope.eligible_chat_ids), "owner": scope.owner_person_id},

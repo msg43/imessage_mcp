@@ -10,6 +10,86 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-23 — Every message is filed: rows with no chat link go into the chat their evidence names, or a holding chat
+
+Owner decision D13: recall over purity. "I'd rather keep all the messages
+in the active corpus." `chat.db` keeps some messages with no
+`chat_message_join` row, and S2 logged each one
+(`extract.message_without_chat`) and dropped it. A read-only survey of the
+four sources the production index reads found 2,543 distinct such messages
+in no chat of the index: 168 in Apple's "Recently Deleted", 11 with a 1:1
+chat id that agrees with the sender, 1,967 carrying the id of a group chat
+that no longer exists as a linked chat, and 397 with no chat evidence.
+
+- **Filing rules, in order** (`imsg.stages.unlinked_filing`): the chat
+  "Recently Deleted" names (`recoverable_join`, with `message.deleted_at`);
+  the 1:1 chat a `ck_chat_id` names when its handle is the sender or the
+  owner sent it (`ck_1to1`; created under Apple's own GUID when the index
+  lacks it); the one indexed group a group-style id names
+  (`ck_group_match`, filed automatically, accepting the measured misfiling);
+  otherwise a holding chat per lost group id (`holding_lost_group`); and
+  with no evidence at all, a holding chat per sender, one for the owner's
+  own messages (`holding_sender`). `message.chat_evidence` records which.
+  A 1:1 id that names someone other than the sender counts as no evidence.
+- **Group ids are matched across sources.** Every run records each chat's
+  `group_id` and `original_group_id` in `chat_group_id`, and a lost group is
+  matched against every indexed chat. On the Studio's own snapshot none of
+  its 21 lost group ids is carried by any of its own chats, so its share of
+  the 688 rows that do match a group can only be matched through the ids
+  other sources record.
+- **A message moves only toward stronger evidence, never out of a real
+  chat.** A message in a holding chat moves when a later run or source
+  names a chat on stronger evidence, including a chat link. A message in a
+  real chat never changes chat; stronger evidence for the same chat only
+  raises `chat_evidence`. A move is filing, not a merge: it does not count
+  as `replaced`, so a seed still shows `replaced=0`. S4 follows a moved
+  message: `find_dirty_chats` reports both chats, and the destination drops
+  the old segment before placing the message, whichever chat runs first.
+- **Rescan without a flag.** These rows sit below every ROWID watermark, so
+  each run also reads the snapshot's unlinked rows at or below it and
+  selects those that still need work: missing from the index, movable out
+  of a holding chat, or deleted without a delete date in the index. The
+  selection runs before `imsg-dump`, which then decodes back only to the
+  lowest selected row, and the next run selects nothing. Measured on the
+  Studio: the candidate query takes 0.49–0.52 s warm (2.2 s cold) on a
+  699,673-message snapshot with 2,392 candidates; re-recording 21,437
+  group-id pairs takes 48–53 ms; the weakly-filed lookup 1.3–1.8 ms
+  through its partial index. A run that finds work decodes the file once:
+  8.2–8.5 s for 700,000 rows.
+- **Serving.** Under `full` scope, on the local surface and the public one,
+  holding chats and deleted messages are searchable; a deleted message
+  renders as `[deleted]`, and a holding chat's header says it is unfiled.
+  Under `allowlist` scope holding chats are denied by a new rule in the
+  shared eligibility module (`holding-chat`), and deleted messages never
+  show. Export leaves deleted messages out as it leaves out unsent ones:
+  `exportable_message_sql` states both exclusions once, and export, the
+  allowlist re-render, the conversation window, `list_people` and the
+  attachment gate all use it. The unclassified-threads report skips holding
+  chats, which no allowlist can make eligible. The renderer version is not
+  bumped: every existing row renders byte for byte as before.
+- **AT-2** counts a dated message with no chat link in a reference built
+  from a `chat.db` file, since extraction now lands it. An undated one
+  cannot be filed (`sent_at` is NOT NULL); extraction counts it as
+  `skipped_without_date` instead of failing the run.
+- **The chat link is read deterministically**: the lowest chat ROWID that
+  exists in the snapshot, as `imsg-dump` already did. A link to a chat row
+  the file lacks counts as no link.
+- **Migration 0007** (additive): `chat.unfiled_key` (unique, set only on
+  holding chats), `message.chat_evidence` (NOT NULL, default
+  `chat_message_join`, which is how every existing message was filed; no
+  table rewrite), `message.deleted_at`, the `chat_group_id` table, and a
+  partial index for the weakly-filed lookup. Run `imsg migrate` before this
+  build extracts anything.
+- **Tests:** 50 new (28 extraction and 4 serving integration tests, 17
+  unit tests, 1 AT-2 test), each run first against core 14ee55c, where all
+  50 failed or could not import. Four existing test files changed with the
+  schema and the rule: the table count, the per-table report, the AT-2
+  reference fixture, and the CLI report test, which now also checks the
+  unlinked line; the shared `chat.db` fixture gained the columns and table
+  the rules read. Full suite 2,002 passed against a scratch Postgres 17,
+  rebased on the twin merge (the next entry down; 1,919 on 14ee55c in the
+  same environment); ruff, mypy strict and the DDL lint clean.
+
 ## 2026-09-23 — One person per sender again: `imsg identity merge-filtered-twins`
 
 Owner decision D13, item 4. iOS tags a filtered sender's handle `(filtered)`

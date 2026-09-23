@@ -859,12 +859,14 @@ def test_every_table_reports_inserts_then_nothing_on_a_replay(
     assert set(counts) >= {
         "chat", "source_handle", "attachment", "message", "tapback", "message_version",
         "link_preview", "message_attachment", "chat_participant_source", "message_source",
-        "attachment_source",
+        "attachment_source", "chat_group_id",
     }
     assert {t: c.inserted for t, c in counts.items()} == {
         "chat": 2, "source_handle": 2, "attachment": 2, "message": 4, "tapback": 1,
         "message_version": 1, "link_preview": 1, "message_attachment": 2,
         "chat_participant_source": 4, "message_source": 4, "attachment_source": 2,
+        # This fixture's chat table has no group-id columns (D13, migration 0007).
+        "chat_group_id": 0,
     }
 
     replay = _seed(pg_conn, tmp_path, world, "seed-replay")

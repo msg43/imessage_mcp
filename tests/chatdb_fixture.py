@@ -27,7 +27,9 @@ CREATE TABLE chat (
     guid TEXT UNIQUE,
     style INTEGER,
     display_name TEXT,
-    service_name TEXT
+    service_name TEXT,
+    group_id TEXT,
+    original_group_id TEXT
 );
 
 CREATE TABLE handle (
@@ -52,12 +54,20 @@ CREATE TABLE message (
     service TEXT,
     thread_originator_guid TEXT,
     item_type INTEGER NOT NULL DEFAULT 0,
-    payload_data BLOB
+    payload_data BLOB,
+    ck_chat_id TEXT,
+    associated_message_type INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE chat_message_join (
     chat_id INTEGER,
     message_id INTEGER
+);
+
+CREATE TABLE chat_recoverable_message_join (
+    chat_id INTEGER,
+    message_id INTEGER,
+    delete_date INTEGER
 );
 
 CREATE TABLE attachment (
@@ -90,6 +100,8 @@ class FixtureChat:
     display_name: str | None = None
     service_name: str | None = "iMessage"
     rowid: int | None = None
+    group_id: str | None = None
+    original_group_id: str | None = None
 
 
 @dataclass
@@ -102,7 +114,9 @@ class FixtureHandle:
 @dataclass
 class FixtureMessage:
     guid: str
-    chat_guid: str
+    chat_guid: str | None
+    """None writes no `chat_message_join` row: a message `chat.db` keeps
+    with no chat link (D13)."""
     is_from_me: bool = False
     handle_raw_value: str | None = None
     date: datetime | None = field(default_factory=lambda: datetime(2024, 1, 1, tzinfo=UTC))
@@ -116,6 +130,12 @@ class FixtureMessage:
     item_type: int = 0
     payload_data: bytes | None = None
     rowid: int | None = None
+    ck_chat_id: str | None = None
+    associated_message_type: int = 0
+    recoverable_chat_guid: str | None = None
+    """Writes a `chat_recoverable_message_join` row: Apple's "Recently
+    Deleted" naming this chat, with `delete_date`."""
+    delete_date: datetime | None = None
 
 
 @dataclass
@@ -174,9 +194,12 @@ class ChatDbBuilder:
             for i, chat in enumerate(self._chats, start=1):
                 rowid = chat.rowid if chat.rowid is not None else i
                 conn.execute(
-                    "INSERT INTO chat (ROWID, guid, style, display_name, service_name) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (rowid, chat.guid, chat.style, chat.display_name, chat.service_name),
+                    "INSERT INTO chat (ROWID, guid, style, display_name, service_name, "
+                    "group_id, original_group_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        rowid, chat.guid, chat.style, chat.display_name, chat.service_name,
+                        chat.group_id, chat.original_group_id,
+                    ),
                 )
                 chat_rowid_by_guid[chat.guid] = rowid
 
@@ -207,8 +230,9 @@ class ChatDbBuilder:
                     """
                     INSERT INTO message (
                         ROWID, guid, handle_id, is_from_me, date, date_edited, date_retracted,
-                        service, thread_originator_guid, item_type, payload_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        service, thread_originator_guid, item_type, payload_data,
+                        ck_chat_id, associated_message_type
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         rowid,
@@ -222,13 +246,26 @@ class ChatDbBuilder:
                         message.thread_originator_guid,
                         message.item_type,
                         message.payload_data,
+                        message.ck_chat_id,
+                        message.associated_message_type,
                     ),
                 )
                 message_rowid_by_guid[message.guid] = rowid
-                conn.execute(
-                    "INSERT INTO chat_message_join (chat_id, message_id) VALUES (?, ?)",
-                    (chat_rowid_by_guid[message.chat_guid], rowid),
-                )
+                if message.chat_guid is not None:
+                    conn.execute(
+                        "INSERT INTO chat_message_join (chat_id, message_id) VALUES (?, ?)",
+                        (chat_rowid_by_guid[message.chat_guid], rowid),
+                    )
+                if message.recoverable_chat_guid is not None:
+                    conn.execute(
+                        "INSERT INTO chat_recoverable_message_join (chat_id, message_id, delete_date) "
+                        "VALUES (?, ?, ?)",
+                        (
+                            chat_rowid_by_guid[message.recoverable_chat_guid],
+                            rowid,
+                            apple_ns(message.delete_date) if message.delete_date else None,
+                        ),
+                    )
 
             attachment_rowid_by_guid: dict[str, int] = {}
             for i, att in enumerate(self._attachments, start=1):

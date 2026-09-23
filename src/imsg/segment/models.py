@@ -71,6 +71,9 @@ class MessageForSegmentation:
     attachments: tuple[AttachmentSnippet, ...] = ()
     tapback_suffixes: tuple[str, ...] = ()
     edit_history: tuple[EditVersion, ...] = ()
+    is_deleted: bool = False
+    """In Apple's "Recently Deleted" (`message.deleted_at` is set, D13).
+    Still segmented and searchable; rendered with a `[deleted]` label."""
 
 
 @dataclass(frozen=True, slots=True)

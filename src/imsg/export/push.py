@@ -40,6 +40,7 @@ from imsg.export.documents import (
 from imsg.export.eligibility import (
     compute_attachment_eligibility,
     eligible_chat_ids,
+    exportable_message_sql,
     snapshot_allowlist,
 )
 from imsg.export.errors import ExportDriftError, ExportPushError
@@ -108,13 +109,13 @@ def _verify_eligibility_unchanged(
         # Current eligible-attachment guid sets per segment.
         attachment_eligibility = compute_attachment_eligibility(conn, segment_ids)
         cur.execute(
-            """
+            f"""
             SELECT DISTINCT sm.segment_id, ma.attachment_id, a.source_guid
             FROM segment_message sm
             JOIN message m ON m.message_id = sm.message_id
             JOIN message_attachment ma ON ma.message_id = m.message_id
             JOIN attachment a ON a.attachment_id = ma.attachment_id
-            WHERE sm.segment_id = ANY(%s) AND NOT m.is_unsent
+            WHERE sm.segment_id = ANY(%s) AND {exportable_message_sql('m')}
             """,
             (segment_ids,),
         )

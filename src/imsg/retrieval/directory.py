@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from imsg.export.eligibility import effective_sender_sql
+from imsg.export.eligibility import effective_sender_sql, exportable_message_sql
 from imsg.retrieval.access import (
     AccessContext,
     RequestScope,
@@ -64,8 +64,9 @@ def list_people(
     scope-filtered, like `imsg.retrieval.people`'s suggestions): only
     `imsg.retrieval.access.visible_person_ids` — people who appear in an
     eligible chat — with `message_count`, `first_message` and
-    `last_message` over their non-unsent messages in eligible chats only,
-    so nothing about an ineligible thread shows through the counts. An
+    `last_message` over their exportable messages (not unsent, not
+    deleted) in eligible chats only, so nothing about an ineligible
+    thread shows through the counts. An
     allowlisted person with no eligible chat is not listed: nothing the
     caller could search for involves them.
 
@@ -90,7 +91,8 @@ def list_people(
         params.update(chats.params)
         params["owner"] = scope.owner_person_id
         message_join = (
-            f"{effective_sender_sql('m')} = p.person_id AND {chats.sql} AND NOT m.is_unsent"
+            f"{effective_sender_sql('m')} = p.person_id AND {chats.sql} "
+            f"AND {exportable_message_sql('m')}"
         )
 
     with conn.cursor() as cur:
@@ -160,7 +162,7 @@ def get_attachment_text(
     attachment. Under `full` scope any parent authorizes. Under
     `allowlist` a parent authorizes only if its chat passes export's chat
     rule AND the attachment passes export's separate attachment gate in
-    that segment — every non-unsent message linking it there has a
+    that segment — every exportable message linking it there has a
     sender with `attachments_allowed` (SPEC §11.2: "An attachment's text
     exports iff its segment is eligible and the attachment's sender (via
     every message link through which it enters the document) has

@@ -103,6 +103,17 @@ evidence. Every table's inserts, fills, newer edits and replacements
 are counted (`ExtractResult.table_counts`). The rule, and why, is in the
 merge-policy section below.
 
+**Messages with no chat link (owner decision D13, 2026-09-23)**: a
+`chat.db` row with no `chat_message_join` row used to be logged
+(`extract.message_without_chat`) and dropped; 2,543 such messages across
+the four sources the index reads were in no chat at all. Every one is now
+filed -- into the chat Apple's "Recently Deleted" names (with
+`deleted_at`), the 1:1 or group chat its `ck_chat_id` names, or a holding
+chat -- and records how (`message.chat_evidence`). They sit below every
+ROWID watermark, so each run also re-reads the snapshot's unlinked rows
+that still need filing. The rules, the rescan and its measured cost are
+in `imsg.stages.unlinked_filing`.
+
 **System/group-action messages**: chat.db also carries non-conversational
 rows (member added/removed, group name changed, ...) via a nonzero
 `item_type` column. Migration 0001 has no dedicated table for these —
@@ -137,6 +148,24 @@ from imsg.keys import attachment_key, message_key, thread_key
 from imsg.paths import is_same_file
 from imsg.sqlite_readonly import open_readonly_immutable, wal_frame_bytes, wal_sidecar_path
 from imsg.stages.imsg_dump import ImsgDumpMessage, ImsgDumpRun, run_imsg_dump
+from imsg.stages.unlinked_filing import (
+    CHAT_DB_TAPBACK_TYPES_SQL,
+    ChatChoice,
+    ChatEvidence,
+    GroupDirectory,
+    RefileOutcome,
+    UnlinkedMessage,
+    choose_chat,
+    ensure_chat,
+    fetch_group_chats,
+    fetch_indexed_filings,
+    fetch_weakly_filed,
+    is_group_id,
+    record_group_ids,
+    refile_message,
+    refile_wanted,
+    rescan_wanted,
+)
 from imsg.textnorm import normalize_text, strip_nul
 
 logger = structlog.get_logger(__name__)
@@ -235,6 +264,10 @@ class ChatRow:
     display_name: str | None
     service_name: str | None
     participant_count: int
+    group_ids: tuple[str, ...] = ()
+    """`chat.group_id` and `chat.original_group_id`, where set: what a
+    lost group's `message.ck_chat_id` is matched against (D13,
+    `imsg.stages.unlinked_filing`)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +291,16 @@ class MessageRow:
     item_type: int
     payload_data: bytes | None
     chat_rowid: int | None
+    """The chat `chat_message_join` links the message to (the lowest chat
+    ROWID when there are several), or None when no link names a chat in
+    this snapshot: then `imsg.stages.unlinked_filing` chooses one."""
+    ck_chat_id: str | None = None
+    recoverable_chat_rowid: int | None = None
+    """The chat Apple's "Recently Deleted" (`chat_recoverable_message_join`)
+    names, when that chat is in this snapshot."""
+    deleted_at: datetime | None = None
+    """`chat_recoverable_message_join.delete_date`: set when the message is
+    in "Recently Deleted" in this snapshot."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,17 +362,41 @@ class SnapshotReader:
 
     def __init__(self, conn: apsw.Connection) -> None:
         self._conn = conn
+        # Columns and a table that every modern `chat.db` has, and that an
+        # older or hand-built database may lack: each is read as NULL where
+        # it is missing, so a file without them extracts exactly as before.
+        self._chat_columns = self._columns("chat")
+        self._message_columns = self._columns("message")
+        self._has_recoverable_join = bool(
+            list(
+                self._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'chat_recoverable_message_join'"
+                )
+            )
+        )
+
+    def _columns(self, table: str) -> frozenset[str]:
+        return frozenset(str(row[1]) for row in self._conn.execute(f"PRAGMA table_info({table})"))
+
+    def _message_column(self, name: str) -> str:
+        return f"m.{name}" if name in self._message_columns else "NULL"
 
     def fetch_max_message_rowid(self) -> int:
         row = next(self._conn.execute("SELECT COALESCE(MAX(ROWID), 0) FROM message"), None)
         return int(row[0]) if row else 0
 
     def fetch_chats(self) -> list[ChatRow]:
+        group_id = "c.group_id" if "group_id" in self._chat_columns else "NULL"
+        original_group_id = (
+            "c.original_group_id" if "original_group_id" in self._chat_columns else "NULL"
+        )
         rows = list(
             self._conn.execute(
-                """
+                f"""
                 SELECT c.ROWID, c.guid, c.style, c.display_name, c.service_name,
-                       (SELECT COUNT(*) FROM chat_handle_join chj WHERE chj.chat_id = c.ROWID)
+                       (SELECT COUNT(*) FROM chat_handle_join chj WHERE chj.chat_id = c.ROWID),
+                       {group_id}, {original_group_id}
                 FROM chat c
                 """
             )
@@ -342,9 +409,62 @@ class SnapshotReader:
                 display_name=r[3],
                 service_name=r[4],
                 participant_count=r[5],
+                group_ids=tuple(dict.fromkeys(str(g) for g in (r[6], r[7]) if g)),
             )
             for r in rows
         ]
+
+    def _message_select(self) -> str:
+        """The columns every message query returns, in `_to_message_row`'s
+        order. The chat link is read as the lowest-ROWID chat that exists in
+        this snapshot, which makes a message joined to several chats land
+        in the same one on every run (and matches `imsg-dump`, which orders
+        the same way); a link to a chat row the file lacks counts as no
+        link, and the D13 rules file the message instead."""
+        if self._has_recoverable_join:
+            recoverable_chat = (
+                "(SELECT r.chat_id FROM chat_recoverable_message_join r "
+                "JOIN chat rc ON rc.ROWID = r.chat_id "
+                "WHERE r.message_id = m.ROWID ORDER BY r.chat_id LIMIT 1)"
+            )
+            deleted_at = (
+                "(SELECT MAX(r.delete_date) FROM chat_recoverable_message_join r "
+                "WHERE r.message_id = m.ROWID)"
+            )
+        else:
+            recoverable_chat = deleted_at = "NULL"
+        return f"""
+            SELECT m.ROWID, m.guid, m.handle_id, m.is_from_me, m.date, m.date_edited,
+                   m.date_retracted, m.service, m.thread_originator_guid,
+                   COALESCE(m.item_type, 0), m.payload_data,
+                   (SELECT cmj.chat_id FROM chat_message_join cmj
+                    JOIN chat jc ON jc.ROWID = cmj.chat_id
+                    WHERE cmj.message_id = m.ROWID ORDER BY cmj.chat_id LIMIT 1),
+                   {self._message_column("ck_chat_id")},
+                   {recoverable_chat},
+                   {deleted_at}
+            FROM message m
+        """
+
+    @staticmethod
+    def _to_message_row(r: Sequence[Any]) -> MessageRow:
+        return MessageRow(
+            rowid=r[0],
+            guid=r[1],
+            handle_rowid=r[2],
+            is_from_me=bool(r[3]),
+            date=_apple_ns_to_datetime(r[4]),
+            date_edited=_apple_ns_to_datetime(r[5]),
+            date_retracted=_apple_ns_to_datetime(r[6]),
+            service=r[7],
+            reply_to_guid=r[8],
+            item_type=r[9],
+            payload_data=r[10],
+            chat_rowid=r[11],
+            ck_chat_id=r[12] or None,
+            recoverable_chat_rowid=r[13],
+            deleted_at=_apple_ns_to_datetime(r[14]),
+        )
 
     def fetch_handles(self) -> list[HandleRow]:
         rows = list(self._conn.execute("SELECT ROWID, id, service FROM handle"))
@@ -361,36 +481,48 @@ class SnapshotReader:
         `date_retracted` moved past `last_run_start_ns` (a rescan of an
         older row that was edited/retracted since the last successful
         run, regardless of its own ROWID)."""
-        query = """
-            SELECT m.ROWID, m.guid, m.handle_id, m.is_from_me, m.date, m.date_edited,
-                   m.date_retracted, m.service, m.thread_originator_guid,
-                   COALESCE(m.item_type, 0), m.payload_data,
-                   (SELECT cmj.chat_id FROM chat_message_join cmj
-                    WHERE cmj.message_id = m.ROWID LIMIT 1)
-            FROM message m
+        query = (
+            self._message_select()
+            + """
             WHERE m.ROWID > ?
                OR COALESCE(m.date_edited, 0) > ?
                OR COALESCE(m.date_retracted, 0) > ?
             ORDER BY m.ROWID
         """
-        rows = list(self._conn.execute(query, (watermark, last_run_start_ns, last_run_start_ns)))
-        return [
-            MessageRow(
-                rowid=r[0],
-                guid=r[1],
-                handle_rowid=r[2],
-                is_from_me=bool(r[3]),
-                date=_apple_ns_to_datetime(r[4]),
-                date_edited=_apple_ns_to_datetime(r[5]),
-                date_retracted=_apple_ns_to_datetime(r[6]),
-                service=r[7],
-                reply_to_guid=r[8],
-                item_type=r[9],
-                payload_data=r[10],
-                chat_rowid=r[11],
-            )
-            for r in rows
-        ]
+        )
+        rows = self._conn.execute(query, (watermark, last_run_start_ns, last_run_start_ns))
+        return [self._to_message_row(r) for r in rows]
+
+    def fetch_unlinked_messages(self, max_rowid: int) -> list[MessageRow]:
+        """Every row at or below `max_rowid` that is a candidate for D13's
+        rescan: a message (not a tapback by its SQL type, not a system
+        row), dated, with a GUID, and linked to no chat in this snapshot.
+        The run decides which of them need work
+        (`imsg.stages.unlinked_filing.rescan_wanted`).
+
+        A row with no date is left out: `message.sent_at` is NOT NULL, so
+        it cannot be filed, and selecting it would re-read it forever."""
+        tapback_filter = (
+            f"AND NOT ({CHAT_DB_TAPBACK_TYPES_SQL})"
+            if "associated_message_type" in self._message_columns
+            else ""
+        )
+        query = (
+            self._message_select()
+            + f"""
+            WHERE m.ROWID <= ?
+              AND m.guid IS NOT NULL
+              AND COALESCE(m.item_type, 0) = 0
+              AND COALESCE(m.date, 0) <> 0
+              {tapback_filter}
+              AND NOT EXISTS (
+                  SELECT 1 FROM chat_message_join j JOIN chat jc ON jc.ROWID = j.chat_id
+                  WHERE j.message_id = m.ROWID
+              )
+            ORDER BY m.ROWID
+        """
+        )
+        return [self._to_message_row(r) for r in self._conn.execute(query, (max_rowid,))]
 
     def fetch_attachments_for_messages(self, message_rowids: list[int]) -> tuple[
         list[AttachmentRow], dict[int, list[int]]
@@ -722,6 +854,56 @@ class _UpsertTally:
 
 
 @dataclass(frozen=True, slots=True)
+class UnlinkedCounts:
+    """What a run did with messages its snapshot links to no chat (owner
+    decision D13; `imsg.stages.unlinked_filing`)."""
+
+    rescanned: int = 0
+    """Rows at or below the watermark this run read again because they
+    still needed work: missing from the index, movable out of a holding
+    chat, or deleted without a delete date in the index. Zero on a run
+    with nothing left to file."""
+    recoverable_join: int = 0
+    ck_1to1: int = 0
+    ck_group_match: int = 0
+    holding_lost_group: int = 0
+    holding_sender: int = 0
+    """Messages this run placed by each rule: inserted, or moved out of a
+    holding chat. A message already where the rule would put it is not
+    counted."""
+    moved_from_holding: int = 0
+    """Messages moved out of a holding chat into a chat with stronger
+    evidence (by any rule, a chat link included)."""
+    evidence_raised: int = 0
+    """Messages left in the same chat whose recorded evidence rose."""
+    in_recently_deleted: int = 0
+    """Messages this run read that its snapshot has in Apple's "Recently
+    Deleted" (a delete date). Their `deleted_at` is filled where the index
+    has none (the `message` table's `filled` count includes it)."""
+    chats_created: int = 0
+    """1:1 chats created under Apple's own GUID from a `ck_chat_id`."""
+    holding_chats_created: int = 0
+    skipped_without_date: int = 0
+    """Unlinked rows with no `date`, which cannot be filed
+    (`message.sent_at` is NOT NULL). Logged, not raised: before D13 these
+    rows were skipped with every other unlinked row."""
+
+    def placed(self, evidence: ChatEvidence) -> int:
+        return int(getattr(self, evidence.value, 0))
+
+
+@dataclass(slots=True)
+class _UnlinkedTally:
+    counts: dict[str, int] = field(default_factory=dict)
+
+    def add(self, name: str, n: int = 1) -> None:
+        self.counts[name] = self.counts.get(name, 0) + n
+
+    def freeze(self) -> UnlinkedCounts:
+        return UnlinkedCounts(**self.counts)
+
+
+@dataclass(frozen=True, slots=True)
 class ExtractResult:
     run_id: int
     watermark_before: int
@@ -780,6 +962,11 @@ class ExtractResult:
     tapback_targets_resolved: int = 0
     """Tapbacks whose target message had not been extracted yet when
     they were, attached to it at the end of this run."""
+    chat_group_ids: UpsertCounts = field(default_factory=UpsertCounts)
+    """`(group id, chat)` pairs recorded in `chat_group_id`: inserted, or
+    already present (`unchanged`). Insert-only."""
+    unlinked: UnlinkedCounts = field(default_factory=UnlinkedCounts)
+    """Messages with no chat link: how this run filed them (D13)."""
     dry_run: bool = False
     """True when this result came from `run_extract(dry_run=True)`
     (SPEC §8: "takes --dry-run where writes leave the machine"): every
@@ -796,6 +983,7 @@ class ExtractResult:
         `extraction_run.upsert_counts` records."""
         return {
             "chat": self.chat_upserts,
+            "chat_group_id": self.chat_group_ids,
             "source_handle": self.handle_upserts,
             "chat_participant_source": self.chat_participant_links,
             "attachment": self.attachment_upserts,
@@ -1070,7 +1258,18 @@ def _do_extract(
     chat_handle_joins = reader.fetch_chat_handle_joins()
 
     last_run_start_ns = _datetime_to_apple_ns(last_run_start)
-    target_messages = reader.fetch_target_messages(watermark_before, last_run_start_ns)
+    # D13: the rows this snapshot links to no chat, including the ones below
+    # the watermark that still need filing, are chosen a chat *before* the
+    # decoder runs, so `imsg-dump` reaches back only as far as they need.
+    unlinked_plan = _plan_unlinked_filing(
+        conn,
+        reader,
+        chats=chats,
+        handles=handles,
+        targets=reader.fetch_target_messages(watermark_before, last_run_start_ns),
+        watermark=watermark_before,
+    )
+    target_messages = unlinked_plan.targets
     target_rowids = [m.rowid for m in target_messages]
 
     dump_since_rowid = watermark_before
@@ -1097,6 +1296,11 @@ def _do_extract(
             chat_tally.record(chat_row.outcome)
             if chat_row.renders_changed:
                 rerender.chat_ids.add(chat_row.row_id)
+
+        group_ids_inserted, group_ids_present = record_group_ids(
+            cur,
+            ((group_id, chat_id_by_rowid[chat.rowid]) for chat in chats for group_id in chat.group_ids),
+        )
 
         handle_id_by_rowid: dict[int, int] = {}
         handle_tally = _UpsertTally()
@@ -1141,6 +1345,25 @@ def _do_extract(
         bodies_missing = 0
         bodies_kept_as_history = 0
 
+        # D13: where the index already has each unlinked target, and every
+        # message it filed on weaker evidence than a chat link (the only
+        # ones a run may refile).
+        unlinked = _UnlinkedTally()
+        unlinked.add("rescanned", unlinked_plan.rescanned)
+        filings, _ = fetch_indexed_filings(
+            cur, (m.guid for m in target_messages if m.rowid in unlinked_plan.choices)
+        )
+        weakly_filed = fetch_weakly_filed(cur)
+        resolver = _ChatResolver(
+            cur,
+            chat_ids={chat.guid: chat_id_by_rowid[chat.rowid] for chat in chats},
+            handles=handles,
+            handle_id_by_rowid=handle_id_by_rowid,
+            participant_tally=participant_tally,
+            handle_tally=handle_tally,
+            unlinked=unlinked,
+        )
+
         for msg in target_messages:
             dump_msg = dump_by_guid.get(msg.guid)
             if dump_msg is None:
@@ -1163,13 +1386,42 @@ def _do_extract(
                 system_messages_skipped += 1
                 continue
 
-            chat_id = chat_id_by_rowid.get(msg.chat_rowid) if msg.chat_rowid is not None else None
-            if chat_id is None:
-                logger.warning("extract.message_without_chat", guid=msg.guid, rowid=msg.rowid)
+            # Which chat, and on what evidence (D13). A chat link wins; a row
+            # without one is filed by `imsg.stages.unlinked_filing`'s rules.
+            # A message the index already has keeps its chat (`chat_id` is
+            # insert-only) unless `refile_message` below moves it out of a
+            # holding chat, so a chat is only resolved -- and a 1:1 or
+            # holding chat only created -- where the message will land in it.
+            linked_chat_id = (
+                chat_id_by_rowid.get(msg.chat_rowid) if msg.chat_rowid is not None else None
+            )
+            choice = unlinked_plan.choices.get(msg.rowid)
+            refile = False
+            if linked_chat_id is not None:
+                chat_id, evidence = linked_chat_id, ChatEvidence.CHAT_MESSAGE_JOIN
+                stored_evidence = weakly_filed.get(msg.guid, evidence)
+                refile = stored_evidence is not None and evidence.rank > stored_evidence.rank
+            elif choice is None or msg.date is None:
+                # `message.sent_at` is NOT NULL: a row with no date cannot be
+                # filed. Counted and logged, as every unlinked row used to be.
+                unlinked.add("skipped_without_date")
+                logger.warning("extract.unlinked_message_without_date", guid=msg.guid, rowid=msg.rowid)
                 continue
+            else:
+                evidence = choice.evidence
+                filing = filings.get(msg.guid)
+                if filing is None:
+                    chat_id = resolver.chat_for(msg, choice)
+                elif refile_wanted(choice, filing):
+                    chat_id, refile = resolver.chat_for(msg, choice), True
+                else:
+                    chat_id = filing.chat_id
+            if msg.deleted_at is not None:
+                unlinked.add("in_recently_deleted")
 
             message_row = _upsert_message(
-                cur, msg, dump_msg, chat_id=chat_id, handle_id_by_rowid=handle_id_by_rowid,
+                cur, msg, dump_msg, chat_id=chat_id, chat_evidence=evidence,
+                handle_id_by_rowid=handle_id_by_rowid,
                 has_attachments=bool(attachments_by_message.get(msg.rowid)),
                 merge_mode=merge_mode,
             )
@@ -1178,6 +1430,18 @@ def _do_extract(
             # A message inserted by this run is unsegmented, so everything
             # below that changes how it renders needs no mark of its own.
             existed = message_row.outcome is not UpsertOutcome.INSERTED
+            if not existed and evidence is not ChatEvidence.CHAT_MESSAGE_JOIN:
+                unlinked.add(evidence.value)
+            elif existed and refile:
+                refiled = refile_message(
+                    cur, message_id=message_id, chat_id=chat_id, evidence=evidence
+                )
+                if refiled is RefileOutcome.MOVED:
+                    unlinked.add("moved_from_holding")
+                    if evidence is not ChatEvidence.CHAT_MESSAGE_JOIN:
+                        unlinked.add(evidence.value)
+                elif refiled is RefileOutcome.EVIDENCE_RAISED:
+                    unlinked.add("evidence_raised")
 
             message_source_tally.record(
                 _upsert_message_source(cur, message_id, source_name, msg.rowid, run_id)
@@ -1253,6 +1517,8 @@ def _do_extract(
             messages_marked_for_resegmentation=messages_marked,
             bodies_kept_as_history=bodies_kept_as_history,
             tapback_targets_resolved=len(resolved_targets),
+            chat_group_ids=UpsertCounts(inserted=group_ids_inserted, unchanged=group_ids_present),
+            unlinked=unlinked.freeze(),
         )
 
         # clock_timestamp(), not now(): now() is frozen at transaction start,
@@ -1297,6 +1563,196 @@ def _do_extract(
         )
 
     return result
+
+
+# --------------------------------------------------------------------------
+# messages with no chat link (owner decision D13)
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _UnlinkedPlan:
+    targets: list[MessageRow]
+    """This run's targets, in ROWID order: the usual ones plus every row
+    below the watermark the rescan selected."""
+    choices: dict[int, ChatChoice]
+    """Where each target with no chat link goes, by ROWID."""
+    rescanned: int
+
+
+def _chat_kind_for_style(style: int | None) -> str | None:
+    if style == CHAT_STYLE_GROUP:
+        return "group"
+    if style == CHAT_STYLE_DM:
+        return "dm"
+    return None
+
+
+def _plan_unlinked_filing(
+    conn: psycopg.Connection,
+    reader: SnapshotReader,
+    *,
+    chats: Sequence[ChatRow],
+    handles: Sequence[HandleRow],
+    targets: Sequence[MessageRow],
+    watermark: int,
+) -> _UnlinkedPlan:
+    """Choose a chat for every target this snapshot links to no chat, and
+    add the rows below the watermark that still need filing
+    (`imsg.stages.unlinked_filing`, "Rescan"). Reads only: the snapshot's
+    unlinked rows, and the index's filings of them and of the group ids
+    they carry. Runs before `imsg-dump`, so the decoder reaches back only
+    to the lowest ROWID that has work.
+
+    A group id is matched against the chats this snapshot has and every
+    chat the index recorded one for (`chat_group_id`), so a group that
+    another source showed still counts, and two chats carrying one id are
+    ambiguity, not a match."""
+    in_scope = {m.rowid for m in targets}
+    candidates = [m for m in reader.fetch_unlinked_messages(watermark) if m.rowid not in in_scope]
+    unlinked = [m for m in targets if m.chat_rowid is None] + candidates
+    if not unlinked:
+        return _UnlinkedPlan(targets=list(targets), choices={}, rescanned=0)
+
+    chat_guid_by_rowid = {chat.rowid: chat.guid for chat in chats}
+    sender_by_rowid = {handle.rowid: handle.raw_value for handle in handles}
+    groups = GroupDirectory()
+    for chat in chats:
+        for group_id in chat.group_ids:
+            groups.add(group_id, chat.guid, _chat_kind_for_style(chat.style))
+    with conn.cursor() as cur:
+        fetch_group_chats(
+            cur, (m.ck_chat_id for m in unlinked if m.ck_chat_id and is_group_id(m.ck_chat_id)), groups
+        )
+        filings, tapbacks = fetch_indexed_filings(cur, (m.guid for m in candidates))
+
+    choices: dict[int, ChatChoice] = {}
+    for m in unlinked:
+        sender = None
+        if not m.is_from_me and m.handle_rowid is not None:
+            sender = sender_by_rowid.get(m.handle_rowid)
+        recoverable = (
+            chat_guid_by_rowid.get(m.recoverable_chat_rowid)
+            if m.recoverable_chat_rowid is not None
+            else None
+        )
+        choices[m.rowid] = choose_chat(
+            UnlinkedMessage(
+                rowid=m.rowid,
+                is_from_me=m.is_from_me,
+                sender=sender,
+                ck_chat_id=m.ck_chat_id,
+                recoverable_chat_guid=recoverable,
+            ),
+            groups,
+        )
+
+    selected = [
+        m
+        for m in candidates
+        if rescan_wanted(
+            choices[m.rowid], filings.get(m.guid), deleted_at=m.deleted_at, is_tapback=m.guid in tapbacks
+        )
+    ]
+    kept = in_scope | {m.rowid for m in selected}
+    return _UnlinkedPlan(
+        targets=sorted([*targets, *selected], key=lambda m: m.rowid),
+        choices={rowid: choice for rowid, choice in choices.items() if rowid in kept},
+        rescanned=len(selected),
+    )
+
+
+class _ChatResolver:
+    """The chat a D13 choice names, as a `chat_id`, inside S2's
+    transaction. A chat this snapshot has was upserted already; one only
+    the index has is looked up; a 1:1 chat or a holding chat the index
+    lacks is created, with the participants it is known to have:
+
+    * a holding chat: every incoming sender filed into it;
+    * a 1:1 chat created from a `ck_chat_id`: the handle the id names
+      (the sender, or for the owner's own message a source handle this
+      snapshot has for it, created if it has none).
+
+    A 1:1 chat that already existed gets no participant from here: its
+    own source's `chat_handle_join` supplied them, and a differently
+    written copy of the same handle would only add a stub person."""
+
+    def __init__(
+        self,
+        cur: psycopg.Cursor[Any],
+        *,
+        chat_ids: dict[str, int],
+        handles: Sequence[HandleRow],
+        handle_id_by_rowid: dict[int, int],
+        participant_tally: _UpsertTally,
+        handle_tally: _UpsertTally,
+        unlinked: _UnlinkedTally,
+    ) -> None:
+        self._cur = cur
+        self._chat_ids = dict(chat_ids)
+        self._handle_id_by_rowid = handle_id_by_rowid
+        self._participant_tally = participant_tally
+        self._handle_tally = handle_tally
+        self._unlinked = unlinked
+        self._handle_ids_by_raw: dict[str, dict[str, int]] = {}
+        for handle in handles:
+            source_handle_id = handle_id_by_rowid.get(handle.rowid)
+            if source_handle_id is not None:
+                self._handle_ids_by_raw.setdefault(handle.raw_value, {})[
+                    _normalize_service(handle.service)
+                ] = source_handle_id
+
+    def chat_for(self, msg: MessageRow, choice: ChatChoice) -> int:
+        cached = self._chat_ids.get(choice.chat_guid)
+        created = False
+        if cached is not None:
+            chat_id = cached
+        else:
+            chat_id, created = ensure_chat(
+                self._cur, choice, service=_service_evidence(choice.ck_service)
+            )
+            self._chat_ids[choice.chat_guid] = chat_id
+            if created:
+                self._unlinked.add(
+                    "holding_chats_created" if choice.unfiled_key is not None else "chats_created"
+                )
+        participant = self._participant(msg, choice, created=created)
+        if participant is not None:
+            self._cur.execute(
+                "INSERT INTO chat_participant_source (chat_id, source_handle_id) "
+                "VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (chat_id, participant),
+            )
+            self._participant_tally.record(_inserted_or_unchanged(self._cur))
+        return chat_id
+
+    def _participant(self, msg: MessageRow, choice: ChatChoice, *, created: bool) -> int | None:
+        sender = None
+        if not msg.is_from_me and msg.handle_rowid is not None:
+            sender = self._handle_id_by_rowid.get(msg.handle_rowid)
+        if choice.unfiled_key is not None:
+            return sender
+        if not created or not choice.ck_handle:
+            return None
+        if sender is not None:
+            # `ck_1to1` requires the sender to be the id's handle.
+            return sender
+        return self._source_handle(choice.ck_handle, choice.ck_service)
+
+    def _source_handle(self, raw_value: str, raw_service: str | None) -> int:
+        known = self._handle_ids_by_raw.get(raw_value, {})
+        service = _normalize_service(raw_service)
+        if service in known:
+            return known[service]
+        if known:
+            return known[min(known)]
+        source_handle_id, outcome = _upsert_source_handle(
+            self._cur, HandleRow(rowid=0, raw_value=raw_value, service=raw_service)
+        )
+        self._handle_tally.record(outcome)
+        self._handle_ids_by_raw.setdefault(raw_value, {})[service] = source_handle_id
+        return source_handle_id
+
 
 # --------------------------------------------------------------------------
 # merge policy: what each source is allowed to overwrite
@@ -2098,6 +2554,16 @@ _MESSAGE_COLUMNS: tuple[_Column, ...] = (
     _Column("date_edited", Merge.EDIT_TIME),
     _Column("reply_to_guid", Merge.INSERT_ONLY),
     _Column("has_attachments", Merge.POSITIVE, empty=Empty.FALSE),
+    # How the chat was chosen (D13), recorded with `chat_id` on insert and,
+    # like it, never assigned here: a later run changes the pair only through
+    # `imsg.stages.unlinked_filing.refile_message`, toward stronger evidence.
+    _Column("chat_evidence", Merge.INSERT_ONLY),
+    # Apple's "Recently Deleted" delete date (D13). Rendered: the message
+    # shows as "[deleted]". Empty: NULL only, and NULL is never evidence, so
+    # no run ever clears it -- a message restored on one device keeps the
+    # label another device's delete gave it. A seed fills it; only the live
+    # run may replace one date with another.
+    _Column("deleted_at", Merge.PRESENT),
 )
 
 _MESSAGE_BODY = _BodyRule(text="text_original", edited_at="date_edited")
@@ -2117,6 +2583,7 @@ def _upsert_message(
     dump_msg: ImsgDumpMessage | None,
     *,
     chat_id: int,
+    chat_evidence: ChatEvidence = ChatEvidence.CHAT_MESSAGE_JOIN,
     handle_id_by_rowid: dict[int, int],
     has_attachments: bool,
     merge_mode: MergeMode,
@@ -2145,6 +2612,8 @@ def _upsert_message(
         thing S3 joins on to backfill `sender_person_id`, which is the
         rendered sender. Stale here means a message attributed to the
         wrong person forever.
+      * `deleted_at` — Apple's "Recently Deleted" date (D13); the
+        message renders as `[deleted]`.
 
     A fill is an UPDATE like any other, so migration 0003's trigger
     moves `updated_at` and S4 re-segments the chat. What a segment
@@ -2155,17 +2624,17 @@ def _upsert_message(
     **Deliberately left first-write-wins**, and therefore neither
     assigned nor compared:
 
-      * `chat_id`. It affects rendering more than anything on the list,
-        and it is still excluded, for a stronger reason than
-        irrelevance: the incoming value is not trustworthy.
-        `fetch_target_messages` derives it from
-        `chat_message_join ... LIMIT 1` with no `ORDER BY`, so for a
-        message that belongs to more than one chat SQLite may return
-        either. Reassigning it per run would flap the row between chats
-        on every extraction — permanently dirty, and orphaning the
-        `segment_message` rows that place it. Correcting a genuinely
-        wrong chat association needs a deterministic choice first;
-        that is a separate change, not a side effect of this one.
+      * `chat_id` (and `chat_evidence`, which says how it was chosen).
+        It affects rendering more than anything on the list, and it is
+        still excluded here, because moving a message between chats is
+        a filing decision, not a column merge. Until 2026-09-23 the
+        incoming value came from `chat_message_join ... LIMIT 1` with no
+        `ORDER BY`, so a message in more than one chat could flap
+        between them. The link is now read deterministically (lowest
+        chat ROWID), and the one move a later run may make is D13's:
+        out of a holding chat, toward stronger evidence, never from one
+        real chat to another (`imsg.stages.unlinked_filing.
+        refile_message`, which `_do_extract` calls after this upsert).
       * `service` and `reply_to_guid`. Nothing downstream reads either
         column — not segmentation, not retrieval, not export, not the
         MCP surface — so a stale value cannot affect rendering or
@@ -2245,6 +2714,8 @@ def _upsert_message(
             "date_edited": msg.date_edited,
             "reply_to_guid": reply_to_guid,
             "has_attachments": has_attachments,
+            "chat_evidence": chat_evidence.value,
+            "deleted_at": msg.deleted_at,
         },
         merge_mode,
     )
@@ -2557,6 +3028,7 @@ __all__ = [
     "MergeMode",
     "MessageRow",
     "SnapshotReader",
+    "UnlinkedCounts",
     "UpsertCounts",
     "UpsertOutcome",
     "merge_mode_for_source",

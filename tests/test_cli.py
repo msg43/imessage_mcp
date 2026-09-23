@@ -637,6 +637,8 @@ def test_extract_reports_every_table_with_fills_told_apart(
     )
     assert any(line.startswith("extract: table=tapback inserted=1 ") for line in table_lines)
     assert "mode=seed" in output
+    # D13: how messages with no chat link were filed, on a line of its own.
+    assert "extract: unlinked: rescanned=0 recoverable_join=0 " in output
 
 
 def test_identity_wires_run_identity_and_warns_on_degraded_contacts(
