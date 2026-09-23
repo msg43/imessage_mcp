@@ -192,6 +192,32 @@ Anything else — a half-written set from an interrupted run, a staging
 directory, an operator's own file — is counted, reported, and left
 alone.
 
+**Attachments whose file is not on this host** can be fetched from
+wherever else a copy exists: another Mac's Messages folder, its
+attached drives, a NAS share (migration 0008, `attachment_location`).
+
+```bash
+# on the index host: find candidate copies (counts only are printed)
+uv run imsg locate-attachments --listing other-mac=listing.tsv \
+    --catalog catalogs/ --seed-db other-mac=other-mac-chat.db --dry-run
+# on the index host: this host's folder, the cache, attachments.pull shares
+uv run imsg backfill-attachments
+# on the other Mac, which the index host cannot reach: copy what it has
+uv run imsg push-attachments --ssh-host index-host \
+    --remote-imsg /path/to/imsg --remote-config /path/to/config.yaml \
+    --root "other-mac=$HOME/Library/Messages/Attachments" --root "D-XXXXX=/Volumes/Drive"
+# on the index host again: verify and materialize what was pushed
+uv run imsg backfill-attachments
+```
+
+A copy is accepted at a path a chat.db recorded for the attachment, in a
+folder named after its GUID under its name, or, flagged, under its name
+at its byte size anywhere else; never on a name alone. Each copy is
+checked against the size and hash its location reported before it enters
+the cache. Every source is only read: both copies are plain rsync runs
+whose source side is rsync's sender, and the flags that would make it
+delete or remove anything are refused. No command prints a path.
+
 **Before exposing the public surface**, AT-1 must pass:
 
 ```bash

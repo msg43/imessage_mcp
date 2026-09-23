@@ -859,7 +859,7 @@ def test_every_table_reports_inserts_then_nothing_on_a_replay(
     assert set(counts) >= {
         "chat", "source_handle", "attachment", "message", "tapback", "message_version",
         "link_preview", "message_attachment", "chat_participant_source", "message_source",
-        "attachment_source", "chat_group_id",
+        "attachment_source", "chat_group_id", "attachment_location",
     }
     assert {t: c.inserted for t, c in counts.items()} == {
         "chat": 2, "source_handle": 2, "attachment": 2, "message": 4, "tapback": 1,
@@ -867,12 +867,14 @@ def test_every_table_reports_inserts_then_nothing_on_a_replay(
         "chat_participant_source": 4, "message_source": 4, "attachment_source": 2,
         # This fixture's chat table has no group-id columns (D13, migration 0007).
         "chat_group_id": 0,
+        "attachment_location": 2,
     }
 
     replay = _seed(pg_conn, tmp_path, world, "seed-replay")
     for table, c in replay.table_counts().items():
-        if table in ("message_source", "attachment_source"):
-            # A new source name records its own provenance rows.
+        if table in ("message_source", "attachment_source", "attachment_location"):
+            # A new source name records its own provenance rows, and the
+            # attachment paths it recorded (filed under its own name).
             continue
         assert (c.inserted, c.updated) == (0, 0), table
 

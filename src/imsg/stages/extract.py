@@ -142,6 +142,7 @@ import psycopg
 import structlog
 
 from imsg.backfill.classify import NO_SOURCE_PATH_ERROR
+from imsg.backfill.locations import record_recorded_path
 from imsg.errors import ExtractionError
 from imsg.hashing import sha256_file
 from imsg.keys import attachment_key, message_key, thread_key
@@ -947,6 +948,10 @@ class ExtractResult:
     moves to this run -- bookkeeping, not corpus content (see
     `_upsert_message_source`). `replaced` on `attachment_source` means a
     source row now resolves to a different attachment."""
+    attachment_location_rows: UpsertCounts = field(default_factory=UpsertCounts)
+    """The path this source's chat.db recorded for each attachment it read
+    (`imsg.backfill.locations.record_recorded_path`): inserted, or already
+    recorded (`unchanged`). Never updated, so a path is never lost."""
     merge_mode: MergeMode = MergeMode.SEED
     """The rule this run applied to rows the index already held."""
     messages_marked_for_resegmentation: int = 0
@@ -988,6 +993,7 @@ class ExtractResult:
             "chat_participant_source": self.chat_participant_links,
             "attachment": self.attachment_upserts,
             "attachment_source": self.attachment_source_rows,
+            "attachment_location": self.attachment_location_rows,
             "message": self.message_upserts,
             "message_source": self.message_source_rows,
             "message_version": self.message_version_upserts,
@@ -1323,6 +1329,7 @@ def _do_extract(
         attachment_id_by_rowid: dict[int, int] = {}
         attachment_tally = _UpsertTally()
         attachment_source_tally = _UpsertTally()
+        attachment_location_tally = _UpsertTally()
         for att in attachments:
             att_row = _upsert_attachment(cur, att, merge_mode)
             attachment_id_by_rowid[att.rowid] = att_row.row_id
@@ -1332,6 +1339,18 @@ def _do_extract(
             attachment_source_tally.record(
                 _upsert_attachment_source(cur, source_name, att.rowid, att_row.row_id)
             )
+            # Every source's recorded path is kept, under the source's name
+            # (D12, D13): `attachment.source_path` holds only one, and the
+            # attachment fetcher tries the others.
+            if att.source_path:
+                attachment_location_tally.record(
+                    UpsertOutcome.INSERTED
+                    if record_recorded_path(
+                        cur, attachment_id=att_row.row_id, source_name=source_name,
+                        path=att.source_path,
+                    )
+                    else UpsertOutcome.UNCHANGED
+                )
 
         message_tally = _UpsertTally()
         message_source_tally = _UpsertTally()
@@ -1514,6 +1533,7 @@ def _do_extract(
             chat_participant_links=participant_tally.freeze(),
             message_source_rows=message_source_tally.freeze(),
             attachment_source_rows=attachment_source_tally.freeze(),
+            attachment_location_rows=attachment_location_tally.freeze(),
             merge_mode=merge_mode,
             messages_marked_for_resegmentation=messages_marked,
             bodies_kept_as_history=bodies_kept_as_history,

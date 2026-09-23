@@ -2,7 +2,9 @@
 
 Wired up for real: `migrate`, `check-permissions`, `status`,
 `guard-mount`, `snapshot`, `extract`, `identity`, `segment`, `embed`,
-`sync`, `enrich`, `backfill-attachments`, `backup`, `mcp local`, `mcp
+`sync`, `enrich`, `backfill-attachments`, `locate-attachments`,
+`push-attachments` (with the index-host halves `push-attachments-plan`
+and `push-attachments-record`), `backup`, `mcp local`, `mcp
 public` (serve, and `--probe` for AT-1), `models verify`,
 `install-agents`, and `export` (`plan`, `approve`, `push`,
 `purge-person`, `unclassified-report` — SPEC §11, `src/imsg/export/`).
@@ -42,11 +44,13 @@ traceback reach the terminal for an expected failure mode.
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
+import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any
 
 import anyio
 import apsw
@@ -55,7 +59,21 @@ import typer
 import uvicorn
 
 from imsg.agents.plists import render_agent_plists
+from imsg.backfill.fetch import LocationFetchReport, access_from_config, settings_from_config
+from imsg.backfill.locate import CoverageReport, LocatedFile, build_coverage, run_locate
 from imsg.backfill.pipeline import DEFAULT_RATE_PER_MINUTE, run_backfill
+from imsg.backfill.push import (
+    PushError,
+    build_push_plan,
+    parse_plan,
+    parse_results,
+    parse_root,
+    plan_to_lines,
+    record_push_results,
+    results_to_lines,
+    run_push,
+)
+from imsg.backfill.transfer import TransferError, run_copy
 from imsg.backup.pipeline import OUT_OF_SCOPE_NOTE, SAME_DEVICE_CAVEAT, run_backup
 from imsg.backup.retention import DEFAULT_KEEP
 from imsg.config.loader import default_config_path, load_config
@@ -1880,9 +1898,25 @@ def backfill_attachments(
             "retry ladder first — attempts 0, eligible now — so they are re-examined this run.",
         ),
     ] = False,
+    no_pull: Annotated[
+        bool,
+        typer.Option(
+            "--no-pull",
+            help="Skip the attachments.pull locations this run (no SSH copies); every other "
+            "location is still tried.",
+        ),
+    ] = False,
     dry_run: DryRunOption = False,
 ) -> None:
-    """S5a — materialize iCloud-optimized attachments locally (SPEC §8 S5a)."""
+    """S5a — materialize attachments into the cache (SPEC §8 S5a).
+
+    First each attachment's own path on this host, as before. Then every
+    other known copy of every attachment still not materialized — missing
+    and unsupported ones included — best first: content already in the
+    cache, this host's Messages folder, copies another host pushed into
+    staging, then attachments.pull locations over SSH. Each copy is checked
+    against the size and hash its location reported before it enters the
+    cache (D13). Sources are only ever read. Counts only are printed."""
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
 
@@ -1897,8 +1931,9 @@ def backfill_attachments(
             yes_full_run=yes_full_run,
             dry_run=dry_run,
             retry_failed=retry_failed,
+            locations=settings_from_config(cfg, run_pulls=not no_pull),
         )
-    except ImsgError as exc:
+    except (ImsgError, TransferError) as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     finally:
@@ -1919,6 +1954,9 @@ def backfill_attachments(
         f"missing_no_source_path={report.reclassified_missing_no_source}; "
         f"retry_failed_reset={report.retry_reset}"
     )
+    if report.locations is not None:
+        for line in _location_fetch_lines(report.locations):
+            typer.echo(f"backfill-attachments: {line}")
     if report.trial_gate_capped:
         typer.echo(
             "backfill-attachments: first-run trial gate active — pass --yes-full-run "
@@ -1929,6 +1967,336 @@ def backfill_attachments(
         typer.echo("backfill-attachments: halted — low disk space", err=True)
     if dry_run:
         typer.echo(DRY_RUN_MARKER)
+
+
+def _counter_text(counts: Mapping[Any, int]) -> str:
+    if not counts:
+        return "none"
+    parts = []
+    for key, n in sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0]))):
+        label = "/".join(key) if isinstance(key, tuple) else key
+        parts.append(f"{label}={n}")
+    return " ".join(parts)
+
+
+def _location_fetch_lines(report: LocationFetchReport) -> list[str]:
+    """The location phase, counts only (no path is ever printed: the
+    terminal output of a run on another host lands on that host's disk)."""
+    if report.dry_run:
+        return [
+            f"locations (dry run): attachments with an open copy="
+            f"{report.attachments_with_candidates}; first copy each would try: "
+            f"{_counter_text(report.would_try)}",
+            f"locations (dry run): waiting on a push: {_counter_text(report.awaiting_push)}; "
+            f"no host reads: {_counter_text(report.no_access)}",
+        ]
+    return [
+        f"locations: attachments with an open copy={report.attachments_with_candidates} "
+        f"attempted={report.attempted} materialized={report.materialized_total} "
+        f"(flagged name+size={report.materialized_flagged})",
+        f"locations: materialized by tier/location/match: {_counter_text(report.materialized)}",
+        f"locations: rejected (size or hash differed): {_counter_text(report.rejected)}; "
+        f"absent: {_counter_text(report.absent)}; refused: {_counter_text(report.refused)}; "
+        f"unreachable: {_counter_text(report.unreachable)}",
+        f"locations: pulled: {_counter_text(report.pulled)}; "
+        f"pull runs that did not reach their host: {_counter_text(report.pull_runs_failed)}",
+        f"locations: still waiting on a push: {_counter_text(report.awaiting_push)}; "
+        f"only on locations no host reads: {_counter_text(report.no_access)}; "
+        f"pulls not run (--no-pull): {_counter_text(report.pull_skipped)}; "
+        f"name+size copies held back for a pending push={report.deferred_flagged}",
+    ]
+
+
+def _coverage_lines(coverage: CoverageReport) -> list[str]:
+    not_materialized = sum(coverage.not_materialized.values())
+    return [
+        f"coverage: not materialized={not_materialized} "
+        f"({_counter_text(coverage.not_materialized)})",
+        f"coverage: next copy would come from: {_counter_text(coverage.best)}; "
+        f"of which a name+size match only (flagged)={coverage.best_is_flagged}",
+        f"coverage: unfetchable={coverage.unfetchable}; every copy tried and closed, by "
+        f"state/kind: {_counter_text(coverage.exhausted)}; no copy found anywhere, by "
+        f"state/kind: {_counter_text(coverage.no_candidate)}",
+        f"coverage: candidate rows by location/match: {_counter_text(coverage.rows)}",
+        f"coverage: materialized from a location, by location/match: "
+        f"{_counter_text(coverage.fetched)}",
+    ]
+
+
+def _located_files(specs: list[str] | None, flag: str) -> list[LocatedFile]:
+    located: list[LocatedFile] = []
+    for spec in specs or []:
+        code, sep, raw = spec.partition("=")
+        if not sep or not code or not raw:
+            typer.echo(f"imsg: {flag} must be CODE=PATH, got {spec!r}", err=True)
+            raise typer.Exit(code=2)
+        path = Path(raw).expanduser()
+        if not path.is_file():
+            typer.echo(f"imsg: {flag} {code}: no such file", err=True)
+            raise typer.Exit(code=1)
+        located.append(LocatedFile(code, path))
+    return located
+
+
+@app.command("locate-attachments")
+def locate_attachments(
+    config: ConfigOption = None,
+    listing: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--listing",
+            help="CODE=PATH: a tab-separated listing (rel, size, mtime, sha256) of another "
+            "Mac's Messages attachments folder, CODE being that Mac. Repeatable.",
+        ),
+    ] = None,
+    catalog: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--catalog",
+            help="[CODE=]PATH: a drive catalog (path, size, mtime, ext; gzip or plain), or a "
+            "directory searched for them. The drive code comes from the file or run-directory "
+            "name unless given. Repeatable.",
+        ),
+    ] = None,
+    seed_db: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--seed-db",
+            help="CODE=PATH: a chat.db-shaped database (opened read-only) whose recorded "
+            "attachment paths are stored under CODE, the Mac it came from. Repeatable.",
+        ),
+    ] = None,
+    no_local_walk: Annotated[
+        bool, typer.Option("--no-local-walk", help="Do not walk this host's Messages folder.")
+    ] = False,
+    report_only: Annotated[
+        bool, typer.Option("--report-only", help="Print coverage from the table; read nothing.")
+    ] = False,
+    dry_run: DryRunOption = False,
+) -> None:
+    """Find every candidate copy of every attachment not yet materialized (D13).
+
+    Records each in attachment_location with how it matched: a recorded
+    path, a GUID folder plus name, or name plus size (flagged). A name alone
+    is counted and never stored. Then prints where each attachment's next
+    copy would come from and what remains unfetchable. Reads listings,
+    catalogs and databases only; copies nothing. Counts only are printed:
+    the paths stay in the database."""
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    seeds = _located_files(seed_db, "--seed-db")
+    listings = _located_files(listing, "--listing")
+    access = access_from_config(cfg)
+
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        if report_only:
+            coverage = build_coverage(conn, access, cfg.paths.data_root)
+            for line in _coverage_lines(coverage):
+                typer.echo(f"locate-attachments: {line}")
+            return
+        report, coverage = run_locate(
+            conn,
+            access=access,
+            data_root=cfg.paths.data_root,
+            seeds=seeds,
+            listings=listings,
+            catalogs=catalog or [],
+            walk_local=not no_local_walk,
+            dry_run=dry_run,
+        )
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    typer.echo(
+        f"locate-attachments: attachments not materialized={report.targets} "
+        f"({_counter_text(report.targets_by_state)})"
+    )
+    typer.echo(
+        f"locate-attachments: read seed_rows={report.seed_rows} local_files={report.local_files} "
+        f"listing_rows={report.listing_rows} catalog_files={report.catalog_files} "
+        f"catalog_rows={report.catalog_rows} catalogs_without_a_code={report.catalogs_skipped}"
+    )
+    typer.echo(f"locate-attachments: rows by location/match/outcome: {_counter_text(report.stored)}")
+    typer.echo(
+        f"locate-attachments: weak matches (name only, or a GUID folder holding another name) — "
+        f"never stored, never fetched: {_counter_text(report.weak)}; over the per-location "
+        f"cap={report.capped}; paths not valid UTF-8={report.undecodable_paths}"
+    )
+    for line in _coverage_lines(coverage):
+        typer.echo(f"locate-attachments: {line}")
+    if dry_run:
+        typer.echo(DRY_RUN_MARKER)
+
+
+@app.command("push-attachments-plan")
+def push_attachments_plan(
+    location: Annotated[
+        list[str],
+        typer.Option("--location", help="A location code the pushing host serves. Repeatable."),
+    ],
+    config: ConfigOption = None,
+) -> None:
+    """Index host: print the push plan for `imsg push-attachments` (machine-readable).
+
+    For the pushing host's own use over SSH. The plan names file paths, so
+    it is written only to a pipe: run from a terminal it refuses. Counts go
+    to stderr. Reads only."""
+    if sys.stdout.isatty():
+        typer.echo(
+            "imsg: push-attachments-plan writes file paths; it is read by "
+            "'imsg push-attachments' over SSH and refuses to print to a terminal",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        plan = build_push_plan(
+            conn, locations=location, access=access_from_config(cfg), data_root=cfg.paths.data_root
+        )
+    finally:
+        conn.close()
+    for line in plan_to_lines(plan):
+        sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+    candidates = sum(len(item.candidates) for item in plan.items)
+    typer.echo(
+        f"push-attachments-plan: attachments={len(plan.items)} candidates={candidates}", err=True
+    )
+
+
+@app.command("push-attachments-record")
+def push_attachments_record(config: ConfigOption = None) -> None:
+    """Index host: record what `imsg push-attachments` did (results on stdin).
+
+    Writes only the attempt columns of the planned attachment_location
+    rows; rsync's messages go to a log under data_root/logs."""
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    try:
+        results, rsync_log = parse_results(sys.stdin)
+    except (PushError, ValueError) as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        counts = record_push_results(
+            conn, results, rsync_log=rsync_log, log_dir=cfg.paths.data_root / "logs"
+        )
+    finally:
+        conn.close()
+    typer.echo(f"push-attachments-record: recorded {_counter_text(counts)}")
+
+
+def _remote_imsg(
+    ssh: str, ssh_host: str, argv: list[str], *, stdin: bytes | None, timeout: float
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        [*shlex.split(ssh), ssh_host, shlex.join(argv)],
+        input=stdin,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+@app.command("push-attachments")
+def push_attachments(
+    ssh_host: Annotated[str, typer.Option(help="The index host, as ssh names it.")],
+    remote_imsg: Annotated[
+        str, typer.Option(help="Absolute path of the imsg executable on the index host.")
+    ],
+    root: Annotated[
+        list[str],
+        typer.Option(
+            "--root",
+            help="CODE=PATH: a location this host serves and the directory its paths are "
+            "below (this Mac's ~/Library/Messages/Attachments, or a drive's mount point). "
+            "Repeatable, in preference order.",
+        ),
+    ],
+    remote_config: Annotated[
+        str | None, typer.Option(help="Absolute path of config.yaml on the index host.")
+    ] = None,
+    ssh: Annotated[str, typer.Option(help="ssh command, with options.")] = "ssh -o BatchMode=yes",
+    rsync: Annotated[str, typer.Option(help="rsync command on this host.")] = "rsync",
+    dry_run: DryRunOption = False,
+) -> None:
+    """Run on a host the index host cannot reach: copy attachment files the
+    index is missing into its staging directory, read-only (D13).
+
+    Asks the index host for a plan over SSH, checks each planned file here
+    (below its --root, a regular file, the listed size), and copies the first
+    good copy of each attachment with one rsync per location; this host is
+    rsync's sender and its files are only read. Then sends back what
+    happened to each candidate. The index host verifies and materializes
+    the copies at its next `imsg backfill-attachments`. Needs no config and
+    no database here. Prints counts only; neither the plan nor any file
+    list touches this host's disk."""
+    try:
+        roots = [parse_root(spec) for spec in root]
+    except PushError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    base = [remote_imsg]
+    config_args = ["--config", remote_config] if remote_config else []
+    plan_argv = [*base, "push-attachments-plan", *config_args]
+    for push_root in roots:
+        plan_argv += ["--location", push_root.location]
+
+    fetched = _remote_imsg(ssh, ssh_host, plan_argv, stdin=None, timeout=1800)
+    for line in fetched.stderr.decode("utf-8", "replace").splitlines():
+        typer.echo(f"index host: {line}", err=True)
+    if fetched.returncode != 0:
+        typer.echo(f"imsg: the index host did not return a plan (exit {fetched.returncode})",
+                   err=True)
+        raise typer.Exit(code=1)
+    try:
+        # Split on "\n" only: `splitlines` also breaks on Unicode line
+        # separators, which a file name inside a JSON string may contain.
+        plan = parse_plan(fetched.stdout.decode("utf-8").split("\n"))
+        report, results, rsync_log = run_push(
+            plan, roots, ssh_host=ssh_host, ssh=ssh, rsync=rsync, runner=run_copy, dry_run=dry_run
+        )
+    except (PushError, TransferError, ValueError) as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        f"push-attachments: plan attachments={report.items} "
+        f"candidates checked here={report.candidates_checked} "
+        f"candidates at locations with no --root here={report.no_root_here}"
+    )
+    typer.echo(
+        f"push-attachments: {'would send' if dry_run else 'sent'}: "
+        f"{_counter_text(report.selected)}; rsync exit codes: "
+        f"{_counter_text(report.copy_exit_codes)}"
+    )
+    typer.echo(
+        f"push-attachments: not sent, by location/outcome: {_counter_text(report.not_sent)}; "
+        f"attachments with nothing sendable here={report.unserved}"
+    )
+    if dry_run:
+        typer.echo(DRY_RUN_MARKER)
+        return
+    record_argv = [*base, "push-attachments-record", *config_args]
+    payload = "".join(line + "\n" for line in results_to_lines(results, rsync_log))
+    recorded = _remote_imsg(ssh, ssh_host, record_argv, stdin=payload.encode("utf-8"),
+                            timeout=600)
+    for line in (recorded.stdout + recorded.stderr).decode("utf-8", "replace").splitlines():
+        typer.echo(f"index host: {line}")
+    if recorded.returncode != 0:
+        typer.echo(
+            f"imsg: the index host did not record the results (exit {recorded.returncode}); "
+            f"the staged copies are still verified at its next backfill",
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
 
 @mcp_app.command("local")

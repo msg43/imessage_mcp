@@ -10,6 +10,68 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-23 — Attachment fetcher: every known copy of an attachment is tried, read-only, verified
+
+Owner decision D13 (recall over purity): build the fetcher that finds every
+attachment copy that can possibly be added. Before this, S5a tried one path
+per attachment, the one this host's chat.db recorded, on this host only. On
+the production host 978 attachments were `missing` and 469 `unsupported`;
+a survey that day found copies of most of them elsewhere: 668 of the 978 at
+the path another Mac's own chat.db recorded, which the index had never
+stored, because `attachment.source_path` holds one path and D12 lets a seed
+only fill it.
+
+- **Migration 0008** (additive): `attachment_location`, one row per
+  attachment and candidate copy: location (a host or drive code), path,
+  match quality, who reported it, size and sha256 when known, and the last
+  attempt. Match quality is `recorded_path`, `guid_folder` or `name_size`
+  (flagged). A name alone has no enum value, so it can never be stored or
+  fetched. Measured on the production corpus against another Mac's folder:
+  a GUID folder plus the name found the right content 57,532 of 57,532
+  times; the same name and size in another folder 38,018 of 38,210 times.
+- **Extraction keeps every source's recorded path**, filed under the
+  source's name, insert-only; `imsg extract` reports it as table
+  `attachment_location`.
+- **`imsg locate-attachments`** records candidate copies from seed
+  databases (read-only), this host's Messages folder (stat only), listings
+  of another Mac's folder (with hashes) and drive catalogs, then prints
+  where each attachment's next copy would come from and what has none.
+  `--dry-run` rolls back; `--report-only` reads the table.
+- **The backfill tries copies best first** after each attachment's own
+  path: content already in the cache (a listed hash), this host's folder,
+  copies another host pushed into staging, then `attachments.pull` shares
+  over SSH. Identity matches come before name-and-size matches, and a
+  name-and-size copy waits while an identity copy is due from a push. Every
+  copy is checked against its location's size and hash before it enters
+  the cache; a mismatch is recorded as `rejected` and not retried until
+  `locate-attachments` records new evidence. `unsupported` and `missing`
+  attachments are tried whenever a new copy appears.
+- **`imsg push-attachments`** runs on a host the index host cannot reach:
+  it asks for a plan over SSH (`push-attachments-plan`), checks each file
+  on its own disks, copies the good ones into the index host's staging
+  directory with one rsync per location, and reports back
+  (`push-attachments-record`). No config or database is needed there.
+- **Sources are read-only.** Both copies are plain rsync runs whose source
+  side is rsync's sender; flags that remove or delete anything are refused
+  before a command runs; remote paths must be plain absolute paths; a
+  pushing host's root may not expose `~/Library/Messages` beyond its
+  Attachments folder. The only files the fetcher deletes are its own
+  staged copies, once materialized.
+- **No path is printed.** Plans travel over SSH into memory and file
+  lists reach rsync on stdin; rsync's messages go to logs under
+  `data_root/logs`. Commands print counts only.
+- **Config:** optional `attachments` section (`staging_dir` under
+  `data_root`, `local_location`, `push_locations`, `pull`).
+- **Tests:** 80 new; every one failed on `14ee55c` (the extraction and
+  backfill ones on their assertions once this migration was present, the
+  rest at import). Full suite, rebased onto the day's other D13 work:
+  2,082 passed against a scratch Postgres 17; with no database, 1,630
+  passed and 452 skipped.
+- **Known limit:** a drive catalog built from several Time Machine
+  snapshot mounts files all its rows under one drive code, but each
+  snapshot's paths are relative to its own mount, so one `--root` serves
+  only the snapshot it names.
+
 ## 2026-09-23 — Every message is filed: rows with no chat link go into the chat their evidence names, or a holding chat
 
 Owner decision D13: recall over purity. "I'd rather keep all the messages

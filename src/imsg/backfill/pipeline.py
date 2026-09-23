@@ -18,6 +18,12 @@ Two kinds of write happen in a run, and the report keeps them apart:
   containment check can only ever be `unsupported`. Both are applied
   at the start of every run so an index built before those states
   existed heals on its next pass, with no manual UPDATE.
+
+After those, when the caller passes `locations`, the **location phase**
+(`imsg.backfill.fetch`, owner decision D13) tries every other known copy
+of each attachment still not materialized — `missing` and `unsupported`
+included — best first, verified before it reaches the cache. Its report
+is `BackfillRunReport.locations`.
 """
 
 from __future__ import annotations
@@ -37,6 +43,7 @@ from imsg.backfill.classify import (
     format_unsupported_error,
 )
 from imsg.backfill.dataless import is_dataless
+from imsg.backfill.fetch import LocationFetchReport, LocationFetchSettings, fetch_from_locations
 from imsg.backfill.materialize import materialize_attachment
 from imsg.backfill.throttle import RateThrottle
 from imsg.paths import is_contained_in, resolve_path
@@ -119,6 +126,10 @@ class BackfillRunReport:
     `marked_missing` are always 0 — see `notes` — because a read's
     outcome can only be known by attempting it, which a dry run never
     does."""
+    locations: LocationFetchReport | None = None
+    """The location phase (`imsg.backfill.fetch`), when it ran. Its
+    materializations are counted there, not in `materialized`, which
+    stays "materialized from the row's own `source_path`"."""
 
 
 def _fetch_candidates(
@@ -360,6 +371,7 @@ def run_backfill(
     disk_free_fn: DiskFreeFn | None = None,
     dry_run: bool = False,
     retry_failed: bool = False,
+    locations: LocationFetchSettings | None = None,
 ) -> BackfillRunReport:
     """Run one backfill pass. `attachments_root` is the live
     `~/Library/Messages/Attachments` directory — every candidate's
@@ -382,6 +394,11 @@ def run_backfill(
     `_mark_materialized`/`_mark_failure`/`_mark_unsupported` — no
     filesystem copy and no Postgres write happens. See
     `BackfillRunReport.dry_run`'s docstring for which counts stay 0.
+
+    `locations` adds step (5), the location phase (module docstring). It
+    runs after the attempt loop, so an attachment's own path is always
+    tried first; it shares the loop's throttle, free-space floor and, on a
+    first run, what is left of the trial gate's allowance.
     """
     disk_free_fn = disk_free_fn or _default_disk_free
     throttle = throttle or RateThrottle(rate_per_minute)
@@ -454,6 +471,8 @@ def run_backfill(
             "materialization would succeed or fail can't be known without "
             "attempting it"
         )
+        if locations is not None and not report.halted_low_disk_space:
+            report.locations = fetch_from_locations(conn, resolved_data_root, locations, dry_run=True)
         return report
 
     for i, candidate in enumerate(candidates, start=1):
@@ -508,6 +527,24 @@ def run_backfill(
             cache_path=result.cache_path,
         )
         report.materialized += 1
+
+    if locations is not None and not report.halted_low_disk_space:
+        budget = max(0, trial_limit - report.considered) if trial_gate_active else None
+        report.locations = fetch_from_locations(
+            conn,
+            resolved_data_root,
+            locations,
+            throttle=throttle,
+            budget=budget,
+            disk_free_fn=disk_free_fn,
+            min_free_bytes=min_free_bytes,
+            free_space_check_interval=free_space_check_interval,
+            read_this_run={c.attachment_id: c.source_path for c in candidates},
+        )
+        if report.locations.halted_low_disk_space:
+            report.halted_low_disk_space = True
+        if report.locations.budget_capped:
+            report.trial_gate_capped = True
 
     return report
 

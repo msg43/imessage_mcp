@@ -679,6 +679,95 @@ class LoggingConfig(StrictModel):
 
 
 # --------------------------------------------------------------------------
+# attachments — where copies of attachments can be fetched from (D13)
+# --------------------------------------------------------------------------
+
+_LOCATION_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_SSH_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
+_REMOTE_ROOT_RE = re.compile(r"^/[A-Za-z0-9._/+@-]*$")
+
+
+def _check_location_code(code: str, field_name: str) -> str:
+    if not _LOCATION_CODE_RE.fullmatch(code) or code in {".", ".."}:
+        raise ValueError(
+            f"{field_name} must be a location code of letters, digits, '.', '_' or '-' "
+            f"(it names a staging directory), got {code!r}"
+        )
+    return code
+
+
+class AttachmentPullConfig(StrictModel):
+    """A location this host copies from itself, read-only, over SSH (a NAS
+    share). `root` is the absolute path on `ssh_host` that the location's
+    catalog paths are relative to."""
+
+    location: str
+    ssh_host: str
+    root: str
+
+    @field_validator("location", mode="after")
+    @classmethod
+    def _code(cls, v: str) -> str:
+        return _check_location_code(v, "attachments.pull[].location")
+
+    @field_validator("ssh_host", mode="after")
+    @classmethod
+    def _host(cls, v: str) -> str:
+        if not _SSH_HOST_RE.fullmatch(v):
+            raise ValueError(f"attachments.pull[].ssh_host must be a plain host or alias, got {v!r}")
+        return v
+
+    @field_validator("root", mode="after")
+    @classmethod
+    def _root(cls, v: str) -> str:
+        if not _REMOTE_ROOT_RE.fullmatch(v) or "/../" in f"{v}/" or "/./" in f"{v}/":
+            raise ValueError(
+                f"attachments.pull[].root must be a plain absolute path of [A-Za-z0-9._/+@-], "
+                f"got {v!r}"
+            )
+        return v
+
+
+class AttachmentsConfig(StrictModel):
+    """The attachment fetcher (D13): every section is optional, and with
+    none of it set the backfill still tries this host's own Messages folder
+    and anything another host has pushed into `staging_dir`."""
+
+    staging_dir: Path = Field(default=Path("attachment-staging"))
+    """Where pushed and pulled copies land before they are verified;
+    relative to `paths.data_root` (checked to resolve under it)."""
+    local_location: str | None = None
+    """The code this host's own Messages folder is filed under. Default:
+    the name of the `sync.sources` entry that is this host's live chat.db."""
+    push_locations: list[str] = Field(default_factory=list)
+    """Locations another host copies in with `imsg push-attachments`
+    (another Mac's Messages folder, its attached drives)."""
+    pull: list[AttachmentPullConfig] = Field(default_factory=list)
+    ssh_command: str = "ssh -o BatchMode=yes"
+    rsync_command: str = "rsync"
+
+    @field_validator("local_location", mode="after")
+    @classmethod
+    def _local_code(cls, v: str | None) -> str | None:
+        return None if v is None else _check_location_code(v, "attachments.local_location")
+
+    @field_validator("push_locations", mode="after")
+    @classmethod
+    def _push_codes(cls, v: list[str]) -> list[str]:
+        for code in v:
+            _check_location_code(code, "attachments.push_locations[]")
+        return v
+
+    @field_validator("pull", mode="after")
+    @classmethod
+    def _unique_pulls(cls, v: list[AttachmentPullConfig]) -> list[AttachmentPullConfig]:
+        codes = [p.location for p in v]
+        if len(codes) != len(set(codes)):
+            raise ValueError(f"attachments.pull locations must be unique, got {codes}")
+        return v
+
+
+# --------------------------------------------------------------------------
 # root
 # --------------------------------------------------------------------------
 
@@ -702,6 +791,7 @@ class Config(StrictModel):
     export: ExportConfig
     eval: EvalConfig = Field(default_factory=EvalConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    attachments: AttachmentsConfig = Field(default_factory=AttachmentsConfig)
 
     # ---- cross-field path-containment validation (hard requirements #1, #2) ----
 
@@ -759,6 +849,7 @@ class Config(StrictModel):
             ("enrichment.caption_prompt", self.enrichment.caption_prompt),
             ("eval.seed_queries", self.eval.seed_queries),
             ("eval.runs_dir", self.eval.runs_dir),
+            ("attachments.staging_dir", self.attachments.staging_dir),
         ]
         for field_name, raw_path in derived:
             resolved = resolve_path(join_under_root(root, raw_path))
@@ -805,6 +896,8 @@ PathLike = Annotated[Path, "resolved via imsg.paths helpers before use"]
 __all__ = [
     "HNSW_EF_SEARCH_MAX",
     "RERANKER_MODEL_FORMS",
+    "AttachmentPullConfig",
+    "AttachmentsConfig",
     "Config",
     "DatabaseConfig",
     "EmbeddingConfig",
