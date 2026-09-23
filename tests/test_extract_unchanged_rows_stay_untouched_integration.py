@@ -173,7 +173,9 @@ _LINK_BLOB = _nskeyedarchiver_blob(
 )
 
 
-def _build_snapshot(path: Path, *, extra_message: bool = False) -> Path:
+def _build_snapshot(
+    path: Path, *, extra_message: bool = False, alice_1_edited_at: datetime | None = None
+) -> Path:
     """Two DM chats, five real messages (one of them the owner's), one
     tapback, one attachment, one link preview and one edited message --
     enough to drive every upsert in `imsg.stages.extract` at least once.
@@ -182,6 +184,10 @@ def _build_snapshot(path: Path, *, extra_message: bool = False) -> Path:
     equivalent in the columns extraction reads: an accidental ROWID
     shuffle would make "the same corpus" a different corpus and quietly
     defeat the whole suite.
+
+    `alice_1_edited_at` makes `_ALICE_1` an edited message: since D12 a
+    body is replaced only by a strictly newer edit, so a test that
+    changes the body has to say when the edit happened.
     """
     builder = ChatDbBuilder()
     alice_chat = builder.add_chat(FixtureChat(guid="chat-alice", rowid=1, display_name=None))
@@ -194,7 +200,7 @@ def _build_snapshot(path: Path, *, extra_message: bool = False) -> Path:
     builder.add_message(
         FixtureMessage(
             guid=_ALICE_1, chat_guid=alice_chat.guid, handle_raw_value=ALICE_HANDLE,
-            rowid=1, date=_BASE,
+            rowid=1, date=_BASE, date_edited=alice_1_edited_at,
         )
     )
     builder.add_message(
@@ -508,15 +514,20 @@ def test_one_changed_body_moves_one_row_and_dirties_one_chat(
 ) -> None:
     """The other half of the invariant: skipping unchanged rows must not
     skip changed ones. An edited body still moves exactly its own row and
-    dirties exactly its own chat."""
+    dirties exactly its own chat.
+
+    The edit carries its `date_edited`, as a real one does: since D12 a
+    different body with no newer edit time is refused
+    (`test_extract_merges_only_add_integration.py`)."""
     before_versions = _row_versions(pg_conn)
     before_updated_at = _message_updated_at(pg_conn)
     chat_ids = _chat_ids_by_guid(pg_conn)
 
     _reset_watermark(pg_conn)
-    result = _extract(
-        pg_conn, tmp_path, settled_corpus, _dump_run(alice_1_body="morning, corrected")
+    edited = _build_snapshot(
+        tmp_path / "snapshot_edited.db", alice_1_edited_at=_BASE + timedelta(minutes=30)
     )
+    result = _extract(pg_conn, tmp_path, edited, _dump_run(alice_1_body="morning, corrected"))
 
     assert result.message_upserts.updated == 1
     assert result.message_upserts.unchanged == 4

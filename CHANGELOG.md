@@ -10,6 +10,76 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-23 — Corpus merges only add: a seed inserts and fills, and never replaces a value
+
+Owner decision D12: "Always want to merge and maintain the fullest corpus
+of chat.db and attachments, not overwrite and lose rows." Each column's
+rule (`Merge` in `imsg.stages.extract`) decided only whether an incoming
+value was evidence, and under `PRESENT` any non-NULL value was — `''` and
+0 included — so whichever source ran last won. A dry run on the production
+host of a recovery candidate built on an older merged corpus would have
+added 608 messages, and would also have put the older values back over 526
+messages, 32,971 attachment rows and 365 chats, one group name blanked to
+`''`. It printed `inserted=608 updated=526 unchanged=664178` and nothing
+about the chats and attachments. Nothing was written; dry runs roll back.
+
+- **Seeds only add.** `run_extract` takes `merge_mode`: `MergeMode.LIVE` or
+  `SEED`, default `SEED`. Only S1's copy of this machine's own
+  `paths.live_chat_db` is live (`merge_mode_for_source`: same resolved path
+  or same inode). `imsg sync` decides from the database S1 copied, so a
+  configured source that points at another Mac's copy is a seed.
+  `imsg extract --snapshot` is always a seed. `imsg extract` without
+  `--snapshot` is live only when every configured source is the live
+  database, because all of them share `snapshots/snapshot.db`. A seed fills
+  empty values and never replaces a non-empty one, `sent_at` and
+  `is_from_me` included; a `POSITIVE` flag's `true` over a stored `false`
+  counts as a fill.
+- **`''` and 0 are never evidence**, from any source. Each column declares
+  which of its values say nothing (`Empty`): NULL or `''` for names, paths,
+  types and bodies; NULL, 0 or less for `byte_size`; NULL or `unknown` for a
+  chat's service; `false` for the five `POSITIVE` flags; only NULL for
+  timestamps, ids and the two asserted columns.
+- **The live run still applies genuine changes**, such as a renamed chat or
+  an attachment the Messages app moved.
+- **Bodies follow edit recency, and edit history only grows.** A body is
+  filled when empty and replaced only by a strictly newer `date_edited`,
+  from any source; a same-or-older edit never replaces it, the live run
+  included. `date_edited` moves only with its body, so an edit whose text
+  did not decode cannot lock that text out. The body a newer edit replaces
+  is appended to `message_version` when the history does not already hold
+  it. A stored version is never replaced (a different text at the same
+  position is a different decode); an undecodable `''` version is filled.
+- **Every table is reported.** `imsg extract` and `imsg sync` print one line
+  per table with `inserted`, `filled`, `newer_edit`, `replaced` and
+  `unchanged`, for all eleven tables S2 writes; the first line is
+  unchanged. A seed must show `replaced=0` on every line. The split is
+  worked out per column inside the same statement, from the row before the
+  write and the row after it, using each column's `Empty` kind.
+- **Migration 0006** (additive): `extraction_run.merge_mode` and
+  `extraction_run.upsert_counts` (jsonb, the per-table split), so a real
+  seed run can be checked after the terminal output is gone. Run
+  `imsg migrate` before this build extracts anything; without the columns
+  the first extraction fails.
+- **Changes S4 could not see now mark the chat.** S4 re-segments a chat only
+  when one of its messages' `updated_at` moves. A chat's name or kind (in
+  every segment header), an attachment's name or type, a new attachment
+  link on an existing message, a tapback and an edit-history version are
+  all rendered through a message but stored elsewhere, and changing them
+  moved nothing, so segments kept the old text. Extract now marks those
+  messages at the end of each run (`messages_marked_for_resegmentation`).
+  This applies to the live run too: a tapback on an older message, or a
+  group rename, now re-segments — a rename re-segments the whole chat, as
+  an identity rename already does.
+- **Cost:** about 1.3× the database time per extracted row, measured as
+  9.1–9.5 s against 7.0–7.3 s per 20,000 messages on a synthetic corpus on
+  the development machine.
+- **Tests:** 38 new, each run first against the previous code, where all
+  failed — on overwrites, blanked values and unmarked chats, or on the
+  counts and mode not existing. Two existing tests asserted the old rule
+  and were rewritten: a body change with no newer edit time, and a second
+  source's rename, service and attachment changes landing from a seed.
+  1,919 passed, 0 skipped, against a scratch Postgres 17.
+
 ## 2026-09-23 — Public `allowlist` scope serves exactly what export would ship
 
 SPEC §10.3a says the public MCP surface under `allowlist` scope applies

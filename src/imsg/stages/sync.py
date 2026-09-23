@@ -55,7 +55,14 @@ import structlog
 from imsg.config.schema import Config
 from imsg.errors import ImsgError, SyncError
 from imsg.mount.guard import guard_mount
-from imsg.stages.extract import ExtractResult, RunImsgDumpFn, _default_run_imsg_dump, run_extract
+from imsg.stages.extract import (
+    ExtractResult,
+    MergeMode,
+    RunImsgDumpFn,
+    _default_run_imsg_dump,
+    merge_mode_for_source,
+    run_extract,
+)
 from imsg.stages.identity import (
     ContactsImporterFn,
     IdentityResult,
@@ -155,6 +162,12 @@ def run_sync(
     S1); otherwise `live_chat_db` is used directly, or resolved from
     `config.sync.sources` by `source_name` if not given.
 
+    The merge rule S2 applies (D12) follows from the same choice: only
+    an S1 copy of this machine's own `paths.live_chat_db` is
+    `MergeMode.LIVE`. An override is always a seed, and so is a
+    configured source that points at another database, such as a
+    transferred Studio copy (`merge_mode_for_source`).
+
     Raises `SyncError` naming which stage failed. S4/S6 are skipped
     (not errors) when their callables are `None` — see the module
     docstring's "S4/S6 are dependency-injected" note. The S3→S4
@@ -193,8 +206,10 @@ def run_sync(
     if snapshot_override is not None:
         snapshot_path = snapshot_override
         snapshot_sha256 = None
+        merge_mode = MergeMode.SEED
     else:
         resolved_chat_db = live_chat_db or _resolve_source_chat_db(config, source_name)
+        merge_mode = merge_mode_for_source(resolved_chat_db, config.paths.live_chat_db)
         try:
             snapshot_result = run_snapshot_fn(
                 live_chat_db=resolved_chat_db, data_root=config.paths.data_root, dry_run=dry_run
@@ -234,6 +249,7 @@ def run_sync(
             imsg_dump_binary=imsg_dump_binary,
             run_imsg_dump_fn=run_imsg_dump_fn,
             dry_run=dry_run,
+            merge_mode=merge_mode,
         )
     except ImsgError as exc:
         raise SyncError(f"sync for source '{source_name}' failed at S2 extract: {exc}") from exc

@@ -134,7 +134,7 @@ from imsg.retrieval.background_warm_up import BackgroundWarmUp
 from imsg.retrieval.model_thread import ModelThread
 from imsg.retrieval.service import RetrievalService
 from imsg.segment.pipeline import REBUILD_ALL_SENTINEL, run_segment, run_segment_for_chat
-from imsg.stages.extract import run_extract
+from imsg.stages.extract import ExtractResult, MergeMode, merge_mode_for_source, run_extract
 from imsg.stages.identity import (
     assign_handle,
     compute_invariant_report,
@@ -721,6 +721,48 @@ def _validate_seed_or_die(cfg: Config, snapshot: Path | None, source: str | None
         raise typer.Exit(code=1)
 
 
+def _pipeline_snapshot_merge_mode(cfg: Config, source_name: str) -> MergeMode:
+    """The D12 merge rule for `imsg extract` without `--snapshot`.
+
+    S1 writes every configured source's copy to the same
+    `snapshots/snapshot.db`, so this command cannot tell whose copy is
+    there. It can vouch for it only when every configured source is this
+    machine's own live database; otherwise it takes the rule that loses
+    nothing. A source name that is not configured is a seed too.
+    (`imsg sync` does not need this: it runs S1 itself and knows.)"""
+    if source_name not in {source.name for source in cfg.sync.sources}:
+        return MergeMode.SEED
+    modes = {
+        merge_mode_for_source(source.chat_db, cfg.paths.live_chat_db)
+        for source in cfg.sync.sources
+    }
+    return MergeMode.LIVE if modes == {MergeMode.LIVE} else MergeMode.SEED
+
+
+_MERGE_MODE_MEANING = {
+    MergeMode.LIVE: "this machine's own chat.db: may replace a non-empty value",
+    MergeMode.SEED: "inserts and fills only; a body changes only for a strictly newer edit",
+}
+
+
+def _extract_report_lines(result: ExtractResult) -> list[str]:
+    """What S2 did to every table it wrote (D12 rule 5), one grep-able
+    line each. `replaced` must be 0 on every line of a seed run."""
+    lines = [f"mode={result.merge_mode.value} ({_MERGE_MODE_MEANING[result.merge_mode]})"]
+    for table, counts in result.table_counts().items():
+        lines.append(
+            f"table={table} inserted={counts.inserted} filled={counts.filled} "
+            f"newer_edit={counts.newer_edit} replaced={counts.replaced} "
+            f"unchanged={counts.unchanged}"
+        )
+    lines.append(
+        f"messages_marked_for_resegmentation={result.messages_marked_for_resegmentation} "
+        f"bodies_kept_as_history={result.bodies_kept_as_history} "
+        f"tapback_targets_resolved={result.tapback_targets_resolved}"
+    )
+    return lines
+
+
 @app.command()
 def extract(
     config: ConfigOption = None,
@@ -745,6 +787,10 @@ def extract(
     `sync.interval_seconds` — anything staged there is destroyed on the next
     tick. It requires `--source` because a seed advances that source's ROWID
     watermark, and ROWIDs mean nothing across database files.
+
+    A seed only adds (D12): it inserts rows and fills empty values, and never
+    replaces a non-empty one. The output names the rule the run applied and
+    reports every table it wrote.
     """
     cfg = _load_config_or_die(config)
     _validate_seed_or_die(cfg, snapshot, source)
@@ -757,6 +803,9 @@ def extract(
             f"imsg: no snapshot found at '{snapshot_path}' — run 'imsg snapshot' first", err=True
         )
         raise typer.Exit(code=1)
+    merge_mode = (
+        MergeMode.SEED if snapshot is not None else _pipeline_snapshot_merge_mode(cfg, source_name)
+    )
 
     conn = _connect_and_verify_or_die(cfg)
     try:
@@ -766,6 +815,7 @@ def extract(
             snapshot_path=snapshot_path,
             imsg_dump_binary=default_binary_path(_repo_root()),
             dry_run=dry_run,
+            merge_mode=merge_mode,
         )
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
@@ -783,6 +833,8 @@ def extract(
         f"watermark {result.watermark_before}->{result.watermark_after} "
         f"bodies_missing={result.bodies_missing}"
     )
+    for line in _extract_report_lines(result):
+        typer.echo(f"extract: {line}")
     if dry_run:
         typer.echo(DRY_RUN_MARKER)
 
@@ -1587,6 +1639,8 @@ def sync(
             f"unchanged={r.extract.message_upserts.unchanged}) "
             f"segment_ran={r.segment_ran} embed_ran={r.embed_ran}"
         )
+        for line in _extract_report_lines(r.extract):
+            typer.echo(f"sync: source={r.source_name} {line}")
     if dry_run:
         typer.echo(DRY_RUN_MARKER)
 

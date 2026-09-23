@@ -19,8 +19,16 @@ attachments lost `source_path`.
 Every test below extracts a RICH snapshot first and a POOR one second.
 The two describe the same conversation; the poor one is a witness that
 never received some of it. Nothing the rich source established may be
-lost, and — the other half — a genuine correction carried by a second
-source must still land, which the `*_still_flows` tests assert.
+lost, and — the other half — a genuine correction must still land, which
+the `*_still_lands` tests assert.
+
+Since owner decision D12 (2026-09-23) "a genuine correction" means one
+the live run carries: the poor witness here is `mini`, this machine's own
+database, so it is extracted as `MergeMode.LIVE` -- the only mode that
+may replace a non-empty value, which makes "it never overwrites with an
+absence" the stronger claim. A seed carrying the same corrections only
+fills, and a body changes only for a strictly newer edit; the full D12
+suite is `test_extract_merges_only_add_integration.py`.
 
 Fictional personas only (D5): Alice Example / Bob Builder, and
 documentation-range phone numbers.
@@ -31,6 +39,7 @@ from __future__ import annotations
 import os
 import plistlib
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -54,7 +63,7 @@ from imsg.segment.pipeline import (
     find_dirty_chats,
     run_segment_for_chat,
 )
-from imsg.stages.extract import ExtractResult, run_extract
+from imsg.stages.extract import ExtractResult, MergeMode, run_extract
 from imsg.stages.identity import run_identity
 from imsg.stages.imsg_dump import EditVersion, ImsgDumpMessage, ImsgDumpRun, TapbackInfo
 
@@ -384,6 +393,8 @@ def _extract(
         snapshot_path=snapshot_path,
         imsg_dump_binary=_fake_binary(tmp_path),
         run_imsg_dump_fn=fake_run,
+        # `mini` is this machine's own database; every other name is a seed.
+        merge_mode=MergeMode.LIVE if source_name == POOR_SOURCE else MergeMode.SEED,
     )
 
 
@@ -735,10 +746,14 @@ def _corrected_dump() -> ImsgDumpRun:
     return ImsgDumpRun(messages=tuple(messages), stderr_lines=())
 
 
+_PHOTO_EDITED_AT = _BASE + timedelta(minutes=30)
+
+
 def _build_corrected(path: Path) -> Path:
     """The poor snapshot plus the corrections a real second witness can
-    legitimately carry: the group was renamed, and the attachment that
-    had no metadata now has a path."""
+    legitimately carry: the group was renamed, the attachment moved and
+    was renamed, and `_PHOTO` was edited -- which `chat.db` records as a
+    `date_edited`, the edit time D12 compares."""
     builder = ChatDbBuilder()
     builder.add_chat(
         FixtureChat(guid=CHAT_GUID, rowid=1, style=43, display_name="Weekend Plans v2",
@@ -751,6 +766,8 @@ def _build_corrected(path: Path) -> Path:
     # heuristic) and not on `_FROM_BOB`, whose `message.handle_id` is NULL.
     builder.link_participant(CHAT_GUID, ALICE_HANDLE)
     for message in _messages(rich=False):
+        if message.guid == _PHOTO:
+            message = replace(message, date_edited=_PHOTO_EDITED_AT)
         builder.add_message(message)
     builder.add_attachment(
         FixtureAttachment(
@@ -764,15 +781,14 @@ def _build_corrected(path: Path) -> Path:
     return builder.build(path)
 
 
-def test_a_genuine_correction_from_a_second_source_still_lands(
+def test_a_genuine_correction_from_the_live_run_still_lands(
     pg_conn: psycopg.Connection, tmp_path: Path
 ) -> None:
-    """The invariant blocks only *absence*. Everything a second witness
-    positively asserts — a rewritten body, a retraction that really did
+    """The invariant blocks only *absence*. Everything the live run
+    positively asserts — an edited body, a retraction that really did
     happen since, a renamed chat, a service it now knows, an attachment
-    whose metadata arrived, a tapback that was taken back — must still
-    overwrite, or the fix would have traded one silent corruption for
-    another."""
+    that moved, a tapback that was taken back — must still land, or the
+    fix would have traded one silent corruption for another."""
     rich_path = _build_rich(tmp_path / "rich.db")
     _extract(pg_conn, tmp_path, rich_path, _rich_dump(), RICH_SOURCE)
 
@@ -790,10 +806,37 @@ def test_a_genuine_correction_from_a_second_source_still_lands(
         pg_conn, "SELECT removed FROM tapback WHERE source_guid = %s", _TAPBACK
     ) == (True,)
 
-    # And the corrections are counted as corrections, not as no-ops.
-    assert result.message_upserts.updated == 2
-    assert result.chat_upserts.updated == 1
-    assert result.attachment_upserts.updated == 1
+    # And the corrections are counted as corrections, not as no-ops: the
+    # edit as a newer edit, the retraction as a fill, the rename and the
+    # move as replacements -- which only the live run may make.
+    assert (result.message_upserts.newer_edit, result.message_upserts.filled) == (1, 1)
+    assert result.message_upserts.replaced == 0
+    assert result.chat_upserts.replaced == 1
+    assert result.attachment_upserts.replaced == 1
+
+
+def test_the_same_corrections_from_a_seed_only_fill(
+    pg_conn: psycopg.Connection, tmp_path: Path
+) -> None:
+    """D12: a seed carrying the same snapshot adds what the index lacks
+    -- the retraction, and the body a strictly newer edit brought, from
+    any source -- and replaces nothing: the rename, the other service and
+    the other attachment metadata are refused."""
+    rich_path = _build_rich(tmp_path / "rich.db")
+    _extract(pg_conn, tmp_path, rich_path, _rich_dump(), RICH_SOURCE)
+    chat_before = _chat_row(pg_conn)
+    attachment_before = _attachment_row(pg_conn, ATT_DOC)
+
+    corrected_path = _build_corrected(tmp_path / "corrected.db")
+    result = _extract(pg_conn, tmp_path, corrected_path, _corrected_dump(), "recovered-copy")
+
+    assert _message(pg_conn, _PHOTO)["text_original"] == "look at THIS"
+    assert _message(pg_conn, _DOC)["is_unsent"] is True
+    assert _chat_row(pg_conn) == chat_before
+    assert _attachment_row(pg_conn, ATT_DOC) == attachment_before
+    assert (result.message_upserts.newer_edit, result.message_upserts.filled) == (1, 1)
+    for table, counts in result.table_counts().items():
+        assert counts.replaced == 0, table
 
 
 def test_a_missing_attachment_path_that_later_arrives_still_reopens_materialization(

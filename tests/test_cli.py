@@ -524,6 +524,121 @@ def test_extract_dry_run_passes_the_flag_and_prints_the_marker(
     assert "DRY RUN — nothing was written" in result.output
 
 
+def _extract_via_cli(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch, *args: str, result: Any = None
+) -> tuple[dict[str, Any], str]:
+    """Run `imsg extract` against a fake `run_extract`; return the kwargs
+    it was called with and the command's output."""
+    from imsg.stages.extract import ExtractResult
+
+    data_root = _data_root_from_config(config_path)
+    (data_root / "snapshots").mkdir(parents=True, exist_ok=True)
+    (data_root / "snapshots" / "snapshot.db").write_text("")
+    captured: dict[str, Any] = {}
+
+    def fake_run_extract(**kwargs: Any) -> ExtractResult:
+        captured.update(kwargs)
+        if result is not None:
+            return result  # type: ignore[no-any-return]
+        return ExtractResult(
+            run_id=1, watermark_before=0, watermark_after=0, chats_upserted=0,
+            handles_upserted=0, messages_upserted=0, tapbacks_upserted=0,
+            system_messages_skipped=0, attachments_upserted=0, link_previews_upserted=0,
+            bodies_missing=0, dump_stderr_line_count=0,
+            merge_mode=kwargs["merge_mode"],
+        )
+
+    monkeypatch.setattr(cli_module, "run_extract", fake_run_extract)
+    invoked = runner.invoke(app, ["extract", "--config", str(config_path), *args])
+    assert invoked.exit_code == 0, invoked.output
+    return captured, invoked.output
+
+
+def test_extract_of_the_pipeline_snapshot_is_live_when_it_can_only_be_the_live_database(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D12: only this machine's own live database may replace a non-empty
+    value. With one configured source, and that source the live
+    `chat.db`, the pipeline snapshot can only have come from it."""
+    from imsg.stages.extract import MergeMode
+
+    captured, output = _extract_via_cli(mocked_pg_env, monkeypatch)
+
+    assert captured["merge_mode"] is MergeMode.LIVE
+    assert "mode=live" in output
+
+
+def test_extract_of_a_seed_file_is_a_seed(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from imsg.stages.extract import MergeMode
+
+    seed = tmp_path / "recovered.db"
+    seed.write_text("")
+    captured, output = _extract_via_cli(
+        mocked_pg_env, monkeypatch, "--snapshot", str(seed), "--source", "seed-2026"
+    )
+
+    assert captured["merge_mode"] is MergeMode.SEED
+    assert "mode=seed" in output
+
+
+def test_extract_of_the_pipeline_snapshot_is_a_seed_when_another_source_shares_it(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every configured source's S1 copy lands in the same
+    `snapshots/snapshot.db`. Once a second source points at another Mac's
+    database, `imsg extract` cannot tell whose copy is there, so it takes
+    the rule that loses nothing -- even when asked for the live source."""
+    from imsg.stages.extract import MergeMode
+
+    studio = tmp_path / "studio-chat.db"
+    studio.write_text("")
+    text = mocked_pg_env.read_text()
+    mocked_pg_env.write_text(
+        text.replace("  sources:\n", f"  sources:\n    - name: studio\n      chat_db: {studio}\n", 1)
+    )
+
+    captured, _ = _extract_via_cli(mocked_pg_env, monkeypatch, "--source", "mini")
+
+    assert captured["merge_mode"] is MergeMode.SEED
+
+
+def test_extract_reports_every_table_with_fills_told_apart(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D12 rule 5. The 2026-09-22 dry run printed only the message counts
+    and hid every chat and attachment rewrite."""
+    from imsg.stages.extract import ExtractResult, MergeMode, UpsertCounts
+
+    reported = ExtractResult(
+        run_id=1, watermark_before=0, watermark_after=9, chats_upserted=2,
+        handles_upserted=2, messages_upserted=3, tapbacks_upserted=1,
+        system_messages_skipped=0, attachments_upserted=1, link_previews_upserted=0,
+        bodies_missing=0, dump_stderr_line_count=0,
+        merge_mode=MergeMode.SEED,
+        chat_upserts=UpsertCounts(filled=1, unchanged=1),
+        message_upserts=UpsertCounts(inserted=1, filled=1, newer_edit=1),
+        attachment_upserts=UpsertCounts(unchanged=1),
+        tapback_upserts=UpsertCounts(inserted=1),
+    )
+    _, output = _extract_via_cli(mocked_pg_env, monkeypatch, result=reported)
+
+    assert "messages_upserted=3 (inserted=1 updated=2 unchanged=0)" in output
+    table_lines = [line for line in output.splitlines() if "table=" in line]
+    assert len(table_lines) == len(reported.table_counts())
+    assert (
+        "extract: table=chat inserted=0 filled=1 newer_edit=0 replaced=0 unchanged=1"
+        in table_lines
+    )
+    assert (
+        "extract: table=message inserted=1 filled=1 newer_edit=1 replaced=0 unchanged=0"
+        in table_lines
+    )
+    assert any(line.startswith("extract: table=tapback inserted=1 ") for line in table_lines)
+    assert "mode=seed" in output
+
+
 def test_identity_wires_run_identity_and_warns_on_degraded_contacts(
     mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

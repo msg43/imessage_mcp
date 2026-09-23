@@ -947,8 +947,8 @@ def test_run_extract_finished_at_is_wall_clock_not_transaction_start(
     original_backfill = extract_module._backfill_tapback_targets
     observed: dict[str, datetime] = {}
 
-    def backfill_then_work_inside_write_transaction(cur: psycopg.Cursor[Any]) -> None:
-        original_backfill(cur)
+    def backfill_then_work_inside_write_transaction(cur: psycopg.Cursor[Any]) -> list[int]:
+        resolved: list[int] = original_backfill(cur)
         # Prove the seam really is inside the write transaction — otherwise
         # the assertions below would be measuring nothing.
         assert cur.connection.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
@@ -957,6 +957,7 @@ def test_run_extract_finished_at_is_wall_clock_not_transaction_start(
         row = cur.fetchone()
         assert row is not None
         observed["after_work"] = row[0]
+        return resolved
 
     monkeypatch.setattr(
         extract_module, "_backfill_tapback_targets", backfill_then_work_inside_write_transaction

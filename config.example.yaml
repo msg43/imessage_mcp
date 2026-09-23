@@ -21,6 +21,9 @@ sync:
   sources:
     - name: mini
       chat_db: ~/Library/Messages/chat.db
+    # A source whose chat_db is not paths.live_chat_db is merged as a seed
+    # (D12): it inserts rows and fills empty values, and never replaces a
+    # value the index already holds.
     # - name: studio-seed
     #   chat_db: /path/to/transferred/studio-snapshot.db
 
