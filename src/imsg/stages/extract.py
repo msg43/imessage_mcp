@@ -1359,6 +1359,7 @@ def _do_extract(
             chat_ids={chat.guid: chat_id_by_rowid[chat.rowid] for chat in chats},
             handles=handles,
             handle_id_by_rowid=handle_id_by_rowid,
+            chat_tally=chat_tally,
             participant_tally=participant_tally,
             handle_tally=handle_tally,
             unlinked=unlinked,
@@ -1684,6 +1685,7 @@ class _ChatResolver:
         chat_ids: dict[str, int],
         handles: Sequence[HandleRow],
         handle_id_by_rowid: dict[int, int],
+        chat_tally: _UpsertTally,
         participant_tally: _UpsertTally,
         handle_tally: _UpsertTally,
         unlinked: _UnlinkedTally,
@@ -1691,6 +1693,7 @@ class _ChatResolver:
         self._cur = cur
         self._chat_ids = dict(chat_ids)
         self._handle_id_by_rowid = handle_id_by_rowid
+        self._chat_tally = chat_tally
         self._participant_tally = participant_tally
         self._handle_tally = handle_tally
         self._unlinked = unlinked
@@ -1713,6 +1716,9 @@ class _ChatResolver:
             )
             self._chat_ids[choice.chat_guid] = chat_id
             if created:
+                # Reported with the snapshot's own chats too (`table=chat`):
+                # D12 rule 5, every table the run writes shows its inserts.
+                self._chat_tally.record(UpsertOutcome.INSERTED)
                 self._unlinked.add(
                     "holding_chats_created" if choice.unfiled_key is not None else "chats_created"
                 )

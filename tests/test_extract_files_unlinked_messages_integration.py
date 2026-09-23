@@ -519,6 +519,10 @@ def test_the_run_reports_how_each_message_was_filed(
     assert (u.chats_created, u.holding_chats_created) == (1, 5)
     assert (u.rescanned, u.moved_from_holding, u.evidence_raised) == (0, 0, 0)
     assert run.result.chat_group_ids.inserted == 4
+    # The chats the rules created are in the per-table report too: the
+    # snapshot's five, one 1:1 chat and five holding chats.
+    assert run.result.table_counts()["chat"].inserted == 11
+    assert _count(pg_conn, "SELECT count(*) FROM chat") == 11
 
 
 def test_a_dry_run_reports_the_filing_and_writes_nothing(
