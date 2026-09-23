@@ -235,6 +235,7 @@ def test_real_backend_resolves_each_class_by_dotted_path(
             {
                 "shared_runtime": None,
                 "cache_limit_bytes": cfg.models.enrichment_cache_limit_bytes,
+                "max_image_side": en.caption_max_image_side,
             },
         )
     ]
@@ -271,6 +272,17 @@ def test_real_backend_passes_operator_settings_through(
         "language": "en",
         "cache_limit_bytes": cfg.models.enrichment_cache_limit_bytes,
     }
+
+
+def test_real_backend_passes_the_caption_image_bound_through(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _install_stub_modules(monkeypatch)
+    raw = config_dict_factory()
+    del raw["models"]
+    raw["enrichment"]["caption_max_image_side"] = None
+    build_enrichment_providers(load_config_dict(raw), caption_prompt="p")
+    assert calls["caption"][0][1]["max_image_side"] is None
 
 
 def test_real_backend_reads_the_caption_prompt_from_data_root(

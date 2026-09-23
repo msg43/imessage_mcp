@@ -99,7 +99,14 @@ from imsg.embed.fts.schema import assert_schema_current, create_schema
 from imsg.embed.fts.sync import sync_fts
 from imsg.embed.pipeline import run_embed
 from imsg.enrich.pipeline import process_one_task
-from imsg.enrich.queue import claim_tasks, preview_claimable_tasks
+from imsg.enrich.planner import EnrichmentPlanReport, plan_enrichment
+from imsg.enrich.queue import (
+    claim_tasks,
+    missing_enrichment_kinds,
+    preview_claimable_tasks,
+    reset_failed_tasks,
+)
+from imsg.enrich.router import DEFAULT_CLAIM_ORDER, ENRICHMENT_KINDS, parse_kinds
 from imsg.errors import AgentInstallError, ImsgError
 from imsg.eval.cli import eval_app
 from imsg.export import (
@@ -1777,6 +1784,41 @@ def sync(
         typer.echo(DRY_RUN_MARKER)
 
 
+def _kind_counts(counts: dict[str, int]) -> str:
+    """`total k1=n k2=n`, kinds in claim order, other keys (MIME types)
+    after them in descending count."""
+    ordered = [k for k in ENRICHMENT_KINDS if k in counts]
+    rest = sorted((k for k in counts if k not in ENRICHMENT_KINDS), key=lambda k: (-counts[k], k))
+    parts = " ".join(f"{k}={counts[k]}" for k in [*ordered, *rest])
+    return f"{sum(counts.values())} {parts}".rstrip()
+
+
+def _echo_plan_report(report: EnrichmentPlanReport) -> None:
+    typer.echo(
+        f"enrich plan: attachments={report.attachments} refused={report.refused} "
+        f"sniff_failed={report.sniff_failed}"
+    )
+    verb = "would_enqueue" if report.dry_run else "enqueued"
+    typer.echo(f"enrich plan: {verb}={_kind_counts(report.enqueued)}")
+    typer.echo(f"enrich plan: already_queued={_kind_counts(report.already_queued)}")
+    if report.not_selected:
+        typer.echo(f"enrich plan: not_selected={_kind_counts(report.not_selected)}")
+    typer.echo(f"enrich plan: unroutable={_kind_counts(report.unroutable)}")
+
+
+def _enrich_plan(cfg: Config, conn: psycopg.Connection, kinds: tuple[str, ...] | None, dry_run: bool) -> None:
+    try:
+        report = plan_enrichment(conn, data_root=cfg.paths.data_root, kinds=kinds, dry_run=dry_run)
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+    _echo_plan_report(report)
+    if dry_run:
+        typer.echo(DRY_RUN_MARKER)
+
+
 @app.command()
 def enrich(
     config: ConfigOption = None,
@@ -1786,18 +1828,57 @@ def enrich(
     ] = "cli",
     retry_failed: Annotated[
         bool,
-        typer.Option("--retry-failed", help="Reset permanently-failed tasks to pending first."),
+        typer.Option(
+            "--retry-failed",
+            help="Reset permanently-failed tasks (of the selected kinds) to pending first.",
+        ),
+    ] = False,
+    kinds: Annotated[
+        str | None,
+        typer.Option(
+            "--kinds",
+            help="Comma-separated enrichment kinds to work on, in the order to claim them "
+            f"(default: {','.join(DEFAULT_CLAIM_ORDER)} — cheap kinds first, captions last). "
+            "With --plan, the kinds to enqueue.",
+        ),
+    ] = None,
+    plan: Annotated[
+        bool,
+        typer.Option(
+            "--plan",
+            help="Fill the queue instead of draining it: enqueue the router's kinds for every "
+            "materialized attachment that lacks them (by content-sniffed MIME type), then exit.",
+        ),
     ] = False,
     dry_run: DryRunOption = False,
 ) -> None:
-    """S5b — OCR/caption/transcribe/pdftotext enrichment queue worker (SPEC §8 S5b)."""
+    """S5b — OCR/caption/transcribe/text-extraction enrichment queue worker (SPEC §8 S5b).
+
+    Claims one task at a time: `--kinds` in the order given, else cheap kinds
+    first and captions last; within a kind, the newest attachment first.
+    `--plan` fills the queue instead (see `imsg.enrich.planner`).
+    """
     cfg = _load_config_or_die(config)
+    if plan and retry_failed:
+        typer.echo(
+            "imsg: --retry-failed resets tasks for a worker run; --plan only adds missing "
+            "tasks and resets nothing — run them separately",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    try:
+        selected = parse_kinds(kinds) if kinds is not None else None
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    claim_order = selected if selected is not None else DEFAULT_CLAIM_ORDER
     run_guard_mount_or_exit(cfg.paths.data_root)
     _echo_backend_line(cfg)
     # Providers before the DB connection so a missing model runtime fails
-    # fast; a dry run claims and dispatches nothing, so it builds none.
+    # fast; a dry run claims and dispatches nothing, and a plan run fills
+    # the queue without running a model, so neither builds any.
     providers = None
-    if not dry_run:
+    if not dry_run and not plan:
         caption_prompt = _caption_prompt_or_die(cfg)
         # One runtime for every vision-language role this process builds,
         # so a composition that captions *and* detects boundaries against
@@ -1814,29 +1895,55 @@ def enrich(
         )
 
     conn = _connect_and_verify_or_die(cfg)
+    try:
+        missing = missing_enrichment_kinds(conn, claim_order)
+    except ImsgError as exc:
+        conn.close()
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if missing:
+        conn.close()
+        typer.echo(
+            f"imsg: this database has no enrichment kind {', '.join(missing)} yet — "
+            f"run `imsg migrate` (migration 0009) first",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    if plan:
+        _enrich_plan(cfg, conn, selected, dry_run)
+        return
 
     if dry_run:
         # No lease claim, no dispatch — see `preview_claimable_tasks`'s
         # docstring for why full per-task dry-run isn't meaningful here.
         try:
-            preview = preview_claimable_tasks(conn)
+            preview = preview_claimable_tasks(conn, kinds=claim_order)
         except ImsgError as exc:
             typer.echo(f"imsg: {exc}", err=True)
             raise typer.Exit(code=1) from exc
         finally:
             conn.close()
 
-        by_kind = " ".join(f"{kind}={count}" for kind, count in sorted(preview.by_kind.items())) or "none"
+        by_kind = (
+            " ".join(f"{k}={preview.by_kind[k]}" for k in claim_order if k in preview.by_kind)
+            or "none"
+        )
         typer.echo(f"enrich: claimable={preview.total} {by_kind}")
         typer.echo(DRY_RUN_MARKER)
         return
 
-    assert providers is not None  # built above for every non-dry run
+    assert providers is not None  # built above for every non-dry, non-plan run
+    if selected is not None:
+        typer.echo(f"enrich: kinds={','.join(selected)}")
     # Enrichment yields to the MCP server, never the reverse (D10.3).
-    # Checked BEFORE claiming and BEFORE each task, never during one: a
-    # claimed task holds a lease and a half-run model call cannot be
-    # represented in the queue, so pausing between units of work is the
-    # only point at which nothing can be abandoned or corrupted.
+    # Checked BEFORE each claim, never during a task: a claimed task
+    # holds a lease and a half-run model call cannot be represented in
+    # the queue, so pausing between units of work is the only point at
+    # which nothing can be abandoned or corrupted. One task is claimed at
+    # a time, so no task sits leased while the worker waits here, a long
+    # run never outlives the leases of tasks it has not started yet, and
+    # a cheap task enqueued mid-run is claimed before the next caption.
     gate = EnrichmentYieldGate(
         conn,
         enabled=cfg.enrichment.yield_to_queries,
@@ -1845,26 +1952,25 @@ def enrich(
     )
     yielded_seconds = 0.0
     yield_pauses = 0
+    processed = 0
+    outcomes: dict[str, int] = {}
     try:
         if retry_failed:
-            with conn.transaction(), conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE enrichment SET state = 'pending', attempts = 0, "
-                    "next_attempt_at = now(), last_error = NULL WHERE state = 'failed'"
-                )
+            with conn.transaction():
+                reset = reset_failed_tasks(conn, kinds=claim_order)
+            typer.echo(f"enrich: reset {reset} failed task(s) to pending")
 
-        report = gate.wait_until_clear()
-        yielded_seconds += report.waited_seconds
-        yield_pauses += int(report.paused)
-        tasks = claim_tasks(conn, worker_id=worker_id, limit=limit)
-        outcomes: dict[str, int] = {}
-        for index, task in enumerate(tasks):
-            if index:  # the check before the first task already ran, above
-                report = gate.wait_until_clear()
-                yielded_seconds += report.waited_seconds
-                yield_pauses += int(report.paused)
-            outcome = process_one_task(conn, cfg, providers, task)
-            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        while processed < limit:
+            report = gate.wait_until_clear()
+            yielded_seconds += report.waited_seconds
+            yield_pauses += int(report.paused)
+            tasks = claim_tasks(conn, worker_id=worker_id, limit=1, kinds=claim_order)
+            if not tasks:
+                break
+            for task in tasks:
+                outcome = process_one_task(conn, cfg, providers, task)
+                outcomes[outcome] = outcomes.get(outcome, 0) + 1
+                processed += 1
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -1872,7 +1978,7 @@ def enrich(
         conn.close()
 
     summary = " ".join(f"{k}={v}" for k, v in sorted(outcomes.items())) or "none"
-    typer.echo(f"enrich: claimed={len(tasks)} {summary}")
+    typer.echo(f"enrich: claimed={processed} {summary}")
     if yield_pauses:
         typer.echo(
             f"enrich: yielded to in-flight queries {yield_pauses} time(s), "
@@ -1957,6 +2063,12 @@ def backfill_attachments(
     if report.locations is not None:
         for line in _location_fetch_lines(report.locations):
             typer.echo(f"backfill-attachments: {line}")
+    if report.enrichment_enqueued or report.enrichment_unroutable or report.enrichment_plan_errors:
+        typer.echo(
+            f"backfill-attachments: enrichment tasks enqueued={report.enrichment_enqueued} "
+            f"unroutable={report.enrichment_unroutable} "
+            f"plan_errors={report.enrichment_plan_errors}"
+        )
     if report.trial_gate_capped:
         typer.echo(
             "backfill-attachments: first-run trial gate active — pass --yes-full-run "

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from imsg.config.schema import Config
-from imsg.enrich import audio, mime, pdf_render, pdf_text, video
+from imsg.enrich import audio, doc_text, mime, pdf_render, pdf_text, video
 from imsg.enrich.chunking import chunk_text
 from imsg.enrich.limits import check_file_size, check_media_duration, check_pdf_page_count
 from imsg.enrich.provider import CaptionProvider, OcrProvider, TranscriptionProvider
@@ -31,7 +31,7 @@ from imsg.enrich.queue import (
     fail_task_permanently,
     skip_task,
 )
-from imsg.enrich.router import PDF_MIME
+from imsg.enrich.router import PDF_MIME, document_format_for_mime
 from imsg.errors import EnrichmentError, UnsupportedEnrichmentTypeError, UntrustedAttachmentError
 from imsg.hashing import sha256_text
 from imsg.paths import is_contained_in, resolve_path
@@ -163,12 +163,22 @@ def _run_ocr(
 
 def _caption_provenance(providers: EnrichmentProviders) -> dict[str, object]:
     """What, besides `model`, determined a caption: the fixed prompt's
-    SHA-256 when the provider exposes one (`MlxVlmCaptionProvider.
-    prompt_sha256`; the fakes do not). SPEC §4.1 makes the prompt part
+    SHA-256 and the largest image side the model was shown, when the
+    provider exposes them (`MlxVlmCaptionProvider.prompt_sha256` and
+    `.max_image_side`; the fakes do not). SPEC §4.1 makes the prompt part
     of the captioning contract, so it is recorded in `detail` — the role
-    `boundary_prompt_sha256` plays inside `seg_config_hash`."""
+    `boundary_prompt_sha256` plays inside `seg_config_hash`. No
+    `max_image_side` means the image was shown at full resolution."""
+    provenance: dict[str, object] = {}
     sha = getattr(providers.caption, "prompt_sha256", None)
-    return {"prompt_sha256": sha} if isinstance(sha, str) and sha else {}
+    if isinstance(sha, str) and sha:
+        provenance["prompt_sha256"] = sha
+    # The largest image side the model was shown (`bounded_image`): the
+    # same photo captioned at a different size is a different input.
+    side = getattr(providers.caption, "max_image_side", None)
+    if isinstance(side, int):
+        provenance["max_image_side"] = side
+    return provenance
 
 
 def _run_caption_image(
@@ -201,6 +211,10 @@ def _sample_and_run(
 ) -> tuple[list[dict[str, object]], float]:
     limits_cfg = config.enrichment.limits
     check_file_size(cache_path, max_bytes=limits_cfg.max_file_bytes)
+    if not audio.has_stream(cache_path, "v", timeout_seconds=limits_cfg.task_timeout_seconds):
+        raise UnsupportedEnrichmentTypeError(
+            "no video stream to sample frames from (an audio-only file in a video container)"
+        )
     duration = audio.probe_duration_seconds(cache_path, timeout_seconds=limits_cfg.task_timeout_seconds)
     check_media_duration(duration, max_seconds=limits_cfg.max_media_seconds)
     frames = video.sample_keyframes(
@@ -258,6 +272,8 @@ def _run_transcript(
     standalone audio file, so no branching on mime type is needed here."""
     limits_cfg = config.enrichment.limits
     check_file_size(cache_path, max_bytes=limits_cfg.max_file_bytes)
+    if not audio.has_stream(cache_path, "a", timeout_seconds=limits_cfg.task_timeout_seconds):
+        raise UnsupportedEnrichmentTypeError("no audio stream to transcribe")
     duration = audio.probe_duration_seconds(cache_path, timeout_seconds=limits_cfg.task_timeout_seconds)
     check_media_duration(duration, max_seconds=limits_cfg.max_media_seconds)
     wav_path = work_dir / "audio.wav"
@@ -267,6 +283,36 @@ def _run_transcript(
         model_version=None,
         text=providers.transcription.transcribe(wav_path),
         detail={"duration_seconds": duration},
+    )
+
+
+def _run_doc_text(
+    cache_path: Path, mime_type: str, config: Config, work_dir: Path
+) -> EnrichmentResult:
+    """Text-bearing documents that are not PDFs (`imsg.enrich.doc_text`):
+    contact cards, plain text, HTML and SVG, Office and RTF documents,
+    spreadsheets and slides. The reader is chosen by the sniffed MIME
+    type."""
+    fmt = document_format_for_mime(mime_type)
+    if fmt is None:
+        raise UnsupportedEnrichmentTypeError(
+            f"'doc_text' has no route for mime type {mime_type!r}"
+        )
+    limits_cfg = config.enrichment.limits
+    check_file_size(cache_path, max_bytes=limits_cfg.max_file_bytes)
+    result = doc_text.extract_document_text(
+        cache_path, fmt, work_dir=work_dir, timeout_seconds=limits_cfg.task_timeout_seconds
+    )
+    return EnrichmentResult(
+        model=result.extractor,
+        model_version=None,
+        text=result.text,
+        detail={
+            "format": fmt,
+            "mime_type": mime_type,
+            "chars": len(result.text),
+            "truncated": result.truncated,
+        },
     )
 
 
@@ -281,6 +327,8 @@ def _dispatch(
 ) -> EnrichmentResult:
     if kind == "pdf_text":
         return _run_pdf_text(cache_path, config)
+    if kind == "doc_text":
+        return _run_doc_text(cache_path, mime_type, config, work_dir)
     if kind == "ocr":
         return _run_ocr(cache_path, mime_type, config, providers, work_dir)
     if kind == "caption":

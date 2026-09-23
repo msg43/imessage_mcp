@@ -10,6 +10,107 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-23 — Enrichment queue filled: every materialized attachment is routed and queued, cheap kinds first
+
+**The gap.** The router (`imsg.enrich.router.kinds_for_mime`) existed, but
+nothing called it: the only `enqueue` in `src/imsg` queued a scanned PDF's
+follow-up OCR. On the production host the `enrichment` table held 0 rows
+against 100,046 materialized attachments, and `attachment_chunk` and its
+embeddings held 0 (checked read-only), so `imsg enrich` had nothing to
+claim. No attachment text had ever been extracted, so none of it was
+searchable (D13 wants all of it searchable).
+
+- **Filling the queue** (`imsg.enrich.planner`). S5a queues the router's
+  kinds the moment a row becomes `materialized`, from its own source path
+  or from another copy the D13 location phase fetched (`imsg.backfill.
+  fetch`). `imsg enrich --plan [--kinds k,...] [--dry-run]` does the same
+  for every materialized attachment: the first run fills the queue for
+  the existing corpus, and later runs catch rows another path
+  materialized and apply routing changes. Insert-only on the queue's
+  primary key `(attachment_id, kind)`, so no row is duplicated or reset.
+  `--dry-run` prints per-kind counts and the unroutable types.
+- **Routing reads the file's content, never chat.db's MIME claim.** The
+  28,720 link-preview payloads (`.pluginPayloadAttachment`) carry no MIME
+  type at all and sniff as images (15,051 PNG, 10,370 JPEG, 2,534
+  favicons, ...). Sniffing all 100,046 files took about 41 s on the
+  production host (one `file` process per batch; aggregates only, read-only).
+- **Voice messages were unroutable.** The `file` 5.41 that macOS 26 ships
+  calls Core Audio Format `application/octet-stream`; a check of the
+  file's own first six bytes (`caff`, version 1) now reports
+  `audio/x-caf`. All 183 production voice messages carry that signature
+  (checked read-only); the other 13 octet-stream files do not.
+- **New kind `doc_text`** (migration 0009) for text-bearing files that are
+  not PDFs: contact cards (vCard, including Apple's shared-location cards,
+  embedded photos dropped), every other `text/*` type, JSON, HTML and SVG
+  (visible text only, parsed in-process), RTF/DOC/DOCX/ODT through macOS
+  `textutil` run under `sandbox-exec` with no network and no file writes,
+  and XLSX/PPTX through `zipfile` and expat with per-part size ceilings.
+  No shell anywhere; input, output and time ceilings are permanent typed
+  failures, except that a long text, vCard or HTML file is read only as
+  far as the 1,000,000 characters kept, and marked truncated. `pdf_text`
+  keeps meaning PDF.
+- **What still routes nowhere on the production index** (from the same
+  sniff): 41 attachments — 16 empty files, 13 unidentified binaries, 11
+  zip archives (iWork documents and wallet passes sniff as zip), 1 CAD
+  drawing. The old router, given the same sniffed types, had no route for
+  1,188 — and in any case was never asked.
+- **Claim order: cheap kinds first, captions last.** `doc_text, pdf_text,
+  ocr, transcript, frame_ocr, caption` unless `imsg enrich --kinds`
+  names kinds, which is both the filter and the order. Within a kind the
+  newest attachment goes first, so months of captions start with recent
+  photos. The worker now claims one task at a time: the yield gate (D10.3)
+  still runs before every claim, no task holds a lease while the worker
+  waits, and a long `--limit` run never outlives the leases of tasks it
+  has not started. Index `enrichment_claim_idx` (migration 0009) serves
+  each claim: 0.2-0.7 ms at 202,000 queued rows (scratch database).
+  `imsg enrich` refuses to run, with "run `imsg migrate`", against a
+  database without migration 0009.
+- **Four defects the first real run would have hit, fixed here:**
+  - *Every HEIC caption failed.* `mlx_vlm` opens images with PIL, which
+    decodes HEIC only after pillow-heif registers its opener, and nothing
+    in the enrichment process registered it. The caption provider now
+    does. 25,380 production images are HEIC.
+  - *Captions cost about 7x the planned figure.* The 14.2 s per caption
+    measured on the production host (2026-09-17) was for 1440x1920
+    images; a 12-megapixel photo shown at full resolution took 37.6 s on
+    the Studio against 5.2 s for that image, which scales to roughly
+    100 s on the production host. The model is now shown a copy scaled to
+    fit `enrichment.caption_max_image_side` (default 1920, `null` for
+    full resolution; EXIF orientation applied; the attachment is never
+    rewritten; recorded in each caption's `detail`). The same photo then
+    took 5.9 s (JPEG) and 6.8 s (HEIC). OCR still reads the original.
+  - *A video with no hard cut had no sampled frame*, so its frame OCR and
+    caption finished `done` with empty text. The sampler now always keeps
+    the first frame.
+  - *A video with no audio track, or an audio-only MP4 (which `file`
+    calls `video/mp4`), failed five times over half an hour* because
+    ffmpeg exits 234 on the missing stream. Such tasks are now `skipped`
+    with the reason. 69 production videos have no audio track.
+- **Segments show document text.** An attachment that is not a PDF,
+  image, audio or video now renders `[attachment "<name>": "<snippet>" —
+  full text via get_attachment_text(...)]` once its `doc_text` is done, so
+  the reranker sees what matched. Unchanged without `doc_text` output,
+  so no stored segment goes stale and `RENDERER_VERSION` stays 1. Export
+  renders these attachments exactly as before (default deny).
+- **Expected queue on the production index** (sniff results through this
+  router): 202,292 tasks — `doc_text` 976, `pdf_text` 1,039, `ocr` 93,165,
+  `transcript` 4,825, `frame_ocr` 4,561, `caption` 97,726 — plus OCR for
+  any scanned PDFs, found as their `pdf_text` runs.
+- **Estimated run on the production host** (per-item timings measured on
+  the Studio with synthetic inputs, scaled by the measured caption ratio
+  2.7x for GPU work and an inferred 1.0-1.5x for Vision and CPU work):
+  cheap kinds 14-27 h in total (OCR 4.5-10 h, transcripts about 7 h,
+  frame OCR 2-8 h, text kinds minutes); captions 340-400 h, which is
+  57-66 six-hour nightly windows, or about 75 nights at the nightly
+  agent's `--limit 100` every 30 minutes. At full resolution, photo
+  captions alone would have been about 1,580 h.
+- **Tests:** 2,203 pass against a scratch Postgres, up from 2,082 (one
+  old test removed: `text/plain` now has a route). The tests for each new
+  behaviour were run against the code before this change and failed
+  there; a few guard tests (backoff still gates a claim, a dry run writes
+  nothing, a small image reaches the model untouched) pass on both, by
+  design. ruff and mypy strict clean; DDL lint clean.
+
 ## 2026-09-23 — Attachment fetcher: every known copy of an attachment is tried, read-only, verified
 
 Owner decision D13 (recall over purity): build the fetcher that finds every

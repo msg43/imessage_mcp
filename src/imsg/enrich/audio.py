@@ -81,4 +81,39 @@ def probe_duration_seconds(path: Path, *, timeout_seconds: int) -> float:
         ) from exc
 
 
-__all__ = ["WHISPER_SAMPLE_RATE", "convert_to_whisper_wav", "probe_duration_seconds"]
+def has_stream(path: Path, stream_type: str, *, timeout_seconds: int) -> bool:
+    """Whether `path` holds at least one stream of `stream_type` (`a` for
+    audio, `v` for video), by `ffprobe`. `file` calls an audio-only MP4
+    `video/mp4`, and a screen recording or a muted clip has no audio
+    track; ffmpeg exits 234 on either rather than producing nothing, so
+    without this check such a task burns its whole retry budget and ends
+    `failed` when the honest outcome is `skipped`."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                stream_type,
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise EnrichmentError(f"ffprobe timed out after {timeout_seconds}s on '{path}'") from exc
+    except OSError as exc:
+        raise EnrichmentError(f"ffprobe could not run: {exc}") from exc
+    if proc.returncode != 0:
+        raise EnrichmentError(f"ffprobe failed on '{path}': {proc.stderr.strip()}")
+    return any(line.strip() for line in proc.stdout.splitlines())
+
+
+__all__ = ["WHISPER_SAMPLE_RATE", "convert_to_whisper_wav", "has_stream", "probe_duration_seconds"]

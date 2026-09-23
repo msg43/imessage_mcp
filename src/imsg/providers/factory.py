@@ -547,6 +547,7 @@ def build_enrichment_providers(
         prompt,
         shared_runtime=shared_runtime,
         cache_limit_bytes=cfg.models.enrichment_cache_limit_bytes,
+        max_image_side=enrichment.caption_max_image_side,
     )
     return EnrichmentProviders(
         ocr=cast("OcrProvider", ocr),

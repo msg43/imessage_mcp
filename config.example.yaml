@@ -85,6 +85,8 @@ enrichment:
   caption_model: mlx-community/Qwen3.5-35B-A3B-4bit             # same weights as segmentation.boundary_model
   caption_revision: 1e20fd8d42056f870933bf98ca6211024744f7ec
   caption_prompt: prompts/caption.txt                           # relative to data_root, like boundary_prompt
+  caption_max_image_side: 1920   # the model sees a copy scaled to fit this (a 12 MP photo costs ~7x at
+                                 # full size); null = full resolution. OCR always reads the original.
   ocr_languages: null            # e.g. ["en-US"]; null = Apple Vision automatic language detection (macOS 13+)
   ocr_minimum_text_height: null  # Vision minimumTextHeight, fraction of image height; null = framework default
   # Enrichment stands aside for in-flight searches (never the reverse): the MCP server holds a

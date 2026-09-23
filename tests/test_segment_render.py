@@ -205,3 +205,54 @@ def test_render_is_deterministic() -> None:
         "attachment_snippet_chars": 200,
     }
     assert render_segment(draft, **kwargs) == render_segment(draft, **kwargs)  # type: ignore[arg-type]
+
+
+def _render_one(att: AttachmentSnippet, *, snippet_chars: int = 200) -> str:
+    draft = SegmentDraft(
+        session_started_at=_T0,
+        seq_in_session=0,
+        messages=(_msg(text=None, has_attachments=True, attachments=(att,)),),
+    )
+    return render_segment(
+        draft,
+        participants=["Alice Example"],
+        chat_kind="dm",
+        chat_display_name=None,
+        timezone="UTC",
+        attachment_snippet_chars=snippet_chars,
+    )
+
+
+def test_other_attachment_with_document_text_renders_a_snippet_and_the_full_text_pointer() -> None:
+    """A contact card, a Word document or a text file: once `doc_text`
+    has run, the segment carries its text the way a PDF's does, so the
+    reranker and the caller see what matched."""
+    att = AttachmentSnippet(
+        attachment_key="att_card",
+        kind="other",
+        filename="Alice Example.vcf",
+        document_text="Name: Alice Example\nOrganization: Acme Construction",
+    )
+    text = _render_one(att)
+    assert (
+        '[attachment "Alice Example.vcf": "Name: Alice Example\nOrganization: Acme Construction" '
+        '— full text via get_attachment_text("att_card")]'
+    ) in text
+
+
+def test_document_text_snippet_truncates_like_every_other_attachment_text() -> None:
+    att = AttachmentSnippet(
+        attachment_key="att_doc", kind="other", filename="plan.docx", document_text="x" * 500
+    )
+    text = _render_one(att, snippet_chars=20)
+    assert '"' + "x" * 20 + "…" + '"' in text
+
+
+def test_other_attachment_without_document_text_renders_exactly_as_before() -> None:
+    """Why `RENDERER_VERSION` does not move: every segment stored before
+    `doc_text` existed has no document text, and renders byte for byte
+    the same, so nothing already indexed goes stale."""
+    att = AttachmentSnippet(attachment_key="att_zip", kind="other", filename="bundle.zip")
+    assert '[attachment "bundle.zip"]' in _render_one(att)
+    unnamed = AttachmentSnippet(attachment_key="att_zip", kind="other", filename=None)
+    assert '[attachment "att_zip"]' in _render_one(unnamed)

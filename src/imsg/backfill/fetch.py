@@ -77,6 +77,7 @@ from imsg.backfill.materialize import (
     materialize_from_cache,
 )
 from imsg.backfill.transfer import CopyRunner, pull_command, run_copy
+from imsg.enrich.planner import enqueue_for_materialized
 from imsg.paths import is_contained_in, is_same_file, join_under_root, resolve_path
 
 if TYPE_CHECKING:
@@ -203,6 +204,11 @@ class LocationFetchReport:
     halted_low_disk_space: bool = False
     notes: list[str] = field(default_factory=list)
     dry_run: bool = False
+    enrichment_enqueued: int = 0
+    """S5b tasks queued for the attachments this phase materialized
+    (`imsg.enrich.planner.enqueue_for_materialized`)."""
+    enrichment_unroutable: int = 0
+    enrichment_plan_errors: int = 0
 
     @property
     def materialized_total(self) -> int:
@@ -345,6 +351,14 @@ class _LocationPhase:
         self.report.materialized[
             (attempt.tier.value, attempt.row.location, attempt.row.match.value)
         ] += 1
+        # Queue its S5b enrichment now, exactly as S5a does for a row
+        # materialized from its own source path.
+        outcome = enqueue_for_materialized(
+            self.conn, attempt.row.attachment_id, cache_path, data_root=self.data_root
+        )
+        self.report.enrichment_enqueued += len(outcome.enqueued)
+        self.report.enrichment_unroutable += int(outcome.unroutable)
+        self.report.enrichment_plan_errors += int(outcome.error is not None)
 
     def _space_ok(self) -> bool:
         if self.disk_free_fn is None:

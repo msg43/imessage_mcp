@@ -76,6 +76,14 @@ def _format_attachment(att: AttachmentSnippet, *, snippet_chars: int) -> str:
             f'| transcript "{trunc(att.transcript)}"]'
         )
     label = att.filename or att.attachment_key
+    if att.document_text and att.document_text.strip():
+        # Only an attachment with `doc_text` output renders differently;
+        # every segment stored before that kind existed renders byte for
+        # byte as it did, which is why RENDERER_VERSION does not move.
+        return (
+            f'[attachment "{label}": "{trunc(att.document_text)}" — full text via '
+            f'get_attachment_text("{att.attachment_key}")]'
+        )
     return f'[attachment "{label}"]'
 
 

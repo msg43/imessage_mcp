@@ -63,3 +63,19 @@ def test_video_captions_carry_the_same_provenance_key() -> None:
     """`_run_caption_video` merges the same mapping into its frames detail."""
     assert _caption_provenance(_providers(_PromptedCaption())) == {"prompt_sha256": PROMPT_SHA}
     assert _caption_provenance(_providers(FakeCaptionProvider())) == {}
+
+
+class _BoundedCaption(_PromptedCaption):
+    """The real provider also says how large an image it lets the model see."""
+
+    max_image_side = 1920
+
+
+def test_caption_detail_records_the_image_size_bound(config_dict_factory: Any, tmp_path: Path) -> None:
+    cfg = load_config_dict(config_dict_factory())
+    image = tmp_path / "photo.jpg"
+    image.write_bytes(b"jpeg-ish bytes")
+
+    result = _run_caption_image(image, cfg, _providers(_BoundedCaption()))
+
+    assert result.detail == {"prompt_sha256": PROMPT_SHA, "max_image_side": 1920}

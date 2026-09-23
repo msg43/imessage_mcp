@@ -368,13 +368,26 @@ class _FakePgConn:
 
             def execute(self, sql: str, params: Any = None) -> None:
                 statements.append(sql)
-                allowed = ("proname = 'pg_prewarm'", "pg_try_advisory_lock", "pg_advisory_unlock")
+                allowed = (
+                    "proname = 'pg_prewarm'",
+                    "pg_try_advisory_lock",
+                    "pg_advisory_unlock",
+                    "enum_range(NULL::enrichment_kind)",
+                )
                 assert any(fragment in sql for fragment in allowed), (
                     f"unexpected statement: {sql}"
                 )
 
             def fetchone(self) -> tuple[Any, ...]:
                 return (True,) if "advisory" in statements[-1] else (False,)
+
+            def fetchall(self) -> list[tuple[Any, ...]]:
+                # `imsg enrich` checks the schema has every kind it will
+                # claim (migration 0009): this database is fully migrated.
+                from imsg.enrich.router import ENRICHMENT_KINDS
+
+                assert "enum_range" in statements[-1]
+                return [(kind,) for kind in ENRICHMENT_KINDS]
 
         return _Cursor()
 
@@ -1326,13 +1339,27 @@ def test_sync_dry_run_passes_the_flag_and_prints_the_marker(
     assert "DRY RUN — nothing was written" in result.output
 
 
+def _draining_queue(tasks: list[Any]) -> Any:
+    """A stand-in for `claim_tasks` that behaves like a real queue: each
+    call hands out at most `limit` of the remaining tasks, then nothing."""
+    remaining = list(tasks)
+
+    def _claim(conn: Any, **kw: Any) -> list[Any]:
+        limit = int(kw.get("limit", 1))
+        taken = remaining[:limit]
+        del remaining[:limit]
+        return taken
+
+    return _claim
+
+
 def test_enrich_wires_claim_and_process(
     mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from imsg.enrich.queue import EnrichmentTask
 
     tasks = [EnrichmentTask(attachment_id=1, kind="ocr", attempts=0), EnrichmentTask(attachment_id=2, kind="caption", attempts=0)]
-    monkeypatch.setattr(cli_module, "claim_tasks", lambda conn, **kw: tasks)
+    monkeypatch.setattr(cli_module, "claim_tasks", _draining_queue(tasks))
     monkeypatch.setattr(cli_module, "process_one_task", lambda conn, config, providers, task: "done")
 
     result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env)])
@@ -1381,6 +1408,8 @@ def test_enrich_retry_failed_resets_rows_before_claiming(
         def __exit__(self, *a: object) -> None:
             return None
 
+        rowcount = 0
+
         def execute(self, sql: str, *a: object) -> None:
             executed.append(sql)
 
@@ -1388,6 +1417,11 @@ def test_enrich_retry_failed_resets_rows_before_claiming(
             # The yield gate's advisory-lock probe: True means nobody
             # holds the query-in-flight lock, which is this test's world.
             return (True,)
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            from imsg.enrich.router import ENRICHMENT_KINDS
+
+            return [(kind,) for kind in ENRICHMENT_KINDS]
 
     class _FakeTxnConn(_FakePgConn):
         def transaction(self) -> Any:
@@ -1409,6 +1443,223 @@ def test_enrich_retry_failed_resets_rows_before_claiming(
     )
     assert result.exit_code == 0, result.output
     assert any("state = 'pending'" in sql for sql in executed)
+
+
+def test_enrich_claims_one_task_at_a_time_in_the_default_cheap_first_order(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.enrich.queue import EnrichmentTask
+    from imsg.enrich.router import DEFAULT_CLAIM_ORDER
+
+    calls: list[dict[str, Any]] = []
+    queue = _draining_queue([EnrichmentTask(attachment_id=i, kind="ocr", attempts=0) for i in range(3)])
+
+    def _claim(conn: Any, **kw: Any) -> list[Any]:
+        calls.append(kw)
+        return queue(conn, **kw)
+
+    monkeypatch.setattr(cli_module, "claim_tasks", _claim)
+    monkeypatch.setattr(cli_module, "process_one_task", lambda *a: "done")
+
+    result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env)])
+
+    assert result.exit_code == 0, result.output
+    assert "claimed=3 done=3" in result.output
+    assert len(calls) == 4  # three tasks, then the claim that finds the queue empty
+    assert all(kw["limit"] == 1 for kw in calls)
+    assert all(kw["kinds"] == DEFAULT_CLAIM_ORDER for kw in calls)
+
+
+def test_enrich_stops_at_its_limit(mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from imsg.enrich.queue import EnrichmentTask
+
+    queue = _draining_queue([EnrichmentTask(attachment_id=i, kind="ocr", attempts=0) for i in range(5)])
+    processed: list[int] = []
+    monkeypatch.setattr(cli_module, "claim_tasks", queue)
+    monkeypatch.setattr(
+        cli_module,
+        "process_one_task",
+        lambda conn, cfg, providers, task: processed.append(task.attachment_id) or "done",
+    )
+
+    result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env), "--limit", "3"])
+
+    assert result.exit_code == 0, result.output
+    assert processed == [0, 1, 2]
+    assert "claimed=3" in result.output
+
+
+def test_enrich_kinds_is_both_the_filter_and_the_claim_order(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[Any] = []
+
+    def _claim(conn: Any, **kw: Any) -> list[Any]:
+        captured.append(kw["kinds"])
+        return []
+
+    monkeypatch.setattr(cli_module, "claim_tasks", _claim)
+
+    result = runner.invoke(
+        app, ["enrich", "--config", str(mocked_pg_env), "--kinds", "transcript,ocr,pdf_text"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured == [("transcript", "ocr", "pdf_text")]
+    assert "kinds=transcript,ocr,pdf_text" in result.output
+
+
+def test_enrich_rejects_an_unknown_kind_before_touching_anything(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("nothing may run for an invalid --kinds")
+
+    monkeypatch.setattr(cli_module, "claim_tasks", boom)
+    monkeypatch.setattr(cli_module, "plan_enrichment", boom)
+
+    result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env), "--kinds", "ocr,captions"])
+
+    assert result.exit_code == 1
+    assert "captions" in result.output
+    assert "caption" in result.output  # the valid kinds are listed
+
+
+def test_enrich_dry_run_preview_honours_kinds(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.enrich.queue import EnrichPreviewReport
+
+    captured: dict[str, Any] = {}
+
+    def _preview(conn: Any, **kw: Any) -> EnrichPreviewReport:
+        captured.update(kw)
+        return EnrichPreviewReport(total=2, by_kind={"caption": 1, "ocr": 1})
+
+    monkeypatch.setattr(cli_module, "preview_claimable_tasks", _preview)
+
+    result = runner.invoke(
+        app, ["enrich", "--config", str(mocked_pg_env), "--dry-run", "--kinds", "ocr,caption"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["kinds"] == ("ocr", "caption")
+    # Printed in claim order, not alphabetically.
+    assert "enrich: claimable=2 ocr=1 caption=1" in result.output
+
+
+def test_enrich_retry_failed_resets_only_the_selected_kinds(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _reset(conn: Any, **kw: Any) -> int:
+        captured.update(kw)
+        return 4
+
+    class _TxnConn(_FakePgConn):
+        def transaction(self) -> Any:
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+    monkeypatch.setattr(cli_module, "connect", lambda database, **kw: _TxnConn())
+    monkeypatch.setattr(cli_module, "reset_failed_tasks", _reset)
+    monkeypatch.setattr(cli_module, "claim_tasks", lambda conn, **kw: [])
+
+    result = runner.invoke(
+        app, ["enrich", "--config", str(mocked_pg_env), "--retry-failed", "--kinds", "ocr"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["kinds"] == ("ocr",)
+    assert "reset 4 failed task(s)" in result.output
+
+
+def _plan_report(**overrides: Any) -> Any:
+    from imsg.enrich.planner import EnrichmentPlanReport
+
+    base: dict[str, Any] = {
+        "attachments": 7,
+        "refused": 1,
+        "sniff_failed": 0,
+        "enqueued": {"ocr": 2, "doc_text": 1},
+        "already_queued": {"pdf_text": 1},
+        "not_selected": {"caption": 2},
+        "unroutable": {"application/zip": 2},
+        "dry_run": False,
+    }
+    base.update(overrides)
+    return EnrichmentPlanReport(**base)
+
+
+def test_enrich_plan_fills_the_queue_and_claims_nothing(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _plan(conn: Any, **kw: Any) -> Any:
+        captured.update(kw)
+        return _plan_report()
+
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("--plan fills the queue; it must not claim or process")
+
+    monkeypatch.setattr(cli_module, "plan_enrichment", _plan)
+    monkeypatch.setattr(cli_module, "claim_tasks", boom)
+    monkeypatch.setattr(cli_module, "build_enrichment_providers", boom)
+
+    result = runner.invoke(
+        app, ["enrich", "--config", str(mocked_pg_env), "--plan", "--kinds", "ocr,doc_text"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["kinds"] == ("ocr", "doc_text")
+    assert captured["dry_run"] is False
+    assert captured["data_root"] == _data_root_from_config(mocked_pg_env)
+    assert "enrich plan: attachments=7 refused=1 sniff_failed=0" in result.output
+    assert "enrich plan: enqueued=3 doc_text=1 ocr=2" in result.output
+    assert "enrich plan: already_queued=1 pdf_text=1" in result.output
+    assert "enrich plan: not_selected=2 caption=2" in result.output
+    assert "enrich plan: unroutable=2 application/zip=2" in result.output
+    assert "DRY RUN" not in result.output
+
+
+def test_enrich_plan_refuses_retry_failed_rather_than_ignoring_it(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("nothing may run for --plan --retry-failed")
+
+    monkeypatch.setattr(cli_module, "plan_enrichment", boom)
+    monkeypatch.setattr(cli_module, "reset_failed_tasks", boom)
+
+    result = runner.invoke(
+        app, ["enrich", "--config", str(mocked_pg_env), "--plan", "--retry-failed"]
+    )
+
+    assert result.exit_code == 1
+    assert "--retry-failed" in result.output
+
+
+def test_enrich_plan_dry_run_says_would_enqueue_and_writes_nothing(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _plan(conn: Any, **kw: Any) -> Any:
+        captured.update(kw)
+        return _plan_report(dry_run=True)
+
+    monkeypatch.setattr(cli_module, "plan_enrichment", _plan)
+
+    result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env), "--plan", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["dry_run"] is True
+    assert captured["kinds"] is None
+    assert "enrich plan: would_enqueue=3 doc_text=1 ocr=2" in result.output
+    assert "DRY RUN — nothing was written" in result.output
 
 
 def test_backfill_attachments_wires_run_backfill(
@@ -2295,7 +2546,7 @@ def test_enrich_prints_the_backend_line_and_uses_the_factory(
         return "done"
 
     monkeypatch.setattr(
-        cli_module, "claim_tasks", lambda conn, **kw: [EnrichmentTask(attachment_id=1, kind="ocr", attempts=0)]
+        cli_module, "claim_tasks", _draining_queue([EnrichmentTask(attachment_id=1, kind="ocr", attempts=0)])
     )
     monkeypatch.setattr(cli_module, "process_one_task", fake_process)
     result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env)])
@@ -2574,9 +2825,11 @@ def test_enrich_checks_the_yield_gate_before_claiming_and_between_tasks(
     captured: dict[str, Any] = {}
     monkeypatch.setattr(cli_module, "EnrichmentYieldGate", _Gate)
 
+    queue = _draining_queue(tasks)
+
     def _claim(conn: Any, **kw: Any) -> list[EnrichmentTask]:
         order.append("claim")
-        return tasks
+        return queue(conn, **kw)
 
     monkeypatch.setattr(cli_module, "claim_tasks", _claim)
     monkeypatch.setattr(
@@ -2587,7 +2840,14 @@ def test_enrich_checks_the_yield_gate_before_claiming_and_between_tasks(
 
     result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env)])
     assert result.exit_code == 0, result.output
-    assert order == ["gate", "claim", "task1", "gate", "task2", "gate", "task3"]
+    # One task is claimed at a time, so no task ever holds a lease while
+    # the worker waits on the gate; the last claim finds the queue empty.
+    assert order == [
+        "gate", "claim", "task1",
+        "gate", "claim", "task2",
+        "gate", "claim", "task3",
+        "gate", "claim",
+    ]
     assert captured["gate_kwargs"]["enabled"] is True  # the schema default
 
 
@@ -2607,13 +2867,15 @@ def test_enrich_reports_the_time_it_spent_yielding(
     monkeypatch.setattr(
         cli_module,
         "claim_tasks",
-        lambda conn, **kw: [EnrichmentTask(attachment_id=1, kind="ocr", attempts=0)],
+        _draining_queue([EnrichmentTask(attachment_id=1, kind="ocr", attempts=0)]),
     )
     monkeypatch.setattr(cli_module, "process_one_task", lambda *a: "done")
 
     result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env)])
     assert result.exit_code == 0, result.output
-    assert "yielded to in-flight queries 1 time(s), 1.5s total" in result.output
+    # Before the claim that found the task, and before the one that found
+    # the queue empty.
+    assert "yielded to in-flight queries 2 time(s), 3.0s total" in result.output
 
 
 def test_enrich_says_nothing_about_yielding_when_it_never_paused(

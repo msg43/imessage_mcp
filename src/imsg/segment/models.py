@@ -25,6 +25,9 @@ class AttachmentSnippet:
     ocr_text: str | None = None
     transcript: str | None = None
     pdf_text: str | None = None
+    document_text: str | None = None
+    """Text of a text-bearing attachment that is not a PDF (`doc_text`
+    enrichment): a contact card, a text file, a Word document."""
     withheld: bool = False
     """Render a content-free placeholder instead of this attachment — no
     key, kind, filename or text. Set only by `imsg.retrieval` under

@@ -218,6 +218,26 @@ the cache. Every source is only read: both copies are plain rsync runs
 whose source side is rsync's sender, and the flags that would make it
 delete or remove anything are refused. No command prints a path.
 
+**Attachment text (OCR, PDF and document text, transcripts, captions)**
+comes from the S5b queue. `imsg backfill-attachments` queues each
+attachment's kinds as it materializes it; `imsg enrich --plan` queues
+everything already materialized (migration 0009 first). Routing reads the
+file's content, never its name or chat.db's MIME claim.
+
+```bash
+uv run imsg migrate                                    # 0009 adds the doc_text kind
+uv run imsg enrich --plan --dry-run                    # per-kind counts, unroutable types; writes nothing
+uv run imsg enrich --plan                              # fill the queue (insert-only, safe to repeat)
+uv run imsg enrich --kinds doc_text,pdf_text,transcript,ocr,frame_ocr --limit 200000
+uv run imsg enrich --dry-run                           # what is still claimable, by kind
+```
+
+A worker claims one task at a time, cheap kinds first and captions last
+unless `--kinds` names kinds (then that list is the order), newest
+attachment first within a kind, and stands aside between tasks while a
+search is running. Captions are the slow part (about 16 s each on an
+M4 Pro, estimated); the nightly `…enrich` agent works through them.
+
 **Before exposing the public surface**, AT-1 must pass:
 
 ```bash

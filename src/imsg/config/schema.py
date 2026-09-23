@@ -254,6 +254,15 @@ class EnrichmentConfig(StrictModel):
     model auto-detect per file."""
     caption_model: str = Field(default=constants.CAPTION_MODEL_REPO, min_length=1)
     caption_revision: str = Field(default=constants.CAPTION_MODEL_REVISION, min_length=1)
+    caption_max_image_side: int | None = Field(default=1920, ge=256)
+    """Longest side, in pixels, of the image the captioning model is shown;
+    a larger image is scaled down (aspect kept, EXIF orientation applied)
+    into a temporary copy — the attachment itself is never rewritten.
+    `null` shows the model every image at full resolution. A caption's
+    cost follows the pixels: measured 2026-09-23 on an M2 Ultra, a
+    4032x3024 photo took 37.6 s, the same photo at 1920x1440 5.7 s, and
+    the 1440x1920 image behind the production host's 14.2 s-per-caption
+    figure 5.2 s. OCR always reads the full-resolution original."""
     caption_prompt: Path = Field(default=Path("prompts/caption.txt"))
     """Fixed captioning prompt (SPEC §4.1) — relative to `paths.data_root`,
     same convention as `segmentation.boundary_prompt`; must resolve

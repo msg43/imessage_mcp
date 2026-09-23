@@ -455,6 +455,7 @@ def _fetch_attachments(
                 "caption": None,
                 "ocr_text": None,
                 "transcript": None,
+                "document_text": None,
             }
             order.setdefault(message_id, []).append(attachment_key)
         if enrich_kind == "pdf_text":
@@ -465,6 +466,8 @@ def _fetch_attachments(
             by_key[entry_key]["ocr_text"] = enrich_text
         elif enrich_kind == "transcript":
             by_key[entry_key]["transcript"] = enrich_text
+        elif enrich_kind == "doc_text":
+            by_key[entry_key]["document_text"] = enrich_text
 
     result: dict[int, list[AttachmentSnippet]] = {}
     for message_id, keys in order.items():
@@ -477,6 +480,7 @@ def _fetch_attachments(
                 ocr_text=by_key[(message_id, key)]["ocr_text"],  # type: ignore[arg-type]
                 transcript=by_key[(message_id, key)]["transcript"],  # type: ignore[arg-type]
                 pdf_text=by_key[(message_id, key)]["pdf_text"],  # type: ignore[arg-type]
+                document_text=by_key[(message_id, key)]["document_text"],  # type: ignore[arg-type]
             )
             for key in keys
         ]

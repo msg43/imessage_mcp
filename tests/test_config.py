@@ -686,3 +686,26 @@ def test_reranker_model_symlink_escape_rejected(config_dict_factory: object) -> 
     raw["retrieval"]["reranker_model"] = "models/escaped"
     with pytest.raises(ConfigError, match=r"retrieval\.reranker_model.*resolve under paths\.data_root"):
         load_config_dict(raw)
+
+
+def test_caption_images_are_bounded_at_1920_pixels_by_default(config_dict_factory: object) -> None:
+    """The size the production host's 14.2 s caption figure was measured
+    at; a full-resolution 12-megapixel photo costs about 7x that."""
+    cfg = load_config_dict(config_dict_factory())  # type: ignore[operator]
+    assert cfg.enrichment.caption_max_image_side == 1920
+
+
+def test_caption_image_bound_can_be_switched_off(config_dict_factory: object) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["enrichment"]["caption_max_image_side"] = None
+    assert load_config_dict(raw).enrichment.caption_max_image_side is None
+
+
+@pytest.mark.parametrize("value", [0, 100, 255])
+def test_caption_image_bound_below_256_pixels_is_rejected(
+    config_dict_factory: object, value: int
+) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["enrichment"]["caption_max_image_side"] = value
+    with pytest.raises(ConfigError, match=r"enrichment\.caption_max_image_side"):
+        load_config_dict(raw)

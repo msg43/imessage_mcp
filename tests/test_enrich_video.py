@@ -65,3 +65,24 @@ def test_frame_count_never_exceeds_max_frames(tmp_path: Path) -> None:
 def test_nonexistent_video_raises(tmp_path: Path) -> None:
     with pytest.raises(EnrichmentError):
         sample_keyframes(tmp_path / "missing.mp4", tmp_path / "out", max_frames=5, timeout_seconds=10)
+
+
+def test_a_clip_with_no_scene_change_still_yields_its_first_frame(tmp_path: Path) -> None:
+    """One continuous shot, the usual home video: a scene-change filter
+    alone keeps no frame at all, and frame OCR and the video caption
+    would then finish `done` with empty text."""
+    video = tmp_path / "continuous.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10",
+            "-t", "2", "-pix_fmt", "yuv420p", str(video),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    frames = sample_keyframes(video, tmp_path / "frames", max_frames=20, timeout_seconds=30)
+
+    assert len(frames) >= 1
+    assert frames[0].timestamp_seconds == 0.0

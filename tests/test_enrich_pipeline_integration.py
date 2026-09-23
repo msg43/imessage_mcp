@@ -403,3 +403,152 @@ def test_mime_kind_mismatch_is_skipped_not_failed(
         cur.execute("SELECT state FROM enrichment WHERE attachment_id = %s AND kind = 'ocr'", (att_id,))
         (state,) = cur.fetchone()  # type: ignore[misc]
     assert state == "skipped"
+
+
+# --- text-bearing documents and stream-less media ----------------------
+
+
+_ALICE_CARD = (
+    "BEGIN:VCARD\r\nVERSION:3.0\r\nN:Example;Alice;;;\r\nFN:Alice Example\r\n"
+    "ORG:Acme Construction;\r\nTEL;type=CELL:+1 555 0100\r\n"
+    "PHOTO;ENCODING=b;TYPE=JPEG:/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgK\r\n"
+    "END:VCARD\r\n"
+)
+
+
+def _chat_with_one_attachment(
+    conn: psycopg.Connection, *, chat_guid: str, cache_path: Path, filename: str
+) -> tuple[int, int]:
+    """(attachment_id, segment_id) for one message carrying one attachment."""
+    owner_id = _insert_person(conn, display_name="Jamie Owner", short_name="owner", is_owner=True)
+    chat_id = _insert_chat(conn, source_guid=chat_guid)
+    message_id = _insert_message(
+        conn, chat_id=chat_id, sender_person_id=owner_id, is_from_me=True, text="sending this"
+    )
+    att_id = _insert_attachment(conn, cache_path=cache_path, filename=filename)
+    _link_message_attachment(conn, message_id, att_id)
+    guid = _message_source_guid(conn, message_id)
+    segment_id = _seed_minimal_segment(
+        conn, chat_id=chat_id, message_id=message_id, chat_source_guid=chat_guid, message_guid_row=guid
+    )
+    return att_id, segment_id
+
+
+def test_contact_card_text_is_extracted_chunked_and_rendered(
+    scratch_db: psycopg.Connection, data_root: Path, config: Config, providers: EnrichmentProviders
+) -> None:
+    card_path = data_root / "3f2a"
+    card_path.write_text(_ALICE_CARD)
+    att_id, segment_id = _chat_with_one_attachment(
+        scratch_db, chat_guid="chat-card", cache_path=card_path, filename="Alice Example.vcf"
+    )
+
+    enqueue(scratch_db, att_id, kinds_for_mime("text/vcard"))
+    tasks = claim_tasks(scratch_db, worker_id="w1", limit=10)
+    assert [t.kind for t in tasks] == ["doc_text"]
+    assert process_one_task(scratch_db, config, providers, tasks[0]) == "done"
+
+    with scratch_db.cursor() as cur:
+        cur.execute(
+            "SELECT model, text, detail FROM enrichment WHERE attachment_id = %s AND kind = 'doc_text'",
+            (att_id,),
+        )
+        model, text, detail = cur.fetchone()  # type: ignore[misc]
+        cur.execute(
+            "SELECT text FROM attachment_chunk WHERE attachment_id = %s AND kind = 'doc_text'",
+            (att_id,),
+        )
+        chunks = [row[0] for row in cur.fetchall()]
+        cur.execute("SELECT rendered_text FROM segment WHERE segment_id = %s", (segment_id,))
+        (rendered,) = cur.fetchone()  # type: ignore[misc]
+
+    assert model == "vcard"
+    assert detail["truncated"] is False
+    assert "Acme Construction" in text
+    assert "/9j/4AAQ" not in text
+    assert chunks and "+1 555 0100" in chunks[0]
+    # The segment a search returns must carry the card's text, or the
+    # reranker scores a hit on the chunk against a line that only says
+    # `[attachment "Alice Example.vcf"]`.
+    assert "Alice Example" in rendered
+    assert "Acme Construction" in rendered
+    assert "/9j/4AAQ" not in rendered
+
+
+def test_a_voice_message_container_is_transcribed_not_skipped(
+    scratch_db: psycopg.Connection, data_root: Path, config: Config, providers: EnrichmentProviders
+) -> None:
+    import shutil
+
+    if shutil.which("afconvert") is None:
+        pytest.skip("needs macOS afconvert")
+    wav = data_root / "tone.wav"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", str(wav)],
+        check=True, capture_output=True, timeout=30,
+    )
+    voice = data_root / "a1b2"
+    subprocess.run(
+        ["afconvert", "-f", "caff", "-d", "aac", str(wav), str(voice)],
+        check=True, capture_output=True, timeout=30,
+    )
+    att_id, _ = _chat_with_one_attachment(
+        scratch_db, chat_guid="chat-voice", cache_path=voice, filename="Audio Message.caf"
+    )
+
+    enqueue(scratch_db, att_id, ("transcript",))
+    tasks = claim_tasks(scratch_db, worker_id="w1", limit=10)
+
+    assert process_one_task(scratch_db, config, providers, tasks[0]) == "done"
+    with scratch_db.cursor() as cur:
+        cur.execute("SELECT mime_type FROM attachment WHERE attachment_id = %s", (att_id,))
+        assert cur.fetchone() == ("audio/x-caf",)
+
+
+def test_transcript_of_a_video_with_no_audio_track_is_skipped_not_retried(
+    scratch_db: psycopg.Connection, data_root: Path, config: Config, providers: EnrichmentProviders
+) -> None:
+    silent = data_root / "c3d4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=5",
+         "-t", "1", "-an", "-f", "mp4", str(silent)],
+        check=True, capture_output=True, timeout=30,
+    )
+    att_id, _ = _chat_with_one_attachment(
+        scratch_db, chat_guid="chat-silent", cache_path=silent, filename="clip.mp4"
+    )
+
+    enqueue(scratch_db, att_id, ("transcript",))
+    tasks = claim_tasks(scratch_db, worker_id="w1", limit=10)
+
+    assert process_one_task(scratch_db, config, providers, tasks[0]) == "skipped"
+    with scratch_db.cursor() as cur:
+        cur.execute(
+            "SELECT state, attempts, last_error FROM enrichment WHERE attachment_id = %s", (att_id,)
+        )
+        state, attempts, last_error = cur.fetchone()  # type: ignore[misc]
+    assert state == "skipped"
+    assert attempts == 0
+    assert "no audio" in last_error
+
+
+def test_frames_of_an_audio_only_mp4_are_skipped_not_retried(
+    scratch_db: psycopg.Connection, data_root: Path, config: Config, providers: EnrichmentProviders
+) -> None:
+    """`file` calls an audio-only MP4 `video/mp4`, so the router sends it
+    frame OCR and a caption. There are no frames to sample."""
+    audio_only = data_root / "e5f6"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+         "-c:a", "aac", "-f", "mp4", str(audio_only)],
+        check=True, capture_output=True, timeout=30,
+    )
+    att_id, _ = _chat_with_one_attachment(
+        scratch_db, chat_guid="chat-audio-mp4", cache_path=audio_only, filename="memo.mp4"
+    )
+
+    enqueue(scratch_db, att_id, ("frame_ocr", "caption"))
+    tasks = claim_tasks(scratch_db, worker_id="w1", limit=10)
+    outcomes = {t.kind: process_one_task(scratch_db, config, providers, t) for t in tasks}
+
+    assert outcomes == {"frame_ocr": "skipped", "caption": "skipped"}

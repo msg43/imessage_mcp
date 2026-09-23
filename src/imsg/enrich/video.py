@@ -3,6 +3,13 @@
 video_max_frames)"). Frame timestamps come from the `showinfo` filter's
 stderr output, matched positionally to the numbered PNG files ffmpeg
 writes for the frames that passed the scene-change filter.
+
+The first frame is always kept. A scene-change filter alone keeps
+nothing from a clip with no hard cut — one continuous handheld shot, the
+usual home video — and frame OCR and the video caption then finish
+`done` with empty text, which reads as success (checked 2026-09-23 on a
+continuous synthetic 1080p clip: 0 frames without the first-frame term,
+1 with it).
 """
 
 from __future__ import annotations
@@ -37,7 +44,7 @@ def sample_keyframes(
                 "-i",
                 str(video_path),
                 "-vf",
-                f"select='gt(scene,{SCENE_CHANGE_THRESHOLD})',showinfo",
+                f"select='eq(n,0)+gt(scene,{SCENE_CHANGE_THRESHOLD})',showinfo",
                 "-fps_mode",
                 "vfr",
                 "-frames:v",

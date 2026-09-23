@@ -16,7 +16,7 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 Every buildable component of the governing spec is implemented: 8
 pipeline stages, hybrid retrieval, both MCP surfaces, the export gate,
 the eval harness, 38 CLI commands (counting subcommands), migrations
-0001–0008. 2,082 tests, all passing against a scratch Postgres (measured
+0001–0009. 2,203 tests, all passing against a scratch Postgres (measured
 2026-09-23); ruff and mypy strict clean; DDL lint clean. Since 2026-09-23
 extraction merges only add (D12): a seed inserts rows and fills empty
 values, and only this machine's own live `chat.db` may replace a value.
@@ -30,7 +30,11 @@ attachment fetcher (D13, 2026-09-23) is built but **not yet run against
 the corpus**: `locate-attachments` records every candidate copy of an
 attachment (another Mac, its drives, a NAS share, drive catalogs), the
 backfill tries them best first and verifies each, and `push-attachments`
-copies from a host the index host cannot reach.
+copies from a host the index host cannot reach. **No attachment text has
+been extracted yet** (production `enrichment` table empty, 2026-09-23):
+the queue-filling path is built as of 2026-09-23 — `imsg enrich --plan`,
+S5a queueing on materialization, cheap kinds claimed before captions —
+and not yet run; see the owner to-do below.
 
 **This status previously read "code complete, unrun" and stayed that way
 for three weeks after it stopped being true** — see `CHANGELOG.md`
@@ -99,6 +103,21 @@ accounts).
   `segment` run re-segments every chat. Vector dimensions are load-bearing:
   pgvector's HNSW index caps below what the models natively emit, so
   changing them requires a migration and a full re-embed.
+- **Fill and drain the enrichment queue** (Phase 5; CHANGELOG
+  2026-09-23). On the production host, in order: `imsg migrate` (0009);
+  `imsg enrich --plan --dry-run` (expect about 202,000 tasks: `doc_text`
+  976, `pdf_text` 1,039, `ocr` 93,165, `transcript` 4,825, `frame_ocr`
+  4,561, `caption` 97,726; 41 unroutable); `imsg enrich --plan`; then the
+  cheap kinds, `imsg enrich --kinds doc_text,pdf_text,transcript,ocr,frame_ocr
+  --limit 200000` (estimated 14-27 h, run when searches can take the
+  contention); captions are left to the nightly agent (estimated 340-400
+  GPU-hours, about 75 nights at its `--limit 100` every 30 minutes).
+  Owner decisions open: whether captions may also run in the daytime
+  (D10.3 measured search p95 3.0 s while captioning), and whether
+  link-preview images (28,603 of the 93,165 images, 2,534 of them
+  favicons) need captions at all. Estimates are Studio measurements scaled, not
+  measured on the production host; the first night's `imsg enrich`
+  output gives the real per-kind rate.
 - Confirm the host's unified memory before Phase 0 — it selects the
   model ladder. First real inputs (2026-09-14, M2 Ultra 128 GB, one model
   resident at a time, peak per `models/manifest.lock.yaml`): Qwen3.5-35B-A3B

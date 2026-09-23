@@ -271,3 +271,170 @@ def test_missing_runtime_is_a_clear_error_naming_the_package(
 def test_satisfies_the_caption_provider_protocol() -> None:
     provider: CaptionProvider = MlxVlmCaptionProvider(REPO, None, PROMPT)
     assert provider.model_id == f"{REPO}@main"
+
+
+# --------------------------------------------------------------------------
+# HEIC: the iPhone's default photo format. `mlx_vlm` opens the image with
+# PIL, and PIL decodes HEIC only after pillow-heif registers its opener.
+# Nothing in the enrichment process did, so every HEIC caption failed.
+# --------------------------------------------------------------------------
+
+
+def test_caption_registers_the_heif_opener_before_the_model_reads_the_image(
+    vlm: VlmStub, image: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    heif = types.ModuleType("pillow_heif")
+
+    def register_heif_opener(**kwargs: Any) -> None:  # pillow-heif 1.7.0's signature
+        events.append("registered")
+
+    heif.register_heif_opener = register_heif_opener  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pillow_heif", heif)
+    real_generate = sys.modules["mlx_vlm"].generate  # type: ignore[attr-defined]
+
+    def generate(*args: Any, **kwargs: Any) -> Any:
+        events.append("generate")
+        return real_generate(*args, **kwargs)
+
+    monkeypatch.setattr(sys.modules["mlx_vlm"], "generate", generate)
+    provider = MlxVlmCaptionProvider(REPO, None, PROMPT)
+
+    provider.caption(image)
+    provider.caption(image)
+
+    assert events[0] == "registered"
+    assert events.count("generate") == 2
+
+
+def test_a_real_heic_photo_decodes_by_the_time_the_model_sees_it(
+    vlm: VlmStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pillow_heif = pytest.importorskip("pillow_heif")
+    pil_image = pytest.importorskip("PIL.Image")
+    heic = tmp_path / "photo"  # content-addressed cache names carry no extension
+    pillow_heif.from_pillow(pil_image.new("RGB", (16, 16), "red")).save(heic, quality=50)
+    decoded: list[tuple[int, int]] = []
+
+    def generate(*args: Any, **kwargs: Any) -> Any:
+        # What mlx_vlm.utils.load_image does with a path.
+        with pil_image.open(kwargs["image"][0]) as img:
+            img.load()
+            decoded.append(img.size)
+        return SimpleNamespace(text="A red square.")
+
+    monkeypatch.setattr(sys.modules["mlx_vlm"], "generate", generate)
+
+    assert MlxVlmCaptionProvider(REPO, None, PROMPT).caption(heic) == "A red square."
+    assert decoded == [(16, 16)]
+
+
+def test_caption_still_works_without_pillow_heif(
+    vlm: VlmStub, image: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A JPEG needs no HEIF support; a missing pillow-heif costs HEICs
+    alone, and each of those fails as its own task with PIL's error."""
+    monkeypatch.setitem(sys.modules, "pillow_heif", None)
+    assert MlxVlmCaptionProvider(REPO, None, PROMPT).caption(image) == "A red bicycle."
+
+
+# --------------------------------------------------------------------------
+# Image size: a caption's cost follows the pixels the model is shown.
+# Measured 2026-09-23 on an M2 Ultra with the pinned Qwen3.5-35B-A3B: a
+# 4032x3024 photo took 37.6 s to caption, the same photo scaled to
+# 1920x1440 took 5.7 s, and the 1440x1920 image the production host's
+# 14.2 s figure was measured on took 5.2 s. Photos are scaled to fit
+# `max_image_side` before the model sees them.
+# --------------------------------------------------------------------------
+
+
+def _photo(path: Path, size: tuple[int, int]) -> Path:
+    pil_image = pytest.importorskip("PIL.Image")
+    pil_image.new("RGB", size, "blue").save(path, "JPEG", quality=80)
+    return path
+
+
+def _recording_generate(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+    """A fake `mlx_vlm.generate` that opens the image it is given while
+    it still exists, the way the real one does."""
+    pil_image = pytest.importorskip("PIL.Image")
+    seen: list[tuple[int, int]] = []
+
+    def generate(*args: Any, **kwargs: Any) -> Any:
+        with pil_image.open(kwargs["image"][0]) as img:
+            seen.append(img.size)
+        return SimpleNamespace(text="A blue rectangle.")
+
+    monkeypatch.setattr(sys.modules["mlx_vlm"], "generate", generate)
+    return seen
+
+
+def test_a_full_resolution_photo_is_scaled_to_fit_before_captioning(
+    vlm: VlmStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _recording_generate(monkeypatch)
+    photo = _photo(tmp_path / "photo", (4032, 3024))
+
+    MlxVlmCaptionProvider(REPO, None, PROMPT).caption(photo)
+
+    assert seen == [(1920, 1440)]
+    assert photo.stat().st_size > 0  # the attachment itself is never rewritten
+
+
+def test_the_default_bound_is_the_size_the_caption_cost_was_measured_at() -> None:
+    from imsg.enrich.mlx_vlm_caption import DEFAULT_CAPTION_MAX_IMAGE_SIDE
+
+    assert DEFAULT_CAPTION_MAX_IMAGE_SIDE == 1920
+    assert MlxVlmCaptionProvider(REPO, None, PROMPT).max_image_side == 1920
+
+
+def test_an_image_that_already_fits_is_passed_through_untouched(
+    vlm: VlmStub, tmp_path: Path
+) -> None:
+    small = _photo(tmp_path / "small", (1200, 630))
+    MlxVlmCaptionProvider(REPO, None, PROMPT).caption(small)
+    ((_, kwargs),) = vlm.generate_calls
+    assert kwargs["image"] == [str(small)]
+
+
+def test_no_bound_keeps_full_resolution(
+    vlm: VlmStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _recording_generate(monkeypatch)
+    photo = _photo(tmp_path / "photo", (4032, 3024))
+
+    MlxVlmCaptionProvider(REPO, None, PROMPT, max_image_side=None).caption(photo)
+
+    assert seen == [(4032, 3024)]
+
+
+def test_orientation_is_applied_before_scaling(
+    vlm: VlmStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A portrait iPhone photo is stored landscape with an EXIF rotation.
+    The model loader applies that rotation to what it opens, so a scaled
+    copy must carry it already applied."""
+    pil_image = pytest.importorskip("PIL.Image")
+    seen = _recording_generate(monkeypatch)
+    photo = tmp_path / "portrait"
+    img = pil_image.new("RGB", (4032, 3024), "blue")
+    exif = img.getexif()
+    exif[0x0112] = 6  # rotate 90 degrees clockwise to display
+    img.save(photo, "JPEG", exif=exif)
+
+    MlxVlmCaptionProvider(REPO, None, PROMPT).caption(photo)
+
+    assert seen == [(1440, 1920)]
+
+
+def test_an_unreadable_image_goes_to_the_model_unchanged(vlm: VlmStub, image: Path) -> None:
+    """PIL cannot open it; the model's own loader reports that, as a
+    per-task failure, exactly as before."""
+    MlxVlmCaptionProvider(REPO, None, PROMPT).caption(image)
+    ((_, kwargs),) = vlm.generate_calls
+    assert kwargs["image"] == [str(image)]
+
+
+def test_a_non_positive_bound_is_rejected_at_construction() -> None:
+    with pytest.raises(ConfigError):
+        MlxVlmCaptionProvider(REPO, None, PROMPT, max_image_side=0)

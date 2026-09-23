@@ -46,6 +46,7 @@ from imsg.backfill.dataless import is_dataless
 from imsg.backfill.fetch import LocationFetchReport, LocationFetchSettings, fetch_from_locations
 from imsg.backfill.materialize import materialize_attachment
 from imsg.backfill.throttle import RateThrottle
+from imsg.enrich.planner import enqueue_for_materialized
 from imsg.paths import is_contained_in, resolve_path
 
 if TYPE_CHECKING:
@@ -112,6 +113,16 @@ class BackfillRunReport:
     eligible now) before candidates were selected."""
     detected_dataless: int = 0
     detected_already_local: int = 0
+    enrichment_enqueued: int = 0
+    """S5b tasks queued for the rows this run materialized, from their own
+    source path or (location phase) from another copy: the router's kinds
+    for each file's content-sniffed MIME type
+    (`imsg.enrich.planner.enqueue_for_materialized`)."""
+    enrichment_unroutable: int = 0
+    """Materialized rows whose sniffed type has no enrichment route."""
+    enrichment_plan_errors: int = 0
+    """Materialized rows whose file could not be sniffed; the
+    materialization stands, and `imsg enrich --plan` retries them."""
     trial_gate_capped: bool = False
     halted_low_disk_space: bool = False
     notes: list[str] = field(default_factory=list)
@@ -357,6 +368,21 @@ def _reclassify_out_of_root(
     return len(reclassified), reclassified
 
 
+def _enqueue_enrichment(
+    conn: psycopg.Connection,
+    attachment_id: int,
+    cache_path: Path,
+    data_root: Path,
+    report: BackfillRunReport,
+) -> None:
+    """The row just became `materialized`: queue its S5b enrichment now,
+    so the worker has something to claim (SPEC §8 S5b)."""
+    outcome = enqueue_for_materialized(conn, attachment_id, cache_path, data_root=data_root)
+    report.enrichment_enqueued += len(outcome.enqueued)
+    report.enrichment_unroutable += int(outcome.unroutable)
+    report.enrichment_plan_errors += int(outcome.error is not None)
+
+
 def run_backfill(
     conn: psycopg.Connection,
     data_root: Path,
@@ -527,6 +553,7 @@ def run_backfill(
             cache_path=result.cache_path,
         )
         report.materialized += 1
+        _enqueue_enrichment(conn, candidate.attachment_id, result.cache_path, resolved_data_root, report)
 
     if locations is not None and not report.halted_low_disk_space:
         budget = max(0, trial_limit - report.considered) if trial_gate_active else None
@@ -545,6 +572,9 @@ def run_backfill(
             report.halted_low_disk_space = True
         if report.locations.budget_capped:
             report.trial_gate_capped = True
+        report.enrichment_enqueued += report.locations.enrichment_enqueued
+        report.enrichment_unroutable += report.locations.enrichment_unroutable
+        report.enrichment_plan_errors += report.locations.enrichment_plan_errors
 
     return report
 
