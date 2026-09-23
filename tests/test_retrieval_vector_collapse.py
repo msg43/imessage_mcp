@@ -17,7 +17,7 @@ import psycopg
 import pytest
 
 from imsg.retrieval import vector_search
-from imsg.retrieval.access import LOCAL_FULL_ACCESS
+from imsg.retrieval.access import LOCAL_FULL_ACCESS, resolve_request_scope
 from imsg.retrieval.filters import SearchFilters, compile_predicate
 from imsg.retrieval.vector_search import (
     COLLAPSE_FETCH_ROWS,
@@ -149,7 +149,7 @@ def test_reads_everything_when_fewer_than_k_segments_exist() -> None:
 
 def test_sets_the_scan_and_cursor_planning_inside_the_same_transaction_before_streaming() -> None:
     conn = _FakeConn([(1, 0.1)])
-    predicate = compile_predicate(SearchFilters(), LOCAL_FULL_ACCESS)
+    predicate = compile_predicate(SearchFilters(), resolve_request_scope(None, LOCAL_FULL_ACCESS))
     search_multimodal_vector(cast(psycopg.Connection, conn), [0.1, 0.2], predicate, 5)
     (scan_name, scan_sql, _), (seq_name, seq_sql, _), (plan_name, plan_sql, _), (
         cursor_name,
@@ -176,7 +176,7 @@ def test_ef_search_is_set_for_the_transaction_only_when_one_is_given() -> None:
     """`retrieval.hnsw_ef_search` reaches the server as a transaction-local
     `set_config`, next to the iterative-scan setting; without a value the
     server's own (40) stands."""
-    predicate = compile_predicate(SearchFilters(), LOCAL_FULL_ACCESS)
+    predicate = compile_predicate(SearchFilters(), resolve_request_scope(None, LOCAL_FULL_ACCESS))
 
     conn = _FakeConn([(1, 0.1)])
     search_multimodal_vector(

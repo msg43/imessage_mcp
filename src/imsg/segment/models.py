@@ -25,6 +25,17 @@ class AttachmentSnippet:
     ocr_text: str | None = None
     transcript: str | None = None
     pdf_text: str | None = None
+    withheld: bool = False
+    """Render a content-free placeholder instead of this attachment — no
+    key, kind, filename or text. Set only by `imsg.retrieval` under
+    `allowlist` scope, for an attachment the separate attachment gate
+    denies (SPEC §11.2); segmentation never sets it, so stored
+    `segment.rendered_text` is unaffected."""
+
+    @classmethod
+    def withheld_placeholder(cls) -> AttachmentSnippet:
+        """A snippet that carries nothing about the attachment it replaces."""
+        return cls(attachment_key="", kind="other", filename=None, withheld=True)
 
 
 @dataclass(frozen=True, slots=True)

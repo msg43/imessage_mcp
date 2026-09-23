@@ -4,8 +4,8 @@ people, dates, attachment flag) and apply it to every candidate path —
 public scope is enforced in this repository layer, not in individual
 tools (§10.3a, D6)."
 
-`compile_predicate` is that one place. It always folds in
-`imsg.retrieval.access.segment_eligibility_predicate`, so every caller
+`compile_predicate` is that one place. It always folds in the request's
+`imsg.retrieval.access.RequestScope.chat_predicate`, so every caller
 gets scope enforcement "for free" rather than remembering to AND it in
 separately — the exact failure mode §10.3a is written to prevent.
 
@@ -23,9 +23,9 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from imsg.retrieval.access import AccessContext, segment_eligibility_predicate
+from imsg.retrieval.access import RequestScope
 from imsg.retrieval.errors import DateRangeInvalidError, InvalidArgumentError
-from imsg.retrieval.people import resolve_person
+from imsg.retrieval.people import resolve_people
 
 if TYPE_CHECKING:
     import psycopg
@@ -64,8 +64,8 @@ def _parse_local_midnight(value: str, timezone: str) -> datetime:
 
 
 def resolve_filters(
-    conn: psycopg.Connection,
-    context: AccessContext,
+    conn: psycopg.Connection | None,
+    scope: RequestScope,
     *,
     people: list[str] | None,
     after: str | None,
@@ -77,13 +77,19 @@ def resolve_filters(
     (SPEC §10.2) into a `SearchFilters`. Raises `InvalidArgumentError`,
     `PersonNotFoundError`, `PersonAmbiguousError`, or
     `DateRangeInvalidError` exactly as SPEC §10.2 documents for this
-    tool's error set."""
+    tool's error set. `conn` is only read when `people` is non-empty;
+    person names resolve within `scope` (`imsg.retrieval.people`)."""
     people = people or []
     if len(people) > MAX_PEOPLE_FILTER:
         raise InvalidArgumentError(
             f"'people' accepts at most {MAX_PEOPLE_FILTER} entries, got {len(people)}"
         )
-    person_ids = tuple(resolve_person(conn, context, p) for p in people)
+    if people:
+        if conn is None:
+            raise ValueError("resolve_filters: a 'people' filter needs a database connection")
+        person_ids = resolve_people(conn, scope, people)
+    else:
+        person_ids = ()
 
     after_dt = _parse_local_midnight(after, timezone) if after else None
     before_dt = _parse_local_midnight(before, timezone) if before else None
@@ -104,11 +110,12 @@ class CompiledPredicate:
 
 
 def compile_predicate(
-    filters: SearchFilters, context: AccessContext, *, segment_alias: str = "s"
+    filters: SearchFilters, scope: RequestScope, *, segment_alias: str = "s"
 ) -> CompiledPredicate:
     """Build the combined boolean SQL expression (+ bound params) for
-    `filters`/`context`, safe to `AND` into any query with a `segment`
-    row aliased `segment_alias` in scope.
+    `filters`/`scope`, safe to `AND` into any query with a `segment`
+    row aliased `segment_alias` in scope. The scope's clause comes first
+    and is always present (`TRUE` under `full` scope).
 
     People-filter semantics (judgment call, not specified by SPEC
     §10.2 beyond "person short_names or display names; resolved to
@@ -119,8 +126,9 @@ def compile_predicate(
     defensible and flagged in the build report as an alternative worth
     an explicit spec decision.
     """
-    clauses = [segment_eligibility_predicate(context, chat_id_expr=f"{segment_alias}.chat_id")]
-    params: dict[str, object] = {}
+    scope_clause = scope.chat_predicate(f"{segment_alias}.chat_id")
+    clauses = [scope_clause.sql]
+    params: dict[str, object] = dict(scope_clause.params)
 
     if filters.after is not None:
         clauses.append(f"{segment_alias}.started_at >= %(f_after)s")

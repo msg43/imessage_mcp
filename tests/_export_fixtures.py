@@ -230,6 +230,7 @@ def insert_segment(
     ended_at: datetime,
     message_ids: list[int],
     stable_key: str | None = None,
+    rendered_text: str = "local-render",
 ) -> int:
     stable_key = stable_key or f"stable-{uuid.uuid4()}"
     with conn.cursor() as cur:
@@ -247,10 +248,10 @@ def insert_segment(
                 stable_key, chat_id, session_id, seq_in_session, started_at,
                 ended_at, message_count, rendered_text, rendered_sha256,
                 seg_config_hash
-            ) VALUES (%s, %s, %s, 0, %s, %s, %s, 'local-render', 'x', 'cfg')
+            ) VALUES (%s, %s, %s, 0, %s, %s, %s, %s, 'x', 'cfg')
             RETURNING segment_id
             """,
-            (stable_key, chat_id, session_id, started_at, ended_at, len(message_ids)),
+            (stable_key, chat_id, session_id, started_at, ended_at, len(message_ids), rendered_text),
         )
         row = cur.fetchone()
         assert row is not None

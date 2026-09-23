@@ -15,20 +15,22 @@ and only when they are unique.
 
 D6 additionally requires near-match suggestions to respect the
 effective access scope ("public person near-match suggestions are
-themselves filtered by the effective access scope") — `_fuzzy_pool`
-below applies `access.segment_eligibility_predicate`-equivalent
-person-level filtering (via `allowlist_person.text_allowed`) whenever
-`context.scope != "full"`. The local surface is always full scope, so
-this never actually filters anything in this build; it exists so a
-later public-surface build gets the D6 behavior for free.
+themselves filtered by the effective access scope"). Under `allowlist`
+scope every tier here — exact `short_name`, exact `display_name`, the
+candidates of an ambiguous display name, and the fuzzy suggestions —
+looks only at `imsg.retrieval.access.visible_person_ids`: people who
+appear in an eligible chat. A person outside that set is reported as
+`PERSON_NOT_FOUND`, exactly like a name that exists nowhere, so a public
+caller cannot learn who is in the corpus by trying names.
 """
 
 from __future__ import annotations
 
 import difflib
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from imsg.retrieval.access import AccessContext
+from imsg.retrieval.access import RequestScope, visible_person_ids
 from imsg.retrieval.errors import (
     InvalidArgumentError,
     PersonAmbiguousError,
@@ -49,32 +51,24 @@ plausible "did you mean" and the result is `PersonNotFoundError` with
 no candidates rather than noise."""
 
 
-def _fuzzy_pool(
-    conn: psycopg.Connection, context: AccessContext
-) -> list[tuple[int, str, str]]:
-    """`(person_id, short_name, display_name)` for every person the
-    fuzzy tier is allowed to suggest, scope-filtered per D6."""
-    with conn.cursor() as cur:
-        if context.scope == "full":
-            cur.execute("SELECT person_id, short_name, display_name FROM person")
-        else:
-            cur.execute(
-                """
-                SELECT p.person_id, p.short_name, p.display_name
-                FROM person p
-                JOIN allowlist_person ap ON ap.person_id = p.person_id
-                WHERE ap.text_allowed
-                """
-            )
-        return [(int(pid), sn, dn) for pid, sn, dn in cur.fetchall()]
+def _within(visible: frozenset[int] | None) -> tuple[str, dict[str, object]]:
+    """The `AND ...` clause (and its parameter) limiting a `person` query
+    to `visible`; nothing under `full` scope."""
+    if visible is None:
+        return "", {}
+    return " AND person_id = ANY(%(visible)s::bigint[])", {"visible": sorted(visible)}
 
 
 def _fuzzy_candidates(
-    conn: psycopg.Connection, context: AccessContext, query: str
+    conn: psycopg.Connection, query: str, visible: frozenset[int] | None
 ) -> tuple[PersonCandidate, ...]:
+    within, params = _within(visible)
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT short_name, display_name FROM person WHERE TRUE{within}", params)
+        pool = [(str(sn), str(dn)) for sn, dn in cur.fetchall()]
     lowered = query.lower()
     scored: list[tuple[float, PersonCandidate]] = []
-    for _person_id, short_name, display_name in _fuzzy_pool(conn, context):
+    for short_name, display_name in pool:
         score = max(
             difflib.SequenceMatcher(None, lowered, short_name.lower()).ratio(),
             difflib.SequenceMatcher(None, lowered, display_name.lower()).ratio(),
@@ -85,45 +79,63 @@ def _fuzzy_candidates(
     return tuple(c for _, c in scored[:MAX_CANDIDATES])
 
 
-def resolve_person(conn: psycopg.Connection, context: AccessContext, query: str) -> int:
-    """Resolve one `people` filter entry (SPEC §10.2 `search_messages`
-    schema) to a `person_id`.
-
-    Raises `InvalidArgumentError` for an empty entry,
-    `PersonNotFoundError`/`PersonAmbiguousError` per the ladder
-    described in this module's docstring.
-    """
+def _resolve_one(
+    conn: psycopg.Connection, query: str, visible: frozenset[int] | None
+) -> int:
     stripped = query.strip()
     if not stripped:
         raise InvalidArgumentError("a 'people' filter entry must not be empty")
 
+    within, visible_params = _within(visible)
+    params: dict[str, object] = {"q": stripped, "n": MAX_CANDIDATES, **visible_params}
     with conn.cursor() as cur:
-        cur.execute("SELECT person_id FROM person WHERE short_name = %s", (stripped,))
+        cur.execute(f"SELECT person_id FROM person WHERE short_name = %(q)s{within}", params)
         row = cur.fetchone()
         if row is not None:
             return int(row[0])
 
-        cur.execute("SELECT person_id FROM person WHERE display_name = %s", (stripped,))
+        cur.execute(f"SELECT person_id FROM person WHERE display_name = %(q)s{within}", params)
         exact_display_matches = cur.fetchall()
 
-    if len(exact_display_matches) == 1:
-        return int(exact_display_matches[0][0])
-    if len(exact_display_matches) > 1:
-        with conn.cursor() as cur:
+        if len(exact_display_matches) == 1:
+            return int(exact_display_matches[0][0])
+        if len(exact_display_matches) > 1:
             cur.execute(
-                "SELECT short_name, display_name FROM person WHERE display_name = %s "
-                "ORDER BY short_name LIMIT %s",
-                (stripped, MAX_CANDIDATES),
+                f"SELECT short_name, display_name FROM person WHERE display_name = %(q)s{within} "
+                "ORDER BY short_name LIMIT %(n)s",
+                params,
             )
             candidates = tuple(
                 PersonCandidate(short_name=sn, display_name=dn) for sn, dn in cur.fetchall()
             )
-        raise PersonAmbiguousError(stripped, candidates)
+            raise PersonAmbiguousError(stripped, candidates)
 
-    fuzzy = _fuzzy_candidates(conn, context, stripped)
+    fuzzy = _fuzzy_candidates(conn, stripped, visible)
     if not fuzzy:
         raise PersonNotFoundError(stripped, ())
     raise PersonAmbiguousError(stripped, fuzzy)
 
 
-__all__ = ["FUZZY_MIN_SCORE", "MAX_CANDIDATES", "resolve_person"]
+def resolve_people(
+    conn: psycopg.Connection, scope: RequestScope, queries: Sequence[str]
+) -> tuple[int, ...]:
+    """Resolve every `people` filter entry (SPEC §10.2 `search_messages`
+    schema) to a `person_id`, in order, looking up the scope's visible
+    people once for all of them.
+
+    Raises `InvalidArgumentError` for an empty entry,
+    `PersonNotFoundError`/`PersonAmbiguousError` per the ladder
+    described in this module's docstring.
+    """
+    if not queries:
+        return ()
+    visible = visible_person_ids(conn, scope)
+    return tuple(_resolve_one(conn, q, visible) for q in queries)
+
+
+def resolve_person(conn: psycopg.Connection, scope: RequestScope, query: str) -> int:
+    """Resolve one `people` filter entry; see `resolve_people`."""
+    return resolve_people(conn, scope, [query])[0]
+
+
+__all__ = ["FUZZY_MIN_SCORE", "MAX_CANDIDATES", "resolve_people", "resolve_person"]

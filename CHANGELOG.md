@@ -10,6 +10,78 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-23 — Public `allowlist` scope serves exactly what export would ship
+
+SPEC §10.3a says the public MCP surface under `allowlist` scope applies
+"the same eligibility predicate" as export. It had its own rule instead:
+`imsg.retrieval.access` checked only a chat's current `chat_participant`
+rows, and counted a chat with no participants as eligible. Export's rule
+(`imsg.export.eligibility`) also denies a chat when a former member, a
+message sender, a raw participant handle or a tapback sender is
+unresolved or not allowlisted. Nothing was exposed, because the
+production allowlist had no rows; the first row would have let the public
+surface serve threads export refuses.
+
+- **One rule, one implementation.** `imsg.retrieval.access` calls
+  `imsg.export.eligibility.eligible_chat_ids` instead of keeping a copy.
+  The deny rules are declared once (`_DENY_RULES`), and both
+  `compute_chat_eligibility` (with reasons, for the review report) and
+  `eligible_chat_ids` build their SQL from them. Both take `among=` to
+  evaluate only some chats.
+- **Evaluated once per request.** The rule is not written inline in the
+  candidate queries: a search runs five of them, and one evaluation of
+  the message rules for the largest chat (88,540 messages) takes 74 ms on
+  the production host. Each request evaluates the rule once and filters
+  candidates on `chat_id = ANY(<eligible ids>)`; with few eligible chats
+  the planner switches to an exact scan by chat (1 ms for 53 chats).
+  `eligible_chat_ids` runs the participant rules over every chat, then
+  the message rules only over the chats left: 17 ms with today's empty
+  allowlist, 12-31 ms for allowlists leaving 2 or 53 eligible chats,
+  99-192 ms for 1,061 chats or with every person allowlisted (production
+  host, read-only, allowlists simulated, 2026-09-22). There is no cache:
+  an identity merge that repoints `message.sender_person_id` changes
+  eligibility, and no cheap cache key would see it.
+- **Attachment text passes export's separate gate.** Under `allowlist`,
+  `get_attachment_text` returns text only through a parent segment where
+  every non-unsent message linking the attachment has a sender with
+  `attachments_allowed` (SPEC §11.2, `compute_attachment_eligibility`).
+  The same gate now covers the snippets inside `get_conversation` lines
+  and `search_messages` text, which carried every attachment's caption
+  and OCR text; a gated attachment renders as `[attachment withheld]`.
+  Search results under `allowlist` are re-rendered from their rows
+  instead of returned from `segment.rendered_text`, and the reranker
+  scores the re-rendered text. The placeholder is a new
+  `AttachmentSnippet.withheld` field that segmentation never sets, so no
+  stored rendering changes and `RENDERER_VERSION` stays at 1.
+- **No unsent messages or edit history under `allowlist`**, whatever
+  `policy.*` says. These are the exclusions §11.2 imposes on export
+  unconditionally (D1).
+- **People.** `list_people` under `allowlist` lists only people who
+  appear in an eligible chat, counting only their messages there. Before,
+  it listed every text-allowed person with counts over all their
+  messages. Person filters resolve within the same set, so an exact name
+  outside it is `PERSON_NOT_FOUND` instead of an empty success that
+  confirms the person exists. `include_handles` is refused off the local
+  surface.
+- **Same `NOT_FOUND` text for unknown and denied threads.**
+  `get_conversation` gave different messages for the two, and the public
+  server returns error text verbatim.
+- **An empty allowlist answers at once.** With no eligible chat,
+  `search_messages` returns an empty result without embedding the query
+  or scanning an index.
+- **Tests.** `tests/test_retrieval_allowlist_parity_integration.py`, 20
+  cases through the service's public methods. Against the code before
+  this change 18 fail and the 2 controls pass; after it, all pass. The
+  parity case builds every deny reason in one database and checks that
+  the chats `get_conversation` and `search_messages` serve equal
+  `eligible_chat_ids`, and that the per-chat and whole-corpus evaluations
+  agree. Full suite: 1,881 passed against a scratch Postgres 17 with
+  pgvector 0.8.6.
+- **Not yet measured:** whole-query p95 under `allowlist` on the
+  production host, which needs this build deployed and allowlist rows to
+  exist. `scripts/bench_retrieval_latency.py --scope allowlist` times it,
+  with the new `scope` and `render_scoped` stages.
+
 ## 2026-09-18 — the last two command surfaces: `imsg backup`, and the AT-1 probe's CLI
 
 Both were found the same way — by reading what the deployment guide and

@@ -53,6 +53,16 @@ Configurations are `<scorer>:<rerank_top>:<doc cap | none>[:nomm]`:
 The service never reranks fewer candidates than the request's `limit`
 (10 here), so a `rerank_top` below 10 behaves as 10.
 
+`--scope allowlist` runs the sweep as the public MCP server does under
+`mcp.public.scope: allowlist` (`AccessContext(surface="public",
+scope="allowlist")`): export's eligibility rule evaluated per request
+(the `scope` stage), candidates limited to eligible chats, and the
+reranked pool re-rendered through the attachment gate (the
+`render_scoped` stage). With no eligible chat every search returns at
+once, empty, so it measures something only once `allowlist_person` has
+rows. It cannot be combined with `--rerank-only`, whose captured pools
+are the stored segment texts.
+
 `--rerank-only` isolates the reranker from the database: one pass of the
 real service per query (a pass-through reranker, a 50-candidate pool, and
 channel C on or off as the configurations need) records each query's
@@ -128,6 +138,7 @@ WARMUP_QUERIES: tuple[str, ...] = (
 )
 
 STAGES: tuple[str, ...] = (
+    "scope",
     "filters",
     "analyze",
     "segment_fts",
@@ -139,6 +150,7 @@ STAGES: tuple[str, ...] = (
     "multimodal_vector",
     "fuse",
     "fetch_summaries",
+    "render_scoped",
     "rerank",
 )
 NON_RERANK_STAGES: tuple[str, ...] = tuple(s for s in STAGES if s != "rerank")
@@ -249,6 +261,7 @@ def instrument_service_modules(clock: StageClock) -> None:
     from imsg.retrieval import fts_search, segments, service, vector_search
 
     patches: list[tuple[Any, str, str]] = [
+        (service, "resolve_request_scope", "scope"),
         (service, "resolve_filters", "filters"),
         (service, "compile_predicate", "filters"),
         (service, "analyze_query", "analyze"),
@@ -259,6 +272,7 @@ def instrument_service_modules(clock: StageClock) -> None:
         (vector_search, "search_multimodal_vector", "multimodal_vector"),
         (service, "reciprocal_rank_fusion", "fuse"),
         (segments, "fetch_segment_summaries", "fetch_summaries"),
+        (segments, "render_segment_texts", "render_scoped"),
     ]
     for module, name, stage in patches:
         setattr(module, name, timed(clock, stage, getattr(module, name)))
@@ -545,6 +559,15 @@ class Bench:
     multimodal: Any
     clock: StageClock
     alternates: dict[str, Any] = field(default_factory=dict)
+    scope: str = "full"
+
+    def context(self) -> Any:
+        """The `AccessContext` every sweep search runs under (`--scope`)."""
+        from imsg.retrieval.access import LOCAL_FULL_ACCESS, AccessContext
+
+        if self.scope == "allowlist":
+            return AccessContext(surface="public", scope="allowlist", subject=None)
+        return LOCAL_FULL_ACCESS
 
     def scorer_for(self, config: SweepConfig) -> tuple[Any, Any | None]:
         """`(scorer, provider)` for a configuration; the provider (for token
@@ -581,8 +604,7 @@ class Bench:
     def run(
         self, config: SweepConfig, queries: Sequence[str], passes: int, label: str
     ) -> tuple[list[QueryRecord], RerankTally]:
-        from imsg.retrieval.access import LOCAL_FULL_ACCESS
-
+        context = self.context()
         tally = RerankTally()
         service = self.service_for(config, tally)
         records: list[QueryRecord] = []
@@ -591,7 +613,7 @@ class Bench:
             for index, query in enumerate(queries):
                 self.clock.reset()
                 t0 = time.perf_counter()
-                result = service.search_messages(LOCAL_FULL_ACCESS, query=query, limit=10)
+                result = service.search_messages(context, query=query, limit=10)
                 total = time.perf_counter() - t0
                 records.append(
                     QueryRecord(
@@ -863,8 +885,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="capture each query's pool once, then time only the rerank stage per configuration",
     )
+    parser.add_argument(
+        "--scope",
+        choices=("full", "allowlist"),
+        default="full",
+        help="run the sweep under the local surface's full scope (default) or the public "
+        "surface's allowlist scope",
+    )
     parser.add_argument("--report-json", type=Path, help="write the aggregate numbers here")
     args = parser.parse_args(argv)
+    if args.rerank_only and args.scope != "full":
+        parser.error("--rerank-only measures stored segment texts; it cannot run with --scope allowlist")
 
     from imsg.config.loader import load_config
     from imsg.retrieval import fts_search
@@ -884,7 +915,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     instrument_service_modules(clock)
     if not hasattr(fts_search.search_segment_fts, "__wrapped__"):
         raise SystemExit("stage instrumentation did not reach the service's modules")
-    bench = Bench(cfg, pg, fts, text, reranker, multimodal, clock, alternates)
+    bench = Bench(cfg, pg, fts, text, reranker, multimodal, clock, alternates, args.scope)
 
     if args.rerank_only:
         return rerank_only_main(bench, configs, queries, args.warmup, args.report_json)
@@ -896,7 +927,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for label in alternates:
             bench.run(parse_config(f"new@{label}:50:none"), warm[:1], 1, f"warm-up {label}")
 
-    report: dict[str, Any] = {"queries": len(queries), "passes": args.passes}
+    report: dict[str, Any] = {"queries": len(queries), "passes": args.passes, "scope": args.scope}
     if not args.no_first_touch:
         pinned = [c for c in configs if c.batching == "new" and c.reranker is None] or [
             parse_config("new:10:256")

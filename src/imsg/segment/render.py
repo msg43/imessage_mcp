@@ -18,8 +18,16 @@ from zoneinfo import ZoneInfo
 from imsg.segment.models import AttachmentSnippet, MessageForSegmentation, SegmentDraft
 
 RENDERER_VERSION = "1"
+"""Unchanged by `WITHHELD_ATTACHMENT`: segmentation never renders a
+withheld attachment, so no stored text renders differently."""
 
 _EMPTY_SNIPPET = "—"  # em dash, matches the SPEC §9.1 example's "ocr \"—\""
+
+WITHHELD_ATTACHMENT = "[attachment withheld]"
+"""What an attachment the separate attachment gate denies renders as on
+the public surface under `allowlist` scope (SPEC §11.2): content-free by
+design, like export's placeholder — a filename, a kind or an opaque key
+can each say more than the owner allowlisted."""
 
 
 def _truncate(text: str | None, *, snippet_chars: int) -> str:
@@ -34,6 +42,9 @@ def _truncate(text: str | None, *, snippet_chars: int) -> str:
 
 
 def _format_attachment(att: AttachmentSnippet, *, snippet_chars: int) -> str:
+    if att.withheld:
+        return WITHHELD_ATTACHMENT
+
     def trunc(s: str | None) -> str:
         return _truncate(s, snippet_chars=snippet_chars)
 
@@ -132,4 +143,4 @@ def render_segment(
     return "\n".join(lines)
 
 
-__all__ = ["RENDERER_VERSION", "render_message_line", "render_segment"]
+__all__ = ["RENDERER_VERSION", "WITHHELD_ATTACHMENT", "render_message_line", "render_segment"]

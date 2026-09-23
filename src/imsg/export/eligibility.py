@@ -1,6 +1,14 @@
 """The eligibility engine (SPEC §11.2, hard requirement 5): default
 deny, computed fresh from the live database every time it is asked.
 
+It is also the public MCP surface's `allowlist` scope. SPEC §10.3a:
+"Public `allowlist` scope applies the same eligibility predicate to
+`search_messages`, `get_conversation`, `list_people`,
+`get_attachment_text`, and any future tool". `imsg.retrieval.access`
+calls `eligible_chat_ids` and `compute_attachment_eligibility` below
+rather than keeping a second copy of the rule, so a change here changes
+what export ships and what the public surface serves together.
+
 Design rules this module enforces mechanically:
 
 1. **Absence denies.** A chat with no `allowlist_person` coverage, no
@@ -39,10 +47,28 @@ Design rules this module enforces mechanically:
 Unsent messages: excluded from *documents* unconditionally (D1), but
 their senders still count as deny evidence here — an outsider's
 retracted message is still an outsider in the thread.
+
+**Two ways to evaluate the same rules.** `compute_chat_eligibility` runs
+every rule over every chat and keeps each chat's reasons, for the export
+review report. `eligible_chat_ids` only needs the answer, and the public
+surface asks for it on every request, so it runs the rules in two
+passes: the participant rules, which read small tables, over every chat;
+then the message rules, which read `message` and `tapback`, over only
+the chats the first pass left. A chat the first pass denies is denied
+whatever its messages say, so the two answers are the same set — which
+`tests/test_retrieval_allowlist_parity_integration.py` checks on a
+fixture database. Measured on the real corpus (2026-09-22, 13,074 chats,
+675,556 messages, allowlists simulated read-only): the seven queries of
+one full evaluation summed to 166 ms; the two passes took 17 ms with the
+allowlist empty, 12 ms with only the owner allowlisted, 21-31 ms with
+the owner and the people of 50 direct-message chats, and 188 ms with
+every person allowlisted.
 """
 
 from __future__ import annotations
 
+from collections.abc import Collection
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from imsg.export.models import (
@@ -58,84 +84,124 @@ from imsg.export.models import (
 if TYPE_CHECKING:
     import psycopg
 
-# `%(owner)s` below is the singleton owner's person_id, or NULL when no
-# owner person exists — in which case every is_from_me row's effective
-# sender is NULL and the affected chats are denied (fail closed).
-_EFFECTIVE_SENDER = "coalesce(m.sender_person_id, CASE WHEN m.is_from_me THEN %(owner)s::bigint END)"
-_EFFECTIVE_TAPBACK_SENDER = (
-    "coalesce(t.sender_person_id, CASE WHEN t.is_from_me THEN %(owner)s::bigint END)"
+
+def effective_sender_sql(alias: str) -> str:
+    """The person a `message` or `tapback` row (aliased `alias`) counts as
+    sent by: its resolved sender, or the owner for an `is_from_me` row.
+
+    `%(owner)s` is the singleton owner's person_id, or NULL when no owner
+    person exists — in which case every is_from_me row's effective sender
+    is NULL and the affected chats are denied (fail closed). Callers bind
+    it from `owner_person_id`."""
+    return f"coalesce({alias}.sender_person_id, CASE WHEN {alias}.is_from_me THEN %(owner)s::bigint END)"
+
+
+_EFFECTIVE_SENDER = effective_sender_sql("m")
+_EFFECTIVE_TAPBACK_SENDER = effective_sender_sql("t")
+
+
+@dataclass(frozen=True, slots=True)
+class _DenyRule:
+    """One kind of deny evidence: every chat for which `evidence` holds
+    on at least one row of `source`.
+
+    `reads_messages` puts the rule in the second pass of
+    `eligible_chat_ids` (it reads `message`/`tapback`, the large tables);
+    the other rules read participant tables only."""
+
+    reason: str
+    chat_column: str
+    source: str
+    evidence: str
+    reads_messages: bool
+
+    def sql(self, *, among: bool) -> str:
+        """`SELECT DISTINCT ... AS chat_id` for every chat with this
+        evidence — with `among`, only chats in `%(among)s`. The evidence is
+        parenthesized so the restriction can never bind to one arm of an
+        `OR` inside it."""
+        restriction = f" AND {self.chat_column} = ANY(%(among)s::bigint[])" if among else ""
+        return (
+            f"SELECT DISTINCT {self.chat_column} AS chat_id FROM {self.source} "
+            f"WHERE ({self.evidence}){restriction}"
+        )
+
+
+# Each rule returns chat ids that are *evidence for deny*. Adding a rule
+# can only shrink the eligible set; removing one can only widen it —
+# treat deletions here as security-relevant.
+_DENY_RULES: tuple[_DenyRule, ...] = (
+    _DenyRule(
+        reason=DENY_PARTICIPANT_NOT_ALLOWLISTED,
+        chat_column="cp.chat_id",
+        source=(
+            "chat_participant cp "
+            "LEFT JOIN allowlist_person al ON al.person_id = cp.person_id"
+        ),
+        evidence="NOT coalesce(al.text_allowed, false)",
+        reads_messages=False,
+    ),
+    _DenyRule(
+        reason=DENY_UNRESOLVED_SOURCE_PARTICIPANT,
+        chat_column="cps.chat_id",
+        source=(
+            "chat_participant_source cps "
+            "LEFT JOIN source_handle_resolution shr "
+            "ON shr.source_handle_id = cps.source_handle_id"
+        ),
+        evidence="shr.handle_id IS NULL",
+        reads_messages=False,
+    ),
+    _DenyRule(
+        reason=DENY_SOURCE_PERSON_NOT_ALLOWLISTED,
+        chat_column="cps.chat_id",
+        source=(
+            "chat_participant_source cps "
+            "JOIN source_handle_resolution shr ON shr.source_handle_id = cps.source_handle_id "
+            "JOIN handle h ON h.handle_id = shr.handle_id "
+            "LEFT JOIN allowlist_person al ON al.person_id = h.person_id"
+        ),
+        evidence="NOT coalesce(al.text_allowed, false)",
+        reads_messages=False,
+    ),
+    _DenyRule(
+        reason=DENY_UNRESOLVED_SENDER,
+        chat_column="m.chat_id",
+        source="message m",
+        evidence=f"{_EFFECTIVE_SENDER} IS NULL",
+        reads_messages=True,
+    ),
+    _DenyRule(
+        reason=DENY_SENDER_NOT_ALLOWLISTED,
+        chat_column="m.chat_id",
+        source=f"message m LEFT JOIN allowlist_person al ON al.person_id = {_EFFECTIVE_SENDER}",
+        evidence=f"{_EFFECTIVE_SENDER} IS NOT NULL AND NOT coalesce(al.text_allowed, false)",
+        reads_messages=True,
+    ),
+    # Tapbacks are attributed to a chat through their target message; a
+    # tapback whose target is unresolved cannot enter any document and
+    # cannot be attributed to a chat, so it contributes no evidence.
+    _DenyRule(
+        reason=DENY_TAPBACK_SENDER,
+        chat_column="m.chat_id",
+        source=(
+            "tapback t "
+            "JOIN message m ON m.message_id = t.target_message_id "
+            f"LEFT JOIN allowlist_person al ON al.person_id = {_EFFECTIVE_TAPBACK_SENDER}"
+        ),
+        evidence=f"{_EFFECTIVE_TAPBACK_SENDER} IS NULL OR NOT coalesce(al.text_allowed, false)",
+        reads_messages=True,
+    ),
 )
 
-# Each query returns (chat_id, ...) rows that are *evidence for deny*.
-# Adding a query can only shrink the eligible set; removing one can
-# only widen it — treat deletions here as security-relevant.
 
-_PARTICIPANT_COUNTS_SQL = """
-    SELECT c.chat_id, count(cp.person_id)
-    FROM chat c
-    LEFT JOIN chat_participant cp ON cp.chat_id = c.chat_id
-    GROUP BY c.chat_id
-"""
-
-_PARTICIPANT_NOT_ALLOWLISTED_SQL = """
-    SELECT DISTINCT cp.chat_id
-    FROM chat_participant cp
-    LEFT JOIN allowlist_person al ON al.person_id = cp.person_id
-    WHERE NOT coalesce(al.text_allowed, false)
-"""
-
-_UNRESOLVED_SOURCE_PARTICIPANT_SQL = """
-    SELECT DISTINCT cps.chat_id
-    FROM chat_participant_source cps
-    LEFT JOIN source_handle_resolution shr
-           ON shr.source_handle_id = cps.source_handle_id
-    WHERE shr.handle_id IS NULL
-"""
-
-_SOURCE_PERSON_NOT_ALLOWLISTED_SQL = """
-    SELECT DISTINCT cps.chat_id
-    FROM chat_participant_source cps
-    JOIN source_handle_resolution shr
-      ON shr.source_handle_id = cps.source_handle_id
-    JOIN handle h ON h.handle_id = shr.handle_id
-    LEFT JOIN allowlist_person al ON al.person_id = h.person_id
-    WHERE NOT coalesce(al.text_allowed, false)
-"""
-
-_UNRESOLVED_SENDER_SQL = f"""
-    SELECT DISTINCT m.chat_id
-    FROM message m
-    WHERE {_EFFECTIVE_SENDER} IS NULL
-"""
-
-_SENDER_NOT_ALLOWLISTED_SQL = f"""
-    SELECT DISTINCT m.chat_id
-    FROM message m
-    LEFT JOIN allowlist_person al ON al.person_id = {_EFFECTIVE_SENDER}
-    WHERE {_EFFECTIVE_SENDER} IS NOT NULL
-      AND NOT coalesce(al.text_allowed, false)
-"""
-
-# Tapbacks are attributed to a chat through their target message; a
-# tapback whose target is unresolved cannot enter any document and
-# cannot be attributed to a chat, so it contributes no evidence.
-_TAPBACK_SENDER_SQL = f"""
-    SELECT DISTINCT m.chat_id
-    FROM tapback t
-    JOIN message m ON m.message_id = t.target_message_id
-    LEFT JOIN allowlist_person al ON al.person_id = {_EFFECTIVE_TAPBACK_SENDER}
-    WHERE {_EFFECTIVE_TAPBACK_SENDER} IS NULL
-       OR NOT coalesce(al.text_allowed, false)
-"""
-
-_REASON_QUERIES: tuple[tuple[str, str], ...] = (
-    (DENY_PARTICIPANT_NOT_ALLOWLISTED, _PARTICIPANT_NOT_ALLOWLISTED_SQL),
-    (DENY_UNRESOLVED_SOURCE_PARTICIPANT, _UNRESOLVED_SOURCE_PARTICIPANT_SQL),
-    (DENY_SOURCE_PERSON_NOT_ALLOWLISTED, _SOURCE_PERSON_NOT_ALLOWLISTED_SQL),
-    (DENY_UNRESOLVED_SENDER, _UNRESOLVED_SENDER_SQL),
-    (DENY_SENDER_NOT_ALLOWLISTED, _SENDER_NOT_ALLOWLISTED_SQL),
-    (DENY_TAPBACK_SENDER, _TAPBACK_SENDER_SQL),
-)
+def _participant_counts_sql(*, among: bool) -> str:
+    restriction = " WHERE c.chat_id = ANY(%(among)s::bigint[])" if among else ""
+    return (
+        "SELECT c.chat_id, count(cp.person_id) FROM chat c "
+        f"LEFT JOIN chat_participant cp ON cp.chat_id = c.chat_id{restriction} "
+        "GROUP BY c.chat_id"
+    )
 
 
 def owner_person_id(conn: psycopg.Connection) -> int | None:
@@ -147,20 +213,28 @@ def owner_person_id(conn: psycopg.Connection) -> int | None:
         return int(row[0]) if row else None
 
 
-def compute_chat_eligibility(conn: psycopg.Connection) -> dict[int, ChatEligibility]:
-    """Every chat's verdict, computed fresh. Callers MUST treat a
-    chat_id missing from the result as denied (default deny)."""
-    owner = owner_person_id(conn)
-    params = {"owner": owner}
+def compute_chat_eligibility(
+    conn: psycopg.Connection, *, among: Collection[int] | None = None
+) -> dict[int, ChatEligibility]:
+    """Every chat's verdict, computed fresh — or, with `among`, only
+    those chats' verdicts. Callers MUST treat a chat_id missing from the
+    result as denied (default deny)."""
+    if among is not None and not among:
+        return {}
+    restricted = among is not None
+    params: dict[str, object] = {
+        "owner": owner_person_id(conn),
+        "among": sorted({int(c) for c in among}) if among is not None else None,
+    }
     with conn.cursor() as cur:
-        cur.execute(_PARTICIPANT_COUNTS_SQL)
+        cur.execute(_participant_counts_sql(among=restricted), params)
         counts: dict[int, int] = {int(chat_id): int(n) for chat_id, n in cur.fetchall()}
 
         reasons: dict[int, set[str]] = {chat_id: set() for chat_id in counts}
-        for reason, sql in _REASON_QUERIES:
-            cur.execute(sql, params)
+        for rule in _DENY_RULES:
+            cur.execute(rule.sql(among=restricted), params)
             for (chat_id,) in cur.fetchall():
-                reasons.setdefault(int(chat_id), set()).add(reason)
+                reasons.setdefault(int(chat_id), set()).add(rule.reason)
 
     return {
         chat_id: ChatEligibility(
@@ -172,14 +246,45 @@ def compute_chat_eligibility(conn: psycopg.Connection) -> dict[int, ChatEligibil
     }
 
 
-def eligible_chat_ids(conn: psycopg.Connection) -> set[int]:
-    """The set of chats whose segments may export. Everything else is
-    denied — including chats this function has never heard of."""
-    return {
-        chat_id
-        for chat_id, verdict in compute_chat_eligibility(conn).items()
-        if verdict.eligible
-    }
+def eligible_chat_ids(
+    conn: psycopg.Connection, *, among: Collection[int] | None = None
+) -> set[int]:
+    """The set of chats whose segments may export — and the only chats
+    the public surface serves under `allowlist` scope. Everything else is
+    denied, including chats this function has never heard of. With
+    `among`, only those chats are evaluated, so only they can be returned.
+
+    The same answer as keeping the eligible verdicts of
+    `compute_chat_eligibility`, reached in two passes (module docstring):
+    chats with at least one participant and no participant-rule evidence,
+    then, of those, the ones with no message-rule evidence. Both passes
+    are set differences (`EXCEPT`) built from the rules above, so this
+    function cannot admit a chat that any rule denies."""
+    if among is not None and not among:
+        return set()
+    restricted = among is not None
+    owner = owner_person_id(conn)
+    members = "SELECT DISTINCT cp.chat_id AS chat_id FROM chat_participant cp" + (
+        " WHERE cp.chat_id = ANY(%(among)s::bigint[])" if restricted else ""
+    )
+    first_pass = members + "".join(
+        f" EXCEPT ({rule.sql(among=restricted)})"
+        for rule in _DENY_RULES
+        if not rule.reads_messages
+    )
+    second_pass = "SELECT unnest(%(among)s::bigint[]) AS chat_id" + "".join(
+        f" EXCEPT ({rule.sql(among=True)})" for rule in _DENY_RULES if rule.reads_messages
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            first_pass,
+            {"owner": owner, "among": sorted({int(c) for c in among}) if among is not None else None},
+        )
+        survivors = sorted(int(chat_id) for (chat_id,) in cur.fetchall())
+        if not survivors:
+            return set()
+        cur.execute(second_pass, {"owner": owner, "among": survivors})
+        return {int(chat_id) for (chat_id,) in cur.fetchall()}
 
 
 def compute_attachment_eligibility(
@@ -255,6 +360,7 @@ def snapshot_allowlist(conn: psycopg.Connection) -> list[dict[str, object]]:
 __all__ = [
     "compute_attachment_eligibility",
     "compute_chat_eligibility",
+    "effective_sender_sql",
     "eligible_chat_ids",
     "owner_person_id",
     "snapshot_allowlist",

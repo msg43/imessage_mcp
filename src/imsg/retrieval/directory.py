@@ -1,5 +1,11 @@
 """`list_people` and `get_attachment_text` (SPEC §10.2) — simple
 directory-style lookups that do not go through the hybrid query flow.
+
+Both apply the request's scope from `imsg.retrieval.access`: under
+`allowlist`, `list_people` lists only the people who appear in an
+eligible chat, with activity counted inside eligible chats only, and
+`get_attachment_text` returns text only through a parent segment where
+export's chat rule and its separate attachment gate both pass.
 """
 
 from __future__ import annotations
@@ -7,7 +13,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from imsg.retrieval.access import AccessContext
+from imsg.export.eligibility import effective_sender_sql
+from imsg.retrieval.access import (
+    AccessContext,
+    RequestScope,
+    attachment_gate,
+    resolve_request_scope,
+    visible_person_ids,
+)
 from imsg.retrieval.errors import NotEnrichedError, NotFoundError
 
 if TYPE_CHECKING:
@@ -37,31 +50,47 @@ class PersonListing:
 
 def list_people(
     conn: psycopg.Connection,
-    context: AccessContext,
+    scope: RequestScope,
     *,
     query: str | None,
     limit: int,
     include_handles: bool = False,
 ) -> list[PersonListing]:
     """SPEC §10.2 `list_people`. `query` filters on `short_name` OR
-    `display_name` (case-insensitive substring); omitted, every person
-    with at least one message. Scope-filtered exactly like
-    `imsg.retrieval.people`'s fuzzy suggestions (D6): under
-    `scope='allowlist'`, only allowlisted persons are ever listed —
-    never raw handles regardless of scope (SPEC §10.2: "never raw
-    handles on the public surface"; `include_handles` is a **local**-
-    only extension so it is meaningless to gate on scope here, but the
-    caller — the local MCP server — never sets `scope != 'full'`
-    anyway)."""
-    clauses = ["1=1"]
+    `display_name` (case-insensitive substring).
+
+    Under `full` scope: every person, with counts over all their
+    messages. Under `allowlist` (D6: what the public surface lists is
+    scope-filtered, like `imsg.retrieval.people`'s suggestions): only
+    `imsg.retrieval.access.visible_person_ids` — people who appear in an
+    eligible chat — with `message_count`, `first_message` and
+    `last_message` over their non-unsent messages in eligible chats only,
+    so nothing about an ineligible thread shows through the counts. An
+    allowlisted person with no eligible chat is not listed: nothing the
+    caller could search for involves them.
+
+    Never raw handles on the public surface (SPEC §10.2);
+    `include_handles` is a local-only extension the service refuses on
+    any other surface."""
+    clauses = ["TRUE"]
     params: dict[str, object] = {"limit": limit}
     if query:
         clauses.append("(p.short_name ILIKE %(q)s OR p.display_name ILIKE %(q)s)")
         params["q"] = f"%{query}%"
-    if context.scope == "allowlist":
-        clauses.append(
-            "EXISTS (SELECT 1 FROM allowlist_person ap "
-            "WHERE ap.person_id = p.person_id AND ap.text_allowed)"
+
+    visible = visible_person_ids(conn, scope)
+    if visible is None:
+        message_join = "m.sender_person_id = p.person_id"
+    else:
+        if not visible:
+            return []
+        clauses.append("p.person_id = ANY(%(visible)s::bigint[])")
+        params["visible"] = sorted(visible)
+        chats = scope.chat_predicate("m.chat_id")
+        params.update(chats.params)
+        params["owner"] = scope.owner_person_id
+        message_join = (
+            f"{effective_sender_sql('m')} = p.person_id AND {chats.sql} AND NOT m.is_unsent"
         )
 
     with conn.cursor() as cur:
@@ -71,7 +100,7 @@ def list_people(
                    count(m.message_id) AS message_count,
                    min(m.sent_at) AS first_message, max(m.sent_at) AS last_message
             FROM person p
-            LEFT JOIN message m ON m.sender_person_id = p.person_id
+            LEFT JOIN message m ON {message_join}
             WHERE {" AND ".join(clauses)}
             GROUP BY p.person_id
             ORDER BY p.display_name
@@ -123,17 +152,26 @@ class AttachmentText:
 def get_attachment_text(
     conn: psycopg.Connection, context: AccessContext, attachment_key: str
 ) -> AttachmentText:
-    """SPEC §10.2 `get_attachment_text`. Authorization: at least one
-    message/segment linking to this attachment must be eligible under
-    `context` (D6: "Authorization checks every linked message/segment
-    through `message_attachment`; text is returned only when at least
-    one authorized parent exists"). An attachment that exists but has
-    no authorized parent is indistinguishable from one that does not
-    exist at all (D6's existence-oracle rule) — both raise
-    `NotFoundError`."""
-    from imsg.retrieval.access import segment_eligibility_predicate
+    """SPEC §10.2 `get_attachment_text`. "Authorization checks every
+    linked message/segment through `message_attachment`; text is
+    returned only when at least one authorized parent exists" (D6).
 
-    predicate = segment_eligibility_predicate(context, chat_id_expr="s.chat_id")
+    A parent is a segment containing a message that links the
+    attachment. Under `full` scope any parent authorizes. Under
+    `allowlist` a parent authorizes only if its chat passes export's chat
+    rule AND the attachment passes export's separate attachment gate in
+    that segment — every non-unsent message linking it there has a
+    sender with `attachments_allowed` (SPEC §11.2: "An attachment's text
+    exports iff its segment is eligible and the attachment's sender (via
+    every message link through which it enters the document) has
+    `attachments_allowed = true`"). §10.3a applies that same predicate to
+    this tool, so the public surface returns an attachment's text exactly
+    when export would ship it under at least one parent.
+
+    An attachment that exists but has no authorized parent is
+    indistinguishable from one that does not exist at all (D6's
+    existence-oracle rule) — both raise the same `NotFoundError`."""
+    not_found = NotFoundError(f"no attachment found for attachment_key {attachment_key!r}")
     with conn.cursor() as cur:
         cur.execute(
             "SELECT attachment_id, filename, mime_type FROM attachment WHERE attachment_key = %s",
@@ -141,25 +179,30 @@ def get_attachment_text(
         )
         row = cur.fetchone()
         if row is None:
-            raise NotFoundError(f"no attachment found for attachment_key {attachment_key!r}")
+            raise not_found
         attachment_id, filename, mime_type = row
 
         cur.execute(
-            f"""
-            SELECT EXISTS (
-                SELECT 1
-                FROM message_attachment ma
-                JOIN segment_message sm ON sm.message_id = ma.message_id
-                JOIN segment s ON s.segment_id = sm.segment_id
-                WHERE ma.attachment_id = %(attachment_id)s AND ({predicate})
-            )
+            """
+            SELECT DISTINCT sm.segment_id, s.chat_id
+            FROM message_attachment ma
+            JOIN segment_message sm ON sm.message_id = ma.message_id
+            JOIN segment s ON s.segment_id = sm.segment_id
+            WHERE ma.attachment_id = %(attachment_id)s
             """,
             {"attachment_id": attachment_id},
         )
-        authorized = bool(cur.fetchone()[0])  # type: ignore[index]
-        if not authorized:
-            raise NotFoundError(f"no attachment found for attachment_key {attachment_key!r}")
+        parents = [(int(segment_id), int(chat_id)) for segment_id, chat_id in cur.fetchall()]
 
+    scope = resolve_request_scope(
+        conn, context, among_chat_ids={chat_id for _, chat_id in parents}
+    )
+    admitted = [segment_id for segment_id, chat_id in parents if scope.admits_chat(chat_id)]
+    gate = attachment_gate(conn, scope, admitted)
+    if not any(gate.allows(segment_id, int(attachment_id)) for segment_id in admitted):
+        raise not_found
+
+    with conn.cursor() as cur:
         cur.execute(
             "SELECT kind, model, state, text FROM enrichment WHERE attachment_id = %s ORDER BY kind",
             (attachment_id,),

@@ -24,7 +24,7 @@ from imsg.db.enrichment_yield_locks import QueryInFlightMarker
 from imsg.db.prewarm import prewarm_query_path
 from imsg.embed.provider import MultimodalEmbeddingProvider, TextEmbeddingProvider
 from imsg.retrieval import directory, fts_search, segments, vector_search
-from imsg.retrieval.access import AccessContext, segment_eligibility_predicate
+from imsg.retrieval.access import AccessContext, resolve_request_scope
 from imsg.retrieval.background_warm_up import WarmUpStep
 from imsg.retrieval.errors import InvalidArgumentError, NotFoundError
 from imsg.retrieval.filters import compile_predicate, resolve_filters
@@ -88,7 +88,9 @@ class RetrievalService:
     """One instance per MCP server process — holds the (long-lived)
     connections and model providers every tool call needs. Every
     method's first positional argument is a non-optional
-    `AccessContext` (SPEC §10.3a)."""
+    `AccessContext` (SPEC §10.3a), which the method turns into the
+    request's `imsg.retrieval.access.RequestScope` before reading
+    anything."""
 
     def __init__(
         self,
@@ -245,17 +247,36 @@ class RetrievalService:
         if not (1 <= effective_limit <= MAX_SEARCH_LIMIT):
             raise InvalidArgumentError(f"'limit' must be between 1 and {MAX_SEARCH_LIMIT}")
 
+        scope = resolve_request_scope(self._pg, context)
         filters = resolve_filters(
             self._pg,
-            context,
+            scope,
             people=people,
             after=after,
             before=before,
             has_attachment=has_attachment,
             timezone=self._config.render.timezone,
         )
-        predicate = compile_predicate(filters, context)
+        predicate = compile_predicate(filters, scope)
         analyzed = analyze_query(query)
+        if scope.admits_nothing:
+            # Nothing is eligible (an empty allowlist): every channel would
+            # return nothing, so skip the model calls and the scans. SPEC
+            # §10.1: an empty result is a success.
+            return SearchMessagesResult(
+                results=[],
+                candidate_lists=dict.fromkeys(
+                    (
+                        "segment_fts",
+                        "attachment_fts",
+                        "segment_vector",
+                        "attachment_vector",
+                        "multimodal_vector",
+                    ),
+                    0,
+                ),
+                scan_cap_reached=False,
+            )
 
         k_fts = self._config.retrieval.k_fts
         k_vector = self._config.retrieval.k_vector
@@ -308,10 +329,24 @@ class RetrievalService:
         # delete/re-segmentation) — drop rather than crash; RRF already
         # ranked the survivors correctly relative to each other.
         pool = [r for r in pool if r.segment_id in summaries]
+        texts = {r.segment_id: summaries[r.segment_id].text for r in pool}
+        if scope.withholds_ineligible_content:
+            # The stored text carries every attachment's snippet and
+            # whatever `policy.*` allowed at segmentation time; under this
+            # scope both the reranker and the caller see only the
+            # re-rendered, gated text (imsg.retrieval.access).
+            texts = segments.render_segment_texts(
+                self._pg,
+                scope,
+                [r.segment_id for r in pool],
+                timezone=self._config.render.timezone,
+                attachment_snippet_chars=self._config.render.attachment_snippet_chars,
+            )
+            pool = [r for r in pool if r.segment_id in texts]
 
         reranked: list[tuple[int, float]] = []
         if pool:
-            documents = [summaries[r.segment_id].text for r in pool]
+            documents = [texts[r.segment_id] for r in pool]
             scores = self._run_model(lambda: self._reranker.score(analyzed.phrase, documents))
             reranked = sorted(
                 ((r.segment_id, s) for r, s in zip(pool, scores, strict=True)),
@@ -336,7 +371,7 @@ class RetrievalService:
                     "message_count": summary.message_count,
                     "has_attachments": summary.has_attachments,
                     "score": score,
-                    "text": summary.text,
+                    "text": texts[segment_id],
                     "untrusted_content": True,
                 }
             )
@@ -376,29 +411,24 @@ class RetrievalService:
             raise InvalidArgumentError(f"'window' must be between 1 and {MAX_CONVERSATION_WINDOW}")
 
         resolution = segments.resolve_thread(self._pg, thread_id)
-        self._assert_chat_authorized(context, resolution.chat_id)
+        scope = resolve_request_scope(self._pg, context, among_chat_ids=[resolution.chat_id])
+        if not scope.admits_chat(resolution.chat_id):
+            # The same error, word for word, as an identifier that matches
+            # nothing (segments.THREAD_NOT_FOUND_MESSAGE).
+            raise NotFoundError(segments.THREAD_NOT_FOUND_MESSAGE)
         anchor_dt = segments.resolve_anchor(self._pg, resolution, anchor)
         messages = segments.fetch_conversation_window(
             self._pg,
             resolution,
             anchor_dt,
             window,
+            scope=scope,
             index_unsent=self._config.policy.index_unsent,
             include_edit_history=self._config.policy.index_edit_history,
             timezone=self._config.render.timezone,
             attachment_snippet_chars=self._config.render.attachment_snippet_chars,
         )
         return {"thread_key": resolution.thread_key, "messages": messages}
-
-    def _assert_chat_authorized(self, context: AccessContext, chat_id: int) -> None:
-        predicate_sql = segment_eligibility_predicate(context, chat_id_expr="%(chat_id)s")
-        if predicate_sql == "TRUE":
-            return
-        with self._pg.cursor() as cur:
-            cur.execute(f"SELECT ({predicate_sql})", {"chat_id": chat_id})
-            row = cur.fetchone()
-        if row is None or not row[0]:
-            raise NotFoundError("no thread found for the given identifier")
 
     # -- list_people ------------------------------------------------------
 
@@ -412,8 +442,14 @@ class RetrievalService:
     ) -> dict[str, object]:
         if not (1 <= limit <= MAX_LIST_PEOPLE_LIMIT):
             raise InvalidArgumentError(f"'limit' must be between 1 and {MAX_LIST_PEOPLE_LIMIT}")
+        if include_handles and context.surface != "local":
+            # SPEC §10.2: "never raw handles on the public surface" — the
+            # public schema omits the property; this holds even if a
+            # caller reaches the service some other way.
+            raise InvalidArgumentError("'include_handles' is available on the local surface only")
+        scope = resolve_request_scope(self._pg, context)
         listings = directory.list_people(
-            self._pg, context, query=query, limit=limit, include_handles=include_handles
+            self._pg, scope, query=query, limit=limit, include_handles=include_handles
         )
         people: list[dict[str, object]] = []
         for p in listings:

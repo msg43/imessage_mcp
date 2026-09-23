@@ -13,6 +13,14 @@ SQL statements here — reusing the same *domain* dataclasses
 (`imsg.segment.render.render_message_line`) — was judged lower-risk
 than reaching into another package's private functions. Flagged as a
 small, acceptable duplication in the build report.
+
+**Under `allowlist` scope nothing here returns stored text.** A
+conversation window hides unsent messages and edit history whatever
+`policy.*` says, and shows an attachment's content only where the
+request's `imsg.retrieval.access.AttachmentGate` allows it.
+`render_segment_texts` re-renders search results under the same rules,
+because `segment.rendered_text` was rendered with every attachment's text
+and with `policy.*` as it stood at segmentation time.
 """
 
 from __future__ import annotations
@@ -23,12 +31,25 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
+from imsg.retrieval.access import AttachmentGate, RequestScope, attachment_gate
 from imsg.retrieval.errors import InvalidArgumentError, NotFoundError
-from imsg.segment.models import AttachmentSnippet, EditVersion, MessageForSegmentation
-from imsg.segment.render import render_message_line
+from imsg.segment.models import (
+    AttachmentSnippet,
+    EditVersion,
+    MessageForSegmentation,
+    SegmentDraft,
+)
+from imsg.segment.render import render_message_line, render_segment
 
 if TYPE_CHECKING:
     import psycopg
+
+THREAD_NOT_FOUND_MESSAGE = "no thread found for the given thread_id"
+"""The one `NOT_FOUND` message `get_conversation` gives, whether the
+identifier matches nothing or matches a thread the scope denies. The
+public surface returns an error's text verbatim, so two different
+messages would tell a caller which threads exist (SPEC §10.2's
+existence-oracle rule)."""
 
 
 def _classify_attachment_kind(mime_type: str | None) -> str:
@@ -178,7 +199,7 @@ def resolve_thread(conn: psycopg.Connection, thread_id: str) -> ThreadResolution
         if row is not None:
             return ThreadResolution(chat_id=row[0], thread_key=row[1], default_anchor=None)
 
-    raise NotFoundError(f"no thread found for thread_id {thread_id!r}")
+    raise NotFoundError(THREAD_NOT_FOUND_MESSAGE)
 
 
 def _latest_segment_start(conn: psycopg.Connection, chat_id: int) -> datetime | None:
@@ -251,9 +272,13 @@ def _rows_to_messages(
     rows: Sequence[tuple[Any, ...]],
     *,
     include_edit_history: bool,
+    gate: AttachmentGate,
+    segment_by_message: dict[int, int],
 ) -> list[MessageForSegmentation]:
     message_ids: list[int] = [row[0] for row in rows]
-    attachments_by_message = _fetch_attachments(cur, message_ids)
+    attachments_by_message = _fetch_attachments(
+        cur, message_ids, gate=gate, segment_by_message=segment_by_message
+    )
     tapbacks_by_message = _fetch_tapback_suffixes(cur, message_ids)
     edit_history_by_message = _fetch_edit_history(cur, message_ids) if include_edit_history else {}
 
@@ -291,13 +316,22 @@ def _rows_to_messages(
 
 
 def _fetch_attachments(
-    cur: psycopg.Cursor, message_ids: list[int]
+    cur: psycopg.Cursor,
+    message_ids: list[int],
+    *,
+    gate: AttachmentGate,
+    segment_by_message: dict[int, int],
 ) -> dict[int, list[AttachmentSnippet]]:
+    """Each message's attachments in display order. An attachment `gate`
+    denies in its message's segment becomes
+    `AttachmentSnippet.withheld_placeholder()` before any of its fields
+    are read into a snippet."""
     if not message_ids:
         return {}
     cur.execute(
         """
-        SELECT ma.message_id, a.attachment_key, a.filename, a.mime_type, e.kind, e.text
+        SELECT ma.message_id, a.attachment_key, a.filename, a.mime_type, e.kind, e.text,
+               a.attachment_id
         FROM message_attachment ma
         JOIN attachment a ON a.attachment_id = ma.attachment_id
         LEFT JOIN enrichment e ON e.attachment_id = a.attachment_id AND e.state = 'done'
@@ -308,8 +342,25 @@ def _fetch_attachments(
     )
     by_key: dict[tuple[int, str], dict[str, object]] = {}
     order: dict[int, list[str]] = {}
-    for message_id, attachment_key, filename, mime_type, enrich_kind, enrich_text in cur.fetchall():
+    withheld: set[tuple[int, str]] = set()
+    for (
+        message_id,
+        attachment_key,
+        filename,
+        mime_type,
+        enrich_kind,
+        enrich_text,
+        attachment_id,
+    ) in cur.fetchall():
         entry_key = (message_id, attachment_key)
+        if entry_key in withheld:
+            continue
+        if entry_key not in by_key and not gate.allows(
+            segment_by_message.get(message_id), int(attachment_id)
+        ):
+            withheld.add(entry_key)
+            order.setdefault(message_id, []).append(attachment_key)
+            continue
         if entry_key not in by_key:
             by_key[entry_key] = {
                 "filename": filename,
@@ -332,7 +383,9 @@ def _fetch_attachments(
     result: dict[int, list[AttachmentSnippet]] = {}
     for message_id, keys in order.items():
         result[message_id] = [
-            AttachmentSnippet(
+            AttachmentSnippet.withheld_placeholder()
+            if (message_id, key) in withheld
+            else AttachmentSnippet(
                 attachment_key=key,
                 kind=str(by_key[(message_id, key)]["kind"]),
                 filename=by_key[(message_id, key)]["filename"],  # type: ignore[arg-type]
@@ -405,6 +458,7 @@ def fetch_conversation_window(
     anchor_dt: datetime,
     window: int,
     *,
+    scope: RequestScope,
     index_unsent: bool,
     include_edit_history: bool,
     timezone: str,
@@ -416,7 +470,14 @@ def fetch_conversation_window(
     side of the anchor", rendered per-message (SPEC §9.1 format) with
     opaque keys. The "at-or-after" query below fetches `window + 1`
     rows precisely so the anchor message occupies its own slot instead
-    of silently consuming one of the `window` after-anchor slots."""
+    of silently consuming one of the `window` after-anchor slots.
+
+    `index_unsent` / `include_edit_history` are the `policy.*` values;
+    `scope` decides whether they apply (never under `allowlist`) and
+    which attachments show their content. The caller has already
+    authorized `resolution.chat_id` under `scope`."""
+    index_unsent = scope.shows_unsent(index_unsent)
+    include_edit_history = scope.shows_edit_history(include_edit_history)
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -457,8 +518,16 @@ def fetch_conversation_window(
         after_rows = cur.fetchall()
 
         all_rows = before_rows + after_rows
+        message_ids = [int(row[0]) for row in all_rows]
+        segment_by_message = _segment_by_message(cur, message_ids) if not scope.is_full else {}
+        gate = attachment_gate(conn, scope, segment_by_message.values())
         messages = _rows_to_messages(
-            cur, resolution.chat_id, all_rows, include_edit_history=include_edit_history
+            cur,
+            resolution.chat_id,
+            all_rows,
+            include_edit_history=include_edit_history,
+            gate=gate,
+            segment_by_message=segment_by_message,
         )
 
     tz = ZoneInfo(timezone)
@@ -483,11 +552,155 @@ def fetch_conversation_window(
     return out
 
 
+def _segment_by_message(cur: psycopg.Cursor, message_ids: list[int]) -> dict[int, int]:
+    """Each message's segment; a message not yet segmented is absent."""
+    if not message_ids:
+        return {}
+    cur.execute(
+        "SELECT message_id, segment_id FROM segment_message "
+        "WHERE message_id = ANY(%(ids)s::bigint[])",
+        {"ids": message_ids},
+    )
+    return {int(message_id): int(segment_id) for message_id, segment_id in cur.fetchall()}
+
+
+@dataclass(frozen=True, slots=True)
+class _ChatHeader:
+    kind: str
+    display_name: str | None
+    other_participant_display_names: tuple[str, ...]
+
+
+def _chat_headers(cur: psycopg.Cursor, chat_ids: list[int]) -> dict[int, _ChatHeader]:
+    """What `render_segment`'s header needs, for many chats in two
+    queries. The participant list mirrors `imsg.segment.pipeline.
+    fetch_chat_context` (non-owner participants' display names, ordered by
+    display name) — `tests/test_retrieval_allowlist_parity_integration.py`
+    checks a re-render against the pipeline's own rendering."""
+    if not chat_ids:
+        return {}
+    cur.execute(
+        "SELECT chat_id, kind, display_name FROM chat WHERE chat_id = ANY(%(ids)s::bigint[])",
+        {"ids": chat_ids},
+    )
+    base = {int(chat_id): (str(kind), display_name) for chat_id, kind, display_name in cur.fetchall()}
+    cur.execute(
+        """
+        SELECT cp.chat_id, p.display_name
+        FROM chat_participant cp
+        JOIN person p ON p.person_id = cp.person_id
+        WHERE cp.chat_id = ANY(%(ids)s::bigint[]) AND NOT p.is_owner
+        ORDER BY cp.chat_id, p.display_name
+        """,
+        {"ids": chat_ids},
+    )
+    others: dict[int, list[str]] = {}
+    for chat_id, display_name in cur.fetchall():
+        others.setdefault(int(chat_id), []).append(str(display_name))
+    return {
+        chat_id: _ChatHeader(
+            kind=kind,
+            display_name=display_name,
+            other_participant_display_names=tuple(others.get(chat_id, ())),
+        )
+        for chat_id, (kind, display_name) in base.items()
+    }
+
+
+def render_segment_texts(
+    conn: psycopg.Connection,
+    scope: RequestScope,
+    segment_ids: list[int],
+    *,
+    timezone: str,
+    attachment_snippet_chars: int,
+) -> dict[int, str]:
+    """Each segment's §9.1 text rendered now, from its rows, under
+    `scope`: only segments whose chat `scope` admits, each attachment
+    through the request's `AttachmentGate`, and never an unsent message
+    or an edit history — this is the renderer for scopes that withhold
+    content, so it applies D1 unconditionally rather than reading
+    `policy.*`. Used in place of the stored `segment.rendered_text`
+    whenever `scope.withholds_ineligible_content` (module docstring). A
+    segment with no message left to show is absent from the result, as
+    export plans no document for it."""
+    if not segment_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT s.segment_id, s.chat_id, s.seq_in_session, se.started_at
+            FROM segment s
+            JOIN session se ON se.session_id = s.session_id
+            WHERE s.segment_id = ANY(%(ids)s::bigint[])
+            """,
+            {"ids": segment_ids},
+        )
+        segment_rows = [
+            (int(segment_id), int(chat_id), int(seq), started_at)
+            for segment_id, chat_id, seq, started_at in cur.fetchall()
+            if scope.admits_chat(int(chat_id))
+        ]
+        if not segment_rows:
+            return {}
+        admitted = [row[0] for row in segment_rows]
+        cur.execute(
+            f"""
+            SELECT sm.segment_id, {_MESSAGE_COLUMNS}
+            FROM segment_message sm
+            JOIN message m ON m.message_id = sm.message_id
+            LEFT JOIN person p ON p.person_id = m.sender_person_id
+            WHERE sm.segment_id = ANY(%(ids)s::bigint[])
+              AND NOT m.is_unsent
+            ORDER BY sm.segment_id, m.sent_at, m.message_id
+            """,
+            {"ids": admitted},
+        )
+        rows_by_segment: dict[int, list[tuple[Any, ...]]] = {}
+        segment_by_message: dict[int, int] = {}
+        for segment_id, *row in cur.fetchall():
+            rows_by_segment.setdefault(int(segment_id), []).append(tuple(row))
+            segment_by_message[int(row[0])] = int(segment_id)
+
+        gate = attachment_gate(conn, scope, admitted)
+        headers = _chat_headers(cur, sorted({row[1] for row in segment_rows}))
+        texts: dict[int, str] = {}
+        for segment_id, chat_id, seq_in_session, session_started_at in segment_rows:
+            rows = rows_by_segment.get(segment_id)
+            header = headers.get(chat_id)
+            if not rows or header is None:
+                continue
+            messages = _rows_to_messages(
+                cur,
+                chat_id,
+                rows,
+                include_edit_history=False,
+                gate=gate,
+                segment_by_message=segment_by_message,
+            )
+            draft = SegmentDraft(
+                session_started_at=session_started_at,
+                seq_in_session=seq_in_session,
+                messages=tuple(messages),
+            )
+            texts[segment_id] = render_segment(
+                draft,
+                participants=header.other_participant_display_names,
+                chat_kind=header.kind,
+                chat_display_name=header.display_name,
+                timezone=timezone,
+                attachment_snippet_chars=attachment_snippet_chars,
+            )
+    return texts
+
+
 __all__ = [
+    "THREAD_NOT_FOUND_MESSAGE",
     "SegmentSummary",
     "ThreadResolution",
     "fetch_conversation_window",
     "fetch_segment_summaries",
+    "render_segment_texts",
     "resolve_anchor",
     "resolve_thread",
 ]

@@ -44,7 +44,7 @@ from imsg.embed.provider import FakeMultimodalEmbeddingProvider, FakeTextEmbeddi
 from imsg.embed.vector_codec import vector_literal
 from imsg.keys import message_key as derive_message_key
 from imsg.keys import thread_key as derive_thread_key
-from imsg.retrieval.access import LOCAL_FULL_ACCESS, AccessContext
+from imsg.retrieval.access import LOCAL_FULL_ACCESS, AccessContext, resolve_request_scope
 from imsg.retrieval.errors import (
     DateRangeInvalidError,
     NotEnrichedError,
@@ -64,6 +64,7 @@ TEST_PG_HOST = os.environ.get("IMSG_TEST_PG_HOST", "/tmp/imsgpg1")
 TEST_PG_PORT = os.environ.get("IMSG_TEST_PG_PORT", "55432")
 TEST_PG_USER = os.environ.get("IMSG_TEST_PG_USER", "postgres")
 TEST_DB_NAME = "imsg_index_retrieval_test"
+FULL = resolve_request_scope(None, LOCAL_FULL_ACCESS)
 
 REAL_MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
 
@@ -359,7 +360,7 @@ def test_bm25_search_survives_apostrophe_style_mismatch(
 
     query = analyze_query("I can't make it Friday")  # straight apostrophe, as typed
     assert query.mode == "bm25"
-    predicate = compile_predicate(SearchFilters(), LOCAL_FULL_ACCESS)
+    predicate = compile_predicate(SearchFilters(), FULL)
     result = search_segment_fts(fts_conn, scratch_db, query, predicate, k=10)
 
     assert segment_id in result.segment_ids
@@ -394,7 +395,7 @@ def test_trigram_finds_a_substring_bm25_cannot(
         person_id=alice_id,
     )
 
-    predicate = compile_predicate(SearchFilters(), LOCAL_FULL_ACCESS)
+    predicate = compile_predicate(SearchFilters(), FULL)
 
     # unicode61 tokenizes "bid-rev3" into "bid"/"rev3" — the literal
     # substring "id-rev" spans a token boundary and is never itself a
@@ -473,14 +474,14 @@ def test_filtered_retrieval_does_not_starve_on_a_selective_filter(
 
     people_filter = resolve_filters(
         scratch_db,
-        LOCAL_FULL_ACCESS,
+        FULL,
         people=[bob_short],
         after=None,
         before=None,
         has_attachment=None,
         timezone="UTC",
     )
-    predicate = compile_predicate(people_filter, LOCAL_FULL_ACCESS)
+    predicate = compile_predicate(people_filter, FULL)
 
     naive_raw = _raw_segment_candidates(fts_conn, query, k)  # no overfetch at all
     naive_eligible = _authorize_segment_ids(scratch_db, naive_raw, predicate)
@@ -534,10 +535,10 @@ def test_scan_cap_reached_is_reported_when_the_pool_is_exhausted(
 
     query = analyze_query("deck")
     people_filter = resolve_filters(
-        scratch_db, LOCAL_FULL_ACCESS, people=[bob_short], after=None, before=None,
+        scratch_db, FULL, people=[bob_short], after=None, before=None,
         has_attachment=None, timezone="UTC",
     )
-    predicate = compile_predicate(people_filter, LOCAL_FULL_ACCESS)
+    predicate = compile_predicate(people_filter, FULL)
 
     result = search_segment_fts(fts_conn, scratch_db, query, predicate, k=k)
     assert result.segment_ids == ()
@@ -621,7 +622,7 @@ def test_multimodal_channel_early_stop_matches_collapsing_every_row(
                     (attachment_id, uuid.uuid4().hex, vector_literal(vec)),
                 )
 
-    predicate = compile_predicate(SearchFilters(), LOCAL_FULL_ACCESS)
+    predicate = compile_predicate(SearchFilters(), FULL)
     for k in (3, 10, 60):
         query = _unit([rng.gauss(0.0, 1.0) for _ in range(dim)])
         fetched.clear()
@@ -661,25 +662,25 @@ def test_multimodal_channel_early_stop_matches_collapsing_every_row(
 
 def test_resolve_person_exact_short_name(scratch_db: psycopg.Connection) -> None:
     person_id, short_name = _insert_person(scratch_db, "Alice Example")
-    assert resolve_person(scratch_db, LOCAL_FULL_ACCESS, short_name) == person_id
+    assert resolve_person(scratch_db, FULL, short_name) == person_id
 
 
 def test_resolve_person_exact_display_name(scratch_db: psycopg.Connection) -> None:
     person_id, _ = _insert_person(scratch_db, "Unique Display Name")
     assert (
-        resolve_person(scratch_db, LOCAL_FULL_ACCESS, "Unique Display Name") == person_id
+        resolve_person(scratch_db, FULL, "Unique Display Name") == person_id
     )
 
 
 def test_resolve_person_not_found(scratch_db: psycopg.Connection) -> None:
     with pytest.raises(PersonNotFoundError):
-        resolve_person(scratch_db, LOCAL_FULL_ACCESS, "nobody-like-this-exists-zzz")
+        resolve_person(scratch_db, FULL, "nobody-like-this-exists-zzz")
 
 
 def test_resolve_person_fuzzy_never_silently_picks(scratch_db: psycopg.Connection) -> None:
     _insert_person(scratch_db, "Alice Example")
     with pytest.raises(PersonAmbiguousError) as exc_info:
-        resolve_person(scratch_db, LOCAL_FULL_ACCESS, "Alise Example")  # one-letter typo
+        resolve_person(scratch_db, FULL, "Alise Example")  # one-letter typo
     assert len(exc_info.value.candidates) >= 1
 
 
@@ -687,7 +688,7 @@ def test_resolve_person_ambiguous_on_duplicate_display_names(scratch_db: psycopg
     _insert_person(scratch_db, "Duplicate Name")
     _insert_person(scratch_db, "Duplicate Name")
     with pytest.raises(PersonAmbiguousError):
-        resolve_person(scratch_db, LOCAL_FULL_ACCESS, "Duplicate Name")
+        resolve_person(scratch_db, FULL, "Duplicate Name")
 
 
 # ==========================================================================
