@@ -1,0 +1,76 @@
+name: CI
+
+# macos-15 (Apple Silicon) is required, not a stand-in for convenience:
+# extraction and identity resolution use pyobjc-framework-Contacts, which
+# only exists on macOS, and the mount guard / db fingerprint code is
+# macOS-specific too. macos-14 is deprecated in actions/runner-images as
+# of this writing; macos-15 is the current arm64 image.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # Full history so the public-safety check can scan the actual
+          # push/PR commit range below, not just the tip.
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync dev dependencies
+        run: uv sync --extra dev
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Determine commit range for public-safety scan
+        id: range
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              # First push of a branch/repo: nothing to diff against, so
+              # scan just the tip commit's own message.
+              range="${{ github.sha }}~1..${{ github.sha }}"
+            else
+              range="${before}..${{ github.sha }}"
+            fi
+          fi
+          echo "range=$range" >> "$GITHUB_OUTPUT"
+
+      - name: Public-safety check (files and commit messages)
+        run: |
+          uv run python scripts/check_public_safety.py --all-files \
+            --commits "${{ steps.range.outputs.range }}"
+
+      - name: Test (no Postgres)
+        env:
+          # Points at a host/port that can never answer, so integration
+          # tests that need Postgres skip cleanly instead of hanging or
+          # attempting to talk to whatever happens to be on 5432/5433 on
+          # the runner.
+          IMSG_TEST_PG_HOST: /nonexistent
+          IMSG_TEST_PG_PORT: "1"
+        run: |
+          # addopts="-q" is already set in pyproject.toml; a second -q on
+          # the command line would suppress the pass/fail summary line
+          # entirely, so acceptance/CI checks must override it with -o
+          # addopts="" rather than stacking another -q.
+          uv run pytest -o addopts="" -q
+
+      - name: Type check (mypy, non-blocking)
+        # main has pre-existing mypy errors (96 at the time this workflow
+        # was added). This step reports them without failing the build
+        # until that debt is paid down separately.
+        continue-on-error: true
+        run: uv run mypy .
