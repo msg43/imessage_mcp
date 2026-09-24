@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "imsg-local": {
+      "command": "/Users/alice/imessage-index/.venv/bin/imsg",
+      "args": ["mcp", "local"],
+      "env": {
+        "IMSG_CONFIG": "/Users/alice/imessage-index/config.yaml"
+      }
+    }
+  }
+}

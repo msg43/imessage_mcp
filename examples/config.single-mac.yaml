@@ -1,0 +1,192 @@
+# examples/config.single-mac.yaml — a filled-in config for the common
+# case: one Mac, your own iMessages, local search only (no export to an
+# enterprise search index, no public/internet MCP surface).
+#
+# This is a companion to config.example.yaml, which documents every
+# field. Copy THIS file if you just want local search working:
+#
+#   cp examples/config.single-mac.yaml config.yaml
+#   export IMSG_CONFIG="$PWD/config.yaml"
+#
+# Then edit the paths below for your own Mac. Every "alice" you see is a
+# placeholder for your own macOS username — replace it, don't leave it
+# literally as "alice". See docs/install-macos.md for the full walkthrough.
+#
+# Unknown keys are validation errors (`imsg check-permissions` or any
+# other command will refuse to start) — that is deliberate, so a typo'd
+# field fails loudly instead of silently doing nothing.
+
+paths:
+  # Where the index, models, and Postgres data files live.
+  #
+  # SIMPLE DEFAULT (this file): a folder on your normal startup disk,
+  # protected by FileVault. Turn on FileVault once, in System Settings ->
+  # Privacy & Security -> FileVault, and every file under your home
+  # directory — including this folder — is encrypted at rest. Most Macs
+  # set up since 2018 already have this on.
+  #
+  # STRICTER OPTION: create a separate encrypted APFS volume (Disk
+  # Utility -> File -> New Image, or a new APFS volume in the existing
+  # container, "Encrypted") and point data_root at a folder on that
+  # volume instead, e.g. /Volumes/Data-Encrypted/imsgindex. This keeps
+  # your derived message index on its own encrypted container, separate
+  # from the rest of your disk. Either way, the pipeline refuses to
+  # start unless data_root resolves onto an actually-encrypted, actually
+  # -mounted volume, and unless the sentinel file below exists there.
+  data_root: /Users/alice/imsgindex-data
+
+  # Read-only. This is the ONLY path in this whole file allowed to point
+  # inside ~/Library/Messages, and it's how the pipeline finds your
+  # real Messages database. It is never written to.
+  live_chat_db: ~/Library/Messages/chat.db
+
+database:
+  # Port 5433 is required (not Postgres's usual 5432) — this instance is
+  # dedicated to imessage-index and must never be the same cluster as
+  # any other Postgres on the machine. docs/install-macos.md walks
+  # through creating it.
+  dsn: postgresql://imsg@127.0.0.1:5433/imsgindex
+  # `keychain:<item-name>` means: read this password from the macOS
+  # Keychain, item name `imsgindex-pg`, at run time. Never write a real
+  # password into this file. docs/install-macos.md shows the
+  # `security add-generic-password` command that creates this item.
+  password: keychain:imsgindex-pg
+  cluster_fingerprint_file: pg17/.imsgindex-cluster
+
+sync:
+  interval_seconds: 900
+  sources:
+    # Your own Mac's live chat.db is always the first source. Give it
+    # any name you like — it shows up in status output and logs.
+    - name: alices-mac
+      chat_db: ~/Library/Messages/chat.db
+    # If you also want to merge in messages from an old phone backup or
+    # a second Mac, add another source here (SPEC D12: a second source
+    # only ever fills in gaps — it can insert missing rows, never
+    # overwrite ones you already have):
+    # - name: old-macbook-backup
+    #   chat_db: /path/to/an/exported/chat.db
+
+identity:
+  default_region: US   # the country code assumed for phone numbers with no country prefix
+  contacts_import: true
+
+policy:
+  index_unsent: false
+  index_edit_history: false
+
+# `models.backend: real` (the default) uses the actual local MLX / Apple
+# Vision models named below — that's what makes search results
+# meaningful. It needs the `models` extra:
+#   uv sync --extra models
+# `fake` swaps in deterministic stand-ins that make every stage "work"
+# with meaningless results — useful only for running the test suite
+# without downloading any models.
+models:
+  backend: real
+  share_boundary_and_caption_weights: true
+  query_cache_limit_bytes: 8589934592       # 8 GiB
+  enrichment_cache_limit_bytes: 4294967296  # 4 GiB
+
+segmentation:
+  session_gap_hours: 3.0
+  topical_min_messages: 10
+  max_messages: 50
+  max_tokens: 2000
+  boundary_model: mlx-community/Qwen3.5-35B-A3B-4bit
+  boundary_revision: 1e20fd8d42056f870933bf98ca6211024744f7ec
+  boundary_prompt: prompts/segment_boundaries.txt
+
+enrichment:
+  egress: local_only
+  window: "01:00-07:00"
+  concurrency: { ocr: 4, caption: 1, transcribe: 1, pdf: 4 }
+  max_attempts: 5
+  video_max_frames: 20
+  pdf_scanned_threshold_chars_per_page: 50
+  limits:
+    max_file_bytes: 1073741824
+    max_pdf_pages: 1000
+    max_media_seconds: 14400
+    task_timeout_seconds: 1800
+    temp_bytes_per_task: 10737418240
+  transcription_model: mlx-community/whisper-large-v3-mlx
+  transcription_revision: 49e6aa286ad60c14352c404340ded53710378a11
+  transcription_language: null
+  caption_model: mlx-community/Qwen3.5-35B-A3B-4bit
+  caption_revision: 1e20fd8d42056f870933bf98ca6211024744f7ec
+  caption_prompt: prompts/caption.txt
+  caption_max_image_side: 1920
+  ocr_languages: null
+  ocr_minimum_text_height: null
+  yield_to_queries: true
+  yield_poll_interval_seconds: 0.25
+  yield_max_pause_seconds: 300
+
+embedding:
+  model: mlx-community/Qwen3-Embedding-8B-mxfp8
+  revision: 51c773b7464b630a6c67b4f75dbd796b658d6236
+  quantization: mxfp8
+  dim: 2048
+  batch_size: 32
+  max_batch_tokens: 2048
+  query_instruction: "Given a personal message search query, retrieve relevant conversation segments"
+  multimodal:
+    enabled: true
+    provider: local
+    scope: full
+    model: timm/PE-Core-bigG-14-448
+    revision: 17aa0c25addfa14198fa2ff73d845a22d433432e
+    dim: 1280
+    batch_size: 16
+
+retrieval:
+  k_fts: 100
+  k_vector: 100
+  rrf_k: 60
+  rerank_top: 20
+  rerank_doc_max_tokens: 256
+  # This is a LOCAL CONVERSION — a directory under data_root that you
+  # produce yourself with the command in models/manifest.lock.yaml (also
+  # shown verbatim in docs/install-macos.md), not something downloaded
+  # as-is from Hugging Face.
+  reranker_model: models/qwen3-reranker-0.6b-mxfp8-e61197ed
+  reranker_revision: e61197ed45024b0ed8a2d74b80b4d909f1255473
+  default_limit: 10
+  hnsw_ef_search: 1000
+
+render:
+  timezone: America/Los_Angeles   # your own IANA timezone, e.g. America/New_York
+  attachment_snippet_chars: 200
+
+mcp:
+  local:
+    enabled: true
+    idle_unload_seconds: 600
+  public:
+    # A single-Mac local-search setup never needs the internet-facing
+    # surface. Leave this disabled; `scope` must still be set (no
+    # default is allowed) even while disabled.
+    enabled: false
+    bind: 127.0.0.1:8700
+    scope: allowlist
+
+# Only needed if you later want to push a filtered subset of your
+# messages into an enterprise search index (Google Cloud). Local search
+# via `imsg mcp local` never touches this section or the `export` extra.
+# Values below are placeholders; `uv sync --extra export` installs the
+# Google client libraries this section's commands need.
+export:
+  gcp_project: example-project-id
+  gcs_bucket: example-bucket
+  data_store_id: example-datastore-id
+  format: txt
+  batch_max_files: 100000
+
+eval:
+  seed_queries: private/eval/queries.yaml
+  runs_dir: eval/runs
+
+logging:
+  level: INFO
+  allow_content_debug: false
