@@ -223,7 +223,7 @@ def test_check_data_volume_passes_when_guard_accepts(
     from imsg.mount.guard import MountInfo
 
     def _accept(data_root: Path, **kwargs: Any) -> MountInfo:
-        return MountInfo(mount_point=data_root, encrypted=True, volume_name="Data-Encrypted-Test")
+        return MountInfo(mount_point=data_root, encrypted=True, volume_name="IMSG-Data-Test")
 
     monkeypatch.setattr("imsg.mount.guard.guard_mount", _accept)
     result = doctor.check_data_volume(tmp_path)
@@ -239,7 +239,7 @@ def test_check_data_volume_calls_the_real_guard_function(
 
     def _spy(data_root: Path, **kwargs: Any) -> MountInfo:
         calls.append(data_root)
-        return MountInfo(mount_point=data_root, encrypted=True, volume_name="Data-Encrypted-Test")
+        return MountInfo(mount_point=data_root, encrypted=True, volume_name="IMSG-Data-Test")
 
     monkeypatch.setattr("imsg.mount.guard.guard_mount", _spy)
     doctor.check_data_volume(tmp_path)

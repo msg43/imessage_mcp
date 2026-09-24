@@ -54,7 +54,7 @@ class StrictModel(BaseModel):
 
 
 class PathsConfig(StrictModel):
-    data_root: Path = Field(default=Path("/Volumes/Data-Encrypted/imsgindex"))
+    data_root: Path = Field(default=Path("/Volumes/IMSG-Data/imsgindex"))
     live_chat_db: Path = Field(default=Path("~/Library/Messages/chat.db"))
 
     @field_validator("data_root", "live_chat_db", mode="after")

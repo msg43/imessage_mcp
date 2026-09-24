@@ -66,7 +66,7 @@ def containing_mount_point(path: Path) -> Path:
 
     `diskutil info` accepts a device node or a **mount point** — never
     an arbitrary path inside a volume. `data_root` is always inside one
-    (`/Volumes/Data-Encrypted/imsgindex`, per SPEC §6 and the
+    (`/Volumes/IMSG-Data/imsgindex`, per SPEC §6 and the
     implementation guide §0.6), so passing it to `diskutil` directly
     fails with exit 1 on every valid deployment.
     """

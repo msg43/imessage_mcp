@@ -8,7 +8,7 @@
 # default — both are deliberate (SPEC §6, D6).
 
 paths:
-  data_root: /Volumes/Data-Encrypted/imsgindex   # must be on an encrypted, mounted volume (§5.4)
+  data_root: /Volumes/IMSG-Data/imsgindex   # must be on an encrypted, mounted volume (§5.4)
   live_chat_db: ~/Library/Messages/chat.db       # read-only source; the ONLY path permitted under ~/Library/Messages
 
 database:

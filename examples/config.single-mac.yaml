@@ -28,7 +28,7 @@ paths:
   # STRICTER OPTION: create a separate encrypted APFS volume (Disk
   # Utility -> File -> New Image, or a new APFS volume in the existing
   # container, "Encrypted") and point data_root at a folder on that
-  # volume instead, e.g. /Volumes/Data-Encrypted/imsgindex. This keeps
+  # volume instead, e.g. /Volumes/IMSG-Data/imsgindex. This keeps
   # your derived message index on its own encrypted container, separate
   # from the rest of your disk. Either way, the pipeline refuses to
   # start unless data_root resolves onto an actually-encrypted, actually

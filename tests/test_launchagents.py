@@ -65,7 +65,7 @@ def test_calendar_intervals_rejects_nonpositive_spacing() -> None:
 # --------------------------------------------------------------------------
 
 
-_FIXED_DATA_ROOT = "/Volumes/Data-Encrypted/imsgindex"
+_FIXED_DATA_ROOT = "/Volumes/IMSG-Data/imsgindex"
 """A fixed, fictional `data_root` — deliberately NOT derived from
 pytest's own `tmp_path` fixture, whose default location
 (`/…/pytest-of-<local-username>/…`) embeds the real local OS username
@@ -85,7 +85,7 @@ def rendered(config: Config) -> dict[str, bytes]:
         imsg_binary=Path("/usr/local/bin/imsg"),
         postgres_binary=Path("/opt/homebrew/bin/postgres"),
         cloudflared_binary=Path("/opt/homebrew/bin/cloudflared"),
-        config_path=Path("/Volumes/Data-Encrypted/imsgindex/private/config.yaml"),
+        config_path=Path("/Volumes/IMSG-Data/imsgindex/private/config.yaml"),
     )
 
 

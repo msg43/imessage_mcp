@@ -55,11 +55,11 @@ product.
 ## ⚠️ Read this before you clone
 
 **No model has run on the pipeline end to end yet.** With a plain
-`uv sync --extra dev` and no database, the test suite is 1,740 passed
+`uv sync --extra dev` and no database, the test suite is 1,803 passed
 and 503 skipped (most skips need a scratch PostgreSQL; the rest need the
 `models` and/or `export` extras, which are not required for a plain
 install). With every extra installed (`--extra dev --extra models
---extra export`) and still no database, it's 1,784 passed and 477
+--extra export`) and still no database, it's 1,847 passed and 477
 skipped, almost all of those needing PostgreSQL — measured 2026-09-24.
 The CLI works,
 migrations apply against real PostgreSQL + pgvector, and the snapshot →
@@ -396,14 +396,14 @@ invalid result is treated exactly like a failure: scope stays
   FileVault-encrypted startup disk, or a separate encrypted APFS volume
   — either is accepted as `data_root`, and the mount gate refuses to run
   against an unencrypted or unmounted location
-  (`src/imsg/mount/guard.py:147-152`). Whichever you use, it must contain
+  (`src/imsg/mount/guard.py`). Whichever you use, it must contain
   a sentinel file named `.imsgindex-volume` at the root of `data_root` so
   the gate can confirm it is the intended volume and not, say, an
   unmounted mount point silently resolving to the boot disk underneath
-  it (`src/imsg/mount/guard.py:34`).
+  it (`src/imsg/mount/guard.py`).
 - **PostgreSQL 17 + pgvector, as a dedicated instance on port 5433**,
   with its data directory under `$DATA_ROOT/pg17` (`src/imsg/config/
-  schema.py:86,103-107`, `src/imsg/db/fingerprint.py:24-28`). A generic
+  schema.py`, `src/imsg/db/fingerprint.py`). A generic
   Postgres install on the default port will not work — config validation
   rejects any other port, and a two-sided fingerprint check refuses to
   treat any other data directory as this project's own instance. The
@@ -435,8 +435,8 @@ extra (below) skip cleanly without them.
 cargo build --release --manifest-path tools/imsg-dump/Cargo.toml
 ```
 ```bash
-uv run pytest        # 1740 passed, 503 skipped with `--extra dev` alone and no database;
-                     # 1784 passed, 477 skipped with every extra installed and still no database — 2026-09-24
+uv run pytest        # 1803 passed, 503 skipped with `--extra dev` alone and no database;
+                     # 1847 passed, 477 skipped with every extra installed and still no database — 2026-09-24
 ```
 
 Copy `config.example.yaml`, fill it in, and point the CLI at it:

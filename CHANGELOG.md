@@ -42,6 +42,30 @@ held real contact data used as test fixtures.
 - **Plain-language CLI help** with no references to the private design
   spec; README "Is this for you?", complete requirements and an honest
   privacy note; SECURITY.md, CONTRIBUTING.md, issue and PR templates.
+- **Install guide QA fixes** (2026-09-24, following a full readiness
+  review). `docs/install-macos.md` Step 3's manual Postgres commands
+  did not work as written: `createuser` collided with the role
+  `initdb -U imsg` already created, later `psql`/`createdb` calls had
+  no `-U`/`-h`/`-p` and failed against a non-default macOS user, and
+  `postgresql@17` being keg-only meant a bare `psql` wasn't even on
+  `PATH`. Rewrote Step 3 to use the full keg path throughout, drop the
+  redundant `createuser`, and match `scripts/bootstrap_local_postgres.sh`'s
+  trust-auth cluster — including the Keychain item `database.password`
+  still needs to resolve even though trust auth never checks its value;
+  `bootstrap_local_postgres.sh` now prints that same step and supports
+  `--help`. Proved end to end with a throwaway cluster on a scratch port,
+  cleaned up afterward. Also: Step 1's Rust install now uses the
+  official rustup.rs installer (Homebrew's `rustup` formula is keg-only
+  and no longer ships `rustup-init`); the guide and README now say
+  `imsg install-agents` is what schedules `imsg sync` to run on its own,
+  rather than claiming it happens automatically; README's source
+  line-number citations (prone to rotting) were replaced with bare file
+  references; measured test counts corrected to 1,803 passed / 503
+  skipped (`--extra dev` alone) and 1,847 passed / 477 skipped (every
+  extra), matching GAMEPLAN; the planted commit-message fixture in
+  `tests/test_check_public_safety.py` no longer reuses the real leaked
+  brand/amount/wording; and the owner's real encrypted-volume name was
+  replaced with the generic `/Volumes/IMSG-Data` throughout.
 
 ## 2026-09-24 — Every model-loading process checks the host's memory first; heavy background work can be paused
 

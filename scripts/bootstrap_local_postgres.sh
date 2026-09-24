@@ -26,7 +26,7 @@
 # only processes on this Mac can do.
 #
 # Usage:
-#   scripts/bootstrap_local_postgres.sh /Volumes/Data-Encrypted/imsgindex
+#   scripts/bootstrap_local_postgres.sh /Volumes/IMSG-Data/imsgindex
 #
 # Requires Postgres 17 client/server binaries (e.g. from
 # `brew install postgresql@17`) on PATH, or discoverable at the
@@ -46,15 +46,45 @@ DB_NAME=imsgindex
 DB_ROLE=imsg
 
 usage() {
-  echo "Usage: $0 DATA_ROOT" >&2
-  echo "  DATA_ROOT: the directory this project's config.yaml paths.data_root" >&2
-  echo "             points at (must be on your encrypted data volume)." >&2
-  exit 2
+  cat >&2 <<'EOF'
+Usage: scripts/bootstrap_local_postgres.sh DATA_ROOT
+
+Creates the dedicated local Postgres 17 cluster this project expects,
+entirely under DATA_ROOT (must already exist, and should be on your
+encrypted data volume -- see docs/install-macos.md Step 2).
+
+What it does:
+  1. initdb a brand-new cluster at DATA_ROOT/pg17 (refuses to touch one
+     that already exists), with --auth=trust, listening on 127.0.0.1
+     only, on port 5433.
+  2. Start it with pg_ctl.
+  3. Create the 'imsgindex' database owned by the 'imsg' role that
+     initdb --username already created.
+  4. Enable the 'vector' (pgvector) and 'pg_prewarm' extensions the
+     migrations require.
+  5. Print the 'security add-generic-password' command that creates
+     the Keychain item config.yaml's database.password field expects
+     -- run that once, by hand; the script does not touch your
+     Keychain.
+
+No password is ever set or stored for Postgres itself: trust auth on
+127.0.0.1 means only processes on this Mac can connect at all.
+
+Example:
+  scripts/bootstrap_local_postgres.sh /Users/alice/imsgindex-data
+EOF
+  exit "${1:-2}"
 }
 
 if [ "$#" -ne 1 ]; then
-  usage
+  usage 2
 fi
+
+case "$1" in
+  -h|--help)
+    usage 0
+    ;;
+esac
 
 DATA_ROOT="$1"
 
@@ -215,7 +245,14 @@ echo "  listening on:   127.0.0.1:$PG_PORT"
 echo "  database:       $DB_NAME (owned by role '$DB_ROLE')"
 echo "  extensions:     vector, pg_prewarm"
 echo ""
-echo "No password was set or stored -- only processes on this Mac can connect."
+echo "No password was set or stored for Postgres itself -- trust auth on"
+echo "127.0.0.1 means only processes on this Mac can connect."
+echo ""
+echo "One more step: config.yaml's database.password field still reads"
+echo "from the Keychain, even though trust auth never checks its value."
+echo "Create that item now with any placeholder string:"
+echo ""
+echo "  security add-generic-password -a \"\$USER\" -s imsgindex-pg -w \"unused-trust-auth-placeholder\""
 echo ""
 echo "To stop it later:  $PG_CTL --pgdata='$PG_DATA_DIR' --mode=fast stop"
 echo "To start it again: $PG_CTL --pgdata='$PG_DATA_DIR' --log='$PG_LOG_FILE' start"

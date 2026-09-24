@@ -222,7 +222,7 @@ def test_run_guard_mount_or_exit_exits_78_and_logs_content_free(
 # was never exercised. It passed `data_root` straight to
 # `diskutil info`, which accepts a device or a *mount point* and exits 1
 # for any path inside a volume — and `data_root` is always inside one
-# (`/Volumes/Data-Encrypted/imsgindex`). The gate therefore failed on
+# (`/Volumes/IMSG-Data/imsgindex`). The gate therefore failed on
 # every real deployment while 836 tests stayed green.
 # --------------------------------------------------------------------------
 

@@ -1725,7 +1725,7 @@ def _fake_which(name: str) -> str | None:
     }.get(name)
 
 
-_FIXED_DATA_ROOT = "/Volumes/Data-Encrypted/imsgindex"
+_FIXED_DATA_ROOT = "/Volumes/IMSG-Data/imsgindex"
 """Deliberately NOT `tmp_path`-derived: pytest's own tmp dirs
 (`/…/pytest-of-<local-username>/…`) embed the real local OS username,
 which would make the leak-substring check below fire for a reason that

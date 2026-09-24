@@ -205,6 +205,6 @@ def encrypted_mount_info() -> Callable[[Path], MountInfo]:
     """A fake `diskutil_info` that reports `path` itself as a mounted, encrypted volume."""
 
     def _make(path: Path) -> MountInfo:
-        return MountInfo(mount_point=path, encrypted=True, volume_name="Data-Encrypted-Test")
+        return MountInfo(mount_point=path, encrypted=True, volume_name="IMSG-Data-Test")
 
     return _make

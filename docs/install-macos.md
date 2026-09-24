@@ -34,22 +34,39 @@ If you don't already have [Homebrew](https://brew.sh) installed:
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 ```
 
-Then install `uv` (the Python package/venv manager this project uses),
-the Rust toolchain manager, and PostgreSQL 17 with the pgvector
-extension:
+Then install `uv` (the Python package/venv manager this project uses)
+and PostgreSQL 17 with the pgvector extension:
 
 ```bash
-brew install uv rustup-init postgresql@17 pgvector
-rustup-init -y    # accepts the defaults; installs the stable Rust toolchain
+brew install uv postgresql@17 pgvector
 ```
 
-Restart your terminal (or `source ~/.zshrc`) after this so `uv`,
-`cargo`, and `psql` are all on your `PATH`. Confirm:
+`postgresql@17` is a **keg-only** formula — Homebrew deliberately does
+not link it onto your `PATH`, so a bare `psql`/`initdb`/`pg_ctl` won't
+resolve yet. Step 3 below uses the full keg path for every Postgres
+command, so you don't need to fight your `PATH` for this.
+
+For Rust, use the official installer rather than Homebrew's `rustup`
+formula — it is keg-only and, as of this writing, no longer ships a
+`rustup-init` binary, which breaks the old copy-paste instructions:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"    # or just restart your terminal
+```
+
+**[UNVERIFIED]** the exact command above was not run end-to-end for
+this guide revision. It is the command published at
+[rustup.rs](https://rustup.rs) as of today; if it fails, follow the
+interactive prompts there directly.
+
+Restart your terminal (or `source ~/.zshrc` and `source
+"$HOME/.cargo/env"`) after this so `uv` and `cargo` are both on your
+`PATH`. Confirm:
 
 ```bash
 uv --version
 cargo --version
-psql --version
 ```
 
 Note: this project pins an exact Rust compiler version in
@@ -73,7 +90,7 @@ called `data_root`. Two ways to protect it:
   Utility, select your main container, and add a new APFS volume with
   encryption turned on (or use an encrypted disk image). Then point
   `data_root` at a folder on that volume instead, e.g.
-  `/Volumes/Data-Encrypted/imsgindex`.
+  `/Volumes/IMSG-Data/imsgindex`.
 
 Either way, create the folder and drop a sentinel file in it — this is
 how the pipeline proves to itself, every time it starts, that it's
@@ -101,14 +118,26 @@ data files live under your `data_root`, in a subfolder named `pg17`.
 > before running it — the manual steps below are what it's automating,
 > and are worth understanding once even if you use the script.
 
+All the commands below use the full keg path,
+`$(brew --prefix postgresql@17)/bin/...`, rather than a bare `psql` /
+`initdb` / etc. — because `postgresql@17` is keg-only (Step 1), a bare
+command name isn't guaranteed to resolve to it, or to resolve at all.
+
 Manual steps:
 
 ```bash
 export DATA_ROOT=/Users/alice/imsgindex-data
 export LC_ALL=C   # required — see the gotcha below
 mkdir -p "$DATA_ROOT/pg17"
-$(brew --prefix postgresql@17)/bin/initdb -D "$DATA_ROOT/pg17" -U imsg
+$(brew --prefix postgresql@17)/bin/initdb -D "$DATA_ROOT/pg17" --auth=trust -U imsg
 ```
+
+`-U imsg` makes `imsg` the cluster's initial superuser role — it
+already exists after this command, so there's no separate `createuser`
+step. `--auth=trust` means "anyone who can already reach this port on
+this machine is allowed in, no password checked" — scoped to
+`127.0.0.1` below, so nothing outside this Mac can connect, and no
+password ever needs to be typed or stored for Postgres itself to work.
 
 > **Gotcha that will cost you an hour if you skip it.** On macOS,
 > Postgres needs `LC_ALL=C` set or the postmaster dies at startup with
@@ -123,27 +152,38 @@ $(brew --prefix postgresql@17)/bin/pg_ctl -D "$DATA_ROOT/pg17" \
   -o "-p 5433" -l "$DATA_ROOT/pg17/server.log" start
 ```
 
-Create the database and role, and enable pgvector:
+Create the database and enable pgvector. Every command needs
+`-h 127.0.0.1 -p 5433 -U imsg` so it connects as the role you just
+created, on the right port, over TCP (where trust auth applies) rather
+than the local Unix socket (where it doesn't):
 
 ```bash
-$(brew --prefix postgresql@17)/bin/createuser -p 5433 imsg
-$(brew --prefix postgresql@17)/bin/createdb -p 5433 imsgindex --owner imsg
-psql -p 5433 -d imsgindex -c 'CREATE EXTENSION IF NOT EXISTS vector;'
+$(brew --prefix postgresql@17)/bin/createdb -h 127.0.0.1 -p 5433 -U imsg \
+  imsgindex --owner imsg
+$(brew --prefix postgresql@17)/bin/psql -h 127.0.0.1 -p 5433 -U imsg \
+  -d imsgindex -c 'CREATE EXTENSION IF NOT EXISTS vector;'
 ```
 
-Set a password for the `imsg` role and store it in your macOS Keychain
-(never in a config file):
+`config.yaml`'s `database.password` field still has to resolve to
+*something* — `imsg` reads it via the Keychain even though trust auth
+on this Mac never actually checks it. Create the Keychain item with any
+placeholder string; nothing reads its contents:
 
 ```bash
-psql -p 5433 -d imsgindex -c "ALTER ROLE imsg WITH PASSWORD 'pick-a-real-password-here';"
-security add-generic-password -a "$USER" -s imsgindex-pg -w    # prompts for the same password; no shell history
+security add-generic-password -a "$USER" -s imsgindex-pg -w "unused-trust-auth-placeholder"
 ```
+
+If you used `scripts/bootstrap_local_postgres.sh` instead of the manual
+steps above, it prints this same `security add-generic-password`
+command at the end — run it once, it's the one piece the script can't
+safely do for you.
 
 **Check it worked** — this should print a path ending in
 `.../pg17` under your `data_root`:
 
 ```bash
-psql -p 5433 -c 'SHOW data_directory'
+$(brew --prefix postgresql@17)/bin/psql -h 127.0.0.1 -p 5433 -U imsg \
+  -d imsgindex -c 'SHOW data_directory'
 ```
 
 ## Step 4: Build the Rust extraction shim
@@ -281,10 +321,18 @@ uv run imsg enrich                      # OCR / captioning / transcription of at
 uv run imsg status                      # confirms everything above actually landed
 ```
 
-After the first full run, `imsg sync` (which the pipeline also runs on
-its own schedule, per `sync.interval_seconds` in your config) keeps the
-index caught up as new messages arrive — you don't need to re-run
-`snapshot`/`extract`/`segment`/`embed` by hand every time.
+After the first full run, `imsg sync` keeps the index caught up as new
+messages arrive, without re-running `snapshot`/`extract`/`segment`/
+`embed` by hand. It does not run on its own until you schedule it:
+
+```bash
+uv run imsg install-agents
+```
+
+This renders and installs LaunchAgents (under
+`~/Library/LaunchAgents`) that run `imsg sync` and the other periodic
+jobs on the schedule set by `sync.interval_seconds` in your config.
+Skip this command and `imsg sync` only runs when you run it yourself.
 
 ## Step 10: Connect it to Claude
 
