@@ -12,6 +12,46 @@ explicitly allowlist it.
 
 ---
 
+## Is this for you?
+
+**What it does.** It reads your Mac's Messages history, figures out who
+each contact really is across their various numbers and emails, groups
+messages into topical conversations, and builds a local search index —
+full-text plus vector — that an AI assistant (Claude Desktop or Claude
+Code, over MCP) can query. Everything stays on your machine unless you
+explicitly export a filtered subset.
+
+**Who it's for right now.** Someone comfortable running commands in a
+terminal, installing developer tools (Python, Rust, PostgreSQL), and
+troubleshooting when a step doesn't go cleanly — not a turnkey app for a
+non-technical user yet. The step-by-step guide in
+[`docs/install-macos.md`](docs/install-macos.md) walks through the whole
+setup and the [`scripts/doctor.py`](scripts/doctor.py) diagnostic checks
+your machine before you start, but real command-line comfort still
+helps.
+
+**Hardware.** An Apple Silicon Mac (M1 or later) — the pipeline depends
+on macOS-only APIs (Full Disk Access to Messages, the Contacts
+framework, Apple Vision) and on Apple's MLX framework for local model
+inference, which does not run on Intel Macs. RAM: the README's own
+requirement below is 32 GB unified memory for the full 8B-class local
+models; smaller models work with less, but no specific lower figure has
+been measured [UNVERIFIED].
+
+**Time and disk.** Not measured end to end for a first-time setup
+[UNVERIFIED] — expect at least an hour between installing dependencies,
+downloading pinned models, and running the reranker conversion step (see
+[Requirements](#requirements) below). Disk usage depends heavily on the
+size of your own Messages history and attachments; no general figure has
+been measured [UNVERIFIED].
+
+**Before you read further**, the section immediately below is important:
+this project has never been run end to end against real models, so
+treat it as a rigorous, well-tested foundation rather than a finished
+product.
+
+---
+
 ## ⚠️ Read this before you clone
 
 **No model has run on the pipeline end to end yet.** 1,315 tests (1,116
@@ -344,10 +384,36 @@ invalid result is treated exactly like a failure: scope stays
 - **macOS on Apple Silicon.** The pipeline depends on macOS-only APIs:
   Full Disk Access to Messages, the Contacts framework, Apple Vision.
 - **Python 3.12+** and [`uv`](https://docs.astral.sh/uv/).
-- **PostgreSQL 17 + pgvector**, as a dedicated instance.
 - **Rust toolchain**, to build the extraction shim.
 - **≥ 32 GB unified memory** for 8B-class local models; smaller models
   work with reduced quality.
+- **An encrypted volume to hold all derived state.** Either your Mac's
+  FileVault-encrypted startup disk, or a separate encrypted APFS volume
+  — either is accepted as `data_root`, and the mount gate refuses to run
+  against an unencrypted or unmounted location
+  (`src/imsg/mount/guard.py:147-152`). Whichever you use, it must contain
+  a sentinel file named `.imsgindex-volume` at the root of `data_root` so
+  the gate can confirm it is the intended volume and not, say, an
+  unmounted mount point silently resolving to the boot disk underneath
+  it (`src/imsg/mount/guard.py:34`).
+- **PostgreSQL 17 + pgvector, as a dedicated instance on port 5433**,
+  with its data directory under `$DATA_ROOT/pg17` (`src/imsg/config/
+  schema.py:86,103-107`, `src/imsg/db/fingerprint.py:24-28`). A generic
+  Postgres install on the default port will not work — config validation
+  rejects any other port, and a two-sided fingerprint check refuses to
+  treat any other data directory as this project's own instance. The
+  `pgvector` and `pg_prewarm` extensions must both be installed into that
+  instance; `pg_prewarm` fills PostgreSQL's shared buffer cache with the
+  search index at startup so queries don't wait on disk (migration
+  `0004_pg_prewarm.sql`). [`scripts/bootstrap_local_postgres.sh`](scripts/bootstrap_local_postgres.sh)
+  sets up a cluster meeting all of this for you.
+- **A one-time reranker conversion step.** The pinned reranker model is
+  not downloaded ready-to-use — it's converted locally from a Hugging
+  Face checkpoint using the exact command recorded in
+  [`models/manifest.lock.yaml`](models/manifest.lock.yaml) (see the
+  `qwen3-reranker-0.6b` entry). This requires the `models` extra
+  installed first. [`docs/install-macos.md`](docs/install-macos.md) has
+  this command spelled out step by step.
 
 ## Getting started
 
@@ -388,6 +454,16 @@ config validation rejects anything that looks like a literal secret.
 > grant goes to the binary that *launches* the job, not to Messages.
 
 Then `uv run imsg --help`. Every stage supports `--dry-run`.
+
+## Connect to Claude
+
+Once the pipeline is set up and indexed, point an AI assistant at the
+local MCP server so it can search your messages: `uv run imsg mcp local`
+speaks the MCP protocol over stdio. Full step-by-step instructions for
+registering it with both **Claude Desktop** and **Claude Code** —
+including example config — are in
+[`docs/install-macos.md`](docs/install-macos.md) and
+[`examples/`](examples/).
 
 ## Replacing the model providers
 
@@ -718,9 +794,13 @@ differently and that is yours to reason about.
 
 Instance configuration, by design: real config values, contact seed
 data, allowlists and eval queries live in a separate private overlay
-you supply and point at with `IMSG_CONFIG`. This repo is public-safe by
-construction — no real names, hosts or secrets have ever been committed
-to it, and `config.example.yaml` ships placeholders only.
+you supply and point at with `IMSG_CONFIG`, and `config.example.yaml`
+ships placeholders only. **This repo's git history was rewritten on
+2026-09-24 to remove real contact data that had been committed as test
+fixtures.** If you find a real name, number, address, or other personal
+identifier anywhere in this repo — in code, history, or an issue — do
+not open a public issue about it; report it privately as described in
+[`SECURITY.md`](SECURITY.md).
 
 The design record — architecture rationale, full build spec, and the
 decision log explaining *why* each choice above was made — is kept
