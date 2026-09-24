@@ -26,9 +26,14 @@ import os
 import shutil
 import socket
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
+
+if TYPE_CHECKING:
+    from imsg.config.schema import Config
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 IMSG_DUMP_PATH = REPO_ROOT / "tools" / "imsg-dump" / "target" / "release" / "imsg-dump"
@@ -177,7 +182,7 @@ def check_data_volume(data_root: Path) -> CheckResult:
     return _pass(name, f"'{data_root}' is a mounted, encrypted volume with its sentinel file.")
 
 
-def check_config_loads(config_path: Path | None) -> tuple[CheckResult, object | None]:
+def check_config_loads(config_path: Path | None) -> tuple[CheckResult, Config | None]:
     """Returns the check result and the loaded `Config` (or `None`)."""
     name = "config loads (imsg.config.loader.load_config)"
     try:
@@ -204,7 +209,7 @@ def check_config_loads(config_path: Path | None) -> tuple[CheckResult, object | 
 REAL_BACKEND_PACKAGES = ("mlx", "mlx_lm")
 
 
-def check_models_present(config: object | None) -> CheckResult:
+def check_models_present(config: Config | None) -> CheckResult:
     name = "models present"
     if config is None:
         return _fail(name, "Do this next: fix your config first (see the config check above).")
@@ -223,7 +228,7 @@ def check_models_present(config: object | None) -> CheckResult:
     return _pass(name, "Model runtime packages are importable.")
 
 
-def check_reranker_present(config: object | None) -> CheckResult:
+def check_reranker_present(config: Config | None) -> CheckResult:
     name = "reranker converted directory present"
     if config is None:
         return _fail(name, "Do this next: fix your config first (see the config check above).")
@@ -278,7 +283,7 @@ def check_full_disk_access(chat_db_path: Path) -> CheckResult:
     return _pass(name, f"'{chat_db_path}' is readable.")
 
 
-def run_check(fn, *args) -> CheckResult:  # type: ignore[no-untyped-def]
+def run_check(fn: Callable[..., Any], *args: Any) -> Any:
     """Run one check, converting any surprise exception into a FAIL."""
     try:
         return fn(*args)

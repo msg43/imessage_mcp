@@ -14,6 +14,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -34,11 +35,11 @@ def cps() -> ModuleType:
     return _load_module()
 
 
-def _hard(findings: list) -> list:
+def _hard(findings: list[Any]) -> list[Any]:
     return [f for f in findings if f.hard]
 
 
-def _soft(findings: list) -> list:
+def _soft(findings: list[Any]) -> list[Any]:
     return [f for f in findings if not f.hard]
 
 
@@ -147,7 +148,7 @@ def test_unknown_capitalized_pair_is_report_only_not_hard(cps: ModuleType) -> No
 def test_all_files_in_this_repo_have_no_hard_findings(cps: ModuleType) -> None:
     repo_root = SCRIPT_PATH.parents[1]
     files = cps.git_ls_files(repo_root)
-    findings: list = []
+    findings: list[Any] = []
     for f in files:
         findings.extend(cps.scan_file(repo_root / f))
     assert _hard(findings) == []

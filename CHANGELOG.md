@@ -10,6 +10,39 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-24 — Public repo made usable and safe for a non-expert
+
+**Why.** A non-expert could not get from a clone to "Claude searches my
+iMessages": the requirements were incomplete, nothing explained how to
+connect Claude, the plain install failed 18 of its own tests, and the
+README claimed no real names had ever been committed when the history
+held real contact data used as test fixtures.
+
+- **History rewritten** (2026-09-24, `git filter-repo`): real contact
+  names, a real phone number and quoted message text removed from every
+  commit and commit message. Commit ids before that date changed.
+- **Install path.** `docs/install-macos.md` walks through setup on one
+  Mac; `examples/` holds a single-Mac config and Claude Desktop / Claude
+  Code connection examples, tested to load. `scripts/bootstrap_local_postgres.sh`
+  creates the dedicated cluster; `scripts/doctor.py` checks a setup
+  read-only and says what to do next for each failure.
+- **Encrypted storage rule relaxed** (owner decision): `data_root` may
+  sit on a FileVault-encrypted startup disk, not only a separate
+  encrypted volume. Still fails closed when FileVault is off or unknown,
+  when the sentinel is missing, and when a `/Volumes/` path resolves to
+  the startup disk (an unmounted data volume). CLAUDE.md non-negotiable
+  #2 updated.
+- **Dependencies.** The Google export libraries moved to the `export`
+  extra; tests needing mlx/PIL/google skip with a reason, so
+  `uv sync --extra dev` passes the suite.
+- **Guards against a repeat.** `scripts/check_public_safety.py` and a
+  GitHub Actions workflow check phone numbers, emails, home paths and
+  name shapes in files and commit messages on every push. It cannot
+  catch a single common first name; SECURITY.md says so.
+- **Plain-language CLI help** with no references to the private design
+  spec; README "Is this for you?", complete requirements and an honest
+  privacy note; SECURITY.md, CONTRIBUTING.md, issue and PR templates.
+
 ## 2026-09-24 — Every model-loading process checks the host's memory first; heavy background work can be paused
 
 **Why.** The index host (64 GiB) ran out of memory and hung: idle MCP

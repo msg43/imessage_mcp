@@ -11,6 +11,17 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-09-24 public readiness + host memory fixes:** git history
+rewritten to remove real contact data used as fixtures; install guide,
+examples, setup doctor, Postgres bootstrap, CI with a public-safety
+check, and plain-language CLI help landed. `data_root` may now sit on a
+FileVault-encrypted startup disk. The index host ran out of memory and
+hung on 2026-09-24 (idle MCP servers each holding a full model set, plus
+`sync` and `embed` running together): model-heavy commands now take a
+host-wide lock, and idle `mcp local` servers unload their models after
+10 minutes. Test suite: 1,847 passed / 477 skipped with every extra
+(no database); ruff clean; mypy reports 96 pre-existing errors.
+
 **2026-09-24 memory protections (not yet deployed):** every model load now
 asks whether the host has room first (both MCP servers, segment, embed,
 enrich, sync's heavy steps, eval); `imsg mcp local` loads nothing until
@@ -31,7 +42,7 @@ Every buildable component of the governing spec is implemented: 8
 pipeline stages, hybrid retrieval, both MCP surfaces, the export gate,
 the eval harness, 38 CLI commands (counting subcommands), migrations
 0001–0009. 2,203 tests, all passing against a scratch Postgres (measured
-2026-09-23); ruff and mypy strict clean; DDL lint clean. Since 2026-09-23
+2026-09-23); ruff clean (mypy: 96 pre-existing errors as of 2026-09-24); DDL lint clean. Since 2026-09-23
 extraction merges only add (D12): a seed inserts rows and fills empty
 values, and only this machine's own live `chat.db` may replace a value.
 `imsg identity merge-filtered-twins` (2026-09-23) merges the persons that

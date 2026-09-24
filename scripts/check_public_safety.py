@@ -396,11 +396,20 @@ def scan_file(path: Path) -> list[Finding]:
     return scan_text(str(path), text)
 
 
+SELF_TEST_FILES = frozenset({"tests/test_check_public_safety.py"})
+
+
 def git_ls_files(repo_root: Path) -> list[str]:
     out = subprocess.run(
         ["git", "ls-files"], cwd=repo_root, capture_output=True, text=True, check=True
     )
-    return [line for line in out.stdout.splitlines() if line]
+    # This check's own tests hold deliberately planted fake leaks (the
+    # cases it must catch), so the repo-wide scan skips that one file.
+    return [
+        line
+        for line in out.stdout.splitlines()
+        if line and line not in SELF_TEST_FILES
+    ]
 
 
 def git_commit_messages(repo_root: Path, commit_range: str) -> list[tuple[str, str]]:

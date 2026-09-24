@@ -142,8 +142,8 @@ class _FakeCursor:
     def __enter__(self) -> _FakeCursor:
         return self
 
-    def __exit__(self, *exc_info: Any) -> bool:
-        return False
+    def __exit__(self, *exc_info: Any) -> None:
+        return None
 
 
 class _FakeConn:
@@ -156,8 +156,8 @@ class _FakeConn:
     def __enter__(self) -> _FakeConn:
         return self
 
-    def __exit__(self, *exc_info: Any) -> bool:
-        return False
+    def __exit__(self, *exc_info: Any) -> None:
+        return None
 
 
 def test_check_extensions_fails_when_both_missing(monkeypatch: pytest.MonkeyPatch) -> None:
