@@ -44,6 +44,7 @@ from imsg.eval.io import (
 from imsg.eval.models import EvalQuery
 from imsg.eval.pool import build_pool, import_pool_worksheet, pool_to_worksheet_yaml
 from imsg.eval.runner import run_eval
+from imsg.heavy_lock import HeavyModelLock
 from imsg.providers.factory import (
     backend_status_line,
     build_multimodal_provider,
@@ -64,6 +65,16 @@ eval_app = typer.Typer(name="eval", help="Eval harness: queries, labels, runs, d
 ConfigOption = Annotated[
     Path | None,
     typer.Option("--config", "-c", help="Path to config.yaml. Defaults to $IMSG_CONFIG, then ./config.yaml."),
+]
+
+
+NoWaitOption = Annotated[
+    bool,
+    typer.Option(
+        "--no-wait",
+        help="If another model-heavy command holds the host-wide lock, exit with an error "
+        "instead of waiting for it (imsg.heavy_lock).",
+    ),
 ]
 
 
@@ -268,6 +279,7 @@ def run_cmd(
         str | None,
         typer.Option("--label", help="Extra tag folded into this run's config hash, e.g. 'baseline'."),
     ] = None,
+    no_wait: NoWaitOption = False,
 ) -> None:
     """Score every `eval_query` (for `--target`) against a retrieval
     backend and write `eval/runs/<...>.json` (SPEC §13.3). This is the
@@ -289,11 +301,14 @@ def run_cmd(
     conn = _connect_and_verify_or_die(cfg)
     fts_conn = _open_fts_conn(cfg)
     try:
-        backend = _build_local_backend(conn, fts_conn, cfg, variant=variant)
-        config_sha = config_projection_sha256(
-            target=target, k=k, extra={"variant": variant, "label": run_label}
-        )
-        result = run_eval(conn, backend, target=target, config_sha256=config_sha, k=k)
+        # The query-side models (embedder, reranker) load here: one
+        # model-heavy process at a time on this host (imsg.heavy_lock).
+        with HeavyModelLock(cfg.paths.data_root, command="imsg eval run", wait=not no_wait):
+            backend = _build_local_backend(conn, fts_conn, cfg, variant=variant)
+            config_sha = config_projection_sha256(
+                target=target, k=k, extra={"variant": variant, "label": run_label}
+            )
+            result = run_eval(conn, backend, target=target, config_sha256=config_sha, k=k)
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -355,6 +370,7 @@ def pool_cmd(
     top_n: Annotated[int, typer.Option(help="Pool depth per config (SPEC §13.2 default: 20).")] = 20,
     seed: Annotated[int | None, typer.Option(help="Randomization seed, for reproducible worksheets.")] = None,
     target: Annotated[str | None, typer.Option(help="Restrict to queries whose targets include this.")] = None,
+    no_wait: NoWaitOption = False,
 ) -> None:
     """SPEC §13.2: run >= 2 materially different configs, pool their
     top-N unique results per query, randomize, and write a worksheet
@@ -372,9 +388,12 @@ def pool_cmd(
     conn = _connect_and_verify_or_die(cfg)
     fts_conn = _open_fts_conn(cfg)
     try:
-        backends = {name: _build_local_backend(conn, fts_conn, cfg, variant=name) for name in names}
-        queries: list[EvalQuery] = load_queries(conn, target=target)
-        entries = build_pool(conn, backends, queries, top_n=top_n, seed=seed)
+        with HeavyModelLock(cfg.paths.data_root, command="imsg eval pool", wait=not no_wait):
+            backends = {
+                name: _build_local_backend(conn, fts_conn, cfg, variant=name) for name in names
+            }
+            queries: list[EvalQuery] = load_queries(conn, target=target)
+            entries = build_pool(conn, backends, queries, top_n=top_n, seed=seed)
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc

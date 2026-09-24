@@ -2887,3 +2887,254 @@ def test_enrich_says_nothing_about_yielding_when_it_never_paused(
     result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env)])
     assert result.exit_code == 0, result.output
     assert "yielded" not in result.output
+
+
+# --------------------------------------------------------------------------
+# Host-wide heavy-model lock (imsg.heavy_lock): which commands take it, when
+# --------------------------------------------------------------------------
+
+
+def _write_boundary_prompt(config_path: Path) -> Path:
+    data_root = _data_root_from_config(config_path)
+    prompt_path = data_root / "prompts" / "segment_boundaries.txt"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text("x")
+    return data_root
+
+
+def _lock_held(data_root: Path) -> bool:
+    from imsg.heavy_lock import inspect_heavy_lock
+
+    return inspect_heavy_lock(data_root).held
+
+
+def test_embed_holds_the_heavy_lock_while_embedding_and_releases_it(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.embed.fts.sync import SyncReport
+    from imsg.embed.pipeline import EmbedRunReport
+
+    data_root = _data_root_from_config(mocked_pg_env)
+    seen: list[bool] = []
+
+    def fake_run_embed(conn: Any, provider: Any, **kw: Any) -> EmbedRunReport:
+        seen.append(_lock_held(data_root))
+        return EmbedRunReport(segments_embedded=0, chunks_embedded=0, attachments_embedded=0)
+
+    monkeypatch.setattr(cli_module, "run_embed", fake_run_embed)
+    monkeypatch.setattr(
+        cli_module, "sync_fts", lambda *a, **kw: SyncReport(events_applied=0, upserts=0, deletes=0)
+    )
+    result = runner.invoke(app, ["embed", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert seen == [True]
+    assert not _lock_held(data_root)
+
+
+def test_embed_dry_run_takes_no_heavy_lock(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.embed.pipeline import EmbedRunReport
+
+    data_root = _data_root_from_config(mocked_pg_env)
+    seen: list[bool] = []
+
+    def fake_run_embed(conn: Any, provider: Any, **kw: Any) -> EmbedRunReport:
+        seen.append(_lock_held(data_root))
+        return EmbedRunReport(segments_embedded=0, chunks_embedded=0, attachments_embedded=0)
+
+    monkeypatch.setattr(cli_module, "run_embed", fake_run_embed)
+    result = runner.invoke(app, ["embed", "--config", str(mocked_pg_env), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert seen == [False]
+
+
+def test_embed_no_wait_exits_cleanly_when_another_process_holds_the_lock(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+    import sys
+
+    data_root = _data_root_from_config(mocked_pg_env)
+
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("no model may run while another process holds the lock")
+
+    monkeypatch.setattr(cli_module, "run_embed", boom)
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from pathlib import Path; from imsg.heavy_lock import HeavyModelLock; "
+            "HeavyModelLock(Path(sys.argv[1]), command='imsg enrich').acquire(); "
+            "print('acquired', flush=True); sys.stdin.readline()",
+            str(data_root),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "acquired"
+        result = runner.invoke(app, ["embed", "--config", str(mocked_pg_env), "--no-wait"])
+        assert result.exit_code == 1
+        assert f"pid {holder.pid} (imsg enrich)" in result.output
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+
+def test_segment_holds_the_heavy_lock_even_for_a_dry_run(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A segment dry run still asks the boundary model, so it loads it."""
+    from imsg.segment.models import SegmentationRunReport
+
+    data_root = _write_boundary_prompt(mocked_pg_env)
+    seen: list[bool] = []
+
+    def fake_run_segment(*a: Any, **kw: Any) -> list[SegmentationRunReport]:
+        seen.append(_lock_held(data_root))
+        return []
+
+    monkeypatch.setattr(cli_module, "run_segment", fake_run_segment)
+    for extra in ([], ["--dry-run"]):
+        result = runner.invoke(app, ["segment", "--config", str(mocked_pg_env), *extra])
+        assert result.exit_code == 0, result.output
+    assert seen == [True, True]
+    assert not _lock_held(data_root)
+
+
+def test_sync_takes_the_heavy_lock_at_segmentation_not_during_extraction(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.embed.fts.sync import SyncReport
+    from imsg.embed.pipeline import EmbedRunReport
+
+    data_root = _write_boundary_prompt(mocked_pg_env)
+    seen: dict[str, bool] = {}
+
+    def fake_run_segment(*a: Any, **kw: Any) -> list[Any]:
+        seen["segment"] = _lock_held(data_root)
+        return []
+
+    def fake_run_embed(conn: Any, provider: Any, **kw: Any) -> EmbedRunReport:
+        seen["embed"] = _lock_held(data_root)
+        return EmbedRunReport(segments_embedded=0, chunks_embedded=0, attachments_embedded=0)
+
+    def fake_run_sync_all_sources(**kwargs: Any) -> list[Any]:
+        seen["extract"] = _lock_held(data_root)  # S1-S3 run before segment_fn
+        kwargs["segment_fn"](None, kwargs["config"], dry_run=False)
+        kwargs["embed_fn"](None, kwargs["config"], dry_run=False)  # re-entrant, no deadlock
+        seen["after_both"] = _lock_held(data_root)
+        return []
+
+    monkeypatch.setattr(cli_module, "run_segment", fake_run_segment)
+    monkeypatch.setattr(cli_module, "run_embed", fake_run_embed)
+    monkeypatch.setattr(
+        cli_module, "_open_fts_conn", lambda cfg: SimpleNamespace(close=lambda: None)
+    )
+    monkeypatch.setattr(
+        cli_module, "sync_fts", lambda *a, **kw: SyncReport(events_applied=0, upserts=0, deletes=0)
+    )
+    monkeypatch.setattr(cli_module, "run_sync_all_sources", fake_run_sync_all_sources)
+
+    result = runner.invoke(app, ["sync", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert seen == {"extract": False, "segment": True, "embed": True, "after_both": True}
+    assert not _lock_held(data_root)
+
+
+def test_sync_dry_run_embed_step_takes_no_heavy_lock(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.embed.pipeline import EmbedRunReport
+
+    data_root = _write_boundary_prompt(mocked_pg_env)
+    seen: list[bool] = []
+
+    def fake_run_embed(conn: Any, provider: Any, **kw: Any) -> EmbedRunReport:
+        seen.append(_lock_held(data_root))
+        return EmbedRunReport(segments_embedded=0, chunks_embedded=0, attachments_embedded=0)
+
+    def fake_run_sync_all_sources(**kwargs: Any) -> list[Any]:
+        kwargs["embed_fn"](None, kwargs["config"], dry_run=True)
+        return []
+
+    monkeypatch.setattr(cli_module, "run_embed", fake_run_embed)
+    monkeypatch.setattr(cli_module, "run_sync_all_sources", fake_run_sync_all_sources)
+    result = runner.invoke(app, ["sync", "--config", str(mocked_pg_env), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert seen == [False]
+
+
+def test_enrich_worker_holds_the_heavy_lock_before_its_first_claim(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = _data_root_from_config(mocked_pg_env)
+    seen: list[bool] = []
+
+    def fake_claim(conn: Any, **kw: Any) -> list[Any]:
+        seen.append(_lock_held(data_root))
+        return []
+
+    monkeypatch.setattr(cli_module, "claim_tasks", fake_claim)
+    result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env)])
+    assert result.exit_code == 0, result.output
+    assert seen == [True]
+    assert not _lock_held(data_root)
+
+
+def test_enrich_plan_and_dry_run_take_no_heavy_lock(
+    mocked_pg_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.enrich.queue import EnrichPreviewReport
+
+    data_root = _data_root_from_config(mocked_pg_env)
+    seen: list[bool] = []
+
+    def fake_plan(conn: Any, **kw: Any) -> Any:
+        seen.append(_lock_held(data_root))
+        return _plan_report()
+
+    def fake_preview(conn: Any, **kw: Any) -> EnrichPreviewReport:
+        seen.append(_lock_held(data_root))
+        return EnrichPreviewReport(total=0, by_kind={})
+
+    monkeypatch.setattr(cli_module, "plan_enrichment", fake_plan)
+    monkeypatch.setattr(cli_module, "preview_claimable_tasks", fake_preview)
+    for extra in (["--plan"], ["--dry-run"]):
+        result = runner.invoke(app, ["enrich", "--config", str(mocked_pg_env), *extra])
+        assert result.exit_code == 0, result.output
+    assert seen == [False, False]
+    assert not (data_root / "run" / "heavy-models.lock").exists()
+
+
+def test_mcp_servers_never_take_the_heavy_lock() -> None:
+    """The MCP servers keep their models resident to answer queries; making
+    them queue behind a batch job would stall every search."""
+    import inspect
+
+    for command in (cli_module.mcp_local, cli_module.mcp_public):
+        assert "heavy_lock" not in inspect.getsource(command).lower()
+
+
+def test_status_reports_the_heavy_lock_holder(
+    cli_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from imsg.config.loader import load_config
+    from imsg.heavy_lock import HeavyLockStatus, LockHolder
+
+    data_root = _data_root_from_config(cli_config)
+    holder = LockHolder(pid=4242, command="imsg embed", acquired_at="2026-09-24T03:00:00+00:00")
+    monkeypatch.setattr(
+        cli_module,
+        "inspect_heavy_lock",
+        lambda root: HeavyLockStatus(held=root == data_root, holder=holder),
+    )
+    fields = cli_module._heavy_lock_status_fields(load_config(cli_config))
+    assert fields == {
+        "heavy_models_lock_held": True,
+        "heavy_models_lock_holder": "pid 4242 (imsg embed) since 2026-09-24T03:00:00+00:00",
+    }

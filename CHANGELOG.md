@@ -10,6 +10,43 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-24 — Model-heavy commands run one at a time on a host
+
+**Why.** The production index host (64 GiB) ran out of memory and hung.
+At the crash, `imsg embed` (24.9 GiB: text embedder plus PE-Core image
+embedder) and the 15-minute scheduled `imsg sync` (22.8 GiB: boundary
+LLM plus embedding) were running at the same time, next to idle MCP
+servers. Each model lives in its own process, so nothing inside a
+process could bound the total.
+
+- **Host-wide lock** (`imsg.heavy_lock`): an exclusive `fcntl.flock` on
+  `<data_root>/run/heavy-models.lock`. The kernel drops it when the
+  holder exits for any reason (SIGKILL and crashes included), so there
+  is no stale lock to clean up. The holder writes its pid, command and
+  start time into the file; `imsg status` reports it as
+  `heavy_models_lock_held` / `heavy_models_lock_holder`.
+- **Who takes it, and when.** `segment` (dry runs too: they run the
+  boundary model), `embed`, the `enrich` worker (before its first claim,
+  so no task is leased while it waits), `eval run` and `eval pool`.
+  `sync` takes it when the first source reaches segmentation, so
+  snapshot and extraction never wait; its embed step reuses the same
+  hold. Held until the command ends, because loaded models stay resident
+  until then. Not taken by `mcp local` / `mcp public`, `embed --dry-run`,
+  `enrich --dry-run` or `enrich --plan`.
+- **Waiting.** A second command blocks and logs `heavy_lock.waiting`
+  (naming the holder), then `heavy_lock.acquired` with the wait time.
+  `--no-wait` exits 1 naming the holder instead.
+- **Known cost.** A scheduled `sync` that lands during a long enrichment
+  batch now finishes extraction, then waits for that batch before
+  segmenting and embedding, so new messages become searchable later.
+  It also waits when it has nothing to segment, because it cannot know
+  that before running segmentation.
+- Tests use real processes: a second process waits until the first
+  releases; a SIGKILLed holder frees the lock; a child that outlives a
+  killed holder does not keep it (checked against a variant with an
+  inheritable descriptor, which does keep it); CLI tests read the lock's
+  real state inside each command's model phase.
+
 ## 2026-09-23 — Accept integral transport numbers without retrieval errors
 
 - JSON Schema accepts `3.0` as an integer, but Python slicing does not.

@@ -207,6 +207,17 @@ class ProviderUnavailableError(ImsgError):
     traceback."""
 
 
+class HeavyModelLockError(ImsgError):
+    """The host-wide heavy-model lock (`imsg.heavy_lock`) could not be
+    set up: its path resolves outside `data_root`, or it could not be
+    opened."""
+
+
+class HeavyModelLockBusyError(HeavyModelLockError):
+    """Another model-heavy command holds the host-wide lock and this one
+    was asked not to wait (`--no-wait`). The message names the holder."""
+
+
 class ModelManifestError(ImsgError):
     """`models/manifest.lock.yaml` is missing, malformed, or could not
     be re-verified against the Hugging Face API (SPEC model-manifest

@@ -238,6 +238,24 @@ attachment first within a kind, and stands aside between tasks while a
 search is running. Captions are the slow part (about 16 s each on an
 M4 Pro, estimated); the nightly `…enrich` agent works through them.
 
+**Model-heavy commands run one at a time on a host.** Each one loads
+tens of GiB of model weights, and two together have exhausted a 64 GiB
+host's memory. `sync`, `segment`, `embed`, `enrich` (the worker, not
+`--plan`), `eval run` and `eval pool` take an exclusive lock on
+`<data_root>/run/heavy-models.lock` before their models load, and a
+second one waits for the first, logging `heavy_lock.waiting` with the
+holder's pid and command. `sync` snapshots and extracts first and takes
+the lock only at segmentation. The kernel releases the lock when its
+holder exits, including when it is killed, so there is nothing to clean
+up. The MCP servers never take it. A dry run that loads no model
+(`embed --dry-run`, `enrich --dry-run`, `enrich --plan`) takes no lock;
+`segment --dry-run` does, because it still runs the boundary model.
+
+```bash
+uv run imsg status | grep heavy_models_lock   # held or not, and by which pid/command
+uv run imsg embed --no-wait                   # exit 1 naming the holder, instead of waiting
+```
+
 **Before exposing the public surface**, AT-1 must pass:
 
 ```bash

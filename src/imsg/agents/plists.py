@@ -203,13 +203,17 @@ def _enrich_plist(
       exits when its run finishes — so the second copy is resident only
       while a sync run is actually detecting boundaries, not for the
       whole window.
-    - Nothing prevents that overlap when a sync run *does* segment. On a
-      64 GB host two copies plus the query side measured 80.4 GiB of
-      demand, critical memory pressure and search p95 at 8.73 s against
-      a 2.0 s budget. The mitigations that apply are the shared runtime
-      above (when one process builds both roles) and enrichment yielding
-      to in-flight queries (`imsg.db.enrichment_yield_locks`, config
-      `enrichment.yield_to_queries`), not this schedule.
+    - On a 64 GB host two copies plus the query side measured 80.4 GiB
+      of demand, critical memory pressure and search p95 at 8.73 s
+      against a 2.0 s budget, and on 2026-09-24 an `imsg embed` and an
+      `imsg sync` running together exhausted memory and hung the host.
+      The overlap is now prevented, not scheduled around: every
+      model-heavy command takes the host-wide lock in `imsg.heavy_lock`
+      before its models load, so this agent's worker and `…sync`'s
+      segment/embed steps run one after the other. A `…sync` run that
+      finds the lock held still snapshots and extracts, then waits.
+      The shared runtime above and enrichment yielding to in-flight
+      queries (`imsg.db.enrichment_yield_locks`) still apply.
     - Moving the window away from `…sync`'s interval is not an option:
       `StartInterval` has no window, and pausing sync for six hours
       would stall extraction of everything that arrives overnight.

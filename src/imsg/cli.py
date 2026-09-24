@@ -122,6 +122,7 @@ from imsg.export import (
     verify_push_preconditions,
     write_unclassified_report,
 )
+from imsg.heavy_lock import HeavyModelLock, inspect_heavy_lock
 from imsg.mcp.audit import PostgresAuditSink
 from imsg.mcp.auth import build_public_gate
 from imsg.mcp.probe import run_auth_probe
@@ -220,6 +221,15 @@ DryRunOption = Annotated[
     typer.Option(
         "--dry-run",
         help="Preview what this stage would do without writing anything (SPEC §8).",
+    ),
+]
+
+NoWaitOption = Annotated[
+    bool,
+    typer.Option(
+        "--no-wait",
+        help="If another model-heavy command holds the host-wide lock, exit with an error "
+        "instead of waiting for it (imsg.heavy_lock).",
     ),
 ]
 
@@ -359,6 +369,25 @@ def _build_or_die[T](build: Callable[[], T]) -> T:
     traceback (see `imsg.providers.factory`)."""
     try:
         return build()
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+def _heavy_lock_or_die(cfg: Config, command: str, *, no_wait: bool) -> HeavyModelLock:
+    """The host-wide heavy-model lock for `command`, not yet taken
+    (`imsg.heavy_lock`). One model-heavy process at a time: two of them
+    together exhausted a 64 GiB host's memory (2026-09-24)."""
+    try:
+        return HeavyModelLock(cfg.paths.data_root, command=command, wait=not no_wait)
+    except ImsgError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+def _acquire_heavy_lock_or_die(lock: HeavyModelLock) -> None:
+    try:
+        lock.acquire()
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -516,6 +545,17 @@ def check_permissions(
         typer.echo(f"{key}: {value}")
 
 
+def _heavy_lock_status_fields(cfg: Config) -> dict[str, object]:
+    """`imsg status`'s view of the host-wide heavy-model lock: held or not
+    (asked of the kernel), and the holder's own description of itself."""
+    try:
+        state = inspect_heavy_lock(cfg.paths.data_root)
+    except (ImsgError, OSError) as exc:
+        return {"heavy_models_lock_held": None, "heavy_models_lock_holder": f"unreadable: {exc}"}
+    holder = state.holder.describe() if state.holder is not None else None
+    return {"heavy_models_lock_held": state.held, "heavy_models_lock_holder": holder}
+
+
 @app.command()
 def status(
     config: ConfigOption = None,
@@ -541,6 +581,7 @@ def status(
     # requirement 4), and an unauthenticated readiness endpoint would be
     # the one way past the only access control this project has.
     public_warm_up = read_warm_up_readiness(cfg.paths.data_root)
+    heavy_lock_state = _heavy_lock_status_fields(cfg)
 
     report = {
         "models_backend": cfg.models.backend,
@@ -564,6 +605,7 @@ def status(
         "mcp_public_warm_up": public_warm_up.state,
         "mcp_public_warm_up_detail": public_warm_up.detail,
         "mcp_public_pid": public_warm_up.pid,
+        **heavy_lock_state,
         "watermarks_per_source": None,
         "enrichment_queue_depths": None,
         "fts_applied_event_id": None,
@@ -1566,8 +1608,12 @@ def segment(
         ),
     ] = False,
     dry_run: DryRunOption = False,
+    no_wait: NoWaitOption = False,
 ) -> None:
-    """S4 — sessionize and segment messages for indexing (SPEC §8 S4)."""
+    """S4 — sessionize and segment messages for indexing (SPEC §8 S4).
+
+    Holds the host-wide heavy-model lock (`imsg.heavy_lock`) for the whole
+    run, `--dry-run` included: a dry run still asks the boundary model."""
     cfg = _load_config_or_die(config)
     if rebuild and chat is None:
         typer.echo("imsg: --rebuild requires --chat <id>", err=True)
@@ -1577,9 +1623,11 @@ def segment(
     prompt_bytes = _boundary_prompt_bytes_or_die(cfg)
     _echo_backend_line(cfg)
     provider = _build_or_die(lambda: build_boundary_provider(cfg, _decode_prompt(prompt_bytes)))
+    heavy_lock = _heavy_lock_or_die(cfg, "imsg segment", no_wait=no_wait)
 
     conn = _connect_and_verify_or_die(cfg)
     try:
+        _acquire_heavy_lock_or_die(heavy_lock)
         if rebuild:
             assert chat is not None
             report = run_segment_for_chat(
@@ -1613,12 +1661,18 @@ def segment(
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     finally:
+        heavy_lock.release()
         conn.close()
 
 
 @app.command()
-def embed(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
-    """S6 — embed segments/attachment chunks and update the FTS sidecar (SPEC §8 S6)."""
+def embed(
+    config: ConfigOption = None, dry_run: DryRunOption = False, no_wait: NoWaitOption = False
+) -> None:
+    """S6 — embed segments/attachment chunks and update the FTS sidecar (SPEC §8 S6).
+
+    Holds the host-wide heavy-model lock (`imsg.heavy_lock`) for the run.
+    `--dry-run` only counts pending rows, loads no model and takes no lock."""
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
     _echo_backend_line(cfg)
@@ -1633,7 +1687,10 @@ def embed(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
     # `run_embed(dry_run=True)` never needs it and a dry run must not
     # write anything (SPEC §8).
     fts_conn = _open_fts_conn(cfg) if not dry_run else None
+    heavy_lock = _heavy_lock_or_die(cfg, "imsg embed", no_wait=no_wait)
     try:
+        if not dry_run:
+            _acquire_heavy_lock_or_die(heavy_lock)
         report = run_embed(
             conn,
             text_provider,
@@ -1649,6 +1706,7 @@ def embed(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     finally:
+        heavy_lock.release()
         if fts_conn is not None:
             fts_conn.close()
         conn.close()
@@ -1668,23 +1726,27 @@ def embed(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
         )
 
 
-def _make_segment_fn(cfg: Config) -> SegmentFn:
+def _make_segment_fn(cfg: Config, heavy_lock: HeavyModelLock) -> SegmentFn:
     prompt_bytes = _boundary_prompt_bytes_or_die(cfg)
     provider = _build_or_die(lambda: build_boundary_provider(cfg, _decode_prompt(prompt_bytes)))
 
     def _segment_fn(conn: psycopg.Connection, config: Config, *, dry_run: bool = False) -> object:
+        # A dry run asks the boundary model too, so it takes the lock too.
+        heavy_lock.acquire()
         return run_segment(conn, config, provider, prompt_bytes, dry_run=dry_run)
 
     return _segment_fn
 
 
-def _make_embed_fn(cfg: Config) -> EmbedFn:
+def _make_embed_fn(cfg: Config, heavy_lock: HeavyModelLock) -> EmbedFn:
     # Built once per `sync` process, up front: a real embedder loads model
     # weights, and `run_sync_all_sources` invokes this once per source.
     text_provider = _build_or_die(lambda: build_text_provider(cfg))
     multimodal_provider = _build_or_die(lambda: build_multimodal_provider(cfg))
 
     def _embed_fn(conn: psycopg.Connection, config: Config, *, dry_run: bool = False) -> object:
+        if not dry_run:  # a dry run only counts pending rows (see `embed`)
+            heavy_lock.acquire()
         report = run_embed(
             conn,
             text_provider,
@@ -1723,6 +1785,7 @@ def sync(
         ),
     ] = None,
     dry_run: DryRunOption = False,
+    no_wait: NoWaitOption = False,
 ) -> None:
     """S7 — incremental S1→S2→S3→S4→S6 sync for every configured source (SPEC §8 S7).
 
@@ -1730,12 +1793,18 @@ def sync(
     runs the studio-seed one-shot path SPEC §8 S7 specifies: S1 is skipped
     entirely and the already-prepared file feeds S2→S3→S4→S6, so the seed
     lands under its own source name and its own ROWID watermark.
+
+    The host-wide heavy-model lock (`imsg.heavy_lock`) is taken when the
+    first source reaches S4, not at start: snapshot and extraction never
+    wait behind another process's models. Once taken it is held until the
+    command ends, because the loaded models stay resident until then.
     """
     cfg = _load_config_or_die(config)
     _validate_seed_or_die(cfg, snapshot, source)
     _echo_backend_line(cfg)
-    segment_fn = _make_segment_fn(cfg)  # validates the boundary prompt exists up front
-    embed_fn = _make_embed_fn(cfg)
+    heavy_lock = _heavy_lock_or_die(cfg, "imsg sync", no_wait=no_wait)
+    segment_fn = _make_segment_fn(cfg, heavy_lock)  # validates the boundary prompt exists up front
+    embed_fn = _make_embed_fn(cfg, heavy_lock)
 
     conn = _connect_and_verify_or_die(cfg)
     try:
@@ -1765,6 +1834,7 @@ def sync(
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     finally:
+        heavy_lock.release()
         conn.close()
 
     for r in results:
@@ -1851,12 +1921,17 @@ def enrich(
         ),
     ] = False,
     dry_run: DryRunOption = False,
+    no_wait: NoWaitOption = False,
 ) -> None:
     """S5b — OCR/caption/transcribe/text-extraction enrichment queue worker (SPEC §8 S5b).
 
     Claims one task at a time: `--kinds` in the order given, else cheap kinds
     first and captions last; within a kind, the newest attachment first.
     `--plan` fills the queue instead (see `imsg.enrich.planner`).
+
+    A worker run holds the host-wide heavy-model lock (`imsg.heavy_lock`),
+    taken before the first claim so no task sits leased while it waits.
+    `--plan` and `--dry-run` load no model and take no lock.
     """
     cfg = _load_config_or_die(config)
     if plan and retry_failed:
@@ -1954,7 +2029,10 @@ def enrich(
     yield_pauses = 0
     processed = 0
     outcomes: dict[str, int] = {}
+    heavy_lock = _heavy_lock_or_die(cfg, "imsg enrich", no_wait=no_wait)
     try:
+        # Before any claim or reset: waiting here holds no lease.
+        _acquire_heavy_lock_or_die(heavy_lock)
         if retry_failed:
             with conn.transaction():
                 reset = reset_failed_tasks(conn, kinds=claim_order)
@@ -1975,6 +2053,7 @@ def enrich(
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     finally:
+        heavy_lock.release()
         conn.close()
 
     summary = " ".join(f"{k}={v}" for k, v in sorted(outcomes.items())) or "none"
