@@ -153,6 +153,8 @@ def test_normalize_caption_removes_thinking_blocks() -> None:
 
 
 def test_caption_returns_the_normalised_model_output(vlm: VlmStub, image: Path) -> None:
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     vlm.output = SimpleNamespace(text="  A red bicycle\nleaning on a wall.  ")
     assert MlxVlmCaptionProvider(REPO, None, PROMPT).caption(image) == (
         "A red bicycle leaning on a wall."
@@ -160,11 +162,15 @@ def test_caption_returns_the_normalised_model_output(vlm: VlmStub, image: Path) 
 
 
 def test_caption_accepts_a_plain_string_from_older_runtimes(vlm: VlmStub, image: Path) -> None:
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     vlm.output = "A plain string caption."
     assert MlxVlmCaptionProvider(REPO, None, PROMPT).caption(image) == "A plain string caption."
 
 
 def test_caption_passes_deterministic_decode_parameters(vlm: VlmStub, image: Path) -> None:
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     MlxVlmCaptionProvider(REPO, None, PROMPT, max_tokens=64).caption(image)
     ((args, kwargs),) = vlm.generate_calls
     assert args == (vlm.model, vlm.processor, f"<chat>{PROMPT}</chat>")
@@ -178,6 +184,8 @@ def test_caption_passes_deterministic_decode_parameters(vlm: VlmStub, image: Pat
 
 
 def test_caption_defaults_to_256_max_tokens(vlm: VlmStub, image: Path) -> None:
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     MlxVlmCaptionProvider(REPO, None, PROMPT).caption(image)
     ((_, kwargs),) = vlm.generate_calls
     assert kwargs["max_tokens"] == 256
@@ -186,6 +194,8 @@ def test_caption_defaults_to_256_max_tokens(vlm: VlmStub, image: Path) -> None:
 def test_caption_formats_the_fixed_prompt_through_the_chat_template(
     vlm: VlmStub, image: Path
 ) -> None:
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     MlxVlmCaptionProvider(REPO, None, PROMPT).caption(image)
     ((args, kwargs),) = vlm.template_calls
     assert args == (vlm.processor, vlm.config, PROMPT)
@@ -197,6 +207,8 @@ def test_caption_formats_the_fixed_prompt_through_the_chat_template(
 
 
 def test_model_is_loaded_once_and_reused_across_captions(vlm: VlmStub, image: Path) -> None:
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     provider = MlxVlmCaptionProvider(REPO, None, PROMPT)
     provider.caption(image)
     provider.caption(image)
@@ -208,6 +220,8 @@ def test_model_is_loaded_once_and_reused_across_captions(vlm: VlmStub, image: Pa
 def test_pinned_revision_loads_from_the_resolved_snapshot(
     monkeypatch: pytest.MonkeyPatch, vlm: VlmStub, image: Path, tmp_path: Path
 ) -> None:
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     hub = install_hub_stub(monkeypatch, tmp_path / "snapshot")
     MlxVlmCaptionProvider(REPO, "abc123", PROMPT).caption(image)
     assert hub.calls == [{"repo_id": REPO, "revision": "abc123"}]
@@ -216,6 +230,8 @@ def test_pinned_revision_loads_from_the_resolved_snapshot(
 
 
 def test_empty_output_is_an_enrichment_error(vlm: VlmStub, image: Path) -> None:
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     provider = MlxVlmCaptionProvider(REPO, None, PROMPT)
     for output in ("", "   \n", SimpleNamespace(text="<think>only thoughts</think>")):
         vlm.output = output
@@ -225,6 +241,8 @@ def test_empty_output_is_an_enrichment_error(vlm: VlmStub, image: Path) -> None:
 
 
 def test_textless_output_object_is_an_enrichment_error(vlm: VlmStub, image: Path) -> None:
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     vlm.output = SimpleNamespace(text=None)
     with pytest.raises(EnrichmentError):
         MlxVlmCaptionProvider(REPO, None, PROMPT).caption(image)
@@ -233,6 +251,8 @@ def test_textless_output_object_is_an_enrichment_error(vlm: VlmStub, image: Path
 def test_generate_failure_is_wrapped_as_enrichment_error(
     monkeypatch: pytest.MonkeyPatch, vlm: VlmStub, image: Path, tmp_path: Path
 ) -> None:
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     install_hub_stub(monkeypatch, tmp_path)
     vlm.generate_exception = ValueError("could not decode image")
     with pytest.raises(EnrichmentError) as excinfo:
@@ -283,6 +303,8 @@ def test_satisfies_the_caption_provider_protocol() -> None:
 def test_caption_registers_the_heif_opener_before_the_model_reads_the_image(
     vlm: VlmStub, image: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     events: list[str] = []
     heif = types.ModuleType("pillow_heif")
 
@@ -334,6 +356,8 @@ def test_caption_still_works_without_pillow_heif(
 ) -> None:
     """A JPEG needs no HEIF support; a missing pillow-heif costs HEICs
     alone, and each of those fails as its own task with PIL's error."""
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     monkeypatch.setitem(sys.modules, "pillow_heif", None)
     assert MlxVlmCaptionProvider(REPO, None, PROMPT).caption(image) == "A red bicycle."
 
@@ -430,6 +454,8 @@ def test_orientation_is_applied_before_scaling(
 def test_an_unreadable_image_goes_to_the_model_unchanged(vlm: VlmStub, image: Path) -> None:
     """PIL cannot open it; the model's own loader reports that, as a
     per-task failure, exactly as before."""
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     MlxVlmCaptionProvider(REPO, None, PROMPT).caption(image)
     ((_, kwargs),) = vlm.generate_calls
     assert kwargs["image"] == [str(image)]

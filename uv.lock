@@ -895,9 +895,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "apsw" },
-    { name = "google-auth" },
-    { name = "google-cloud-discoveryengine" },
-    { name = "google-cloud-storage" },
     { name = "jsonschema" },
     { name = "mcp" },
     { name = "phonenumbers" },
@@ -918,6 +915,11 @@ dev = [
     { name = "types-jsonschema" },
     { name = "types-pyyaml" },
 ]
+export = [
+    { name = "google-auth" },
+    { name = "google-cloud-discoveryengine" },
+    { name = "google-cloud-storage" },
+]
 models = [
     { name = "huggingface-hub" },
     { name = "mlx" },
@@ -936,9 +938,9 @@ models = [
 [package.metadata]
 requires-dist = [
     { name = "apsw", specifier = ">=3.45" },
-    { name = "google-auth", specifier = ">=2" },
-    { name = "google-cloud-discoveryengine", specifier = ">=0.13" },
-    { name = "google-cloud-storage", specifier = ">=2" },
+    { name = "google-auth", marker = "extra == 'export'", specifier = ">=2" },
+    { name = "google-cloud-discoveryengine", marker = "extra == 'export'", specifier = ">=0.13" },
+    { name = "google-cloud-storage", marker = "extra == 'export'", specifier = ">=2" },
     { name = "huggingface-hub", marker = "extra == 'models'", specifier = ">=1.31.0" },
     { name = "jsonschema", specifier = ">=4.26.0" },
     { name = "mcp", specifier = ">=2.0.0" },
@@ -967,7 +969,7 @@ requires-dist = [
     { name = "types-jsonschema", marker = "extra == 'dev'" },
     { name = "types-pyyaml", marker = "extra == 'dev'" },
 ]
-provides-extras = ["dev", "models"]
+provides-extras = ["dev", "export", "models"]
 
 [[package]]
 name = "iniconfig"

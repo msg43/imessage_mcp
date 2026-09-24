@@ -197,6 +197,19 @@ class AgentInstallError(ImsgError):
     binary; the caller must install it or point at it explicitly."""
 
 
+class OptionalDependencyMissingError(ImsgError):
+    """A feature behind an optional `pyproject.toml` extra was invoked but
+    that extra is not installed — e.g. `imsg export` / the Gemini eval
+    backend need the Google client libraries (`google-cloud-storage`,
+    `google-cloud-discoveryengine`, `google-auth`), which live in the
+    `export` extra (`uv sync --extra export`) rather than the base
+    install, so a plain `uv sync` stays free of network-SDK weight for
+    users who never touch export. Raised at the point the feature is
+    actually used, not at import of the module that defines it, so
+    importing unrelated code never fails merely because this extra is
+    missing."""
+
+
 class ProviderUnavailableError(ImsgError):
     """`imsg.providers.factory` could not construct a real model
     provider: the provider module is absent from this build, a runtime

@@ -21,11 +21,35 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from google.api_core.exceptions import GoogleAPIError
-from google.cloud import discoveryengine_v1 as discoveryengine
+from imsg.errors import OptionalDependencyMissingError
 
+# The Google client libraries live in the `export` extra (`uv sync --extra
+# export`), not the base install — see `imsg.export.gcp_transport` for the
+# same pattern and its rationale. Importing this module must still succeed
+# without that extra; only constructing a real client raises, with a
+# message naming the extra to install. `TYPE_CHECKING` is always true for
+# mypy and always false at runtime, so mypy type-checks this module
+# against the real imports (one definition per name, matching
+# `gcp_transport`'s `Credentials` pattern) while the runtime always takes
+# the `else` branch's try/except; `_google_available` is the one thing
+# runtime code checks.
 if TYPE_CHECKING:
+    from google.api_core.exceptions import GoogleAPIError
+    from google.cloud import discoveryengine_v1 as discoveryengine
+
     from imsg.eval.backend import GeminiSearchClient  # noqa: F401  (documented conformance only)
+
+    _google_available = True
+else:
+    try:
+        from google.api_core.exceptions import GoogleAPIError
+        from google.cloud import discoveryengine_v1 as discoveryengine
+
+        _google_available = True
+    except ImportError:
+        GoogleAPIError = Exception  # never matches a real error when unavailable
+        discoveryengine = None
+        _google_available = False
 
 
 class GeminiSearchError(Exception):
@@ -56,6 +80,12 @@ class DiscoveryEngineSearchClient:
         )
 
     def search(self, query_text: str, *, page_size: int) -> Sequence[str]:
+        if not _google_available:
+            raise OptionalDependencyMissingError(
+                "the Gemini/Discovery Engine eval backend requires the Google client "
+                "libraries, which are not installed — run `uv sync --extra export` to "
+                "install them."
+            )
         request = discoveryengine.SearchRequest(
             serving_config=self._serving_config_path(),
             query=query_text,

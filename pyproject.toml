@@ -17,13 +17,19 @@ dependencies = [
     "pyobjc-framework-Contacts>=10",
     "mcp>=2.0.0",
     "jsonschema>=4.26.0",
-    "google-cloud-storage>=2",
-    "google-cloud-discoveryengine>=0.13",
-    "google-auth>=2",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6", "mypy>=1.11", "types-PyYAML", "types-jsonschema"]
+# GCS + Discovery Engine export transport (imsg.export.gcp_transport,
+# imsg.eval.gemini_client — SPEC §11.1/§13.3). Only needed by `imsg export`
+# and the Gemini eval backend; most installs never touch either. Install
+# with `uv sync --extra export`.
+export = [
+    "google-cloud-storage>=2",
+    "google-cloud-discoveryengine>=0.13",
+    "google-auth>=2",
+]
 # Real model backends (`models.backend: real`, the default — see
 # imsg.providers.factory). Floors are the PyPI versions verified to exist
 # on 2026-09-14 (https://pypi.org/pypi/<name>/json); they mirror the

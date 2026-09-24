@@ -10,6 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import pytest
+
+pytest.importorskip(
+    "google.api_core.exceptions", reason="needs the `export` extra (`uv sync --extra export`)"
+)
+
 from google.api_core.exceptions import PermissionDenied
 
 from imsg.eval.gemini_client import DiscoveryEngineSearchClient, GeminiSearchError

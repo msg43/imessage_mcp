@@ -54,9 +54,14 @@ product.
 
 ## ⚠️ Read this before you clone
 
-**No model has run on the pipeline end to end yet.** 1,315 tests (1,116
-run without a database; 199 integration tests need a scratch PostgreSQL
-and skip cleanly without one — measured 2026-09-15), the CLI works,
+**No model has run on the pipeline end to end yet.** With a plain
+`uv sync --extra dev` and no database, the test suite is 1,740 passed
+and 503 skipped (most skips need a scratch PostgreSQL; the rest need the
+`models` and/or `export` extras, which are not required for a plain
+install). With every extra installed (`--extra dev --extra models
+--extra export`) and still no database, it's 1,784 passed and 477
+skipped, almost all of those needing PostgreSQL — measured 2026-09-24.
+The CLI works,
 migrations apply against real PostgreSQL + pgvector, and the snapshot →
 extract → identity stages have run against a real corpus. Segmentation,
 embedding, enrichment and retrieval have only ever run on the fake
@@ -423,14 +428,15 @@ cd imessage-index && uv sync --extra models --extra dev
 ```
 The `models` extra installs the real model runtimes (mlx, mlx-lm,
 mlx-whisper, mlx-vlm, torch, open_clip, pyobjc's Vision bridge,
-pillow-heif); plain `uv sync` is enough for the `fake` backend and the
-test suite.
+pillow-heif); `uv sync --extra dev` alone is enough for the `fake`
+backend and the test suite — tests that need `models` or the `export`
+extra (below) skip cleanly without them.
 ```bash
 cargo build --release --manifest-path tools/imsg-dump/Cargo.toml
 ```
 ```bash
-uv run pytest        # 1523 passed, 327 skipped without a database;
-                     # 1850 passed, 0 skipped against a scratch PostgreSQL — 2026-09-18
+uv run pytest        # 1740 passed, 503 skipped with `--extra dev` alone and no database;
+                     # 1784 passed, 477 skipped with every extra installed and still no database — 2026-09-24
 ```
 
 Copy `config.example.yaml`, fill it in, and point the CLI at it:

@@ -14,11 +14,19 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+
+pytest.importorskip(
+    "google.api_core.exceptions", reason="needs the `export` extra (`uv sync --extra export`)"
+)
+
 from google.api_core.exceptions import NotFound, PermissionDenied
 
 from imsg.config.secrets import SecretRef
 from imsg.errors import SecretResolutionError
-from imsg.export.gcp_transport import GcsDiscoveryEngineTransport, resolve_gcp_credentials
+from imsg.export.gcp_transport import (
+    GcsDiscoveryEngineTransport,
+    resolve_gcp_credentials,
+)
 from imsg.export.transport import ImportEntry, TransportError
 
 # ==========================================================================

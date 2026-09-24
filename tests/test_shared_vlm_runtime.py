@@ -153,6 +153,8 @@ def test_one_runtime_loads_the_weights_once_for_both_roles(
 ) -> None:
     """The defect D10.3 names: captioning and boundary detection are
     pinned to the same checkpoint, and loading it twice cost 18 GiB."""
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     runtime = SharedVlmRuntime()
     caption = _caption_provider(runtime)
     boundary = _boundary_provider(runtime)
@@ -173,6 +175,8 @@ def test_two_private_runtimes_load_the_weights_twice(
 ) -> None:
     """The before picture, and proof the fixture would notice a second
     load: providers that share nothing each load their own copy."""
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     caption = _caption_provider(None)
     boundary = _boundary_provider(SharedVlmRuntime())
 
@@ -189,6 +193,8 @@ def test_the_sharing_is_an_argument_not_a_module_level_cache(
     """Two independently-constructed runtimes must not silently share:
     the object passed in is the whole mechanism, so a test (or an
     operator reading the call site) can see what is shared with what."""
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     first, second = SharedVlmRuntime(), SharedVlmRuntime()
     _caption_provider(first).caption(image)
     _caption_provider(second).caption(image)
@@ -200,6 +206,8 @@ def test_the_sharing_is_an_argument_not_a_module_level_cache(
 def test_different_pins_are_different_entries(vlm: VlmRuntimeStub, image: Path) -> None:
     """Sharing is keyed on (repo, revision) — an operator who points the
     two roles at different revisions gets two loads, correctly."""
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     runtime = SharedVlmRuntime()
     _caption_provider(runtime).caption(image)
     MlxVlmCaptionProvider(
@@ -216,6 +224,8 @@ def test_different_pins_are_different_entries(vlm: VlmRuntimeStub, image: Path) 
 def test_a_caption_provider_given_no_runtime_still_works_and_exposes_its_own(
     vlm: VlmRuntimeStub, image: Path
 ) -> None:
+    pytest.importorskip("PIL", reason="needs the `models` extra (`uv sync --extra models`)")
+    pytest.importorskip("mlx", reason="needs the `models` extra (`uv sync --extra models`)")
     provider = _caption_provider(None)
     assert provider.caption(image) == "A red bicycle against a wall."
     assert provider.shared_runtime.loaded_model_ids == (vlm_model_id(REPO, REVISION),)

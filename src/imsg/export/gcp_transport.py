@@ -62,18 +62,58 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import google.cloud.storage as storage
-from google.api_core.exceptions import GoogleAPIError, NotFound
-from google.cloud import discoveryengine_v1 as discoveryengine
-from google.oauth2 import service_account
-
 from imsg.config.secrets import SecretRef
+from imsg.errors import OptionalDependencyMissingError
 from imsg.export.transport import ImportEntry, ImportResult, TransportError
 
+# The Google client libraries live in the `export` extra (`uv sync --extra
+# export`), not the base install (owner decision: most installs never touch
+# `imsg export` or the Gemini eval backend, so they shouldn't pay for
+# google-cloud-storage/discoveryengine/auth). Importing this module must
+# still succeed without that extra — see `_require_google` below — so that
+# nothing which merely imports `imsg.export.gcp_transport` in passing (e.g.
+# a test collecting this file, or a future refactor) breaks; only actually
+# *using* the transport raises, with a message naming the extra to install.
+# `TYPE_CHECKING` is always true for mypy and always false at runtime, so
+# mypy type-checks this module against the real imports (one definition
+# per name) while the runtime always takes the `else` branch's try/except;
+# `_google_available` is the one thing runtime code checks.
 if TYPE_CHECKING:
+    import google.cloud.storage as storage
+    from google.api_core.exceptions import GoogleAPIError, NotFound
     from google.auth.credentials import Credentials
+    from google.cloud import discoveryengine_v1 as discoveryengine
+    from google.oauth2 import service_account
+
+    _google_available = True
+else:
+    try:
+        import google.cloud.storage as storage
+        from google.api_core.exceptions import GoogleAPIError, NotFound
+        from google.cloud import discoveryengine_v1 as discoveryengine
+        from google.oauth2 import service_account
+
+        _google_available = True
+    except ImportError:
+        storage = None
+        GoogleAPIError = NotFound = Exception  # never match a real error when unavailable
+        discoveryengine = None
+        service_account = None
+        _google_available = False
 
 _DEFAULT_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
+
+
+def _require_google() -> None:
+    """Raise a clear, actionable error if the `export` extra is not
+    installed. Called at the top of every entry point that actually
+    touches a Google client, never at module import time."""
+    if not _google_available:
+        raise OptionalDependencyMissingError(
+            "GCS/Discovery Engine export requires the Google client "
+            "libraries, which are not installed — run `uv sync --extra "
+            "export` to install them."
+        )
 
 
 def resolve_gcp_credentials(
@@ -87,6 +127,7 @@ def resolve_gcp_credentials(
     `config.yaml`, never embeds a default item name — the caller always
     names the reference explicitly.
     """
+    _require_google()
     raw = ref.resolve()
     try:
         info = json.loads(raw)
@@ -248,6 +289,7 @@ def build_gcs_discovery_engine_transport(
     caller already read out of it. Constructing the underlying Google
     clients does not itself make a network call.
     """
+    _require_google()
     storage_client = storage.Client(project=gcp_project, credentials=credentials)
     document_client = discoveryengine.DocumentServiceClient(credentials=credentials)
     return GcsDiscoveryEngineTransport(
