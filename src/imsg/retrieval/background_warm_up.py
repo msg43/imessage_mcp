@@ -37,6 +37,12 @@ What this module promises:
   running step is never counted as having less than
   `RUNNING_STEP_FLOOR_SECONDS` left, which also covers a step that has run
   past its estimate.
+- **A ready warm-up can be undone and run again.** `mark_unloaded()` moves
+  a ready warm-up to `unloaded` once its models have been dropped for
+  sitting idle (`imsg.retrieval.idle_unload`); `start()` then runs every
+  step again, with the same logging, status and estimate as the first
+  pass, so a tool call that arrives after an unload waits for the reload
+  exactly the way one that arrives at startup waits for the first load.
 """
 
 from __future__ import annotations
@@ -66,6 +72,12 @@ class WarmUpPhase(StrEnum):
     WARMING = "warming"
     READY = "ready"
     FAILED = "failed"
+    UNLOADED = "unloaded"
+    """Was ready; the models were dropped after sitting idle. The next
+    `start()` loads them again."""
+
+
+_STARTABLE = (WarmUpPhase.NOT_STARTED, WarmUpPhase.UNLOADED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,20 +184,47 @@ class BackgroundWarmUp:
 
     def start(self) -> None:
         """Begin warming on the model thread and return at once.
-        Idempotent. Never raises: a warm-up that cannot even be queued
-        ends failed, like one whose model cannot load."""
+        Idempotent while warming, ready or failed; from `unloaded` it runs
+        every step again. Never raises: a warm-up that cannot even be
+        queued ends failed, like one whose model cannot load."""
         with self._condition:
-            if self._phase is not WarmUpPhase.NOT_STARTED:
+            if self._phase not in _STARTABLE:
                 return
+            reloading = self._phase is WarmUpPhase.UNLOADED
             self._phase = WarmUpPhase.WARMING
             self._started_at = self._clock()
+            self._finished_at = None
+            self._step_index = 0
+            self._step_started_at = None
         names = ", ".join(step.name for step in self._steps)
-        self._log(f"warm-up started: {_steps(len(self._steps))} in the background ({names})")
+        what = "reload" if reloading else "warm-up"
+        self._log(f"{what} started: {_steps(len(self._steps))} in the background ({names})")
         self._publish()
         try:
             self._model_thread.submit(self._run)
         except Exception as exc:
             self._fail(None, describe_failure(exc))
+
+    def mark_unloaded(self) -> bool:
+        """Record that the models were dropped, so the next `start()`
+        loads them again. Only a ready warm-up can be unloaded: one still
+        warming has a pass in progress, and a failed one is reported as
+        failed until the server restarts. Returns whether the phase
+        changed. The caller drops the models itself, on the model thread,
+        and must queue that before anything can call `start()` again
+        (`imsg.retrieval.idle_unload.IdleModelUnloader` holds its own lock
+        across both)."""
+        with self._condition:
+            if self._phase is not WarmUpPhase.READY:
+                return False
+            self._phase = WarmUpPhase.UNLOADED
+            self._started_at = None
+            self._finished_at = None
+            self._step_index = 0
+            self._step_started_at = None
+            self._publish()
+            self._condition.notify_all()
+            return True
 
     def status(self) -> WarmUpStatus:
         with self._condition:
@@ -196,7 +235,7 @@ class BackgroundWarmUp:
         seconds pass, whichever is first; return the status then."""
         deadline = time.monotonic() + max(timeout, 0.0)
         with self._condition:
-            while self._phase in (WarmUpPhase.NOT_STARTED, WarmUpPhase.WARMING):
+            while self._phase in (*_STARTABLE, WarmUpPhase.WARMING):
                 left = deadline - time.monotonic()
                 if left <= 0:
                     break
@@ -300,7 +339,7 @@ class BackgroundWarmUp:
             return WarmUpStatus(
                 self._phase, None, self._step_index, total, elapsed, 0.0, self._failure
             )
-        if self._phase is WarmUpPhase.NOT_STARTED:
+        if self._phase in _STARTABLE:
             remaining = sum(step.estimated_seconds for step in self._steps)
             return WarmUpStatus(self._phase, None, 0, total, 0.0, remaining, None)
         if self._step_index >= total:  # between the last step and READY

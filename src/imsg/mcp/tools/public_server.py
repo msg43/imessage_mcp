@@ -69,6 +69,7 @@ a bounded wait must not do.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
@@ -107,6 +108,7 @@ if TYPE_CHECKING:
     from starlette.routing import Route
 
     from imsg.retrieval.background_warm_up import BackgroundWarmUp, WarmUpStatus
+    from imsg.retrieval.idle_unload import IdleModelUnloader
     from imsg.retrieval.service import RetrievalService
 
 logger = logging.getLogger(__name__)
@@ -268,6 +270,17 @@ class PublicMcpServer:
 
     warm_up_wait_seconds: float = TOOL_CALL_WARM_UP_WAIT_SECONDS
 
+    idle_unloader: IdleModelUnloader | None = None
+    """Drops the models after `mcp.public.idle_unload_seconds` with no
+    retrieval call and reloads them on the next one (off by default: a
+    reload outlasts this surface's 20 s warm-up wait, so the first call
+    after an unload answers `WARMING_UP`). `None` keeps them loaded."""
+
+    def _retrieval_call(self) -> contextlib.AbstractContextManager[None]:
+        if self.idle_unloader is None:
+            return contextlib.nullcontext()
+        return self.idle_unloader.call()
+
     async def on_list_tools(
         self,
         context: ServerRequestContext[None],
@@ -336,33 +349,40 @@ class PublicMcpServer:
         # it valid. Everything else needs the models, so it waits for them
         # here, off the event loop, before the (synchronous) dispatch.
         warm_up: WarmUpStatus | None = None
-        if _invalid_argument(name, arguments) is None:
-            warm_up = await self._settled_warm_up()
+        valid = _invalid_argument(name, arguments) is None
+        # A valid call is registered with the idle unloader from before it
+        # waits until the dispatch returns — or it is cancelled — so the
+        # models are never dropped mid-call.
+        with self._retrieval_call() if valid else contextlib.nullcontext():
+            if valid:
+                warm_up = await self._settled_warm_up()
 
-        def handler(authorized: AuthorizedRequest) -> ToolOutcome[_ToolCallOutcome]:
-            outcome = self._run_tool(authorized, name, arguments, warm_up=warm_up)
-            return ToolOutcome(
-                payload=outcome,
-                result_count=_result_count(outcome.payload),
-                error=outcome.error_code,
-            )
+            def handler(authorized: AuthorizedRequest) -> ToolOutcome[_ToolCallOutcome]:
+                outcome = self._run_tool(authorized, name, arguments, warm_up=warm_up)
+                return ToolOutcome(
+                    payload=outcome,
+                    result_count=_result_count(outcome.payload),
+                    error=outcome.error_code,
+                )
 
-        try:
-            result = self.gate.dispatch(
-                authorization, tool=name, params=arguments, handler=handler
-            )
-        except Exception:
-            # `gate.dispatch` already wrote an INTERNAL audit row and
-            # re-raised (its own docstring: "the transport maps it to
-            # §10.1 INTERNAL — never a stack trace") — this is that
-            # mapping. Nothing here is safe to include in the message:
-            # the whole point of SPEC §10.1 is that public errors never
-            # carry filesystem paths, SQL, or exception text.
-            logger.error("mcp.public_tool_internal_error", extra={"tool": name}, exc_info=True)
-            return types.CallToolResult(
-                content=[types.TextContent(type="text", text="INTERNAL\ninternal error")],
-                is_error=True,
-            )
+            try:
+                result = self.gate.dispatch(
+                    authorization, tool=name, params=arguments, handler=handler
+                )
+            except Exception:
+                # `gate.dispatch` already wrote an INTERNAL audit row and
+                # re-raised (its own docstring: "the transport maps it to
+                # §10.1 INTERNAL — never a stack trace") — this is that
+                # mapping. Nothing here is safe to include in the message:
+                # the whole point of SPEC §10.1 is that public errors never
+                # carry filesystem paths, SQL, or exception text.
+                logger.error(
+                    "mcp.public_tool_internal_error", extra={"tool": name}, exc_info=True
+                )
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text="INTERNAL\ninternal error")],
+                    is_error=True,
+                )
 
         if result.rejection is not None:
             # Rare TOCTOU: `TransportGuardASGIApp` already authorized

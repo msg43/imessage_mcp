@@ -36,6 +36,23 @@ that fail the schema are rejected at once, without waiting. So is
 answers straight away and carries the warm-up's own state
 (`warm_up_report`), so the operator asking "what is this server doing?"
 gets an answer while it is doing it.
+
+**Unloading when idle.** With an `IdleModelUnloader`
+(`imsg.retrieval.idle_unload`, `mcp.idle_unload_seconds`), the models are
+dropped after that long with no retrieval tool call, and the warm-up's
+state becomes `unloaded`. The next retrieval call starts the reload and
+waits for it exactly as a call during the first warm-up does — up to
+`TOOL_CALL_WARM_UP_WAIT_SECONDS`, then `WARMING_UP` with an estimate. Every
+retrieval call is registered with the unloader for its whole span, the
+wait included, so nothing unloads while one is in flight.
+
+**Exiting when the client goes.** The SDK's stdio transport ends
+`server.run` when stdin reaches end-of-file, which is what an SSH client
+that disconnects produces, and nothing here keeps the process alive after
+that: the model thread and the idle watchdog are daemon threads, and a
+call still waiting for the warm-up is cancelled with the rest of the
+server's tasks. (`tests/test_mcp_idle_unload.py` closes a child server's
+stdin during a held warm-up and while a call waits, and requires the exit.)
 """
 
 from __future__ import annotations
@@ -69,6 +86,7 @@ if TYPE_CHECKING:
     from imsg.mcp.audit import AuditSink
     from imsg.retrieval.access import AccessContext
     from imsg.retrieval.background_warm_up import BackgroundWarmUp, WarmUpStatus
+    from imsg.retrieval.idle_unload import IdleModelUnloader
     from imsg.retrieval.service import RetrievalService
 
 
@@ -168,6 +186,17 @@ class LocalMcpServer:
     conn: psycopg.Connection
     warm_up: BackgroundWarmUp
     warm_up_wait_seconds: float = TOOL_CALL_WARM_UP_WAIT_SECONDS
+    idle_unloader: IdleModelUnloader | None = None
+    """Drops the models after `mcp.idle_unload_seconds` with no retrieval
+    call and reloads them on the next one; `None` keeps them loaded for
+    the life of the process."""
+
+    def _retrieval_call(self) -> contextlib.AbstractContextManager[None]:
+        """The span during which this retrieval call holds the models:
+        registered with the idle unloader, when there is one."""
+        if self.idle_unloader is None:
+            return contextlib.nullcontext()
+        return self.idle_unloader.call()
 
     async def on_list_tools(
         self,
@@ -227,17 +256,21 @@ class LocalMcpServer:
                 payload = handlers.check_permissions(config=self.config, conn=self.conn)
                 payload["warm_up"] = warm_up_report(status)
                 return payload
-        else:
-            tool_fn = _RETRIEVAL_HANDLERS[name]
-            warm_up = await self._settled_warm_up()
+        # Retrieval: the handler is defined below, inside the span that
+        # keeps the idle unloader away from the models.
+        with contextlib.ExitStack() as holding:
+            if schema_error is None and name != "check_permissions":
+                tool_fn = _RETRIEVAL_HANDLERS[name]
+                holding.enter_context(self._retrieval_call())
+                warm_up = await self._settled_warm_up()
 
-            def handler() -> dict[str, Any]:
-                warm_up.raise_unless_ready(wait_bound_seconds=self.warm_up_wait_seconds)
-                return tool_fn(self.service, LOCAL_FULL_ACCESS, arguments)
+                def handler() -> dict[str, Any]:
+                    warm_up.raise_unless_ready(wait_bound_seconds=self.warm_up_wait_seconds)
+                    return tool_fn(self.service, LOCAL_FULL_ACCESS, arguments)
 
-        result = call_tool(
-            self.audit, tool=name, params=arguments, handler=handler, started=started
-        )
+            result = call_tool(
+                self.audit, tool=name, params=arguments, handler=handler, started=started
+            )
 
         if result.is_error:
             text = f"{result.error_code}\n{result.error_message}"
@@ -274,9 +307,13 @@ async def run_local_server(local: LocalMcpServer) -> None:
     server = local.build_server()
     async with stdio_server() as (read_stream, write_stream):
         local.warm_up.start()
+        if local.idle_unloader is not None:
+            local.idle_unloader.start_watchdog()
         try:
             await server.run(read_stream, write_stream, server.create_initialization_options())
         finally:
+            if local.idle_unloader is not None:
+                local.idle_unloader.stop()
             with contextlib.suppress(OSError, ValueError):
                 sys.stdout.flush()
 

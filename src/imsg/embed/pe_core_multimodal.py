@@ -362,6 +362,20 @@ class PeCoreMultimodalEmbeddingProvider:
                 self._runtime = self._bring_up(frozenset({"text", "image"}))
             return self._runtime
 
+    @property
+    def is_loaded(self) -> bool:
+        return self._runtime is not None
+
+    def unload(self) -> None:
+        """Drop the resident towers (idempotent); the next embed call
+        builds them again, exactly as the first one did. Holds the load
+        lock, so it never interleaves with a build."""
+        with self._load_lock:
+            if self._runtime is None:
+                return
+            self._runtime = None
+        self._release_freed_memory()
+
     def _release_freed_memory(self) -> None:
         """Give the allocator a chance to hand back what is now
         unreachable — a collection plus the backend's own cache hint."""

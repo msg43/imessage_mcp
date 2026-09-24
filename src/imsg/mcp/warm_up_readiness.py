@@ -234,6 +234,11 @@ def _seconds_since(updated_at: object) -> float:
 def _describe(document: dict[str, Any], phase: str, failure: str | None, age: float) -> str:
     if phase == "failed":
         return f"models failed to load ({failure or 'cause unknown'}); restart the agent"
+    if phase == "unloaded":
+        return (
+            "models unloaded after sitting idle (mcp.public.idle_unload_seconds); the "
+            "next tool call reloads them and is answered WARMING_UP until they are warm"
+        )
     if phase == "ready":
         elapsed = document.get("elapsed_seconds")
         took = f" in {elapsed} s" if isinstance(elapsed, int | float) else ""

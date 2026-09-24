@@ -188,6 +188,18 @@ class RetrievalService:
         steps.append(WarmUpStep(BUFFER_POOL_STEP, estimate[BUFFER_POOL_STEP], buffer_pool))
         return tuple(steps)
 
+    def unload_models(self) -> None:
+        """Drop every model provider's weights, on the calling thread —
+        the idle unloader runs this on the model thread
+        (`imsg.retrieval.idle_unload`). A provider with no `unload` (the
+        fake backend's) holds no weights and is skipped. The next model
+        call loads each one again: every real provider loads lazily, and
+        the server re-runs `warm_up_steps` before it answers anyway."""
+        for provider in (self._text_provider, self._multimodal_provider, self._reranker):
+            unload = getattr(provider, "unload", None)
+            if callable(unload):
+                unload()
+
     def warm_up(self) -> float:
         """Run every :meth:`warm_up_steps` step now, on this thread's
         behalf, and return the seconds it took. The local MCP server runs

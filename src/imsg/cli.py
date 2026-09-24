@@ -157,6 +157,7 @@ from imsg.providers.factory import (
 )
 from imsg.providers.manifest import verify_manifest
 from imsg.retrieval.background_warm_up import BackgroundWarmUp
+from imsg.retrieval.idle_unload import IdleModelUnloader
 from imsg.retrieval.model_thread import ModelThread
 from imsg.retrieval.service import RetrievalService
 from imsg.segment.pipeline import REBUILD_ALL_SENTINEL, run_segment, run_segment_for_chat
@@ -2536,8 +2537,26 @@ def mcp_local(config: ConfigOption = None) -> None:
         model_thread=model_thread,
         log=lambda line: typer.echo(f"mcp local: {line}", err=True),
     )
+    # Drops the models after mcp.local.idle_unload_seconds with no
+    # retrieval call: every client session runs its own copy of this
+    # server, so idle sessions would otherwise hold a model set each
+    # (imsg.retrieval.idle_unload).
+    idle_unloader = IdleModelUnloader(
+        warm_up=warm_up,
+        model_thread=model_thread,
+        unload=service.unload_models,
+        idle_seconds=cfg.mcp.local.idle_unload_seconds,
+        log=lambda line: typer.echo(f"mcp local: {line}", err=True),
+    )
     audit = PostgresAuditSink(lambda: connect(cfg.database, autocommit=True))
-    local = LocalMcpServer(service=service, audit=audit, config=cfg, conn=conn, warm_up=warm_up)
+    local = LocalMcpServer(
+        service=service,
+        audit=audit,
+        config=cfg,
+        conn=conn,
+        warm_up=warm_up,
+        idle_unloader=idle_unloader,
+    )
     try:
         anyio.run(run_local_server, local)
     finally:
@@ -2728,8 +2747,19 @@ def mcp_public(
         log=lambda line: typer.echo(f"mcp public: {line}", err=True),
         on_status=readiness.publish,
     )
+    idle_unloader = IdleModelUnloader(
+        warm_up=warm_up,
+        model_thread=model_thread,
+        unload=service.unload_models,
+        idle_seconds=cfg.mcp.public.idle_unload_seconds,
+        log=lambda line: typer.echo(f"mcp public: {line}", err=True),
+    )
     public = PublicMcpServer(
-        service=service, gate=gate, scope=cfg.mcp.public.scope, warm_up=warm_up
+        service=service,
+        gate=gate,
+        scope=cfg.mcp.public.scope,
+        warm_up=warm_up,
+        idle_unloader=idle_unloader,
     )
     asgi_app = build_public_asgi_app(
         public,
@@ -2749,9 +2779,11 @@ def mcp_public(
     # here blocks — `start()` hands the steps to the model thread and
     # returns, so uvicorn binds and serves while the weights load.
     warm_up.start()
+    idle_unloader.start_watchdog()
     try:
         uvicorn.run(asgi_app, host=host, port=port, log_level="info")
     finally:
+        idle_unloader.stop()
         model_thread.close()
         query_marker.close()
         fts_conn.close()

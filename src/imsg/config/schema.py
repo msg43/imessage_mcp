@@ -572,8 +572,36 @@ class RenderConfig(StrictModel):
 # --------------------------------------------------------------------------
 
 
+IDLE_UNLOAD_MIN_SECONDS = 60
+"""The shortest idle period `mcp.*.idle_unload_seconds` accepts, other
+than 0 (off). Mirrors `imsg.retrieval.idle_unload.MIN_IDLE_UNLOAD_SECONDS`
+(not imported: the config layer imports nothing from the runtime)."""
+
+
+def _check_idle_unload_seconds(value: int, key: str) -> int:
+    if value != 0 and value < IDLE_UNLOAD_MIN_SECONDS:
+        raise ValueError(
+            f"{key} must be 0 (never unload) or at least {IDLE_UNLOAD_MIN_SECONDS} "
+            f"seconds, got {value}: reloading the models takes tens of seconds, so "
+            f"a shorter period would unload them between the queries of one conversation"
+        )
+    return value
+
+
 class McpLocalConfig(StrictModel):
     enabled: bool = True
+    idle_unload_seconds: int = Field(default=600, ge=0)
+    """Drop the retrieval models after this many seconds with no
+    retrieval tool call; the next call reloads them (waiting up to 90 s,
+    else `WARMING_UP`). 0 keeps them loaded for the life of the process.
+    Every client session runs its own `imsg mcp local`, each holding its
+    own copy of the models, so this is what keeps idle sessions from
+    exhausting memory (`imsg.retrieval.idle_unload`)."""
+
+    @field_validator("idle_unload_seconds", mode="after")
+    @classmethod
+    def _idle_unload(cls, value: int) -> int:
+        return _check_idle_unload_seconds(value, "mcp.local.idle_unload_seconds")
 
 
 class McpPublicOauthConfig(StrictModel):
@@ -599,6 +627,18 @@ class McpPublicConfig(StrictModel):
     )
     rate_limit_per_minute: int = Field(default=60, ge=1)
     oauth: McpPublicOauthConfig = Field(default_factory=McpPublicOauthConfig)
+    idle_unload_seconds: int = Field(default=0, ge=0)
+    """As `mcp.local.idle_unload_seconds`, but off by default: the public
+    surface is one process, not one per session, and a public retrieval
+    call waits only 20 s for the models before answering `WARMING_UP`
+    (the Cloudflare edge gives up at 125 s), which is shorter than a
+    reload — so with this on, the first public call after an unload is
+    answered `WARMING_UP` and has to be retried."""
+
+    @field_validator("idle_unload_seconds", mode="after")
+    @classmethod
+    def _idle_unload(cls, value: int) -> int:
+        return _check_idle_unload_seconds(value, "mcp.public.idle_unload_seconds")
 
     @model_validator(mode="after")
     def _enabled_requires_full_configuration(self) -> McpPublicConfig:

@@ -154,6 +154,12 @@ render:
 mcp:
   local:
     enabled: true
+    # Drop the retrieval models (roughly 10-15 GiB per process) after this many
+    # seconds with no retrieval tool call; the next call reloads them,
+    # waiting up to 90 s. Every client session runs its own server, so this
+    # is what stops idle sessions from exhausting memory. 0 = never unload;
+    # otherwise at least 60.
+    idle_unload_seconds: 600
   public:
     enabled: false                # flip on only at Phase 6, after AT-1 passes
     bind: 127.0.0.1:8700
@@ -164,6 +170,9 @@ mcp:
     allowed_hosts: []
     protocol_versions: ["2025-11-25", "2026-07-28"]
     rate_limit_per_minute: 60
+    # Off by default: a public call waits only 20 s for the models, less
+    # than a reload, so the first call after an unload answers WARMING_UP.
+    idle_unload_seconds: 0
     oauth:
       issuer: google
       client_id: env:IMSG_OAUTH_CLIENT_ID
