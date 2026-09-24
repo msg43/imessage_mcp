@@ -2,7 +2,11 @@
 until a file appears — the child process for the stdio test in
 `tests/test_mcp_local_server_warm_up.py`.
 
-Usage: python _run_local_mcp_server_with_held_warm_up.py RELEASE_FILE WAIT_SECONDS
+Usage: python _run_local_mcp_server_with_held_warm_up.py RELEASE_FILE WAIT_SECONDS [IDLE_SECONDS]
+
+With IDLE_SECONDS, the server also runs an idle unloader with its
+watchdog thread started, as `imsg mcp local` does — so a test can show
+that the watchdog does not keep a disconnected server alive either.
 
 Runs `imsg.mcp.tools.local_server.run_local_server` exactly as the CLI
 does, but over a fake retrieval service (no database) and a single fake
@@ -25,6 +29,7 @@ import structlog
 from imsg.mcp.audit import MemoryAuditSink
 from imsg.mcp.tools.local_server import LocalMcpServer, run_local_server
 from imsg.retrieval.background_warm_up import BackgroundWarmUp, WarmUpStep
+from imsg.retrieval.idle_unload import IdleModelUnloader
 from imsg.retrieval.model_thread import ModelThread
 from imsg.retrieval.service import SearchMessagesResult
 
@@ -48,15 +53,25 @@ def main() -> None:
             time.sleep(0.01)
 
     model_thread = ModelThread()
+    warm_up = BackgroundWarmUp(
+        [WarmUpStep("text embedder", 30.0, held_step)], model_thread=model_thread
+    )
+    idle_unloader = None
+    if len(sys.argv) > 3:
+        idle_unloader = IdleModelUnloader(
+            warm_up=warm_up,
+            model_thread=model_thread,
+            unload=lambda: None,
+            idle_seconds=float(sys.argv[3]),
+        )
     local = LocalMcpServer(
         service=cast(Any, _FakeRetrievalService()),
         audit=MemoryAuditSink(),
         config=cast(Any, None),
         conn=cast(Any, None),
-        warm_up=BackgroundWarmUp(
-            [WarmUpStep("text embedder", 30.0, held_step)], model_thread=model_thread
-        ),
+        warm_up=warm_up,
         warm_up_wait_seconds=wait_seconds,
+        idle_unloader=idle_unloader,
     )
     anyio.run(run_local_server, local)
 

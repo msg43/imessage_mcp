@@ -260,6 +260,15 @@ class MlxRerankerProvider:
         if self._cache_limit_bytes is not None:
             bound_buffer_cache(self._cache_limit_bytes)
 
+    def unload(self) -> None:
+        """Drop the weights and tokenizer (idempotent); the next call that
+        needs them loads them again. Dropping the references is all this
+        does — the caller returns the freed memory to the system
+        (`imsg.retrieval.idle_unload.release_freed_memory`), because MLX
+        keeps freed buffers in its own cache until told otherwise."""
+        self._model = None
+        self._tokenizer = None
+
     def score(self, query: str, documents: list[str]) -> list[float]:
         docs = list(documents)
         if not docs:

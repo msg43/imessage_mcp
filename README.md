@@ -430,6 +430,26 @@ query after warm-up still costs a little more than the rest (0.94-4.08 s
 against a 0.87 s median), and the extra is the query embedder's first
 forward pass at a real shape: 0.13-3.07 s against 0.055 s afterwards.
 
+**Idle unload.** Every client session runs its own `imsg mcp local`, and
+each process holds its own copy of the models (text embedder, PE-Core text
+tower, reranker, plus MLX's buffer cache). Idle sessions used to keep that
+memory until they exited; five of them exhausted a 64 GiB index host. Now a
+server drops its models after `mcp.local.idle_unload_seconds` (default 600;
+0 = never) with no retrieval tool call. It clears MLX's and torch's caches
+so the memory goes back to the system, and never unloads while a call is
+in flight. The next retrieval call reloads the models through the same
+warm-up and the same 90 s wait. A reload from a warm OS file cache took
+1.2 s for the 8B embedder and 0.6B reranker on an M2 Ultra (9.4 GB of
+process footprint down to 0.35 GB after unload, 2026-09-24). A reload from
+disk costs about what a cold start does, and past 90 s the call answers
+`WARMING_UP` for the client to retry. `check_permissions` reports the state
+as `unloaded`. `mcp.public.idle_unload_seconds` defaults to 0: the public
+surface is a single process, and its 20 s wait is shorter than a reload.
+A server whose stdin closes, which is what happens when the SSH client
+disconnects, exits at once, even mid-warm-up. A client that vanishes
+without closing the connection (a machine that sleeps) is noticed only
+when sshd's `ClientAliveInterval` gives up on it.
+
 | Interface | What it needs |
 |---|---|
 | `TextEmbeddingProvider` | `embed_documents()` (bare) and `embed_query()` (instruction-prefixed); **2048-dim**, L2-normalized |

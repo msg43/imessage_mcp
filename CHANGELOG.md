@@ -10,6 +10,34 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-24 — Idle MCP servers unload their models (the index host ran out of memory)
+
+- **Why.** The index host (64 GiB) ran out of memory and hung. The kernel
+  panic report showed five idle Python processes holding about 62 GiB
+  between them, 5-33 hours old. Each `imsg mcp local` loads its own model
+  set at startup and kept it until exit, and every client session runs its
+  own server over SSH. So idle sessions stacked up full copies of the
+  models.
+- **Idle unload** (`imsg.retrieval.idle_unload`). After
+  `mcp.local.idle_unload_seconds` (new, default 600, 0 = off, otherwise at
+  least 60) with no retrieval call, the server drops every provider's
+  weights on the model thread, runs `gc`, and empties MLX's buffer cache and
+  torch's MPS cache. The warm-up moves to a new `unloaded` phase. The next
+  retrieval call restarts the warm-up and waits for it like a cold start
+  does (up to 90 s, then `WARMING_UP` with an estimate). The unloader and
+  tool calls share one lock, so nothing unloads while a call is in flight.
+  The public surface gets `mcp.public.idle_unload_seconds`, default 0,
+  because its 20 s wait is shorter than a reload.
+- **Measured** on an M2 Ultra with the 8B embedder and the 0.6B reranker:
+  process footprint went from 9.4 GB loaded to 0.35 GB after the unload,
+  and the reload from the OS file cache took 1.2 s. PE-Core's torch release
+  was not measured.
+- **stdin EOF was already handled.** A server whose client disconnects (its
+  stdin closes) exits within a second, even mid-warm-up or while a call
+  waits for the models. New subprocess tests pin that behaviour, including
+  with the idle watchdog thread running.
+- 29 new unit tests (fake clock; no database).
+
 ## 2026-09-23 — Accept integral transport numbers without retrieval errors
 
 - JSON Schema accepts `3.0` as an integer, but Python slicing does not.
