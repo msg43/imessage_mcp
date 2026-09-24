@@ -73,6 +73,112 @@ def test_guard_mount_never_infers_containment_by_string_prefix(
         guard_mount(escape_link, diskutil_info=reports_decoy_as_the_volume)
 
 
+def _boot_volume_mount_info(path: Path) -> MountInfo:
+    """A fake `diskutil_info` reporting the startup volume ('/') for any path —
+    real `diskutil`'s `Encryption` field for '/' is not what this gate trusts
+    for the boot volume; `filevault_status` is."""
+    return MountInfo(mount_point=Path("/"), encrypted=False, volume_name="Macintosh HD")
+
+
+def test_guard_mount_succeeds_on_boot_volume_when_filevault_on(data_root: Path) -> None:
+    info = guard_mount(
+        data_root,
+        diskutil_info=_boot_volume_mount_info,
+        filevault_status=lambda: True,
+    )
+    assert info.mount_point == Path("/")
+
+
+def test_guard_mount_fails_on_boot_volume_when_filevault_off(data_root: Path) -> None:
+    with pytest.raises(MountGateError, match="FileVault"):
+        guard_mount(
+            data_root,
+            diskutil_info=_boot_volume_mount_info,
+            filevault_status=lambda: False,
+        )
+
+
+def test_guard_mount_fails_on_boot_volume_when_filevault_status_unknown(
+    data_root: Path,
+) -> None:
+    """Ambiguous/undetectable FileVault status must fail closed, not be
+    treated as either on or off."""
+    with pytest.raises(MountGateError, match="could not be determined"):
+        guard_mount(
+            data_root,
+            diskutil_info=_boot_volume_mount_info,
+            filevault_status=lambda: None,
+        )
+
+
+def test_guard_mount_refuses_unmounted_volumes_path_even_with_filevault_on() -> None:
+    """A data_root under /Volumes/ that resolves to the boot volume means the
+    intended separate volume isn't mounted — always refused, before any
+    FileVault check, even when the sentinel is present and FileVault is on."""
+    root = Path("/Volumes/Fictional-Data/imsgindex")
+
+    with pytest.raises(MountGateError, match="not mounted"):
+        guard_mount(
+            root,
+            diskutil_info=_boot_volume_mount_info,
+            filevault_status=lambda: True,
+        )
+
+
+def test_guard_mount_succeeds_on_boot_volume_for_a_path_outside_volumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A data_root outside /Volumes/ (e.g. a home-directory path) that
+    resolves to the boot volume is judged purely on FileVault status, not
+    refused the way an unmounted /Volumes/ path is."""
+    fake_home = tmp_path / "home"
+    root = fake_home / "imsgindex-data"
+    root.mkdir(parents=True)
+    (root / ".imsgindex-volume").write_text("")
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    info = guard_mount(
+        root,
+        diskutil_info=_boot_volume_mount_info,
+        filevault_status=lambda: True,
+    )
+    assert info.mount_point == Path("/")
+
+
+def test_guard_mount_fails_on_boot_volume_when_sentinel_missing(tmp_path: Path) -> None:
+    root = tmp_path / "no_sentinel_on_boot"
+    root.mkdir()
+    with pytest.raises(MountGateError, match="sentinel"):
+        guard_mount(
+            root,
+            diskutil_info=_boot_volume_mount_info,
+            filevault_status=lambda: True,
+        )
+
+
+def test_real_filevault_status_normalizes_subprocess_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`real_filevault_status` must never raise — `FileNotFoundError` (no
+    `fdesetup`, i.e. not macOS) and a timeout both come back as `None`
+    (unknown), which `guard_mount` then fails closed on."""
+    import subprocess as subprocess_module
+
+    from imsg.mount.guard import real_filevault_status
+
+    def _raise_not_found(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("no fdesetup")
+
+    monkeypatch.setattr(subprocess_module, "run", _raise_not_found)
+    assert real_filevault_status() is None
+
+    def _raise_timeout(*args: object, **kwargs: object) -> None:
+        raise subprocess_module.TimeoutExpired(cmd=["fdesetup", "status"], timeout=5)
+
+    monkeypatch.setattr(subprocess_module, "run", _raise_timeout)
+    assert real_filevault_status() is None
+
+
 def test_diskutil_failure_is_normalized_to_mount_gate_error(data_root: Path) -> None:
     def broken(path: Path) -> MountInfo:
         raise RuntimeError("diskutil exploded")

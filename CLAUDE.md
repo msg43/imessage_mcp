@@ -27,8 +27,9 @@ documents contain real names by design. Sweep before committing.
 1. **Never write to the live `chat.db`.** Snapshot via SQLite's
    online-backup API; never `cp` (WAL correctness). All derived state
    lives elsewhere.
-2. **All derived state under `data_root`**, on the encrypted volume.
-   Startup gates on the mount.
+2. **All derived state under `data_root`**, on encrypted storage: either
+   a FileVault-encrypted startup (boot) disk, or a separate encrypted
+   volume. Startup gates on it.
 3. **Identity resolution precedes segmentation.** Nothing downstream
    keys on a raw handle; everything keys on `person_id`.
 4. **Subject validation on the public surface is the only access
