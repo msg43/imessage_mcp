@@ -354,6 +354,7 @@ def test_check_permissions_reports_not_started_ready_and_failed(
         "steps_total": 1,
         "seconds_remaining": None,
         "failure": None,
+        "memory_detail": None,
     }
 
     failing = _Harness(
@@ -476,3 +477,79 @@ def test_over_real_stdio_the_handshake_is_answered_while_the_warm_up_is_held(
     assert "warm-up started: 1 step in the background (text embedder)" in log
     assert "text embedder ready in " in log
     assert "warm-up done: 1 step ready in " in log
+
+
+def test_over_real_stdio_a_lazy_server_loads_nothing_until_asked(tmp_path: Path) -> None:
+    """The real `run_local_server` in a child process, as `imsg mcp local`
+    runs by default: the handshake and `tools/list` load nothing; the first
+    search starts the (held) load and is answered once it finishes."""
+    release_file = tmp_path / "release"
+    stderr_path = tmp_path / "stderr.log"
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
+    with stderr_path.open("wb") as stderr:
+        proc = subprocess.Popen(
+            [sys.executable, str(HELPER), str(release_file), "0.3", "600", "--lazy"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            env=env,
+        )
+    assert proc.stdin is not None and proc.stdout is not None
+    lines: queue.Queue[bytes | None] = queue.Queue()
+
+    def pump() -> None:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            lines.put(raw)
+        lines.put(None)
+
+    threading.Thread(target=pump, daemon=True).start()
+    stray: list[bytes] = []
+
+    def send(message: dict[str, Any]) -> None:
+        assert proc.stdin is not None
+        proc.stdin.write((json.dumps(message) + "\n").encode())
+        proc.stdin.flush()
+
+    try:
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "lazy-test", "version": "0"},
+                },
+            }
+        )
+        assert _read_json_line(lines, stray, timeout=20)["id"] == 1
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        assert _read_json_line(lines, stray, timeout=10)["id"] == 2
+        time.sleep(0.5)
+        assert "warm-up started" not in stderr_path.read_text()  # nothing loaded yet
+
+        call = {"name": "search_messages", "arguments": {"query": "kite festival"}}
+        send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": call})
+        first = _read_json_line(lines, stray, timeout=10)
+        assert first["result"]["content"][0]["text"].startswith("WARMING_UP\n")
+        assert "warm-up started: 1 step in the background (text embedder)" in (
+            stderr_path.read_text()
+        )
+
+        release_file.write_text("")
+        for request_id in range(4, 50):
+            send({"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": call})
+            answered = _read_json_line(lines, stray, timeout=10)
+            if not answered["result"].get("isError"):
+                break
+        assert answered["result"]["structuredContent"]["results"] == []
+        proc.stdin.close()
+        assert proc.wait(timeout=20) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+    assert stray == []

@@ -23,6 +23,13 @@ FTS sidecar sync is a separate concern
 already carries its own `search_index_event` rows from S4/S5b at the
 point it's created or changed; this module only computes vectors.
 
+Stopping between batches (2026-09-24): given a `stop_check`
+(`imsg.background_gate`), the run asks it before every text batch and
+every image or video, and on a reason stops there — every batch already
+embedded is committed, nothing else is started — and raises
+`BackgroundWorkDeferred` carrying the partial `EmbedRunReport`. The rows
+not reached stay pending for the next run.
+
 Batching (2026-09-15): pending rows are embedded longest-first in
 length-sorted, token-budgeted batches (`imsg.embed.batching.
 plan_batches` over `imsg.tokens.estimate_tokens` of the normalized
@@ -48,6 +55,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from imsg import constants
+from imsg.background_gate import BackgroundWorkDeferred, StopCheck, StopReason
 from imsg.embed.batching import DEFAULT_MAX_BATCH_TOKENS, padded_tokens, plan_batches
 from imsg.embed.provider import MultimodalEmbeddingProvider, TextEmbeddingProvider
 from imsg.embed.vector_codec import vector_literal
@@ -172,6 +180,19 @@ def plan_pending_batches(
     ]
 
 
+class _Stopper:
+    """Asks the stop check and remembers the first reason it gave."""
+
+    def __init__(self, check: StopCheck | None) -> None:
+        self._check = check
+        self.reason: StopReason | None = None
+
+    def should_stop(self) -> bool:
+        if self.reason is None and self._check is not None:
+            self.reason = self._check()
+        return self.reason is not None
+
+
 def _embed_rows(
     conn: psycopg.Connection,
     provider: TextEmbeddingProvider,
@@ -179,15 +200,20 @@ def _embed_rows(
     *,
     upsert_sql: str,
     kind: str,
+    stopper: _Stopper | None = None,
 ) -> int:
     """Embed and commit `batches` one at a time: a batch's rows land in
     one transaction, and a failure mid-run leaves every earlier batch
-    committed and the failing one absent (SPEC §8 S6)."""
+    committed and the failing one absent (SPEC §8 S6). A `stopper` that
+    says stop ends the loop before the next batch."""
     written = 0
     total_rows = sum(len(batch) for batch in batches)
     total_tokens = sum(estimate_tokens(text) for batch in batches for _, text, _ in batch)
     done_tokens = 0
     for index, batch in enumerate(batches, start=1):
+        if stopper is not None and stopper.should_stop():
+            logger.info("embed.stopped", kind=kind, batch=index, batches=len(batches))
+            break
         started = time.perf_counter()
         vectors = provider.embed_documents([text for _, text, _ in batch])
         if len(vectors) != len(batch):
@@ -231,11 +257,14 @@ def _embed_segments(
     pending: list[PendingRow],
     batch_size: int,
     max_batch_tokens: int = DEFAULT_MAX_BATCH_TOKENS,
+    stopper: _Stopper | None = None,
 ) -> int:
     batches = plan_pending_batches(
         pending, batch_size=batch_size, max_batch_tokens=max_batch_tokens
     )
-    return _embed_rows(conn, provider, batches, upsert_sql=SEGMENT_UPSERT_SQL, kind="segment")
+    return _embed_rows(
+        conn, provider, batches, upsert_sql=SEGMENT_UPSERT_SQL, kind="segment", stopper=stopper
+    )
 
 
 def _embed_chunks(
@@ -244,11 +273,14 @@ def _embed_chunks(
     pending: list[PendingRow],
     batch_size: int,
     max_batch_tokens: int = DEFAULT_MAX_BATCH_TOKENS,
+    stopper: _Stopper | None = None,
 ) -> int:
     batches = plan_pending_batches(
         pending, batch_size=batch_size, max_batch_tokens=max_batch_tokens
     )
-    return _embed_rows(conn, provider, batches, upsert_sql=CHUNK_UPSERT_SQL, kind="chunk")
+    return _embed_rows(
+        conn, provider, batches, upsert_sql=CHUNK_UPSERT_SQL, kind="chunk", stopper=stopper
+    )
 
 
 # --------------------------------------------------------------------------
@@ -361,7 +393,9 @@ def _upsert_mm_embedding(
 
 
 def _embed_multimodal(
-    conn: psycopg.Connection, provider: MultimodalEmbeddingProvider
+    conn: psycopg.Connection,
+    provider: MultimodalEmbeddingProvider,
+    stopper: _Stopper | None = None,
 ) -> tuple[int, int, int]:
     """Returns `(written, skipped_no_frames, failed)`.
 
@@ -377,6 +411,8 @@ def _embed_multimodal(
     failed = 0
 
     for attachment_id, cache_path, media_sha256 in _pending_multimodal_images(conn):
+        if stopper is not None and stopper.should_stop():
+            return written, skipped_no_frames, failed
         try:
             vectors = provider.embed_images([Path(cache_path)])
         except ImageEmbeddingError as exc:
@@ -397,6 +433,8 @@ def _embed_multimodal(
         written += 1
 
     for attachment_id, detail in _pending_multimodal_videos(conn):
+        if stopper is not None and stopper.should_stop():
+            return written, skipped_no_frames, failed
         frame_paths = [Path(p) for p in _frame_paths_from_detail(detail)]
         existing_paths = [p for p in frame_paths if p.is_file()]
         if not existing_paths:
@@ -435,6 +473,7 @@ def run_embed(
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_batch_tokens: int = DEFAULT_MAX_BATCH_TOKENS,
     dry_run: bool = False,
+    stop_check: StopCheck | None = None,
 ) -> EmbedRunReport:
     """One full embedding pass: every segment/chunk lacking an
     up-to-date embedding, then (if `multimodal_provider` is given)
@@ -442,6 +481,10 @@ def run_embed(
     `attachment_mm_embedding` (D3a). `batch_size` and
     `max_batch_tokens` bound each text batch — rows and padded tokens
     (`plan_pending_batches`).
+
+    `stop_check` is asked before every batch and every image or video;
+    when it gives a reason the run stops there and raises
+    `BackgroundWorkDeferred` with the partial report (module docstring).
 
     `dry_run=True` (SPEC §8: "takes --dry-run where writes leave the
     machine") never calls `text_provider`/`multimodal_provider` at all
@@ -477,28 +520,34 @@ def run_embed(
             dry_run=True,
         )
 
+    stopper = _Stopper(stop_check)
     segments_written = _embed_segments(
-        conn, text_provider, _pending_segments(conn), batch_size, max_batch_tokens
+        conn, text_provider, _pending_segments(conn), batch_size, max_batch_tokens, stopper
     )
-    chunks_written = _embed_chunks(
-        conn, text_provider, _pending_chunks(conn), batch_size, max_batch_tokens
-    )
+    chunks_written = 0
+    if stopper.reason is None:
+        chunks_written = _embed_chunks(
+            conn, text_provider, _pending_chunks(conn), batch_size, max_batch_tokens, stopper
+        )
 
     attachments_written = 0
     skipped_no_frames = 0
     attachments_failed = 0
-    if multimodal_provider is not None:
+    if multimodal_provider is not None and stopper.reason is None:
         attachments_written, skipped_no_frames, attachments_failed = _embed_multimodal(
-            conn, multimodal_provider
+            conn, multimodal_provider, stopper
         )
 
-    return EmbedRunReport(
+    report = EmbedRunReport(
         segments_embedded=segments_written,
         chunks_embedded=chunks_written,
         attachments_embedded=attachments_written,
         attachments_skipped_no_frames=skipped_no_frames,
         attachments_failed=attachments_failed,
     )
+    if stopper.reason is not None:
+        raise BackgroundWorkDeferred(stopper.reason, partial=report)
+    return report
 
 
 __all__ = [

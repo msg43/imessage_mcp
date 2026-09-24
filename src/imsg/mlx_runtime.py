@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import sys
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from types import ModuleType
@@ -110,7 +111,10 @@ def import_mlx_lm() -> ModuleType:
 
 def bound_buffer_cache(limit_bytes: int) -> None:
     """Bound MLX's buffer cache to at most ``limit_bytes``, keeping any
-    tighter bound already in place.
+    tighter bound already in place — and apply this process's MLX memory
+    limit, if its command set one (:func:`set_process_memory_limit`).
+    Every MLX provider calls this when its weights load, which makes it
+    the one point where the runtime is certainly imported.
 
     The cache limit is process-wide, and several providers share one
     process (the retrieval service loads the text embedder and the
@@ -125,11 +129,59 @@ def bound_buffer_cache(limit_bytes: int) -> None:
     if limit_bytes < 0:
         raise ValueError(f"limit_bytes must be >= 0, got {limit_bytes}")
     set_cache_limit = getattr(import_mlx_core(), "set_cache_limit", None)
-    if set_cache_limit is None:
-        return
-    previous = set_cache_limit(limit_bytes)
-    if isinstance(previous, int) and not isinstance(previous, bool) and 0 <= previous < limit_bytes:
-        set_cache_limit(previous)
+    if set_cache_limit is not None:
+        previous = set_cache_limit(limit_bytes)
+        if (
+            isinstance(previous, int)
+            and not isinstance(previous, bool)
+            and 0 <= previous < limit_bytes
+        ):
+            set_cache_limit(previous)
+    apply_process_memory_limit()
+
+
+_process_memory_limit_bytes: int | None = None
+"""The MLX memory limit this process's command asked for, or `None` for
+MLX's own default. See :func:`set_process_memory_limit`."""
+
+
+def set_process_memory_limit(limit_bytes: int | None) -> None:
+    """Record the MLX memory limit this process runs under — the role's
+    `memory.mlx_memory_limits` entry, chosen by the command
+    (`imsg.memory_admission.configure_mlx_memory_limit`) — and apply it
+    now if MLX is already imported. Otherwise the first provider to load
+    applies it (:func:`bound_buffer_cache`), so a command that never
+    loads a model never imports MLX. `None` records nothing to apply
+    (MLX's default stays).
+
+    What the limit does is in `imsg.config.schema.MlxMemoryLimits`: it
+    moves the point at which MLX releases cached buffers and the point
+    at which evaluation waits for work in flight; it never refuses an
+    allocation and never changes a result."""
+    if limit_bytes is not None and limit_bytes <= 0:
+        raise ValueError(f"limit_bytes must be > 0 or None, got {limit_bytes}")
+    global _process_memory_limit_bytes
+    _process_memory_limit_bytes = limit_bytes
+    if limit_bytes is not None and "mlx.core" in sys.modules:
+        apply_process_memory_limit()
+
+
+def process_memory_limit() -> int | None:
+    return _process_memory_limit_bytes
+
+
+def apply_process_memory_limit() -> int | None:
+    """Set MLX's memory limit to the recorded one; returns what was set,
+    or `None` when nothing was recorded or the runtime has no
+    ``set_memory_limit``."""
+    limit = _process_memory_limit_bytes
+    if limit is None:
+        return None
+    set_memory_limit = getattr(import_mlx_core(), "set_memory_limit", None)
+    if set_memory_limit is None:
+        return None
+    set_memory_limit(limit)
+    return limit
 
 
 def format_model_id(model_repo: str, revision: str | None) -> str:
@@ -320,6 +372,7 @@ __all__ = [
     "DEFAULT_CACHE_LIMIT_BYTES",
     "MlxRuntimeError",
     "MlxRuntimeUnavailableError",
+    "apply_process_memory_limit",
     "base_transformer_hidden_states",
     "batched",
     "bound_buffer_cache",
@@ -331,5 +384,7 @@ __all__ = [
     "import_mlx_lm",
     "lm_head_logits",
     "load_model_and_tokenizer",
+    "process_memory_limit",
     "right_pad",
+    "set_process_memory_limit",
 ]

@@ -52,6 +52,7 @@ from typing import Any
 import psycopg
 import structlog
 
+from imsg.background_gate import BackgroundWorkDeferred, StopReason
 from imsg.config.schema import Config
 from imsg.errors import ImsgError, SyncError
 from imsg.mount.guard import guard_mount
@@ -115,6 +116,11 @@ class SyncResult:
     segment_ran: bool
     embed_ran: bool
     dry_run: bool = False
+    deferred: StopReason | None = None
+    """Set when S4/S6 did not run, or stopped part-way, because heavy
+    background work is paused or the host had no memory for the models
+    (`imsg.background_gate`). S1-S3 ran regardless: every new message is
+    in the database; it is segmented and embedded on a later run."""
     note: str | None = None
     """Set when a dry run stopped the chain early (SPEC §8 S1/S7
     sequencing tradeoff: S1's dry-run mode never actually creates a
@@ -268,11 +274,18 @@ def run_sync(
             f"sync for source '{source_name}' stopped before S4: {exc}"
         ) from exc
 
+    # S4/S6 are the heavy steps. A step that is deferred (paused, or no
+    # memory for its models) raises `BackgroundWorkDeferred`; that is not
+    # a failure of this sync — S1-S3's work above stands — so it is
+    # recorded, and the heavy steps after it are skipped.
+    deferred: StopReason | None = None
     segment_ran = False
     if segment_fn is not None:
         try:
             segment_fn(conn, config, dry_run=dry_run)
             segment_ran = True
+        except BackgroundWorkDeferred as exc:
+            deferred = exc.reason
         except ImsgError as exc:
             raise SyncError(f"sync for source '{source_name}' failed at S4 segment: {exc}") from exc
     else:
@@ -281,14 +294,18 @@ def run_sync(
         )
 
     embed_ran = False
-    if embed_fn is not None:
+    if embed_fn is not None and deferred is None:
         try:
             embed_fn(conn, config, dry_run=dry_run)
             embed_ran = True
+        except BackgroundWorkDeferred as exc:
+            deferred = exc.reason
         except ImsgError as exc:
             raise SyncError(f"sync for source '{source_name}' failed at S6 embed: {exc}") from exc
-    else:
+    elif embed_fn is None:
         logger.info("sync.embed_skipped", source=source_name, reason="no embed_fn supplied")
+    if deferred is not None:
+        logger.info("sync.heavy_steps_deferred", source=source_name, reason=deferred.line())
 
     return SyncResult(
         source_name=source_name,
@@ -298,6 +315,7 @@ def run_sync(
         segment_ran=segment_ran,
         embed_ran=embed_ran,
         dry_run=dry_run,
+        deferred=deferred,
     )
 
 

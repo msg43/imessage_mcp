@@ -269,6 +269,17 @@ class MlxBoundaryProvider:
         self._model = model
         self._tokenizer = tokenizer
 
+    def unload(self) -> None:
+        """Drop this provider's hold on the weights (idempotent); the next
+        :meth:`detect_boundaries` loads them again. Dropping references is
+        all it does — the caller returns the freed memory to the system
+        (`imsg.retrieval.idle_unload.release_freed_memory`). A provider
+        on a shared runtime drops only its own reference: the runtime
+        keeps the model for the captioner that shares it."""
+        self._model = None
+        self._tokenizer = None
+        self._vlm = None
+
     def detect_boundaries(self, window: Sequence[MessageForSegmentation]) -> list[int]:
         if len(window) < 2:
             return []  # no index can satisfy 0 < i < len(window); nothing to ask the model

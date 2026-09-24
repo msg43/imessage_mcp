@@ -46,6 +46,7 @@ from imsg.backfill.dataless import is_dataless
 from imsg.backfill.fetch import LocationFetchReport, LocationFetchSettings, fetch_from_locations
 from imsg.backfill.materialize import materialize_attachment
 from imsg.backfill.throttle import RateThrottle
+from imsg.background_gate import StopCheck, StopReason
 from imsg.enrich.planner import enqueue_for_materialized
 from imsg.paths import is_contained_in, resolve_path
 
@@ -125,6 +126,10 @@ class BackfillRunReport:
     materialization stands, and `imsg enrich --plan` retries them."""
     trial_gate_capped: bool = False
     halted_low_disk_space: bool = False
+    stopped: StopReason | None = None
+    """Set when the run stopped between files because heavy background
+    work was paused or the host was short of memory
+    (`imsg.background_gate`); the rest are tried on the next run."""
     notes: list[str] = field(default_factory=list)
     dry_run: bool = False
     """True when this report came from `run_backfill(dry_run=True)`
@@ -398,6 +403,7 @@ def run_backfill(
     dry_run: bool = False,
     retry_failed: bool = False,
     locations: LocationFetchSettings | None = None,
+    stop_check: StopCheck | None = None,
 ) -> BackfillRunReport:
     """Run one backfill pass. `attachments_root` is the live
     `~/Library/Messages/Attachments` directory — every candidate's
@@ -425,6 +431,11 @@ def run_backfill(
     runs after the attempt loop, so an attachment's own path is always
     tried first; it shares the loop's throttle, free-space floor and, on a
     first run, what is left of the trial gate's allowance.
+
+    `stop_check` (`imsg.background_gate`) is asked before each file of a
+    real run, and by the location phase before each copy it tries; on a
+    reason the run stops there with `report.stopped` set, and the
+    location phase does not start.
     """
     disk_free_fn = disk_free_fn or _default_disk_free
     throttle = throttle or RateThrottle(rate_per_minute)
@@ -511,6 +522,11 @@ def run_backfill(
                     f"minimum {min_free_bytes} bytes"
                 )
                 break
+        stop = stop_check() if stop_check is not None else None
+        if stop is not None:
+            report.stopped = stop
+            report.notes.append(f"stopped after {i - 1} file(s): {stop.line()}")
+            break
 
         source_path, refusal = _refusal_reason(candidate.source_path, resolved_attachments_root)
         if refusal is not None:
@@ -555,7 +571,7 @@ def run_backfill(
         report.materialized += 1
         _enqueue_enrichment(conn, candidate.attachment_id, result.cache_path, resolved_data_root, report)
 
-    if locations is not None and not report.halted_low_disk_space:
+    if locations is not None and not report.halted_low_disk_space and report.stopped is None:
         budget = max(0, trial_limit - report.considered) if trial_gate_active else None
         report.locations = fetch_from_locations(
             conn,
@@ -567,9 +583,12 @@ def run_backfill(
             min_free_bytes=min_free_bytes,
             free_space_check_interval=free_space_check_interval,
             read_this_run={c.attachment_id: c.source_path for c in candidates},
+            stop_check=stop_check,
         )
         if report.locations.halted_low_disk_space:
             report.halted_low_disk_space = True
+        if report.locations.stopped is not None:
+            report.stopped = report.locations.stopped
         if report.locations.budget_capped:
             report.trial_gate_capped = True
         report.enrichment_enqueued += report.locations.enrichment_enqueued

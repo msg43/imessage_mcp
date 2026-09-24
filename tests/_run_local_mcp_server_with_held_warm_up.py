@@ -2,11 +2,15 @@
 until a file appears — the child process for the stdio test in
 `tests/test_mcp_local_server_warm_up.py`.
 
-Usage: python _run_local_mcp_server_with_held_warm_up.py RELEASE_FILE WAIT_SECONDS [IDLE_SECONDS]
+Usage: python _run_local_mcp_server_with_held_warm_up.py RELEASE_FILE WAIT_SECONDS [IDLE_SECONDS] [--lazy]
 
 With IDLE_SECONDS, the server also runs an idle unloader with its
 watchdog thread started, as `imsg mcp local` does — so a test can show
 that the watchdog does not keep a disconnected server alive either.
+
+The warm-up starts as soon as the server is serving (`warm_at_start`),
+which is what the tests of a held warm-up need; with `--lazy` it starts
+on the first retrieval call instead, as `imsg mcp local` does by default.
 
 Runs `imsg.mcp.tools.local_server.run_local_server` exactly as the CLI
 does, but over a fake retrieval service (no database) and a single fake
@@ -42,8 +46,10 @@ class _FakeRetrievalService:
 
 
 def main() -> None:
-    release_file = Path(sys.argv[1])
-    wait_seconds = float(sys.argv[2])
+    lazy = "--lazy" in sys.argv
+    args = [arg for arg in sys.argv if arg != "--lazy"]
+    release_file = Path(args[1])
+    wait_seconds = float(args[2])
 
     def held_step() -> None:
         print("stray print from a loading model")
@@ -57,12 +63,12 @@ def main() -> None:
         [WarmUpStep("text embedder", 30.0, held_step)], model_thread=model_thread
     )
     idle_unloader = None
-    if len(sys.argv) > 3:
+    if len(args) > 3:
         idle_unloader = IdleModelUnloader(
             warm_up=warm_up,
             model_thread=model_thread,
             unload=lambda: None,
-            idle_seconds=float(sys.argv[3]),
+            idle_seconds=float(args[3]),
         )
     local = LocalMcpServer(
         service=cast(Any, _FakeRetrievalService()),
@@ -72,6 +78,7 @@ def main() -> None:
         warm_up=warm_up,
         warm_up_wait_seconds=wait_seconds,
         idle_unloader=idle_unloader,
+        warm_at_start=not lazy,
     )
     anyio.run(run_local_server, local)
 

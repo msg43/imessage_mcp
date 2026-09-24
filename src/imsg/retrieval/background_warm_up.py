@@ -43,6 +43,17 @@ What this module promises:
   step again, with the same logging, status and estimate as the first
   pass, so a tool call that arrives after an unload waits for the reload
   exactly the way one that arrives at startup waits for the first load.
+- **No load the host has no memory for.** Given an `admission` check
+  (`imsg.memory_admission`), every pass — the first and every reload —
+  asks it on the model thread before the first step, after any unload
+  queued ahead of it has run. Refused, no step runs: the warm-up enters
+  `memory_busy`, which a waiting tool call treats as settled and answers
+  at once with a retryable `WARMING_UP` error saying the host's memory
+  is busy (`HostMemoryBusyError`). `start()` from `memory_busy` asks
+  again, but no sooner than `admission_retry_seconds` after the last
+  refusal, so a stream of calls cannot turn into a stream of
+  measurements; refusals in a row are logged once every
+  `REFUSAL_LOG_INTERVAL_SECONDS`.
 """
 
 from __future__ import annotations
@@ -57,7 +68,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from imsg.errors import ImsgError
-from imsg.retrieval.errors import WarmingUpError, WarmUpFailedError
+from imsg.memory_admission import AdmissionDecision, refused
+from imsg.retrieval.errors import HostMemoryBusyError, WarmingUpError, WarmUpFailedError
 from imsg.retrieval.model_thread import ModelThread
 
 RUNNING_STEP_FLOOR_SECONDS = 5.0
@@ -65,6 +77,14 @@ RUNNING_STEP_FLOOR_SECONDS = 5.0
 
 MAX_FAILURE_CHARS = 500
 """A failure cause is cut to this length for the log line and tool errors."""
+
+DEFAULT_ADMISSION_RETRY_SECONDS = 15.0
+"""`memory.admission_retry_seconds`'s default, for callers built without a
+config (tests)."""
+
+REFUSAL_LOG_INTERVAL_SECONDS = 300.0
+"""Refused loads in a row are logged at most this often: the public server
+retries on its own for as long as the host is short, which may be hours."""
 
 
 class WarmUpPhase(StrEnum):
@@ -75,9 +95,14 @@ class WarmUpPhase(StrEnum):
     UNLOADED = "unloaded"
     """Was ready; the models were dropped after sitting idle. The next
     `start()` loads them again."""
+    MEMORY_BUSY = "memory_busy"
+    """Not loaded: the memory admission check refused the load. The next
+    `start()` asks again (no sooner than the retry interval)."""
 
 
-_STARTABLE = (WarmUpPhase.NOT_STARTED, WarmUpPhase.UNLOADED)
+_STARTABLE = (WarmUpPhase.NOT_STARTED, WarmUpPhase.UNLOADED, WarmUpPhase.MEMORY_BUSY)
+_PENDING = (WarmUpPhase.NOT_STARTED, WarmUpPhase.UNLOADED, WarmUpPhase.WARMING)
+"""What `wait()` waits through: a pass that may still start or finish."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,20 +132,44 @@ class WarmUpStatus:
     """An estimate; 0 once ready or failed."""
     failure: str | None
     """The cause — set only once failed."""
+    admission: AdmissionDecision | None = None
+    """The refusal — set only while `memory_busy`."""
+    retry_seconds: float = DEFAULT_ADMISSION_RETRY_SECONDS
+    """How often a refused load is tried again."""
 
     @property
     def settled(self) -> bool:
-        return self.phase in (WarmUpPhase.READY, WarmUpPhase.FAILED)
+        """Nothing a waiting call can gain by waiting longer: ready,
+        failed, or refused for memory (retried on a later call)."""
+        return self.phase in (WarmUpPhase.READY, WarmUpPhase.FAILED, WarmUpPhase.MEMORY_BUSY)
 
-    def raise_unless_ready(self, *, wait_bound_seconds: float) -> None:
+    @property
+    def detail(self) -> str | None:
+        """Why the models are not loaded, when the host's memory is why."""
+        return self.admission.reason if self.admission is not None else None
+
+    def raise_unless_ready(self, *, wait_bound_seconds: float, public: bool = False) -> None:
         """Return when ready; otherwise raise the tool error for this
-        status: `WarmUpFailedError` naming the cause, or `WarmingUpError`
+        status: `WarmUpFailedError` naming the cause, `HostMemoryBusyError`
+        when the host had no memory for the models, or `WarmingUpError`
         with the estimate. `wait_bound_seconds` is how long a call waits,
-        which the warming-up message tells the caller."""
+        which the warming-up message tells the caller. `public` keeps the
+        memory refusal to numbers (`AdmissionDecision.public_summary`)."""
         if self.phase is WarmUpPhase.READY:
             return
         if self.phase is WarmUpPhase.FAILED:
             raise WarmUpFailedError(self.failure or "cause unknown")
+        if self.phase is WarmUpPhase.MEMORY_BUSY:
+            decision = self.admission
+            if decision is None:  # pragma: no cover - memory_busy always carries its decision
+                detail = "the host's memory is busy"
+            else:
+                detail = decision.public_summary() if public else decision.reason
+            raise HostMemoryBusyError(
+                detail=detail,
+                retry_seconds=self.retry_seconds,
+                wait_bound_seconds=wait_bound_seconds,
+            )
         raise WarmingUpError(
             seconds_remaining=max(1, math.ceil(self.seconds_remaining)),
             loading=self.loading,
@@ -154,7 +203,8 @@ def log_to_stderr(line: str) -> None:
 
 
 class BackgroundWarmUp:
-    """Runs `steps` once, in order, on `model_thread`."""
+    """Runs `steps` once, in order, on `model_thread` — after `admission`,
+    when one is given, says the host has the memory for them."""
 
     def __init__(
         self,
@@ -164,12 +214,18 @@ class BackgroundWarmUp:
         log: Callable[[str], None] = log_to_stderr,
         on_status: Callable[[WarmUpStatus], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        admission: Callable[[], AdmissionDecision] | None = None,
+        admission_retry_seconds: float = DEFAULT_ADMISSION_RETRY_SECONDS,
     ) -> None:
+        if admission_retry_seconds <= 0:
+            raise ValueError(f"admission_retry_seconds must be > 0, got {admission_retry_seconds}")
         self._steps = tuple(steps)
         self._model_thread = model_thread
         self._log_line = log
         self._on_status = on_status
         self._clock = clock
+        self._admission = admission
+        self._retry_seconds = float(admission_retry_seconds)
         self._condition = threading.Condition()
         self._phase = WarmUpPhase.NOT_STARTED
         self._started_at: float | None = None
@@ -177,6 +233,10 @@ class BackgroundWarmUp:
         self._step_index = 0
         self._step_started_at: float | None = None
         self._failure: str | None = None
+        self._refusal: AdmissionDecision | None = None
+        self._refused_at: float | None = None
+        self._refusal_logged_at: float | None = None
+        self._ever_ready = False
 
     @property
     def steps(self) -> tuple[WarmUpStep, ...]:
@@ -190,15 +250,19 @@ class BackgroundWarmUp:
         with self._condition:
             if self._phase not in _STARTABLE:
                 return
-            reloading = self._phase is WarmUpPhase.UNLOADED
+            retrying = self._phase is WarmUpPhase.MEMORY_BUSY
+            if retrying and self._retry_wait_left() > 0:
+                return  # refused a moment ago: the answer has not changed yet
+            reloading = self._phase is WarmUpPhase.UNLOADED or (retrying and self._ever_ready)
             self._phase = WarmUpPhase.WARMING
             self._started_at = self._clock()
             self._finished_at = None
             self._step_index = 0
             self._step_started_at = None
-        names = ", ".join(step.name for step in self._steps)
-        what = "reload" if reloading else "warm-up"
-        self._log(f"{what} started: {_steps(len(self._steps))} in the background ({names})")
+        if not retrying:
+            names = ", ".join(step.name for step in self._steps)
+            what = "reload" if reloading else "warm-up"
+            self._log(f"{what} started: {_steps(len(self._steps))} in the background ({names})")
         self._publish()
         try:
             self._model_thread.submit(self._run)
@@ -230,12 +294,19 @@ class BackgroundWarmUp:
         with self._condition:
             return self._status()
 
+    def _retry_wait_left(self) -> float:
+        """Caller holds the condition."""
+        if self._refused_at is None:
+            return 0.0
+        return max(0.0, self._retry_seconds - (self._clock() - self._refused_at))
+
     def wait(self, timeout: float) -> WarmUpStatus:
-        """Block until the warm-up is ready or failed, or `timeout`
-        seconds pass, whichever is first; return the status then."""
+        """Block until the warm-up is ready, failed or refused for memory,
+        or `timeout` seconds pass, whichever is first; return the status
+        then."""
         deadline = time.monotonic() + max(timeout, 0.0)
         with self._condition:
-            while self._phase in (*_STARTABLE, WarmUpPhase.WARMING):
+            while self._phase in _PENDING:
                 left = deadline - time.monotonic()
                 if left <= 0:
                     break
@@ -249,6 +320,8 @@ class BackgroundWarmUp:
 
     def _run(self) -> None:
         try:
+            if not self._admitted():
+                return
             for index, step in enumerate(self._steps):
                 step_started = self._clock()
                 with self._condition:
@@ -271,6 +344,7 @@ class BackgroundWarmUp:
                 self._phase = WarmUpPhase.READY
                 self._finished_at = finished
                 self._step_index = len(self._steps)
+                self._ever_ready = True
                 self._publish()
                 self._condition.notify_all()
         finally:
@@ -278,6 +352,54 @@ class BackgroundWarmUp:
                 unexpected = self._phase is WarmUpPhase.WARMING
             if unexpected:  # something other than a step's Exception ended the pass
                 self._fail(None, "the warm-up stopped unexpectedly")
+
+    def _admitted(self) -> bool:
+        """Ask the admission check, on the model thread; `True` to go on.
+        A refusal, or a check that raises (treated as a refusal: fail
+        closed), leaves the warm-up `memory_busy` with nothing loaded."""
+        if self._admission is None:
+            return True
+        try:
+            decision = self._admission()
+        except Exception as exc:
+            decision = refused(
+                "the models", describe_failure(exc), required_bytes=0, reserve_bytes=0
+            )
+        with self._condition:
+            after_refusal = self._refusal is not None
+        if decision.admitted:
+            prefix = "host memory is available again" if after_refusal else "memory admitted"
+            self._log(f"{prefix}: {decision.reason}")
+            with self._condition:
+                self._refusal = None
+                self._refused_at = None
+                self._refusal_logged_at = None
+            return True
+        now = self._clock()
+        with self._condition:
+            due = (
+                self._refusal_logged_at is None
+                or now - self._refusal_logged_at >= REFUSAL_LOG_INTERVAL_SECONDS
+            )
+            if due:
+                self._refusal_logged_at = now
+        if due:
+            self._log(
+                f"not loading the models — {decision.reason}. Retrieval calls answer "
+                f"WARMING_UP (host memory busy) until the host has room; the load is "
+                f"tried again at most every {self._retry_seconds:g} s"
+            )
+        with self._condition:
+            self._phase = WarmUpPhase.MEMORY_BUSY
+            self._refusal = decision
+            self._refused_at = now
+            self._started_at = None
+            self._finished_at = None
+            self._step_index = 0
+            self._step_started_at = None
+            self._publish()
+            self._condition.notify_all()
+        return False
 
     def _fail(self, step: WarmUpStep | None, cause: str, *, seconds: float | None = None) -> None:
         """Called at most once per pass, from the model thread (or from
@@ -339,6 +461,18 @@ class BackgroundWarmUp:
             return WarmUpStatus(
                 self._phase, None, self._step_index, total, elapsed, 0.0, self._failure
             )
+        if self._phase is WarmUpPhase.MEMORY_BUSY:
+            return WarmUpStatus(
+                self._phase,
+                None,
+                0,
+                total,
+                0.0,
+                self._retry_wait_left(),
+                None,
+                admission=self._refusal,
+                retry_seconds=self._retry_seconds,
+            )
         if self._phase in _STARTABLE:
             remaining = sum(step.estimated_seconds for step in self._steps)
             return WarmUpStatus(self._phase, None, 0, total, 0.0, remaining, None)
@@ -355,7 +489,9 @@ class BackgroundWarmUp:
 
 
 __all__ = [
+    "DEFAULT_ADMISSION_RETRY_SECONDS",
     "MAX_FAILURE_CHARS",
+    "REFUSAL_LOG_INTERVAL_SECONDS",
     "RUNNING_STEP_FLOOR_SECONDS",
     "BackgroundWarmUp",
     "WarmUpPhase",

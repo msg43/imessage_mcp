@@ -256,6 +256,69 @@ uv run imsg status | grep heavy_models_lock   # held or not, and by which pid/co
 uv run imsg embed --no-wait                   # exit 1 naming the holder, instead of waiting
 ```
 
+**Nothing loads a model the host has no memory for.** Before any model
+set loads — an MCP server at startup or reloading after an idle unload,
+`segment`, `embed`, the `enrich` worker, `sync`'s segmentation and
+embedding, `eval run`/`eval pool` — it asks `imsg.memory_admission`: is
+the kernel's memory pressure normal, and does available memory (`vm_stat`
+free + inactive + speculative, less what other processes were admitted
+for and have not loaded yet) cover the role's expected footprint
+(`memory.footprints`, measured) plus `memory.reserve_bytes` (8 GiB) for
+the rest of the host? A host that cannot be measured is a no. Background
+commands wait for a yes, re-checking every 30 s for up to 600 s, then
+exit **75** (`deferred: memory`) with the heavy lock released. An MCP
+server loads nothing and answers retrieval calls with the retryable
+`WARMING_UP` code and a "host memory busy" message; the local server tries
+again on a later call, the public one by itself. Two processes admitted in
+the same second cannot both claim the same free memory: admission runs
+under a short host-wide lock and leaves a reservation in
+`<data_root>/run/memory-reservations/`.
+
+**Heavy background work can be paused.** `imsg background pause`
+stops segment, embed, the enrich worker, backfill-attachments and `sync`'s
+segmentation and embedding: a command started while paused exits **76**
+(`deferred: paused`) without loading anything, and a running one stops
+after the unit it is on (a task, a batch, a chat, a file). `sync` keeps
+doing its light work — snapshot, extract, identity — so no message is
+lost; it says it skipped segmentation and embedding and exits 76. The MCP
+servers are never paused. Another project on the host can pause without
+this project's config or encrypted volume by creating the host pause file
+(`background.host_pause_file`, default
+`~/.config/imessage-index/pause-background`):
+
+```bash
+uv run imsg background pause --reason "photo import" --until 6h   # or an ISO time; --until is optional
+uv run imsg background resume
+uv run imsg background status
+
+# from another project on the same host (same user), no imsg needed:
+mkdir -p ~/.config/imessage-index
+printf 'reason=photo import\npid=%d\n' $$ > ~/.config/imessage-index/pause-background   # paused while this shell runs
+rm -f ~/.config/imessage-index/pause-background                                              # resume
+```
+
+A `pid=` line makes the pause end by itself when that process does, so a
+crashed import cannot leave the index paused; an `until=<ISO time>` line
+ends it at that time. Without either, it lasts until the file is removed.
+
+**Running work stops when memory runs short.** Between units of work every
+heavy background command also reads the kernel's memory-pressure level:
+at critical it stops at once, at warn it stops if warn is still there 10 s
+later (`memory.background_stop_at`, `memory.warn_confirm_seconds`), exiting
+75. Every MCP server's watchdog reads the same level every 5 s: at critical
+a server with its models loaded unloads them at once, without waiting for
+its idle timer, as soon as no call is in flight
+(`memory.local_server_release_at`; `memory.public_server_release_at` can be
+`never`). The public server loads again by itself after
+`memory.public_rewarm_cooldown_seconds` (300 s), if admitted. Each role
+also runs under its own MLX memory limit (`memory.mlx_memory_limits`, set
+with `mx.set_memory_limit`): a guideline MLX uses to release cached
+buffers and pace evaluation, never to refuse an allocation, set at 1.25x
+each role's measured MLX peak so it changes neither results nor latency.
+`imsg status` shows available memory and the pressure level, the pause
+state and its reason, and every running model process with its footprint
+(read without root) and what it was admitted for.
+
 **Before exposing the public surface**, AT-1 must pass:
 
 ```bash
@@ -433,12 +496,17 @@ setting, and let the eval harness settle what latency costs.
 
 **Startup.** `imsg mcp local` answers the MCP handshake in about 1 s
 (Claude Code gives up on a server that has not answered within
-`MCP_TIMEOUT`, 30 s by default) and warms up in the background, logging
-each step's time on stderr: text embedder 4.8-12.5 s, PE-Core text tower
-33.8-50.2 s, reranker 2.7-3.2 s, database buffer pool 0.1-14.3 s —
-41.8-65.4 s in all, against 121 s before the 0.6B was pinned. A retrieval
-tool call that arrives during warm-up waits up to 90 s for it, then
-returns `WARMING_UP` with an estimate of the seconds remaining; a model
+`MCP_TIMEOUT`, 30 s by default) and, by default, loads no model until the
+first retrieval call (`mcp.local.warm_at_start: false`): every client
+session starts its own server, most never search, and a server that
+loaded at start held a full model set regardless. The warm-up then runs in
+the background, logging each step's time on stderr: text embedder
+4.8-12.5 s, PE-Core text tower 33.8-50.2 s, reranker 2.7-3.2 s, database
+buffer pool 0.1-14.3 s — 41.8-65.4 s in all, against 121 s before the 0.6B
+was pinned. A retrieval tool call that arrives during warm-up (the first
+one starts it) waits up to 90 s for it, then returns `WARMING_UP` with an
+estimate of the seconds remaining; `mcp.local.warm_at_start: true` loads
+at start instead, as before. `imsg mcp public` always loads at start; a model
 that fails to load makes every such call return `WARM_UP_FAILED` with the
 cause. `check_permissions` is the exception: it is diagnostics, so it
 answers straight away and carries the warm-up's own state (which step is
@@ -450,10 +518,12 @@ forward pass at a real shape: 0.13-3.07 s against 0.055 s afterwards.
 
 **Idle unload.** Every client session runs its own `imsg mcp local`, and
 each process holds its own copy of the models (text embedder, PE-Core text
-tower, reranker, plus MLX's buffer cache). Idle sessions used to keep that
-memory until they exited; five of them exhausted a 64 GiB index host. Now a
-server drops its models after `mcp.local.idle_unload_seconds` (default 600;
-0 = never) with no retrieval tool call. It clears MLX's and torch's caches
+tower, reranker, plus MLX's buffer cache) once it has loaded them. Idle
+sessions used to keep that memory until they exited; five of them
+exhausted a 64 GiB index host. Now a server loads only on its first
+retrieval call (above), and drops its models after
+`mcp.local.idle_unload_seconds` (default 600; 0 = never) with no retrieval
+tool call. It clears MLX's and torch's caches
 so the memory goes back to the system, and never unloads while a call is
 in flight. The next retrieval call reloads the models through the same
 warm-up and the same 90 s wait. A reload from a warm OS file cache took

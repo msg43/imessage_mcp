@@ -343,6 +343,26 @@ def skip_task(conn: psycopg.Connection, attachment_id: int, kind: str, *, reason
         )
 
 
+def release_task(
+    conn: psycopg.Connection, attachment_id: int, kind: str, *, worker_id: str
+) -> bool:
+    """Hand a claimed task back unfinished: `pending` again, lease cleared,
+    its attempt not counted — for a worker interrupted while processing
+    it (`imsg.enrich.worker`). Only a task still `running` under this
+    worker's lease is touched, so a lease that expired and was claimed by
+    someone else is left alone. Returns whether a row was released."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE enrichment
+            SET state = 'pending', locked_at = NULL, locked_by = NULL, updated_at = now()
+            WHERE attachment_id = %s AND kind = %s AND state = 'running' AND locked_by = %s
+            """,
+            (attachment_id, kind, worker_id),
+        )
+        return cur.rowcount == 1
+
+
 __all__ = [
     "DEFAULT_LEASE_SECONDS",
     "EnrichPreviewReport",
@@ -356,6 +376,7 @@ __all__ = [
     "fail_task_permanently",
     "missing_enrichment_kinds",
     "preview_claimable_tasks",
+    "release_task",
     "reset_failed_tasks",
     "skip_task",
 ]

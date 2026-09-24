@@ -49,8 +49,9 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, NoReturn
 
 import anyio
 import apsw
@@ -58,6 +59,7 @@ import psycopg
 import typer
 import uvicorn
 
+from imsg import host_memory
 from imsg.agents.plists import render_agent_plists
 from imsg.backfill.fetch import LocationFetchReport, access_from_config, settings_from_config
 from imsg.backfill.locate import CoverageReport, LocatedFile, build_coverage, run_locate
@@ -74,6 +76,14 @@ from imsg.backfill.push import (
     run_push,
 )
 from imsg.backfill.transfer import TransferError, run_copy
+from imsg.background_gate import BackgroundGate, BackgroundWorkDeferred, StopReason
+from imsg.background_pause import (
+    BackgroundPauseError,
+    clear_pause,
+    parse_until,
+    read_pause_state,
+    write_pause,
+)
 from imsg.backup.pipeline import OUT_OF_SCOPE_NOTE, SAME_DEVICE_CAVEAT, run_backup
 from imsg.backup.retention import DEFAULT_KEEP
 from imsg.config.loader import default_config_path, load_config
@@ -97,7 +107,7 @@ from imsg.diagnostics import (
 )
 from imsg.embed.fts.schema import assert_schema_current, create_schema
 from imsg.embed.fts.sync import sync_fts
-from imsg.embed.pipeline import run_embed
+from imsg.embed.pipeline import EmbedRunReport, run_embed
 from imsg.enrich.pipeline import process_one_task
 from imsg.enrich.planner import EnrichmentPlanReport, plan_enrichment
 from imsg.enrich.queue import (
@@ -107,6 +117,7 @@ from imsg.enrich.queue import (
     reset_failed_tasks,
 )
 from imsg.enrich.router import DEFAULT_CLAIM_ORDER, ENRICHMENT_KINDS, parse_kinds
+from imsg.enrich.worker import run_enrich_worker
 from imsg.errors import AgentInstallError, ImsgError
 from imsg.eval.cli import eval_app
 from imsg.export import (
@@ -123,6 +134,7 @@ from imsg.export import (
     write_unclassified_report,
 )
 from imsg.heavy_lock import HeavyModelLock, inspect_heavy_lock
+from imsg.host_memory import PressureLevel, format_gib
 from imsg.mcp.audit import PostgresAuditSink
 from imsg.mcp.auth import build_public_gate
 from imsg.mcp.probe import run_auth_probe
@@ -139,6 +151,13 @@ from imsg.mcp.warm_up_readiness import (
     WarmUpReadinessFile,
     read_warm_up_readiness,
     readiness_path,
+)
+from imsg.memory_admission import (
+    MemoryAdmission,
+    ModelRole,
+    ReservationBook,
+    configure_mlx_memory_limit,
+    pid_is_running,
 )
 from imsg.mount.guard import run_guard_mount_or_exit
 from imsg.paths import is_contained_in, is_same_file, resolve_path
@@ -157,7 +176,7 @@ from imsg.providers.factory import (
 )
 from imsg.providers.manifest import verify_manifest
 from imsg.retrieval.background_warm_up import BackgroundWarmUp
-from imsg.retrieval.idle_unload import IdleModelUnloader
+from imsg.retrieval.idle_unload import IdleModelUnloader, PressureRelease, release_freed_memory
 from imsg.retrieval.model_thread import ModelThread
 from imsg.retrieval.service import RetrievalService
 from imsg.segment.pipeline import REBUILD_ALL_SENTINEL, run_segment, run_segment_for_chat
@@ -394,6 +413,54 @@ def _acquire_heavy_lock_or_die(lock: HeavyModelLock) -> None:
         raise typer.Exit(code=1) from exc
 
 
+def _background_gate(cfg: Config, command: str) -> BackgroundGate:
+    """The pause switch, memory admission and between-units checks for a
+    heavy background command (`imsg.background_gate`); its progress lines
+    go to stderr, prefixed with the command."""
+    return BackgroundGate.from_config(
+        cfg, log=lambda line: typer.echo(f"{command}: {line}", err=True)
+    )
+
+
+def _exit_deferred(command: str, reason: StopReason) -> NoReturn:
+    """`<command>: deferred: <paused|memory> — <why>` and the matching
+    exit code (`imsg.background_gate`: 76 paused, 75 memory)."""
+    typer.echo(f"{command}: {reason.line()}")
+    raise typer.Exit(code=reason.exit_code)
+
+
+def _exit_if_paused(gate: BackgroundGate, command: str) -> None:
+    reason = gate.paused()
+    if reason is not None:
+        _exit_deferred(command, reason)
+
+
+def _admit_or_exit(
+    gate: BackgroundGate, admission: MemoryAdmission, heavy_lock: HeavyModelLock, command: str
+) -> None:
+    """Memory admission for a command that holds the heavy lock: waits
+    (bounded, logged) for the host to have room; still refused, the lock
+    is released and the command exits `deferred: memory`."""
+    reason = gate.admit(admission)
+    if reason is not None:
+        heavy_lock.release()
+        _exit_deferred(command, reason)
+
+
+def _release_models(*providers: object) -> None:
+    """Drop the weights of every provider that can, then hand the freed
+    memory back to the system — between sync's heavy steps, so the
+    boundary model and the embedders are never resident together."""
+    dropped = False
+    for provider in providers:
+        unload = getattr(provider, "unload", None)
+        if callable(unload):
+            unload()
+            dropped = True
+    if dropped:
+        release_freed_memory()
+
+
 def _query_marker(cfg: Config) -> QueryInFlightMarker:
     """The "a query is in flight" publisher an MCP server holds while it
     answers (`imsg.db.enrichment_yield_locks`), so the nightly enrichment
@@ -557,6 +624,102 @@ def _heavy_lock_status_fields(cfg: Config) -> dict[str, object]:
     return {"heavy_models_lock_held": state.held, "heavy_models_lock_holder": holder}
 
 
+def _host_memory_status_fields() -> dict[str, object]:
+    """`imsg status`'s view of the host's memory (`imsg.host_memory`): what
+    admission would see now, and the kernel's pressure level."""
+    try:
+        memory = host_memory.default_probe().read()
+    except Exception as exc:
+        return {
+            "host_memory_available_bytes": None,
+            "host_memory_total_bytes": None,
+            "host_memory_pressure": None,
+            "host_memory_kernel_free_percent": None,
+            "host_swap_used_bytes": None,
+            "host_memory_summary": f"could not be measured: {exc}",
+        }
+    return {
+        "host_memory_available_bytes": memory.available_bytes,
+        "host_memory_total_bytes": memory.total_bytes,
+        "host_memory_pressure": memory.pressure.value,
+        "host_memory_kernel_free_percent": memory.kernel_free_percent,
+        "host_swap_used_bytes": memory.swap_used_bytes,
+        "host_memory_summary": memory.describe(),
+    }
+
+
+def _background_pause_status_fields(cfg: Config) -> dict[str, object]:
+    """`imsg status`'s view of the pause switch (`imsg.background_pause`)."""
+    state = read_pause_state(cfg.paths.data_root, host_pause_file=cfg.background.host_pause_file)
+    untils = [r.until for r in state.active if r.until is not None]
+    return {
+        "background_paused": state.paused,
+        "background_pause_reason": state.describe() if state.paused else None,
+        "background_paused_until": (
+            max(untils).isoformat(timespec="seconds")
+            if untils and len(untils) == len(state.active)
+            else None
+        ),
+        "background_pause_lapsed": list(state.lapsed),
+        "background_host_pause_file": (
+            str(cfg.background.host_pause_file) if cfg.background.host_pause_file else None
+        ),
+    }
+
+
+def _model_process_status_fields(cfg: Config) -> dict[str, object]:
+    """Every running `imsg` process that loads models, its footprint (read
+    without root, `imsg.host_memory`), and what memory admission reserved
+    for it (`imsg.memory_admission`)."""
+    try:
+        reservations = {r.pid: r for r in ReservationBook(cfg.paths.data_root).reservations()}
+    except (ImsgError, OSError):
+        reservations = {}
+    rows: list[dict[str, object]] = []
+    seen: set[int] = set()
+    for process in host_memory.list_model_processes():
+        reservation = reservations.get(process.pid)
+        seen.add(process.pid)
+        rows.append(
+            {
+                "pid": process.pid,
+                "command": process.command,
+                "footprint_bytes": process.footprint_bytes,
+                "reserved_bytes": reservation.reserved_bytes if reservation else None,
+            }
+        )
+    for pid, reservation in sorted(reservations.items()):
+        if pid in seen or not pid_is_running(pid):
+            continue
+        rows.append(
+            {
+                "pid": pid,
+                "command": reservation.command,
+                "footprint_bytes": host_memory.process_footprint_bytes(pid),
+                "reserved_bytes": reservation.reserved_bytes,
+            }
+        )
+    total = sum(
+        footprint for row in rows if isinstance(footprint := row["footprint_bytes"], int)
+    )
+    return {"model_processes": rows, "model_processes_footprint_bytes": total}
+
+
+def _describe_model_processes(rows: object) -> list[str]:
+    if not isinstance(rows, list) or not rows:
+        return ["  none running"]
+    lines: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        footprint = row.get("footprint_bytes")
+        reserved = row.get("reserved_bytes")
+        held = format_gib(footprint) if isinstance(footprint, int) else "footprint unreadable"
+        extra = f", admitted for {format_gib(reserved)}" if isinstance(reserved, int) else ""
+        lines.append(f"  pid {row.get('pid')} {row.get('command')}: {held}{extra}")
+    return lines
+
+
 @app.command()
 def status(
     config: ConfigOption = None,
@@ -583,6 +746,11 @@ def status(
     # the one way past the only access control this project has.
     public_warm_up = read_warm_up_readiness(cfg.paths.data_root)
     heavy_lock_state = _heavy_lock_status_fields(cfg)
+    # Memory: what admission sees now, whether heavy background work is
+    # paused, and which processes hold models and how much.
+    memory_state = _host_memory_status_fields()
+    pause_state = _background_pause_status_fields(cfg)
+    process_state = _model_process_status_fields(cfg)
 
     report = {
         "models_backend": cfg.models.backend,
@@ -606,6 +774,9 @@ def status(
         "mcp_public_warm_up": public_warm_up.state,
         "mcp_public_warm_up_detail": public_warm_up.detail,
         "mcp_public_pid": public_warm_up.pid,
+        **memory_state,
+        **pause_state,
+        **process_state,
         **heavy_lock_state,
         "watermarks_per_source": None,
         "enrichment_queue_depths": None,
@@ -635,7 +806,134 @@ def status(
     for key, value in report.items():
         if key == "models_backend":
             continue  # already printed in its canonical `models: backend=...` form
+        if key == "model_processes":
+            typer.echo("model_processes:")
+            for line in _describe_model_processes(value):
+                typer.echo(line)
+            continue
         typer.echo(f"{key}: {value}")
+
+
+# --------------------------------------------------------------------------
+# background: the pause switch for heavy background work
+# --------------------------------------------------------------------------
+
+background_app = typer.Typer(
+    name="background",
+    help="Pause and resume heavy background work — segment, embed, the enrich worker, "
+    "backfill-attachments and sync's segmentation and embedding (imsg.background_pause). "
+    "MCP servers are never paused; sync's snapshot, extract and identity steps always run.",
+    no_args_is_help=True,
+)
+app.add_typer(background_app, name="background")
+
+
+def _pause_state_report(cfg: Config) -> dict[str, object]:
+    state = read_pause_state(cfg.paths.data_root, host_pause_file=cfg.background.host_pause_file)
+    return {
+        "paused": state.paused,
+        "summary": state.describe(),
+        "active": [
+            {
+                "source": r.source,
+                "reason": r.reason,
+                "set_at": r.set_at.isoformat(timespec="seconds") if r.set_at else None,
+                "until": r.until.isoformat(timespec="seconds") if r.until else None,
+                "while_pid": r.pid,
+            }
+            for r in state.active
+        ],
+        "lapsed": list(state.lapsed),
+        "host_pause_file": (
+            str(cfg.background.host_pause_file) if cfg.background.host_pause_file else None
+        ),
+    }
+
+
+@background_app.command("pause")
+def background_pause(
+    config: ConfigOption = None,
+    reason: Annotated[
+        str | None, typer.Option("--reason", help="Why, shown by `imsg status`.")
+    ] = None,
+    until: Annotated[
+        str | None,
+        typer.Option(
+            "--until",
+            help="Resume by itself at this time: ISO 8601 (2026-09-26T08:00, this host's "
+            "local time without an offset) or a duration from now (90m, 6h, 2d).",
+        ),
+    ] = None,
+) -> None:
+    """Pause heavy background work until `imsg background resume` (or --until).
+
+    Commands that start while paused exit 76 without loading a model; running
+    ones stop after their current unit of work. The MCP servers keep serving,
+    and `imsg sync` keeps snapshotting, extracting and resolving identities, so
+    no message is lost."""
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    try:
+        until_at = parse_until(until) if until is not None else None
+    except BackgroundPauseError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if until_at is not None and until_at <= datetime.now(UTC):
+        typer.echo(f"imsg: --until {until!r} is already in the past", err=True)
+        raise typer.Exit(code=2)
+    try:
+        request = write_pause(cfg.paths.data_root, reason=reason, until=until_at)
+    except BackgroundPauseError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"background: paused — {request.describe()}")
+    typer.echo(
+        "background: running heavy work stops after its current unit; MCP servers keep "
+        "serving; `imsg sync` still snapshots, extracts and resolves identities"
+    )
+
+
+@background_app.command("resume")
+def background_resume(config: ConfigOption = None) -> None:
+    """Clear the `imsg background pause` switch. A host pause file set by
+    another project keeps background work paused until it is removed."""
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    try:
+        cleared = clear_pause(cfg.paths.data_root)
+    except BackgroundPauseError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        "background: resumed — the `imsg background pause` switch is cleared"
+        if cleared
+        else "background: no `imsg background pause` switch was set"
+    )
+    state = read_pause_state(cfg.paths.data_root, host_pause_file=cfg.background.host_pause_file)
+    if state.paused:
+        typer.echo(f"background: still {state.describe()}")
+
+
+@background_app.command("status")
+def background_status(
+    config: ConfigOption = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
+) -> None:
+    """Whether heavy background work is paused, by what, and until when."""
+    cfg = _load_config_or_die(config)
+    report = _pause_state_report(cfg)
+    if as_json:
+        typer.echo(json.dumps(report, indent=2))
+        return
+    typer.echo(f"background: {report['summary']}")
+    lapsed = report["lapsed"]
+    if isinstance(lapsed, list):
+        for line in lapsed:
+            typer.echo(f"background: no longer in force: {line}")
+    host_file = report["host_pause_file"]
+    typer.echo(
+        f"background: host pause file: {host_file}" if host_file else "background: host pause file: off"
+    )
 
 
 @models_app.command("verify")
@@ -1614,21 +1912,33 @@ def segment(
     """S4 — sessionize and segment messages for indexing (SPEC §8 S4).
 
     Holds the host-wide heavy-model lock (`imsg.heavy_lock`) for the whole
-    run, `--dry-run` included: a dry run still asks the boundary model."""
+    run, `--dry-run` included: a dry run still asks the boundary model.
+
+    Heavy background work (`imsg.background_gate`): exits 76 without
+    loading anything while background work is paused, waits for memory
+    and exits 75 if the host never has room, and between chats stops
+    (exit 75/76) when paused or when the host's memory pressure rises."""
     cfg = _load_config_or_die(config)
     if rebuild and chat is None:
         typer.echo("imsg: --rebuild requires --chat <id>", err=True)
         raise typer.Exit(code=2)
     run_guard_mount_or_exit(cfg.paths.data_root)
+    gate = _background_gate(cfg, "segment")
+    _exit_if_paused(gate, "segment")
 
     prompt_bytes = _boundary_prompt_bytes_or_die(cfg)
     _echo_backend_line(cfg)
     provider = _build_or_die(lambda: build_boundary_provider(cfg, _decode_prompt(prompt_bytes)))
     heavy_lock = _heavy_lock_or_die(cfg, "imsg segment", no_wait=no_wait)
+    admission = MemoryAdmission.for_role(
+        cfg, ModelRole.SEGMENT, command="imsg segment", probe=gate.probe
+    )
 
     conn = _connect_and_verify_or_die(cfg)
     try:
         _acquire_heavy_lock_or_die(heavy_lock)
+        _admit_or_exit(gate, admission, heavy_lock, "segment")
+        configure_mlx_memory_limit(cfg, ModelRole.SEGMENT)
         if rebuild:
             assert chat is not None
             report = run_segment_for_chat(
@@ -1647,7 +1957,20 @@ def segment(
             )
         else:
             chat_ids = {chat} if chat is not None else None
-            reports = run_segment(conn, cfg, provider, prompt_bytes, chat_ids=chat_ids, dry_run=dry_run)
+            stopped: StopReason | None = None
+            try:
+                reports = run_segment(
+                    conn,
+                    cfg,
+                    provider,
+                    prompt_bytes,
+                    chat_ids=chat_ids,
+                    dry_run=dry_run,
+                    stop_check=gate.between_units,
+                )
+            except BackgroundWorkDeferred as exc:
+                stopped = exc.reason
+                reports = exc.partial if isinstance(exc.partial, list) else []
             total_written = sum(r.segments_written for r in reports)
             total_fallback = sum(r.fallback_sessions for r in reports)
             total_unchanged = sum(r.skipped_unchanged for r in reports)
@@ -1656,12 +1979,17 @@ def segment(
                 f"written, {total_unchanged} left unchanged, "
                 f"{total_fallback} fallback session(s)"
             )
+            if stopped is not None:
+                if dry_run:
+                    typer.echo(DRY_RUN_MARKER)
+                _exit_deferred("segment", stopped)
         if dry_run:
             typer.echo(DRY_RUN_MARKER)
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     finally:
+        admission.release()
         heavy_lock.release()
         conn.close()
 
@@ -1673,9 +2001,17 @@ def embed(
     """S6 — embed segments/attachment chunks and update the FTS sidecar (SPEC §8 S6).
 
     Holds the host-wide heavy-model lock (`imsg.heavy_lock`) for the run.
-    `--dry-run` only counts pending rows, loads no model and takes no lock."""
+    `--dry-run` only counts pending rows, loads no model and takes no lock.
+
+    Heavy background work (`imsg.background_gate`): exits 76 while
+    background work is paused, exits 75 if the host never has memory for
+    the models, and between batches stops (committing what is done) when
+    paused or when the host's memory pressure rises."""
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
+    gate = _background_gate(cfg, "embed")
+    if not dry_run:
+        _exit_if_paused(gate, "embed")
     _echo_backend_line(cfg)
     # Providers first, connection second: a missing model runtime fails
     # fast, before anything is opened.
@@ -1689,24 +2025,37 @@ def embed(
     # write anything (SPEC §8).
     fts_conn = _open_fts_conn(cfg) if not dry_run else None
     heavy_lock = _heavy_lock_or_die(cfg, "imsg embed", no_wait=no_wait)
+    admission = MemoryAdmission.for_role(cfg, ModelRole.EMBED, command="imsg embed", probe=gate.probe)
+    stopped: StopReason | None = None
     try:
         if not dry_run:
             _acquire_heavy_lock_or_die(heavy_lock)
-        report = run_embed(
-            conn,
-            text_provider,
-            multimodal_provider=multimodal_provider,
-            batch_size=cfg.embedding.batch_size,
-            max_batch_tokens=cfg.embedding.max_batch_tokens,
-            dry_run=dry_run,
-        )
+            _admit_or_exit(gate, admission, heavy_lock, "embed")
+            configure_mlx_memory_limit(cfg, ModelRole.EMBED)
+        try:
+            report = run_embed(
+                conn,
+                text_provider,
+                multimodal_provider=multimodal_provider,
+                batch_size=cfg.embedding.batch_size,
+                max_batch_tokens=cfg.embedding.max_batch_tokens,
+                dry_run=dry_run,
+                stop_check=None if dry_run else gate.between_units,
+            )
+        except BackgroundWorkDeferred as exc:
+            if not isinstance(exc.partial, EmbedRunReport):  # pragma: no cover - run_embed always sets it
+                raise
+            stopped, report = exc.reason, exc.partial
         if not dry_run:
+            # The FTS sidecar needs no model, so a run stopped for memory
+            # still brings it up to date with what did commit.
             assert fts_conn is not None
             sync_report = sync_fts(conn, fts_conn)
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     finally:
+        admission.release()
         heavy_lock.release()
         if fts_conn is not None:
             fts_conn.close()
@@ -1725,46 +2074,129 @@ def embed(
             f"embed: fts events_applied={sync_report.events_applied} "
             f"(upserts={sync_report.upserts} deletes={sync_report.deletes})"
         )
+    if stopped is not None:
+        _exit_deferred("embed", stopped)
 
 
-def _make_segment_fn(cfg: Config, heavy_lock: HeavyModelLock) -> SegmentFn:
+class _SyncHeavySteps:
+    """`sync`'s S4 and S6 under the pause switch and memory admission
+    (`imsg.background_gate`). Before each heavy step: paused, or refused
+    memory after the bounded wait, raises `BackgroundWorkDeferred`, which
+    `run_sync` records while S1-S3's work stands. A deferral sticks for
+    the rest of the command, so later sources skip their heavy steps at
+    once instead of waiting again, and it releases the heavy lock at once
+    so other heavy commands are not held up by the light work left."""
+
+    def __init__(self, cfg: Config, heavy_lock: HeavyModelLock, gate: BackgroundGate) -> None:
+        self._cfg = cfg
+        self._heavy_lock = heavy_lock
+        self._gate = gate
+        self._admission: MemoryAdmission | None = None
+        self.deferred: StopReason | None = None
+
+    def begin(self, role: ModelRole) -> None:
+        if self.deferred is not None:
+            raise BackgroundWorkDeferred(self.deferred)
+        paused = self._gate.paused()
+        if paused is not None:
+            self.defer(paused)
+        self._heavy_lock.acquire()
+        admission = MemoryAdmission.for_role(
+            self._cfg, role, command="imsg sync", probe=self._gate.probe
+        )
+        self._admission = admission
+        refused = self._gate.admit(admission)
+        if refused is not None:
+            self.defer(refused)
+        configure_mlx_memory_limit(self._cfg, role)
+
+    def stop_check(self) -> StopReason | None:
+        return self._gate.between_units()
+
+    def defer(self, reason: StopReason) -> NoReturn:
+        self.note_stopped(reason)
+        raise BackgroundWorkDeferred(reason)
+
+    def note_stopped(self, reason: StopReason) -> None:
+        self.deferred = reason
+        self.release_admission()
+        self._heavy_lock.release()
+
+    def release_admission(self) -> None:
+        if self._admission is not None:
+            self._admission.release()
+            self._admission = None
+
+
+def _make_segment_fn(cfg: Config, steps: _SyncHeavySteps) -> SegmentFn:
     prompt_bytes = _boundary_prompt_bytes_or_die(cfg)
     provider = _build_or_die(lambda: build_boundary_provider(cfg, _decode_prompt(prompt_bytes)))
 
     def _segment_fn(conn: psycopg.Connection, config: Config, *, dry_run: bool = False) -> object:
-        # A dry run asks the boundary model too, so it takes the lock too.
-        heavy_lock.acquire()
-        return run_segment(conn, config, provider, prompt_bytes, dry_run=dry_run)
+        # A dry run asks the boundary model too, so it takes the lock and
+        # passes the gate too.
+        steps.begin(ModelRole.SEGMENT)
+        try:
+            return run_segment(
+                conn, config, provider, prompt_bytes, dry_run=dry_run, stop_check=steps.stop_check
+            )
+        except BackgroundWorkDeferred as exc:
+            steps.note_stopped(exc.reason)
+            raise
+        finally:
+            # The boundary model is not needed again until the next
+            # source's S4: drop it now, so it and the embedders below are
+            # never resident together.
+            _release_models(provider)
+            steps.release_admission()
 
     return _segment_fn
 
 
-def _make_embed_fn(cfg: Config, heavy_lock: HeavyModelLock) -> EmbedFn:
-    # Built once per `sync` process, up front: a real embedder loads model
-    # weights, and `run_sync_all_sources` invokes this once per source.
+def _make_embed_fn(cfg: Config, steps: _SyncHeavySteps) -> EmbedFn:
+    # Built once per `sync` process, up front (a missing model runtime
+    # fails fast); the weights load lazily, on the first embedding.
     text_provider = _build_or_die(lambda: build_text_provider(cfg))
     multimodal_provider = _build_or_die(lambda: build_multimodal_provider(cfg))
 
     def _embed_fn(conn: psycopg.Connection, config: Config, *, dry_run: bool = False) -> object:
-        if not dry_run:  # a dry run only counts pending rows (see `embed`)
-            heavy_lock.acquire()
-        report = run_embed(
-            conn,
-            text_provider,
-            multimodal_provider=multimodal_provider,
-            batch_size=config.embedding.batch_size,
-            max_batch_tokens=config.embedding.max_batch_tokens,
-            dry_run=dry_run,
-        )
         if dry_run:
-            # See `embed`'s own CLI command: opening the FTS sidecar
-            # creates it on disk, a real write a dry run must not do.
-            return report
-        fts_conn = _open_fts_conn(config)
+            # A dry run only counts pending rows: no model, no lock, no
+            # gate (see `embed`), and no FTS sidecar — opening it creates
+            # it on disk, a real write a dry run must not do.
+            return run_embed(
+                conn,
+                text_provider,
+                multimodal_provider=multimodal_provider,
+                batch_size=config.embedding.batch_size,
+                max_batch_tokens=config.embedding.max_batch_tokens,
+                dry_run=True,
+            )
+        steps.begin(ModelRole.EMBED)
+        stopped: BackgroundWorkDeferred | None = None
         try:
-            sync_fts(conn, fts_conn)
+            try:
+                report: object = run_embed(
+                    conn,
+                    text_provider,
+                    multimodal_provider=multimodal_provider,
+                    batch_size=config.embedding.batch_size,
+                    max_batch_tokens=config.embedding.max_batch_tokens,
+                    stop_check=steps.stop_check,
+                )
+            except BackgroundWorkDeferred as exc:
+                stopped, report = exc, exc.partial
+            fts_conn = _open_fts_conn(config)
+            try:
+                sync_fts(conn, fts_conn)
+            finally:
+                fts_conn.close()
         finally:
-            fts_conn.close()
+            _release_models(text_provider, multimodal_provider)
+            steps.release_admission()
+        if stopped is not None:
+            steps.note_stopped(stopped.reason)
+            raise stopped
         return report
 
     return _embed_fn
@@ -1798,14 +2230,22 @@ def sync(
     The host-wide heavy-model lock (`imsg.heavy_lock`) is taken when the
     first source reaches S4, not at start: snapshot and extraction never
     wait behind another process's models. Once taken it is held until the
-    command ends, because the loaded models stay resident until then.
+    command ends.
+
+    S4 and S6 are heavy background work (`imsg.background_gate`). While
+    background work is paused, or when the host has no memory for their
+    models, sync does its light work only — snapshot, extract, identity,
+    so no message is lost — skips segmentation and embedding, says so,
+    and exits 76 (paused) or 75 (memory). Between S4 and S6 the boundary
+    model is dropped, so the two model sets are never resident together.
     """
     cfg = _load_config_or_die(config)
     _validate_seed_or_die(cfg, snapshot, source)
     _echo_backend_line(cfg)
     heavy_lock = _heavy_lock_or_die(cfg, "imsg sync", no_wait=no_wait)
-    segment_fn = _make_segment_fn(cfg, heavy_lock)  # validates the boundary prompt exists up front
-    embed_fn = _make_embed_fn(cfg, heavy_lock)
+    steps = _SyncHeavySteps(cfg, heavy_lock, _background_gate(cfg, "sync"))
+    segment_fn = _make_segment_fn(cfg, steps)  # validates the boundary prompt exists up front
+    embed_fn = _make_embed_fn(cfg, steps)
 
     conn = _connect_and_verify_or_die(cfg)
     try:
@@ -1835,9 +2275,11 @@ def sync(
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     finally:
+        steps.release_admission()
         heavy_lock.release()
         conn.close()
 
+    deferred: StopReason | None = None
     for r in results:
         if r.extract is None:
             typer.echo(f"sync: source={r.source_name} {r.note}")
@@ -1851,8 +2293,17 @@ def sync(
         )
         for line in _extract_report_lines(r.extract):
             typer.echo(f"sync: source={r.source_name} {line}")
+        if r.deferred is not None:
+            skipped = "segmentation and embedding" if not r.segment_ran else "embedding"
+            typer.echo(
+                f"sync: source={r.source_name} light work done (snapshot, extract, identity); "
+                f"{skipped} skipped — {r.deferred.line()}"
+            )
+            deferred = deferred or r.deferred
     if dry_run:
         typer.echo(DRY_RUN_MARKER)
+    if deferred is not None:
+        raise typer.Exit(code=deferred.exit_code)
 
 
 def _kind_counts(counts: dict[str, int]) -> str:
@@ -1933,6 +2384,12 @@ def enrich(
     A worker run holds the host-wide heavy-model lock (`imsg.heavy_lock`),
     taken before the first claim so no task sits leased while it waits.
     `--plan` and `--dry-run` load no model and take no lock.
+
+    A worker run is heavy background work (`imsg.background_gate`): it
+    exits 76 without claiming anything while background work is paused,
+    exits 75 if the host never has memory for the models, and between
+    tasks — holding no lease — stops when paused or when the host's
+    memory pressure rises (`imsg.enrich.worker`).
     """
     cfg = _load_config_or_die(config)
     if plan and retry_failed:
@@ -1949,6 +2406,9 @@ def enrich(
         raise typer.Exit(code=1) from exc
     claim_order = selected if selected is not None else DEFAULT_CLAIM_ORDER
     run_guard_mount_or_exit(cfg.paths.data_root)
+    gate = _background_gate(cfg, "enrich")
+    if not dry_run and not plan:
+        _exit_if_paused(gate, "enrich")
     _echo_backend_line(cfg)
     # Providers before the DB connection so a missing model runtime fails
     # fast; a dry run claims and dispatches nothing, and a plan run fills
@@ -2020,50 +2480,57 @@ def enrich(
     # a time, so no task sits leased while the worker waits here, a long
     # run never outlives the leases of tasks it has not started yet, and
     # a cheap task enqueued mid-run is claimed before the next caption.
-    gate = EnrichmentYieldGate(
+    # The same point is where the worker stops for a pause or for memory
+    # pressure (`imsg.enrich.worker`).
+    yield_gate = EnrichmentYieldGate(
         conn,
         enabled=cfg.enrichment.yield_to_queries,
         poll_interval_seconds=cfg.enrichment.yield_poll_interval_seconds,
         max_pause_seconds=cfg.enrichment.yield_max_pause_seconds,
     )
-    yielded_seconds = 0.0
-    yield_pauses = 0
-    processed = 0
-    outcomes: dict[str, int] = {}
     heavy_lock = _heavy_lock_or_die(cfg, "imsg enrich", no_wait=no_wait)
+    admission = MemoryAdmission.for_role(
+        cfg, ModelRole.ENRICH, command="imsg enrich", probe=gate.probe
+    )
     try:
         # Before any claim or reset: waiting here holds no lease.
         _acquire_heavy_lock_or_die(heavy_lock)
+        _admit_or_exit(gate, admission, heavy_lock, "enrich")
+        configure_mlx_memory_limit(cfg, ModelRole.ENRICH)
         if retry_failed:
             with conn.transaction():
                 reset = reset_failed_tasks(conn, kinds=claim_order)
             typer.echo(f"enrich: reset {reset} failed task(s) to pending")
 
-        while processed < limit:
-            report = gate.wait_until_clear()
-            yielded_seconds += report.waited_seconds
-            yield_pauses += int(report.paused)
-            tasks = claim_tasks(conn, worker_id=worker_id, limit=1, kinds=claim_order)
-            if not tasks:
-                break
-            for task in tasks:
-                outcome = process_one_task(conn, cfg, providers, task)
-                outcomes[outcome] = outcomes.get(outcome, 0) + 1
-                processed += 1
+        worker = run_enrich_worker(
+            conn,
+            cfg,
+            providers,
+            worker_id=worker_id,
+            claim_order=claim_order,
+            limit=limit,
+            yield_gate=yield_gate,
+            stop_check=gate.between_units,
+            claim=claim_tasks,
+            process=process_one_task,
+        )
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     finally:
+        admission.release()
         heavy_lock.release()
         conn.close()
 
-    summary = " ".join(f"{k}={v}" for k, v in sorted(outcomes.items())) or "none"
-    typer.echo(f"enrich: claimed={processed} {summary}")
-    if yield_pauses:
+    summary = " ".join(f"{k}={v}" for k, v in sorted(worker.outcomes.items())) or "none"
+    typer.echo(f"enrich: claimed={worker.processed} {summary}")
+    if worker.yield_pauses:
         typer.echo(
-            f"enrich: yielded to in-flight queries {yield_pauses} time(s), "
-            f"{yielded_seconds:.1f}s total"
+            f"enrich: yielded to in-flight queries {worker.yield_pauses} time(s), "
+            f"{worker.yielded_seconds:.1f}s total"
         )
+    if worker.stopped is not None:
+        _exit_deferred("enrich", worker.stopped)
 
 
 @app.command("backfill-attachments")
@@ -2102,9 +2569,17 @@ def backfill_attachments(
     cache, this host's Messages folder, copies another host pushed into
     staging, then attachments.pull locations over SSH. Each copy is checked
     against the size and hash its location reported before it enters the
-    cache (D13). Sources are only ever read. Counts only are printed."""
+    cache (D13). Sources are only ever read. Counts only are printed.
+
+    Heavy background work (`imsg.background_gate`), though it loads no
+    model: a real run exits 76 while background work is paused, and
+    between files stops (exit 75/76) when paused or when the host's
+    memory pressure rises."""
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
+    gate = _background_gate(cfg, "backfill-attachments")
+    if not dry_run:
+        _exit_if_paused(gate, "backfill-attachments")
 
     conn = _connect_and_verify_or_die(cfg)
     attachments_root = cfg.paths.live_chat_db.parent / "Attachments"
@@ -2118,6 +2593,7 @@ def backfill_attachments(
             dry_run=dry_run,
             retry_failed=retry_failed,
             locations=settings_from_config(cfg, run_pulls=not no_pull),
+            stop_check=None if dry_run else gate.between_units,
         )
     except (ImsgError, TransferError) as exc:
         typer.echo(f"imsg: {exc}", err=True)
@@ -2159,6 +2635,8 @@ def backfill_attachments(
         typer.echo("backfill-attachments: halted — low disk space", err=True)
     if dry_run:
         typer.echo(DRY_RUN_MARKER)
+    if report.stopped is not None:
+        _exit_deferred("backfill-attachments", report.stopped)
 
 
 def _counter_text(counts: Mapping[Any, int]) -> str:
@@ -2529,26 +3007,49 @@ def mcp_local(config: ConfigOption = None) -> None:
         model_thread=model_thread,
         query_marker=query_marker,
     )
-    # Not warmed here: the server answers the MCP handshake first and
-    # run_local_server starts this once it is serving. Tool calls wait for
-    # it (imsg.mcp.tools.local_server); its progress goes to stderr.
+    # Every load — at startup and after every unload — first asks whether
+    # the host has the memory (imsg.memory_admission); refused, retrieval
+    # calls answer WARMING_UP (host memory busy) and the next call asks
+    # again. This server is never paused: it only ever defers a load.
+    memory_probe = host_memory.default_probe()
+    admission = MemoryAdmission.for_role(
+        cfg, ModelRole.LOCAL_SERVER, command="imsg mcp local", probe=memory_probe
+    )
+    configure_mlx_memory_limit(cfg, ModelRole.LOCAL_SERVER)
+    # Not warmed here: the server answers the MCP handshake first, and
+    # this starts on the first retrieval call (or, with
+    # mcp.local.warm_at_start, once run_local_server is serving). Tool
+    # calls wait for it (imsg.mcp.tools.local_server); its progress goes
+    # to stderr.
     warm_up = BackgroundWarmUp(
         service.warm_up_steps(),
         model_thread=model_thread,
         log=lambda line: typer.echo(f"mcp local: {line}", err=True),
+        admission=admission.check,
+        admission_retry_seconds=cfg.memory.admission_retry_seconds,
     )
     # Drops the models after mcp.local.idle_unload_seconds with no
     # retrieval call: every client session runs its own copy of this
     # server, so idle sessions would otherwise hold a model set each
-    # (imsg.retrieval.idle_unload).
+    # (imsg.retrieval.idle_unload). Drops them at once, idle or not, when
+    # the kernel reports memory.local_server_release_at pressure.
     idle_unloader = IdleModelUnloader(
         warm_up=warm_up,
         model_thread=model_thread,
         unload=service.unload_models,
         idle_seconds=cfg.mcp.local.idle_unload_seconds,
         log=lambda line: typer.echo(f"mcp local: {line}", err=True),
+        pressure_release=PressureRelease(
+            read_pressure=memory_probe.pressure,
+            release_at=PressureLevel(cfg.memory.local_server_release_at),
+            check_seconds=cfg.memory.pressure_check_seconds,
+        ),
+        after_unload=admission.release,
     )
     audit = PostgresAuditSink(lambda: connect(cfg.database, autocommit=True))
+    # Every client session runs its own copy of this server and most never
+    # search, so by default nothing loads until the first retrieval call
+    # (mcp.local.warm_at_start).
     local = LocalMcpServer(
         service=service,
         audit=audit,
@@ -2556,11 +3057,19 @@ def mcp_local(config: ConfigOption = None) -> None:
         conn=conn,
         warm_up=warm_up,
         idle_unloader=idle_unloader,
+        warm_at_start=cfg.mcp.local.warm_at_start,
     )
+    if not cfg.mcp.local.warm_at_start:
+        typer.echo(
+            "mcp local: the models load on the first retrieval call "
+            "(mcp.local.warm_at_start is false)",
+            err=True,
+        )
     try:
         anyio.run(run_local_server, local)
     finally:
         model_thread.close()
+        admission.release()
         query_marker.close()
         fts_conn.close()
         conn.close()
@@ -2741,18 +3250,39 @@ def mcp_public(
     # <data_root>/logs/imsgindex-mcp-public.err.log) and to a readiness
     # file `imsg status` reads (imsg.mcp.warm_up_readiness).
     readiness = WarmUpReadinessFile(readiness_path(cfg.paths.data_root))
+    # As on the local surface, every load first asks whether the host has
+    # the memory (imsg.memory_admission). Unlike it, this server loads
+    # again by itself once admitted (rewarm), since it has to stay warm
+    # for its latency budget, and it releases its models only at
+    # memory.public_server_release_at (critical by default, or never).
+    memory_probe = host_memory.default_probe()
+    admission = MemoryAdmission.for_role(
+        cfg, ModelRole.PUBLIC_SERVER, command="imsg mcp public", probe=memory_probe
+    )
+    configure_mlx_memory_limit(cfg, ModelRole.PUBLIC_SERVER)
     warm_up = BackgroundWarmUp(
         service.warm_up_steps(),
         model_thread=model_thread,
         log=lambda line: typer.echo(f"mcp public: {line}", err=True),
         on_status=readiness.publish,
+        admission=admission.check,
+        admission_retry_seconds=cfg.memory.admission_retry_seconds,
     )
+    release_at = cfg.memory.public_server_release_at
     idle_unloader = IdleModelUnloader(
         warm_up=warm_up,
         model_thread=model_thread,
         unload=service.unload_models,
         idle_seconds=cfg.mcp.public.idle_unload_seconds,
         log=lambda line: typer.echo(f"mcp public: {line}", err=True),
+        pressure_release=PressureRelease(
+            read_pressure=memory_probe.pressure,
+            release_at=None if release_at == "never" else PressureLevel(release_at),
+            check_seconds=cfg.memory.pressure_check_seconds,
+            rewarm=True,
+            rewarm_cooldown_seconds=cfg.memory.public_rewarm_cooldown_seconds,
+        ),
+        after_unload=admission.release,
     )
     public = PublicMcpServer(
         service=service,
@@ -2785,6 +3315,7 @@ def mcp_public(
     finally:
         idle_unloader.stop()
         model_thread.close()
+        admission.release()
         query_marker.close()
         fts_conn.close()
         conn.close()

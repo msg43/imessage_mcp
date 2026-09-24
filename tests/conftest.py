@@ -7,7 +7,44 @@ from typing import Any
 
 import pytest
 
+import imsg.host_memory as host_memory_module
+import imsg.mlx_runtime as mlx_runtime_module
+from imsg.host_memory import GIB, HostMemory, PressureLevel
 from imsg.mount.guard import MountInfo
+
+
+class AmpleMemoryProbe:
+    """A host with room for any model set, at normal pressure."""
+
+    def read(self) -> HostMemory:
+        return HostMemory(
+            total_bytes=1024 * GIB,
+            free_bytes=512 * GIB,
+            inactive_bytes=0,
+            speculative_bytes=0,
+            pressure=PressureLevel.NORMAL,
+            kernel_free_percent=50,
+            swap_used_bytes=0,
+        )
+
+    def pressure(self) -> PressureLevel:
+        return PressureLevel.NORMAL
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_host_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reads the memory of the machine it runs on. Every caller
+    gets its probe from `imsg.host_memory.default_probe()` and its process
+    list from `imsg.host_memory.list_model_processes()`, so replacing both
+    here gives every test an ample, normal-pressure host and no model
+    processes; tests of memory behaviour install their own fakes, and the
+    tests of the real probe call the real functions by name. Also forgets
+    any MLX memory limit a test's command recorded
+    (`imsg.mlx_runtime.set_process_memory_limit`), so none leaks into the
+    next test."""
+    monkeypatch.setattr(host_memory_module, "default_probe", AmpleMemoryProbe)
+    monkeypatch.setattr(host_memory_module, "list_model_processes", lambda **_: [])
+    monkeypatch.setattr(mlx_runtime_module, "_process_memory_limit_bytes", None)
 
 
 @pytest.fixture

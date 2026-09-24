@@ -77,6 +77,7 @@ from imsg.backfill.materialize import (
     materialize_from_cache,
 )
 from imsg.backfill.transfer import CopyRunner, pull_command, run_copy
+from imsg.background_gate import StopCheck, StopReason
 from imsg.enrich.planner import enqueue_for_materialized
 from imsg.paths import is_contained_in, is_same_file, join_under_root, resolve_path
 
@@ -202,6 +203,9 @@ class LocationFetchReport:
     """Dry run only: the first copy each attachment would try."""
     budget_capped: bool = False
     halted_low_disk_space: bool = False
+    stopped: StopReason | None = None
+    """Set when the phase stopped because heavy background work was paused
+    or the host was short of memory (`imsg.background_gate`)."""
     notes: list[str] = field(default_factory=list)
     dry_run: bool = False
     enrichment_enqueued: int = 0
@@ -307,9 +311,11 @@ class _LocationPhase:
         min_free_bytes: int,
         free_space_check_interval: int,
         read_this_run: dict[int, str],
+        stop_check: StopCheck | None = None,
     ) -> None:
         self.conn = conn
         self.read_this_run = read_this_run
+        self.stop_check = stop_check
         self.data_root = data_root
         self.settings = settings
         self.access = settings.access
@@ -359,6 +365,17 @@ class _LocationPhase:
         self.report.enrichment_enqueued += len(outcome.enqueued)
         self.report.enrichment_unroutable += int(outcome.unroutable)
         self.report.enrichment_plan_errors += int(outcome.error is not None)
+
+    def _keep_going(self) -> bool:
+        """False once the stop check has given a reason (recorded)."""
+        if self.stop_check is None:
+            return True
+        reason = self.stop_check()
+        if reason is None:
+            return True
+        self.report.stopped = reason
+        self.report.notes.append(f"stopped: {reason.line()}")
+        return False
 
     def _space_ok(self) -> bool:
         if self.disk_free_fn is None:
@@ -545,7 +562,7 @@ class _LocationPhase:
                         pull_requests.setdefault(attempt.row.location, []).append(attempt)
                         break
                     self._tries += 1
-                    if not self._space_ok():
+                    if not self._space_ok() or not self._keep_going():
                         halted = True
                         break
                     if self._try(attempt):
@@ -561,7 +578,7 @@ class _LocationPhase:
             if halted or not pull_requests:
                 break
             for location, attempts in pull_requests.items():
-                if not self._space_for_pull():
+                if not self._space_for_pull() or not self._keep_going():
                     halted = True
                     break
                 done_ids = self._pull(location, attempts)
@@ -692,6 +709,7 @@ def fetch_from_locations(
     min_free_bytes: int = 0,
     free_space_check_interval: int = 100,
     read_this_run: dict[int, str] | None = None,
+    stop_check: StopCheck | None = None,
 ) -> LocationFetchReport:
     """Run the location phase once (module docstring). `budget` caps how
     many attachments are attempted (the first-run trial gate's remainder).
@@ -710,6 +728,7 @@ def fetch_from_locations(
         min_free_bytes=min_free_bytes,
         free_space_check_interval=free_space_check_interval,
         read_this_run=read_this_run or {},
+        stop_check=stop_check,
     ).run()
 
 

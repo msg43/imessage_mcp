@@ -403,6 +403,68 @@ def test_run_sync_all_sources_stops_at_first_failure(
 
 
 # --------------------------------------------------------------------------
+# heavy steps deferred (paused, or no memory): the light work stands
+# --------------------------------------------------------------------------
+
+
+def _deferred(kind: str) -> Exception:
+    from imsg.background_gate import BackgroundWorkDeferred, DeferralKind, StopReason
+
+    return BackgroundWorkDeferred(StopReason(DeferralKind(kind), f"{kind}: test"))
+
+
+def test_a_deferred_segmentation_skips_embedding_and_keeps_the_light_work(
+    config_dict_factory: ConfigDictFactory, tmp_path: Path
+) -> None:
+    config = _minimal_config(config_dict_factory)
+    order: list[str] = []
+
+    def segment(conn: object, cfg: object, **kw: object) -> None:
+        order.append("segment")
+        raise _deferred("paused")
+
+    result = run_sync(
+        conn=object(),  # type: ignore[arg-type]
+        config=config,
+        source_name="mini",
+        imsg_dump_binary=tmp_path / "imsg-dump",
+        run_snapshot_fn=lambda **kw: order.append("snapshot") or _fake_snapshot_result(tmp_path / "s.db"),
+        run_extract_fn=lambda **kw: order.append("extract") or _fake_extract_result(),
+        run_identity_fn=lambda **kw: order.append("identity") or _fake_identity_result(_ok_invariant()),
+        segment_fn=segment,
+        embed_fn=lambda conn, cfg, **kw: order.append("embed"),
+    )
+
+    assert order == ["snapshot", "extract", "identity", "segment"]
+    assert result.extract is not None and result.identity is not None
+    assert (result.segment_ran, result.embed_ran) == (False, False)
+    assert result.deferred is not None and result.deferred.kind.value == "paused"
+
+
+def test_a_deferred_embedding_is_recorded_after_segmentation_ran(
+    config_dict_factory: ConfigDictFactory, tmp_path: Path
+) -> None:
+    config = _minimal_config(config_dict_factory)
+
+    def embed(conn: object, cfg: object, **kw: object) -> None:
+        raise _deferred("memory")
+
+    result = run_sync(
+        conn=object(),  # type: ignore[arg-type]
+        config=config,
+        source_name="mini",
+        imsg_dump_binary=tmp_path / "imsg-dump",
+        run_snapshot_fn=lambda **kw: _fake_snapshot_result(tmp_path / "s.db"),
+        run_extract_fn=lambda **kw: _fake_extract_result(),
+        run_identity_fn=lambda **kw: _fake_identity_result(_ok_invariant()),
+        segment_fn=lambda conn, cfg, **kw: "segmented",
+        embed_fn=embed,
+    )
+    assert (result.segment_ran, result.embed_ran) == (True, False)
+    assert result.deferred is not None and result.deferred.exit_code == 75
+
+
+# --------------------------------------------------------------------------
 # live-Postgres integration: the real S1->S2->S3 chain end to end
 # --------------------------------------------------------------------------
 

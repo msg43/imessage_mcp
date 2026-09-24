@@ -11,6 +11,15 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-09-24 memory protections (not yet deployed):** every model load now
+asks whether the host has room first (both MCP servers, segment, embed,
+enrich, sync's heavy steps, eval); `imsg mcp local` loads nothing until
+its first retrieval call; heavy background work can be paused (`imsg
+background pause`, or the host pause file another project creates) and
+stops between units under memory pressure; MCP servers unload at critical
+pressure. Follows the 2026-09-24 out-of-memory hang; see `CHANGELOG.md`.
+2,380 tests pass against a scratch Postgres (2026-09-24).
+
 **2026-09-23 MCP transport fix:** validated integral JSON numbers are
 normalized before retrieval, so `limit: 3.0` cannot cause a slice TypeError.
 All three integer tool arguments covered; invalid fractions/booleans remain

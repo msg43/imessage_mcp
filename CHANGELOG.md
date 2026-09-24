@@ -10,6 +10,102 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-24 — Every model-loading process checks the host's memory first; heavy background work can be paused
+
+**Why.** The index host (64 GiB) ran out of memory and hung: idle MCP
+servers held about 62 GiB between them next to enrichment and a
+scheduled sync. The heavy-model lock and idle unload (the two entries
+below) removed two causes, but nothing asked, before a load, whether the
+host had room; another heavy job now shares the host and needs iMessage
+background work to stand aside while it runs; and every client session's
+`imsg mcp local` loaded a full model set at start whether or not it was
+ever asked anything.
+
+- **Memory admission before every load** (`imsg.memory_admission`, one
+  module for every caller). A model set loads only if the kernel's
+  pressure level is normal (`memory.admission_max_pressure`; nothing ever
+  loads at critical) and `vm_stat` free + inactive + speculative, less
+  what other processes were admitted for and have not taken up, covers the
+  role's footprint (`memory.footprints`) plus `memory.reserve_bytes`
+  (8 GiB). A host that cannot be measured is a refusal. Admission runs
+  under a short host-wide `flock` and leaves a reservation per process
+  (`<data_root>/run/memory-reservations/`), so servers started in the same
+  second are admitted one at a time (tested with five real processes: two
+  of five admitted on a 50 GiB host, none of them loading on a guess).
+  Applied to both MCP servers at startup and at every reload, `segment`,
+  `embed`, the `enrich` worker, `sync`'s segmentation and embedding, and
+  `eval run`/`eval pool`.
+- **Refusals.** A background command waits (logged every 30 s, up to
+  600 s), then exits **75** (`deferred: memory`) with the heavy lock
+  released. An MCP server loads nothing (new warm-up phase `memory_busy`)
+  and answers retrieval calls with the existing retryable `WARMING_UP`
+  code and a "host memory busy" message; the public surface says it only
+  after the auth gate, in numbers only (no error text, SPEC §10.1). The
+  local server retries on a later call, the public one by itself.
+- **`imsg mcp local` loads nothing at start** (`mcp.local.warm_at_start`,
+  default false): the first retrieval call starts the load, through
+  admission, and waits up to 90 s as before; idle unload still applies.
+  `true` restores loading at start. `imsg mcp public` still loads at start
+  for its 2 s budget.
+- **Pause switch** (`imsg.background_pause`): `imsg background pause
+  [--reason] [--until 6h|ISO]`, `resume`, `status`, stored in
+  `<data_root>/run/background-pause.json`; or, for another project with no
+  access to this one's config or volume, the host pause file
+  `~/.config/imessage-index/pause-background` (`background.host_pause_file`),
+  whose optional `pid=` line ends the pause when that process exits.
+  Honoured by segment, embed, the enrich worker, backfill-attachments and
+  sync's heavy steps (exit **76**, `deferred: paused`). `sync` still
+  snapshots, extracts and resolves identities while paused, says it
+  skipped segmentation and embedding, and exits 76. MCP servers are never
+  paused. An unreadable pause file counts as a pause.
+- **Stopping between units** (`imsg.background_gate`): before each
+  enrichment task, embedding batch, chat, or attachment file, a running
+  command re-reads the pause switch and the kernel's pressure level;
+  paused, critical, or warn still present 10 s later, it finishes the unit
+  in hand, releases the heavy lock and exits 75/76. The enrich loop moved
+  to `imsg.enrich.worker`, which also hands back a task interrupted
+  mid-processing (Ctrl-C, SIGTERM) instead of leaving it leased for 30 min.
+  `sync` now drops the boundary model before embedding (new
+  `MlxBoundaryProvider.unload`), so the two model sets are never resident
+  together in one sync process.
+- **Emergency release.** Each MCP server's watchdog reads the pressure
+  level every 5 s; at critical a server with loaded models unloads them at
+  once, idle timer or not, as soon as no call is in flight
+  (`memory.local_server_release_at`, `memory.public_server_release_at`,
+  which can be `never`). The public server reloads by itself after a
+  300 s cooldown, if admitted. Every unload releases the server's
+  reservation.
+- **MLX memory limit per role** (`memory.mlx_memory_limits`, applied with
+  `mx.set_memory_limit` when a provider loads): 12 GiB for each MCP server,
+  14 embed, 31 enrich, 24 segment — 1.25x each role's measured MLX peak.
+  In MLX 0.32.2 the limit moves when cached buffers are released and when
+  evaluation waits for work in flight; it never refuses an allocation or
+  changes a result.
+- **Visibility.** `imsg status` adds available memory, the pressure level,
+  swap, the pause state and reason, and every running model process with
+  its footprint (`proc_pid_rusage`, no root; RSS leaves out MLX's GPU
+  buffers — a 2 GiB MLX array showed 33 MB RSS and a 2.16 GB footprint) and
+  what it was admitted for. The pressure level's encoding (1/2/4) was
+  checked against `<dispatch/source.h>` and XNU's sysctl handler.
+- **Found by testing:** the host pause file's `~` default was never
+  expanded (pydantic does not validate defaults); fixed with
+  `validate_default`.
+- Tests: 119 new (fake memory probe throughout; `tests/conftest.py` gives
+  every test an ample host so none depends on the machine running it),
+  plus one existing test updated for the new `memory_detail` field.
+  Against the unfixed code 118 fail or cannot be collected — among them a
+  real stdio server that logs "warm-up started" before any call; the one
+  that passes checks that a dry run loading no model is not paused. Five
+  targeted mutations (reservations ignored, unloading under a call, no stop
+  check in the worker, loading without admission, embedding after a
+  deferral) are each caught.
+
+**Not measured, and honest about it:** none of this has run on the index
+host yet; the footprints and limits are the D10 and incident measurements,
+two of them (enrich, segment) built from measured parts. The query-latency
+claim for the 12 GiB limit rests on the earlier cache measurement (2 vs
+8 GiB of cache within noise), not on a new run.
+
 ## 2026-09-24 — Model-heavy commands run one at a time on a host
 
 **Why.** The production index host (64 GiB) ran out of memory and hung.

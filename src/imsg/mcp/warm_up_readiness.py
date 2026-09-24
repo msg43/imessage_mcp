@@ -126,6 +126,7 @@ class WarmUpReadinessFile:
                 None if status.settled else max(1, math.ceil(status.seconds_remaining))
             ),
             "failure": status.failure,
+            "memory_detail": status.detail,
             "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         }
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -236,8 +237,16 @@ def _describe(document: dict[str, Any], phase: str, failure: str | None, age: fl
         return f"models failed to load ({failure or 'cause unknown'}); restart the agent"
     if phase == "unloaded":
         return (
-            "models unloaded after sitting idle (mcp.public.idle_unload_seconds); the "
-            "next tool call reloads them and is answered WARMING_UP until they are warm"
+            "models unloaded (after sitting idle, mcp.public.idle_unload_seconds, or for "
+            "memory pressure, memory.public_server_release_at); the next tool call reloads "
+            "them and is answered WARMING_UP until they are warm"
+        )
+    if phase == "memory_busy":
+        detail = document.get("memory_detail")
+        why = f": {detail}" if isinstance(detail, str) and detail else ""
+        return (
+            f"models not loaded — the host did not have the memory for them{why}. Tool "
+            f"calls answer WARMING_UP (host memory busy); the server retries by itself"
         )
     if phase == "ready":
         elapsed = document.get("elapsed_seconds")

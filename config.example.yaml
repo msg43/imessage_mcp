@@ -154,6 +154,10 @@ render:
 mcp:
   local:
     enabled: true
+    # Load the retrieval models only on the first retrieval call. Every
+    # client session starts its own server and most never search; true
+    # loads at start instead (the behaviour before 2026-09-24).
+    warm_at_start: false
     # Drop the retrieval models (roughly 10-15 GiB per process) after this many
     # seconds with no retrieval tool call; the next call reloads them,
     # waiting up to 90 s. Every client session runs its own server, so this
@@ -179,6 +183,42 @@ mcp:
       client_secret: keychain:imsgindex-oauth        # (secret)
       owner_subject: keychain:imsgindex-owner-sub     # (secret)
       tokeninfo_cache_ttl_seconds: 60
+
+# Memory: every model load first asks whether the host has room
+# (imsg.memory_admission), heavy background work stops between units when
+# the host is short or paused (imsg.background_gate), and MCP servers give
+# their models back under critical pressure. Defaults are measured on a
+# 64 GiB host; each field's docstring in imsg.config.schema names its source.
+memory:
+  reserve_bytes: 8589934592         # 8 GiB left for the rest of the host after a load
+  admission_max_pressure: normal    # normal | warn; nothing loads at critical, whatever this says
+  admission_wait_seconds: 600       # background commands wait this long for memory, then exit 75
+  admission_poll_seconds: 30
+  admission_retry_seconds: 15       # an MCP server retries a refused load no sooner than this
+  background_stop_at: warn          # warn | critical: workers stop after their current unit
+  warn_confirm_seconds: 10          # warn must still be there this long later to stop a worker
+  pressure_check_seconds: 5         # MCP watchdog's pressure reading interval
+  local_server_release_at: critical # warn | critical: unload a loaded local server at once
+  public_server_release_at: critical  # critical | never
+  public_rewarm_cooldown_seconds: 300
+  # footprints:                     # expected size of each role's model set (admission)
+  #   public_server_bytes: 18468359372   # 17.2 GiB
+  #   local_server_bytes: 18468359372    # 17.2 GiB
+  #   embed_bytes: 26736171417           # 24.9 GiB
+  #   enrich_bytes: 26628797235          # 24.8 GiB
+  #   segment_bytes: 22548578304         # 21.0 GiB
+  # mlx_memory_limits:              # mx.set_memory_limit per role; 0 = MLX's own default
+  #   public_server_bytes: 12884901888   # 12 GiB
+  #   local_server_bytes: 12884901888    # 12 GiB
+  #   embed_bytes: 15032385536           # 14 GiB
+  #   enrich_bytes: 33285996544          # 31 GiB
+  #   segment_bytes: 25769803776         # 24 GiB
+
+# The pause switch for heavy background work (imsg background pause|resume|status).
+background:
+  # Another project on this host can create this file to pause heavy
+  # background work and remove it to resume; imsg only reads it. null = off.
+  host_pause_file: ~/.config/imessage-index/pause-background
 
 export:
   gcp_project: example-project-id

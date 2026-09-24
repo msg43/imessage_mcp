@@ -57,6 +57,14 @@ collapsing to `INTERNAL` — `imsg.mcp.audit.ALLOWED_ERROR_CODES` lists
 them. Restarts are the normal case here, not the exception: the launchd
 agent is `KeepAlive`, so every crash is followed by another cold load.
 
+A load the host has no memory for is not started (`imsg.memory_admission`):
+the warm-up waits in `memory_busy`, retrieval calls get `WARMING_UP` with a
+"host memory busy" message in numbers only, and the server tries the load
+again by itself (`imsg.retrieval.idle_unload.PressureRelease`, `rewarm`).
+That answer comes from the same place as every other tool error, inside
+`gate.dispatch`, so an unauthenticated request never learns the host's
+state.
+
 That the warm-up wait sits *outside* `gate.dispatch` — the one thing in
 this module that is ordered differently from the security layers above —
 is deliberate and costs nothing: `TransportGuardASGIApp` has already
@@ -331,7 +339,11 @@ class PublicMcpServer:
                 # they take the same route out as any other SPEC §10.1
                 # outcome: their own machine code in the tool error and in
                 # the audit row, never `INTERNAL`.
-                warm_up.raise_unless_ready(wait_bound_seconds=self.warm_up_wait_seconds)
+                # `public=True`: a refusal for memory is told in numbers
+                # only, never with the text of a failed measurement.
+                warm_up.raise_unless_ready(
+                    wait_bound_seconds=self.warm_up_wait_seconds, public=True
+                )
             payload = tool_fn(self.service, context, arguments)
         except RetrievalError as exc:
             return _ToolCallOutcome(payload=None, error_code=exc.code, error_message=str(exc))

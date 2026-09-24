@@ -549,6 +549,195 @@ class ModelsConfig(StrictModel):
 
 
 # --------------------------------------------------------------------------
+# memory: admission before a load, stopping between units, emergency release
+# --------------------------------------------------------------------------
+
+_GIB = 2**30
+
+
+def _gib(value: float) -> int:
+    return int(value * _GIB)
+
+
+class ModelFootprints(StrictModel):
+    """What each role's model set is expected to occupy once loaded, in
+    bytes: the figure `imsg.memory_admission` compares with the host's
+    available memory before letting a load start. Each default is a
+    measured process footprint on the 64 GiB production host (M4 Pro)
+    where one exists, and otherwise is built from measured parts; the
+    source is named per field. Raise a figure if a role is seen to use
+    more; `imsg status` shows every model process's live footprint."""
+
+    public_server_bytes: int = Field(default=_gib(17.2), gt=0)
+    """17.2 GiB: the query process (text embedder, PE-Core text tower,
+    0.6B reranker, MLX cache) at its highest sampled footprint over a
+    19-minute run on the production host, 2026-09-17 (CHANGELOG
+    2026-09-17, "query process, footprint 16.1 GiB (17.2 peak-sampled)")."""
+
+    local_server_bytes: int = Field(default=_gib(17.2), gt=0)
+    """17.2 GiB: the same model set as the public server (same source)."""
+
+    embed_bytes: int = Field(default=_gib(24.9), gt=0)
+    """24.9 GiB: `imsg embed` (text embedder plus the PE-Core image tower)
+    in the 2026-09-24 kernel panic report from the production host
+    (CHANGELOG 2026-09-24, "Model-heavy commands run one at a time")."""
+
+    enrich_bytes: int = Field(default=_gib(24.8), gt=0)
+    """24.8 GiB: built from measured parts. The enrichment process
+    measured 28.2 GiB on the production host (CHANGELOG 2026-09-17) with
+    PE-Core's image tower loaded (7.06 GiB, same run), which the real
+    worker never loads (`imsg.enrich.pipeline.EnrichmentProviders` holds
+    OCR, captioning and transcription only), and without Whisper, which
+    it does load for audio (3.66 GiB peak, models/manifest.lock.yaml):
+    28.2 - 7.06 + 3.66 = 24.8."""
+
+    segment_bytes: int = Field(default=_gib(21.0), gt=0)
+    """21.0 GiB: built from measured parts, no whole-process measurement
+    exists. The boundary model through mlx-lm peaked at 19.07 GiB of MLX
+    memory (models/manifest.lock.yaml smoke test), and a model process
+    carries about 1.94 GiB outside its model runtimes (the enrichment
+    process above: 28.2 - 19.00 MLX active - 0.20 MLX cache - 7.06
+    torch)."""
+
+
+class MlxMemoryLimits(StrictModel):
+    """`mx.set_memory_limit` per role, in bytes; 0 leaves MLX's own
+    default (1.5x the GPU's recommended working set, capped at 95% of
+    RAM). The limit is a guideline, not a ceiling: in MLX 0.32.2 it sets
+    the point past which a new allocation first releases cached buffers
+    (`gc_limit`, `mlx/backend/metal/allocator.cpp`) and past which graph
+    evaluation waits for work in flight before queueing more
+    (`mlx/transforms.cpp`); no allocation is ever refused because of it
+    and no computation changes, so model output is identical. Every
+    default is the role's measured MLX peak times 1.25, rounded up to a
+    whole GiB, so evaluation never waits in normal running and the only
+    effect is on the buffer cache. On the query side that means about
+    4 GiB of cache instead of 8, measured not to move query latency (8
+    versus 2 GiB of cache: stage p50s 0.644 versus 0.616 s, within
+    noise; CHANGELOG 2026-09-17)."""
+
+    public_server_bytes: int = Field(default=12 * _GIB, ge=0)
+    """12 GiB: MLX peak 9.56 GiB for the query models (development host,
+    CHANGELOG 2026-09-17; 8.70 GiB on the production host)."""
+
+    local_server_bytes: int = Field(default=12 * _GIB, ge=0)
+    """12 GiB: the same models as the public server."""
+
+    embed_bytes: int = Field(default=14 * _GIB, ge=0)
+    """14 GiB: MLX peak 9-11 GiB for 4k-16k padded tokens including the
+    weights (`imsg.mlx_runtime.DEFAULT_CACHE_LIMIT_BYTES`; 8.6 GiB at the
+    default 2k budget, `imsg.embed.batching`)."""
+
+    enrich_bytes: int = Field(default=31 * _GIB, ge=0)
+    """31 GiB: MLX peak 20.88 GiB for the captioner (production host,
+    CHANGELOG 2026-09-17) plus Whisper's 3.66 GiB, both resident when a
+    run mixes images and audio."""
+
+    segment_bytes: int = Field(default=24 * _GIB, ge=0)
+    """24 GiB: the boundary model's MLX peak of 19.07 GiB
+    (models/manifest.lock.yaml)."""
+
+
+class MemoryConfig(StrictModel):
+    """How every model-loading process stays inside the host's memory
+    (`imsg.memory_admission`, `imsg.background_gate`,
+    `imsg.retrieval.idle_unload`). There is deliberately no switch that
+    turns admission off: a load the host cannot measure is refused."""
+
+    reserve_bytes: int = Field(default=8 * _GIB, ge=0)
+    """8 GiB left for the rest of the host after a load: a load is
+    admitted only if available memory covers its footprint plus this.
+    Reasoned from two measured configurations on the 64 GiB production
+    host, 2026-09-17: 44.3 GiB of model processes kept pressure normal
+    (CHANGELOG 2026-09-17) and 50.8 GiB reached warn (the D10
+    measurements). With macOS, the GUI session and Postgres planned at
+    about 14 GB (the shared-host budget's estimates), the normal case
+    left about 6 GiB and the warn case none. 8 GiB keeps a load clear of
+    both."""
+
+    admission_max_pressure: Literal["normal", "warn"] = "normal"
+    """A load is refused while the kernel reports worse than this. There
+    is no setting that admits a load at critical."""
+
+    admission_wait_seconds: float = Field(default=600.0, ge=0)
+    """How long a background command waits, re-checking, for memory
+    before it exits `deferred: memory`. 600 s matches
+    `mcp.local.idle_unload_seconds`'s default: the most common large and
+    temporary holder is an idle local MCP server, which gives its memory
+    back within that time."""
+
+    admission_poll_seconds: float = Field(default=30.0, gt=0)
+    """How often that wait re-checks, and logs what it saw."""
+
+    admission_retry_seconds: float = Field(default=15.0, gt=0)
+    """An MCP server whose load was refused tries again no sooner than
+    this: the local server on its next retrieval call, the public server
+    by itself. Each try costs one `vm_stat` run."""
+
+    background_stop_at: Literal["warn", "critical"] = "warn"
+    """A background worker finishes its current unit and stops when the
+    kernel reports this pressure or worse."""
+
+    warn_confirm_seconds: float = Field(default=10.0, ge=0)
+    """A warn reading stops a worker only if it is still warn (or worse)
+    this long after: in the 2026-09-17 overlap run the host read warn in
+    2 of 133 samples, each on its own. Critical stops a worker at once."""
+
+    pressure_check_seconds: float = Field(default=5.0, gt=0)
+    """How often an MCP server's watchdog reads the pressure level (one
+    sysctl). The 2026-09-17 failure paged in 218 GiB over 11 minutes, so
+    a few seconds is early enough to matter."""
+
+    local_server_release_at: Literal["warn", "critical"] = "critical"
+    """A local MCP server with its models loaded unloads them at once, not
+    waiting for its idle timer, when the kernel reports this pressure.
+    It waits for a call in flight to finish first."""
+
+    public_server_release_at: Literal["critical", "never"] = "critical"
+    """The same for the public server; `never` keeps its models loaded
+    whatever the pressure."""
+
+    public_rewarm_cooldown_seconds: float = Field(default=300.0, ge=0)
+    """After releasing its models for pressure, the public server waits
+    this long before trying to load them again (and then only if the
+    load is admitted). A reload took 41.8-65.4 s on the production
+    host's cold starts (`imsg.retrieval.service.ESTIMATED_WARM_UP_SECONDS`),
+    so cycling faster than this would spend most of the time loading."""
+
+    footprints: ModelFootprints = Field(default_factory=ModelFootprints)
+    mlx_memory_limits: MlxMemoryLimits = Field(default_factory=MlxMemoryLimits)
+
+
+# --------------------------------------------------------------------------
+# background: the pause switch
+# --------------------------------------------------------------------------
+
+DEFAULT_HOST_PAUSE_FILE = Path("~/.config/imessage-index/pause-background")
+
+
+class BackgroundConfig(StrictModel):
+    """The pause switch for heavy background work
+    (`imsg.background_pause`)."""
+
+    host_pause_file: Path | None = Field(default=DEFAULT_HOST_PAUSE_FILE, validate_default=True)
+    """A file outside the encrypted volume that another project on this
+    host can create to pause heavy background work and remove to resume,
+    without this project's config or volume. Only ever read, never
+    written. `null` turns it off; `imsg background pause` works either
+    way."""
+
+    @field_validator("host_pause_file", mode="after")
+    @classmethod
+    def _expand_and_require_absolute(cls, v: Path | None) -> Path | None:
+        if v is None:
+            return None
+        expanded = v.expanduser()
+        if not expanded.is_absolute():
+            raise ValueError(f"background.host_pause_file must be an absolute path, got '{v}'")
+        return expanded
+
+
+# --------------------------------------------------------------------------
 # render
 # --------------------------------------------------------------------------
 
@@ -590,6 +779,17 @@ def _check_idle_unload_seconds(value: int, key: str) -> int:
 
 class McpLocalConfig(StrictModel):
     enabled: bool = True
+    warm_at_start: bool = False
+    """Load the retrieval models as soon as the server starts. Off by
+    default: every client session starts its own `imsg mcp local`, most
+    never search, and a server that loads at start holds a full model set
+    (`memory.footprints.local_server_bytes`, 17.2 GiB) whether or not
+    anyone asks it anything — that is how idle sessions filled the 64 GiB
+    index host (CHANGELOG 2026-09-24). With it off, the first retrieval
+    call starts the load, through the memory admission check like every
+    load, and waits for it up to 90 s (else `WARMING_UP`); the idle
+    unloader drops the models again afterwards. `true` restores loading
+    at start."""
     idle_unload_seconds: int = Field(default=600, ge=0)
     """Drop the retrieval models after this many seconds with no
     retrieval tool call; the next call reloads them (waiting up to 90 s,
@@ -841,6 +1041,8 @@ class Config(StrictModel):
     eval: EvalConfig = Field(default_factory=EvalConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     attachments: AttachmentsConfig = Field(default_factory=AttachmentsConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    background: BackgroundConfig = Field(default_factory=BackgroundConfig)
 
     # ---- cross-field path-containment validation (hard requirements #1, #2) ----
 
@@ -865,6 +1067,8 @@ class Config(StrictModel):
         candidates: list[tuple[str, Path]] = [
             ("paths.data_root", self.paths.data_root),
         ]
+        if self.background.host_pause_file is not None:
+            candidates.append(("background.host_pause_file", self.background.host_pause_file))
         for i, source in enumerate(self.sync.sources):
             candidates.append((f"sync.sources[{i}] ({source.name}).chat_db", source.chat_db))
 
@@ -943,10 +1147,12 @@ class Config(StrictModel):
 PathLike = Annotated[Path, "resolved via imsg.paths helpers before use"]
 
 __all__ = [
+    "DEFAULT_HOST_PAUSE_FILE",
     "HNSW_EF_SEARCH_MAX",
     "RERANKER_MODEL_FORMS",
     "AttachmentPullConfig",
     "AttachmentsConfig",
+    "BackgroundConfig",
     "Config",
     "DatabaseConfig",
     "EmbeddingConfig",
@@ -959,6 +1165,9 @@ __all__ = [
     "McpLocalConfig",
     "McpPublicConfig",
     "McpPublicOauthConfig",
+    "MemoryConfig",
+    "MlxMemoryLimits",
+    "ModelFootprints",
     "ModelsConfig",
     "MultimodalEmbeddingConfig",
     "PathsConfig",

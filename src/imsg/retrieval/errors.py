@@ -26,6 +26,7 @@ handles, or stack traces").
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from imsg.errors import ImsgError
@@ -134,6 +135,30 @@ class WarmingUpError(RetrievalError):
         )
 
 
+class HostMemoryBusyError(WarmingUpError):
+    """The server did not load its models because the host did not have
+    the memory for them (`imsg.memory_admission`). The same retryable
+    `WARMING_UP` code, so a client that retries a warming server retries
+    this too; the message says the host's memory is busy and when the
+    server tries again. `detail` is the admission's own summary: on the
+    public surface only numbers and the pressure level, never the text
+    of an error (SPEC §10.1: no paths in public errors)."""
+
+    code = "WARMING_UP"
+
+    def __init__(self, *, detail: str, retry_seconds: float, wait_bound_seconds: float) -> None:
+        self.seconds_remaining = max(1, math.ceil(retry_seconds))
+        self.loading = None
+        self.wait_bound_seconds = wait_bound_seconds
+        self.detail = detail
+        RetrievalError.__init__(
+            self,
+            f"host memory busy — the index has not loaded its models: {detail}. Retry "
+            f"this call later; the server tries loading them again at most every "
+            f"{retry_seconds:g} s",
+        )
+
+
 class WarmUpFailedError(RetrievalError):
     """A model failed to load when the server started, so no tool call
     can be answered until the cause is fixed and the server restarts."""
@@ -150,6 +175,7 @@ class WarmUpFailedError(RetrievalError):
 
 __all__ = [
     "DateRangeInvalidError",
+    "HostMemoryBusyError",
     "InvalidArgumentError",
     "NotEnrichedError",
     "NotFoundError",

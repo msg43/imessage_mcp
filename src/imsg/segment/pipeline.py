@@ -57,6 +57,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from imsg.background_gate import BackgroundWorkDeferred, StopCheck
 from imsg.config.schema import Config
 from imsg.errors import SegmentationError
 from imsg.hashing import sha256_text
@@ -1205,6 +1206,7 @@ def run_segment(
     *,
     chat_ids: set[int] | None = None,
     dry_run: bool = False,
+    stop_check: StopCheck | None = None,
 ) -> list[SegmentationRunReport]:
     """Top-level incremental entry point (SPEC §8 S7's S4 step): find
     every dirty chat and re-segment each. `chat_ids`, if given,
@@ -1214,13 +1216,21 @@ def run_segment(
 
     `dry_run` is threaded straight through to each
     `run_segment_for_chat` call (SPEC §8: "takes --dry-run where
-    writes leave the machine")."""
+    writes leave the machine").
+
+    `stop_check` (`imsg.background_gate`) is asked before each chat. A
+    chat is one transaction, so on a reason every chat already done is
+    committed and the rest stay dirty for the next run; the run raises
+    `BackgroundWorkDeferred` with the finished chats' reports."""
     dirty = find_dirty_chats(conn, index_unsent=config.policy.index_unsent)
     if chat_ids is not None:
         dirty = {cid: ts for cid, ts in dirty.items() if cid in chat_ids}
 
-    reports = []
+    reports: list[SegmentationRunReport] = []
     for chat_id, span in dirty.items():
+        reason = stop_check() if stop_check is not None else None
+        if reason is not None:
+            raise BackgroundWorkDeferred(reason, partial=reports)
         reports.append(
             run_segment_for_chat(
                 conn,

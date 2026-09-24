@@ -21,14 +21,18 @@ handler ever runs — a schema violation becomes an ordinary SPEC §10.1
 `INVALID_ARGUMENT` tool error (audited like any other call), never a
 raw exception.
 
-**Serving before the models are warm.** The server answers `initialize`
-and `tools/list` at once; the models warm up in the background
-(`imsg.retrieval.background_warm_up`), started only after the stdio
-transport has taken over stdout (see `run_local_server`). A tool call
-that arrives first waits for the warm-up — without blocking the event
-loop, so pings and other requests are still answered — for at most
+**Loading on the first call.** The server answers `initialize` and
+`tools/list` at once and, by default, loads no model until the first
+retrieval call (`mcp.local.warm_at_start`, off: most client sessions,
+each with its own server, never search, and a server that loaded at
+start held a full model set regardless). That call starts the warm-up
+(`imsg.retrieval.background_warm_up`), which asks the memory admission
+check first, and waits for it — without blocking the event loop, so
+pings and other requests are still answered — for at most
 `TOOL_CALL_WARM_UP_WAIT_SECONDS`, then gets a `WARMING_UP` tool error
-with an estimate of the seconds remaining. A warm-up that failed turns
+with an estimate of the seconds remaining. With `warm_at_start` on, the
+warm-up starts as soon as the stdio transport has taken over stdout (see
+`run_local_server`), as it always did before. A warm-up that failed turns
 every tool call into a `WARM_UP_FAILED` error naming the cause. Both are
 ordinary SPEC §10.1-style tool errors, audited like any other; arguments
 that fail the schema are rejected at once, without waiting. So is
@@ -45,6 +49,15 @@ waits for it exactly as a call during the first warm-up does — up to
 `TOOL_CALL_WARM_UP_WAIT_SECONDS`, then `WARMING_UP` with an estimate. Every
 retrieval call is registered with the unloader for its whole span, the
 wait included, so nothing unloads while one is in flight.
+
+**Loading only when the host has room.** Every load — at startup and at
+each reload — first asks `imsg.memory_admission` whether the host has the
+memory for it. Refused, nothing loads and the warm-up's state becomes
+`memory_busy`; a retrieval call is answered at once with the retryable
+`WARMING_UP` code and a "host memory busy" message naming the numbers
+(`HostMemoryBusyError`), and the next call asks again. The unloader
+also drops loaded models early when the kernel reports critical memory
+pressure (`memory.local_server_release_at`).
 
 **Exiting when the client goes.** The SDK's stdio transport ends
 `server.run` when stdin reaches end-of-file, which is what an SSH client
@@ -76,6 +89,7 @@ from imsg.mcp.tools import handlers
 from imsg.mcp.tools.dispatch import call_tool
 from imsg.mcp.tools.schemas import TOOL_DEFINITIONS, TOOL_DEFINITIONS_BY_NAME, ToolDefinition
 from imsg.retrieval.access import LOCAL_FULL_ACCESS
+from imsg.retrieval.background_warm_up import WarmUpPhase
 from imsg.retrieval.errors import InvalidArgumentError
 
 if TYPE_CHECKING:
@@ -141,11 +155,13 @@ WARM_UP_POLL_SECONDS = 0.1
 
 def warm_up_report(status: WarmUpStatus) -> dict[str, Any]:
     """The warm-up as `check_permissions` reports it: which phase the
-    server is in (`not_started`, `warming`, `ready`, `failed`), what it is
-    loading right now, how many steps are done, an estimate of the seconds
-    left, and — when it failed — the cause. Every retrieval tool is
-    unavailable until this says `ready`, so this is the field that explains
-    a `WARMING_UP` or `WARM_UP_FAILED` answer from any of them."""
+    server is in (`not_started`, `warming`, `ready`, `failed`, `unloaded`,
+    `memory_busy`), what it is loading right now, how many steps are done,
+    an estimate of the seconds left, and — when it failed — the cause, or
+    — when the host had no memory for the models — why
+    (`memory_detail`). Every retrieval tool is unavailable until this says
+    `ready`, so this is the field that explains a `WARMING_UP` or
+    `WARM_UP_FAILED` answer from any of them."""
     return {
         "state": status.phase.value,
         "loading": status.loading,
@@ -155,6 +171,7 @@ def warm_up_report(status: WarmUpStatus) -> dict[str, Any]:
             None if status.settled else max(1, math.ceil(status.seconds_remaining))
         ),
         "failure": status.failure,
+        "memory_detail": status.detail,
     }
 
 
@@ -190,6 +207,25 @@ class LocalMcpServer:
     """Drops the models after `mcp.idle_unload_seconds` with no retrieval
     call and reloads them on the next one; `None` keeps them loaded for
     the life of the process."""
+    warm_at_start: bool = False
+    """Start the warm-up as soon as the server is serving
+    (`mcp.local.warm_at_start`); off, the first retrieval call starts it."""
+
+    def begin_serving(self) -> None:
+        """What happens once the transport is up: the warm-up when
+        `warm_at_start`, and the watchdog that unloads idle models and
+        releases them under memory pressure."""
+        if self.warm_at_start:
+            self.warm_up.start()
+        if self.idle_unloader is not None:
+            self.idle_unloader.start_watchdog()
+
+    def _load_on_first_call(self) -> None:
+        """Start the first load (`warm_at_start` off). A no-op once a load
+        has begun, finished or failed; a reload after an unload, or a retry
+        after a refusal, is the idle unloader's (`IdleModelUnloader.call`)."""
+        if self.warm_up.status().phase is WarmUpPhase.NOT_STARTED:
+            self.warm_up.start()
 
     def _retrieval_call(self) -> contextlib.AbstractContextManager[None]:
         """The span during which this retrieval call holds the models:
@@ -262,6 +298,7 @@ class LocalMcpServer:
             if schema_error is None and name != "check_permissions":
                 tool_fn = _RETRIEVAL_HANDLERS[name]
                 holding.enter_context(self._retrieval_call())
+                self._load_on_first_call()
                 warm_up = await self._settled_warm_up()
 
                 def handler() -> dict[str, Any]:
@@ -291,10 +328,11 @@ class LocalMcpServer:
 
 async def run_local_server(local: LocalMcpServer) -> None:
     """Run the stdio transport until the client disconnects (SPEC
-    §10.3: stdio; binds nothing, no network listener), warming the
-    models in the background meanwhile.
+    §10.3: stdio; binds nothing, no network listener). The models load in
+    the background — at once with `warm_at_start`, else on the first
+    retrieval call.
 
-    The warm-up starts inside `stdio_server()` on purpose. While that
+    Either way the warm-up starts inside `stdio_server()` on purpose. While that
     context is open the SDK writes protocol frames to a private duplicate
     of stdout and points file descriptor 1 at stderr, so anything the
     model libraries print while loading lands on stderr instead of in the
@@ -306,9 +344,7 @@ async def run_local_server(local: LocalMcpServer) -> None:
     in it belongs on stderr too."""
     server = local.build_server()
     async with stdio_server() as (read_stream, write_stream):
-        local.warm_up.start()
-        if local.idle_unloader is not None:
-            local.idle_unloader.start_watchdog()
+        local.begin_serving()
         try:
             await server.run(read_stream, write_stream, server.create_initialization_options())
         finally:

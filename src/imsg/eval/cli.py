@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Annotated
 import apsw
 import typer
 
+from imsg.background_gate import BackgroundGate
 from imsg.config.loader import load_config
 from imsg.db.connection import connect
 from imsg.db.fingerprint import verify_data_directory
@@ -45,6 +46,7 @@ from imsg.eval.models import EvalQuery
 from imsg.eval.pool import build_pool, import_pool_worksheet, pool_to_worksheet_yaml
 from imsg.eval.runner import run_eval
 from imsg.heavy_lock import HeavyModelLock
+from imsg.memory_admission import MemoryAdmission, ModelRole
 from imsg.providers.factory import (
     backend_status_line,
     build_multimodal_provider,
@@ -99,6 +101,24 @@ def _connect_and_verify_or_die(cfg: Config) -> psycopg.Connection:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     return conn
+
+
+def _admit_or_exit(cfg: Config, command: str, *, copies: int) -> MemoryAdmission:
+    """Memory admission (`imsg.memory_admission`) for `copies` sets of the
+    query-side models — every variant builds its own. Waits for the host
+    to have room like a background command does (`imsg.background_gate`);
+    still refused, exits 75 (`deferred: memory`). A pause of heavy
+    background work (`imsg background pause`) defers it too, exit 76: eval
+    loads the same models and competes for the same memory."""
+    admission = MemoryAdmission.for_role(
+        cfg, ModelRole.LOCAL_SERVER, command=command, copies=copies
+    )
+    gate = BackgroundGate.from_config(cfg, log=lambda line: typer.echo(f"{command}: {line}", err=True))
+    reason = gate.admit(admission)
+    if reason is not None:
+        typer.echo(f"{command}: {reason.line()}")
+        raise typer.Exit(code=reason.exit_code)
+    return admission
 
 
 def _open_fts_conn(cfg: Config) -> apsw.Connection:
@@ -300,10 +320,13 @@ def run_cmd(
     typer.echo(backend_status_line(cfg))
     conn = _connect_and_verify_or_die(cfg)
     fts_conn = _open_fts_conn(cfg)
+    admission: MemoryAdmission | None = None
     try:
         # The query-side models (embedder, reranker) load here: one
-        # model-heavy process at a time on this host (imsg.heavy_lock).
+        # model-heavy process at a time on this host (imsg.heavy_lock),
+        # and only when the host has the memory (imsg.memory_admission).
         with HeavyModelLock(cfg.paths.data_root, command="imsg eval run", wait=not no_wait):
+            admission = _admit_or_exit(cfg, "eval run", copies=1)
             backend = _build_local_backend(conn, fts_conn, cfg, variant=variant)
             config_sha = config_projection_sha256(
                 target=target, k=k, extra={"variant": variant, "label": run_label}
@@ -313,6 +336,8 @@ def run_cmd(
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     finally:
+        if admission is not None:
+            admission.release()
         fts_conn.close()
         conn.close()
 
@@ -387,8 +412,10 @@ def pool_cmd(
     typer.echo(backend_status_line(cfg))
     conn = _connect_and_verify_or_die(cfg)
     fts_conn = _open_fts_conn(cfg)
+    admission: MemoryAdmission | None = None
     try:
         with HeavyModelLock(cfg.paths.data_root, command="imsg eval pool", wait=not no_wait):
+            admission = _admit_or_exit(cfg, "eval pool", copies=len(names))
             backends = {
                 name: _build_local_backend(conn, fts_conn, cfg, variant=name) for name in names
             }
@@ -398,6 +425,8 @@ def pool_cmd(
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     finally:
+        if admission is not None:
+            admission.release()
         fts_conn.close()
         conn.close()
 
