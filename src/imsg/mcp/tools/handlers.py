@@ -39,7 +39,9 @@ def search_messages(
         after=params.get("after"),
         before=params.get("before"),
         has_attachment=params.get("has_attachment"),
-        limit=params.get("limit"),
+        # JSON Schema accepts integral floats (e.g. 3.0) as integers.
+        # Normalize validated transport numbers before slicing or SQL use.
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
     )
     return {
         "results": result.results,
@@ -55,7 +57,7 @@ def get_conversation(
         context,
         thread_id=params["thread_id"],
         anchor=params.get("anchor"),
-        window=params.get("window", 20),
+        window=int(params.get("window", 20)),
     )
 
 
@@ -65,7 +67,7 @@ def list_people(
     return service.list_people(
         context,
         query=params.get("query"),
-        limit=params.get("limit", 100),
+        limit=int(params.get("limit", 100)),
         include_handles=params.get("include_handles", False),
     )
 

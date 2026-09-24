@@ -10,6 +10,13 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-23 — Accept integral transport numbers without retrieval errors
+
+- JSON Schema accepts `3.0` as an integer, but Python slicing does not.
+  Normalize validated limit/window values in MCP adapters before retrieval.
+- Regression coverage exercises all three numeric arguments and confirms
+  fractional, boolean, string, and out-of-range limits remain rejected.
+  Focused public server, dispatch, schema tests and ruff pass.
 ## 2026-09-23 — Enrichment queue filled: every materialized attachment is routed and queued, cheap kinds first
 
 **The gap.** The router (`imsg.enrich.router.kinds_for_mime`) existed, but

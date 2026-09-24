@@ -11,6 +11,11 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-09-23 MCP transport fix:** validated integral JSON numbers are
+normalized before retrieval, so `limit: 3.0` cannot cause a slice TypeError.
+All three integer tool arguments covered; invalid fractions/booleans remain
+rejected before the handler. Focused public/dispatch/schema tests pass.
+
 **Running against a real corpus; Phase 1 in progress.** Public at
 [`msg43/imessage_mcp`](https://github.com/msg43/imessage_mcp) (MIT).
 Every buildable component of the governing spec is implemented: 8

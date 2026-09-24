@@ -847,3 +847,30 @@ def test_parse_bind_address_accepts_other_loopback_forms(host: str) -> None:
 def test_parse_bind_address_refuses_non_loopback_or_malformed(bind: str) -> None:
     with pytest.raises(PublicSurfaceStartupError):
         parse_bind_address(bind)
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "field"),
+    [
+        ("search_messages", {"query": "fictional query", "limit": 3.0}, "limit"),
+        ("list_people", {"limit": 3.0}, "limit"),
+        ("get_conversation", {"thread_id": "thread_fictional", "window": 3.0}, "window"),
+    ],
+)
+def test_integral_transport_numbers_reach_service_as_integers(name, arguments, field):
+    server, service, _ = make_server()
+    result = run(server.on_call_tool(fake_context(bearer(OWNER_TOKEN)), call_params(name, arguments)))
+    assert result.is_error is False
+    value = service.calls[0][2][field]
+    assert type(value) is int
+    assert list(range(10))[:value] == [0, 1, 2]
+
+
+@pytest.mark.parametrize("value", [3.5, True, "3", 0, 501])
+def test_invalid_limit_still_rejected_before_service(value):
+    server, service, _ = make_server()
+    result = run(server.on_call_tool(
+        fake_context(bearer(OWNER_TOKEN)), call_params("list_people", {"limit": value})
+    ))
+    assert result.is_error is True
+    assert service.calls == []
