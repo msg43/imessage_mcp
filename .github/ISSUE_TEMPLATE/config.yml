@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security or privacy issue (private)
+    url: https://github.com/msg43/imessage_mcp/security/advisories/new
+    about: >-
+      Use GitHub's private vulnerability reporting for anything involving
+      real personal data, credentials, or a security concern. See
+      SECURITY.md. Do not use a public issue for this.
