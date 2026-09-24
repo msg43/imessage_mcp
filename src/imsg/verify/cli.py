@@ -95,15 +95,14 @@ def verify_seed(
     ] = None,
     report_out: Annotated[Path | None, typer.Option(help="Also write the text report here.")] = None,
 ) -> None:
-    """AT-2 — seed completeness (SPEC §12 AT-2). Exactly one of
+    """AT-2 — seed completeness. Exactly one of
     `--export`/`--reference`/`--reference-db` is required.
 
     `--export <file>` on the *other* machine, copied here (e.g. `rsync`
-    over the tailnet — SPEC §8 S7's Studio-seed transfer already assumes
-    exactly that path), then `--reference <file>` on this one. See
-    `imsg.verify.seed` for why this two-step file exchange replaces the
-    literal `--reference <studio-snapshot.db>` spec text (both hosts
-    are never reachable at once here).
+    over SSH, or however you move files between the two hosts), then
+    `--reference <file>` on this one. See `imsg.verify.seed` for why this
+    two-step file exchange is needed (both hosts are never reachable at
+    once here).
 
     `--reference-db <sqlite>` skips the exchange when the thing being
     verified is a prepared corpus file rather than another host: it
@@ -177,7 +176,7 @@ def reconcile_attachments(
     ] = 25,
     seed: Annotated[int | None, typer.Option(help="Sampling seed, for reproducible runs.")] = None,
 ) -> None:
-    """AT-3 — attachment reconciliation (SPEC §12 AT-3). Layers on top
+    """AT-3 — attachment reconciliation. Layers on top
     of the S5a-built `imsg.backfill.reconcile.build_reconciliation_report`
     (does not duplicate it): by-year/by-type materialization rates, a
     four-category exception manifest, CSV output, and a stratified

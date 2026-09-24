@@ -215,11 +215,13 @@ app = typer.Typer(
     pretty_exceptions_enable=False,
 )
 
-mcp_app = typer.Typer(name="mcp", help="MCP surfaces (SPEC §10).", no_args_is_help=True)
+mcp_app = typer.Typer(
+    name="mcp", help="MCP (Model Context Protocol) servers: local and public search surfaces.", no_args_is_help=True
+)
 app.add_typer(mcp_app, name="mcp")
 models_app = typer.Typer(
     name="models",
-    help="Model pins: models/manifest.lock.yaml (SPEC model-manifest requirement).",
+    help="Check and manage the pinned model versions in models/manifest.lock.yaml.",
     no_args_is_help=True,
 )
 app.add_typer(models_app, name="models")
@@ -240,7 +242,7 @@ DryRunOption = Annotated[
     bool,
     typer.Option(
         "--dry-run",
-        help="Preview what this stage would do without writing anything (SPEC §8).",
+        help="Preview what this stage would do without writing anything.",
     ),
 ]
 
@@ -495,7 +497,7 @@ def _root() -> None:
 
 @app.command("guard-mount")
 def guard_mount_cmd(config: ConfigOption = None) -> None:
-    """Refuse to proceed unless data_root is on a mounted, encrypted volume (SPEC §5.4)."""
+    """Refuse to proceed unless data_root is on a mounted, encrypted volume."""
     cfg = _load_config_or_die(config)
     info = run_guard_mount_or_exit(cfg.paths.data_root)
     typer.echo(f"guard-mount: ok — '{cfg.paths.data_root}' is on encrypted volume "
@@ -511,7 +513,7 @@ def migrate(
         Path | None, typer.Option(help="Override the migrations directory (mainly for testing).")
     ] = None,
 ) -> None:
-    """Apply pending Postgres migrations (SPEC §7.1). Idempotent; roll-forward only."""
+    """Apply pending Postgres migrations. Idempotent; roll-forward only."""
     if status and verify:
         typer.echo("imsg: --status and --verify are mutually exclusive", err=True)
         raise typer.Exit(code=2)
@@ -570,7 +572,7 @@ def check_permissions(
     config: ConfigOption = None,
     as_json: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
 ) -> None:
-    """Report FDA, Contacts, mount, at-rest posture, and Postgres reachability (SPEC §5.1a)."""
+    """Report Full Disk Access, Contacts, mount, at-rest posture, and Postgres reachability."""
     cfg = _load_config_or_die(config)
 
     mount = check_mount(cfg.paths.data_root)
@@ -725,7 +727,7 @@ def status(
     config: ConfigOption = None,
     as_json: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
 ) -> None:
-    """Mount, Postgres, disk free, at-rest posture (SPEC §14). Pipeline fields report as unavailable until built."""
+    """Mount, Postgres, disk free, at-rest posture. Pipeline fields report as unavailable until built."""
     cfg = _load_config_or_die(config)
 
     mount = check_mount(cfg.paths.data_root)
@@ -978,9 +980,9 @@ def models_verify(
     drift versus models/manifest.lock.yaml; check every local conversion's
     directory under data_root against its recorded artifact_sha256; check
     installed runtime packages against its `min_runtime` floors. Never
-    modifies the lock without --write (SPEC: a build must not silently
-    advance a model because 'latest' changed), and never advances a local
-    conversion's upstream pin."""
+    modifies the lock without --write (a build must not silently
+    advance a model just because its upstream 'latest' changed), and never
+    advances a local conversion's upstream pin."""
     code = verify_manifest(
         lock,
         data_root=data_root,
@@ -996,7 +998,7 @@ def models_verify(
 
 @app.command()
 def snapshot(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
-    """S1 — snapshot the live chat.db via the SQLite online-backup API (SPEC §8 S1)."""
+    """S1 — snapshot the live chat.db via the SQLite online-backup API."""
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
     try:
@@ -1160,7 +1162,7 @@ def extract(
     ] = None,
     dry_run: DryRunOption = False,
 ) -> None:
-    """S2 — extract chats/messages/attachments from the current snapshot (SPEC §8 S2).
+    """S2 — extract chats/messages/attachments from the current snapshot.
 
     `--snapshot` is the seed path: it never touches `snapshots/snapshot.db`,
     which S1 atomically replaces from the live chat.db every
@@ -1221,7 +1223,7 @@ def extract(
 
 identity_app = typer.Typer(
     name="identity",
-    help="S3 — resolve handles to person_id, then curate them (SPEC §8 S3).",
+    help="S3 — resolve handles to person_id, then curate them.",
 )
 app.add_typer(identity_app, name="identity")
 
@@ -1285,7 +1287,7 @@ def identity(
     config: ConfigOption = None,
     dry_run: DryRunOption = False,
 ) -> None:
-    """S3 — resolve handles to person_id via Contacts + manual curation (SPEC §8 S3)."""
+    """S3 — resolve handles to person_id via Contacts + manual curation."""
     if ctx.invoked_subcommand is not None:
         # Options parsed HERE belong to the group, not the subcommand, and
         # typer will not forward them. Silently dropping them was dangerous:
@@ -1383,7 +1385,7 @@ def identity_review_report(
         ),
     ] = False,
 ) -> None:
-    """The curation worklist — persons ranked by message volume (SPEC §8 S3).
+    """The curation worklist — persons ranked by message volume.
 
     Ordered by messages descending on purpose: the value of this review is
     concentrated in your top correspondents, and a long tail of one-message
@@ -1471,7 +1473,7 @@ def identity_duplicate_candidates(
     Signals, strongest first:
       * one Contacts card whose identifiers landed on several persons —
         the address book itself says they are one human;
-      * one name being an abbreviation/prefix of another (Jeff/Jeffrey),
+      * one name being an abbreviation/prefix of another (Mike/Michael),
         which the override applier's exact match cannot catch;
       * identical names (already handled on rename, listed for completeness);
       * shared group chats plus non-overlapping active windows, the
@@ -1909,7 +1911,7 @@ def segment(
     dry_run: DryRunOption = False,
     no_wait: NoWaitOption = False,
 ) -> None:
-    """S4 — sessionize and segment messages for indexing (SPEC §8 S4).
+    """S4 — sessionize and segment messages for indexing.
 
     Holds the host-wide heavy-model lock (`imsg.heavy_lock`) for the whole
     run, `--dry-run` included: a dry run still asks the boundary model.
@@ -1998,7 +2000,7 @@ def segment(
 def embed(
     config: ConfigOption = None, dry_run: DryRunOption = False, no_wait: NoWaitOption = False
 ) -> None:
-    """S6 — embed segments/attachment chunks and update the FTS sidecar (SPEC §8 S6).
+    """S6 — embed segments/attachment chunks and update the FTS sidecar.
 
     Holds the host-wide heavy-model lock (`imsg.heavy_lock`) for the run.
     `--dry-run` only counts pending rows, loads no model and takes no lock.
@@ -2212,18 +2214,18 @@ def sync(
     snapshot: Annotated[
         Path | None,
         typer.Option(
-            help="One-shot seed: skip S1 and feed this prepared database straight to S2 "
-            "(SPEC §8 S7). Requires --source, which must not name a configured "
+            help="One-shot seed: skip S1 and feed this prepared database straight to S2. "
+            "Requires --source, which must not name a configured "
             "sync.sources entry.",
         ),
     ] = None,
     dry_run: DryRunOption = False,
     no_wait: NoWaitOption = False,
 ) -> None:
-    """S7 — incremental S1→S2→S3→S4→S6 sync for every configured source (SPEC §8 S7).
+    """S7 — incremental S1→S2→S3→S4→S6 sync for every configured source.
 
     With `--source`, syncs that one source. With `--source` and `--snapshot`,
-    runs the studio-seed one-shot path SPEC §8 S7 specifies: S1 is skipped
+    runs the one-shot seed path: S1 is skipped
     entirely and the already-prepared file feeds S2→S3→S4→S6, so the seed
     lands under its own source name and its own ROWID watermark.
 
@@ -2346,7 +2348,7 @@ def enrich(
     config: ConfigOption = None,
     limit: Annotated[int, typer.Option(help="Max tasks to claim and process this run.")] = 100,
     worker_id: Annotated[
-        str, typer.Option(help="Lease owner id (SPEC §8 S5b lease/backoff).")
+        str, typer.Option(help="Lease owner id, used for the claim/backoff bookkeeping.")
     ] = "cli",
     retry_failed: Annotated[
         bool,
@@ -2375,7 +2377,7 @@ def enrich(
     dry_run: DryRunOption = False,
     no_wait: NoWaitOption = False,
 ) -> None:
-    """S5b — OCR/caption/transcribe/text-extraction enrichment queue worker (SPEC §8 S5b).
+    """S5b — OCR/caption/transcribe/text-extraction enrichment queue worker.
 
     Claims one task at a time: `--kinds` in the order given, else cheap kinds
     first and captions last; within a kind, the newest attachment first.
@@ -2536,11 +2538,11 @@ def enrich(
 @app.command("backfill-attachments")
 def backfill_attachments(
     config: ConfigOption = None,
-    rate: Annotated[float, typer.Option(help="Files per minute (SPEC §8 S5a).")] = DEFAULT_RATE_PER_MINUTE,
+    rate: Annotated[float, typer.Option(help="Files per minute.")] = DEFAULT_RATE_PER_MINUTE,
     yes_full_run: Annotated[
         bool,
         typer.Option(
-            "--yes-full-run", help="Skip the first-run 12-file trial gate (SPEC §8 S5a)."
+            "--yes-full-run", help="Skip the first-run 12-file trial gate."
         ),
     ] = False,
     retry_failed: Annotated[
@@ -2561,7 +2563,7 @@ def backfill_attachments(
     ] = False,
     dry_run: DryRunOption = False,
 ) -> None:
-    """S5a — materialize attachments into the cache (SPEC §8 S5a).
+    """S5a — materialize attachments into the cache.
 
     First each attachment's own path on this host, as before. Then every
     other known copy of every attachment still not materialized — missing
@@ -2971,7 +2973,7 @@ def push_attachments(
 
 @mcp_app.command("local")
 def mcp_local(config: ConfigOption = None) -> None:
-    """`imsg mcp local` — stdio MCP server, tailnet/SSH only, full corpus scope (SPEC §10.3)."""
+    """`imsg mcp local` — stdio MCP server for use on this Mac or over SSH, full corpus scope."""
     cfg = _load_config_or_die(config)
     if not cfg.mcp.local.enabled:
         typer.echo("imsg: mcp.local.enabled is false in config", err=True)
@@ -3138,7 +3140,7 @@ def mcp_public(
         bool,
         typer.Option(
             "--probe",
-            help="Run the AT-1 synthetic auth probe instead of serving (SPEC §12). "
+            help="Run the AT-1 synthetic auth probe instead of serving. "
             "Requires --owner-token-ref and --foreign-token-ref.",
         ),
     ] = False,
@@ -3161,17 +3163,17 @@ def mcp_public(
     ] = None,
 ) -> None:
     """`imsg mcp public` — StreamableHTTP MCP server behind cloudflared,
-    OAuth subject validation, fail closed (SPEC §10.4). Binds loopback
+    OAuth subject validation, fail closed. Binds loopback
     only (`mcp.public.bind`); cloudflared is the only process that ever
     faces a public interface. Every request — including `initialize`
     and `tools/list`, not only tool calls — passes through
     `imsg.mcp.auth.PublicAuthGate` before anything else runs (hard
     requirement 4: no unauthenticated path, no config flag to disable
-    it); scope (`mcp.public.scope`, REQUIRED with no default, SPEC
-    §10.3a/D6) is fixed for the life of this process.
+    it); scope (`mcp.public.scope`, REQUIRED with no default) is fixed
+    for the life of this process.
 
     `--probe` runs AT-1's synthetic auth probe instead of serving — the
-    gate that must pass before any corpus is exposed (SPEC §12 AT-1).
+    gate that must pass before any corpus is exposed.
     """
     cfg = _load_config_or_die(config)
     if probe:
@@ -3340,7 +3342,7 @@ def mcp_public(
 
 export_app = typer.Typer(
     name="export",
-    help="S8 — the default-deny export gate to GCS / Discovery Engine (SPEC §11).",
+    help="S8 — the default-deny export gate to GCS / Discovery Engine.",
     no_args_is_help=True,
 )
 app.add_typer(export_app, name="export")
@@ -3433,11 +3435,11 @@ def _export_transport_or_die(cfg: Config) -> ExportTransport:
 
 @export_app.command("plan")
 def export_plan(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
-    """Compute eligibility, stage the documents, write the review report (SPEC §11.1).
+    """Compute eligibility, stage the documents, write the review report.
 
     Stages immutable bytes under `$DATA_ROOT/export/staging/<run>/` and
     records the run; nothing leaves the machine. Read the report it names
-    before approving — §11.4 calls that review the actual control.
+    before approving — that review is the actual control.
     """
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
@@ -3507,7 +3509,7 @@ def export_approve(
         ),
     ] = None,
 ) -> None:
-    """Record owner approval of a planned run, pinning its exact bytes (SPEC §11.4).
+    """Record owner approval of a planned run, pinning its exact bytes.
 
     Re-reads the staged manifest and re-hashes every staged file first:
     an approval can never be minted for bytes the owner did not stage.
@@ -3542,7 +3544,7 @@ def export_push(
     config: ConfigOption = None,
     dry_run: DryRunOption = False,
 ) -> None:
-    """Promote one approved plan to GCS / Discovery Engine, or refuse (SPEC §11.1).
+    """Promote one approved plan to GCS / Discovery Engine, or refuse.
 
     Re-verifies every hash pin AND re-derives eligibility from the live
     database before the first byte leaves: the pins prove the bytes did
@@ -3642,7 +3644,7 @@ def export_purge_person(
     config: ConfigOption = None,
     dry_run: DryRunOption = False,
 ) -> None:
-    """Revoke one person and plan the deletion of everything they touched (SPEC §11.4).
+    """Revoke one person and plan the deletion of everything they touched.
 
     Flags their allowlist row to deny — the row is kept, so the record
     that they were ever allowed survives — then plans the removal of every
@@ -3698,7 +3700,7 @@ def export_purge_person(
 def export_unclassified_report(
     config: ConfigOption = None, dry_run: DryRunOption = False
 ) -> None:
-    """Write the weekly unclassified-threads report (SPEC §11.5).
+    """Write the weekly unclassified-threads report.
 
     Active chats whose participants have never been classified for
     export, so a static allowlist does not quietly rot as people join and
@@ -3749,7 +3751,7 @@ def backup(
         int,
         typer.Option(
             "--keep",
-            help="How many complete backup sets to retain (SPEC §5.3: 14). "
+            help="How many complete backup sets to retain (default: 14). "
             "Clamped to a minimum of 1 — the newest set is never a deletion candidate.",
         ),
     ] = DEFAULT_KEEP,
@@ -3883,7 +3885,7 @@ def install_agents(
     ] = Path("~/Library/LaunchAgents"),
 ) -> None:
     """Render and install the thin, content-free LaunchAgent plists
-    (SPEC §5.5) into `~/Library/LaunchAgents` — the only place launchd
+    into `~/Library/LaunchAgents` — the only place launchd
     discovers user agents. The rendered plists reference `--config
     <path>` and fixed bootstrap paths only; every real value (hostname,
     secrets) lives in that config file, never in the plist itself, and

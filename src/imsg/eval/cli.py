@@ -61,7 +61,7 @@ if TYPE_CHECKING:
 
     from imsg.config.schema import Config
 
-eval_app = typer.Typer(name="eval", help="Eval harness: queries, labels, runs, diffs (SPEC §13).",
+eval_app = typer.Typer(name="eval", help="Eval harness: queries, labels, runs, diffs.",
                         no_args_is_help=True)
 
 ConfigOption = Annotated[
@@ -179,7 +179,7 @@ def _build_local_backend(
 
 @eval_app.command("import-queries")
 def import_queries(
-    file: Annotated[Path, typer.Option(help="queries.yaml to import (SPEC §13.1 shape).")],
+    file: Annotated[Path, typer.Option(help="queries.yaml to import.")],
     config: ConfigOption = None,
 ) -> None:
     """Upsert every query in `file` into the canonical `eval_query` table."""
@@ -213,7 +213,7 @@ def export_queries(
 
 @eval_app.command("import-labels")
 def import_labels(
-    file: Annotated[Path, typer.Option(help="labels.yaml to import (SPEC §13.1 shape).")],
+    file: Annotated[Path, typer.Option(help="labels.yaml to import.")],
     config: ConfigOption = None,
 ) -> None:
     """Upsert every label in `file` into `relevance_label`, anchored on
@@ -259,8 +259,8 @@ def label_cmd(
     ] = None,
     config: ConfigOption = None,
 ) -> None:
-    """The CLI counterpart to the local `mark_relevant` MCP tool (SPEC
-    §10.2/§13.2): upserts one `relevance_label`, anchored on the
+    """The CLI counterpart to the local `mark_relevant` MCP tool:
+    upserts one `relevance_label`, anchored on the
     segment's first message GUID."""
     cfg = _load_config_or_die(config)
     conn = _connect_and_verify_or_die(cfg)
@@ -291,7 +291,7 @@ def label_cmd(
 def run_cmd(
     config: ConfigOption = None,
     target: Annotated[str, typer.Option(help="local|gemini — this build only wires up local.")] = "local",
-    k: Annotated[int, typer.Option(help="Top-k per query (SPEC §13.3).")] = 10,
+    k: Annotated[int, typer.Option(help="Top-k per query.")] = 10,
     variant: Annotated[
         str, typer.Option(help=f"Config variant: one of {sorted(VARIANT_REGISTRY)}.")
     ] = "default",
@@ -302,8 +302,8 @@ def run_cmd(
     no_wait: NoWaitOption = False,
 ) -> None:
     """Score every `eval_query` (for `--target`) against a retrieval
-    backend and write `eval/runs/<...>.json` (SPEC §13.3). This is the
-    AT-4 baseline artifact once the canonical store meets the SPEC §12
+    backend and write `eval/runs/<...>.json`. This is the
+    AT-4 baseline artifact once the canonical store meets the required
     minimums — the command reports pass/fail against those minimums
     every run, not just once."""
     if target != "local":
@@ -366,8 +366,8 @@ def diff_cmd(
     run_b: Annotated[Path, typer.Argument(help="Path to the candidate run JSON.")],
     out: Annotated[Path | None, typer.Option(help="Write markdown here instead of stdout.")] = None,
 ) -> None:
-    """`imsg eval diff <run-a> <run-b>` (SPEC §13.3): "the artifact
-    every retrieval change must include." Pure file-to-file — no DB
+    """`imsg eval diff <run-a> <run-b>`: the artifact
+    every retrieval change should include. Pure file-to-file — no DB
     connection needed."""
     a = run_result_from_json(run_a.read_text(encoding="utf-8"))
     b = run_result_from_json(run_b.read_text(encoding="utf-8"))
@@ -392,12 +392,12 @@ def pool_cmd(
     variants: Annotated[
         str, typer.Option(help=f"Comma-separated variant names from {sorted(VARIANT_REGISTRY)}.")
     ] = "default,no-rerank",
-    top_n: Annotated[int, typer.Option(help="Pool depth per config (SPEC §13.2 default: 20).")] = 20,
+    top_n: Annotated[int, typer.Option(help="Pool depth per config (default: 20).")] = 20,
     seed: Annotated[int | None, typer.Option(help="Randomization seed, for reproducible worksheets.")] = None,
     target: Annotated[str | None, typer.Option(help="Restrict to queries whose targets include this.")] = None,
     no_wait: NoWaitOption = False,
 ) -> None:
-    """SPEC §13.2: run >= 2 materially different configs, pool their
+    """Run >= 2 materially different configs, pool their
     top-N unique results per query, randomize, and write a worksheet
     for the owner to grade 0/1/2 — import it back with `eval
     import-pool`."""
