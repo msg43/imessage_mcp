@@ -39,12 +39,32 @@ rerank_doc_max_tokens``) bounds the *document* part of the pair only:
 the instruction and query are never cut, and the chat suffix is appended
 after every truncation, so the position the yes/no logits are read from
 is always the row's last real token.
+
+**Shared prefix (2026-09-25).** Every row of one query starts with the
+same tokens: the chat prefix, the instruction, the query and
+``"<Document>:"`` — 69 of a pair's 301 tokens on average on the
+2026-09-24 benchmark pools. With ``reuse_prefix`` (the default,
+``retrieval.rerank_reuse_prefix``), :meth:`MlxRerankerProvider.score`
+runs those tokens through the model once per query, keeps each layer's
+keys and values for them (``mlx_lm``'s ``KVCache``), and then runs each
+batch on the rest of its rows, which attend to a copy of that cache
+instead of recomputing it (:meth:`MlxRerankerProvider.plan`). Under the
+causal mask a token depends only on the tokens before it, so each row's
+last-token logits are the same function of the same tokens either way.
+The arithmetic is grouped differently, so the scores differ by rounding.
+Measured 2026-09-25 on the 45 benchmark pools of 20, against scoring each
+row alone and whole: in bf16, P(yes) moved by up to 0.061, where batching
+whole rows (the path before) moved it by up to 0.070; with the same
+weights in float32, by at most 1e-5, with every pair in the same order
+(``tests/test_mlx_reranker_real.py``). ``reuse_prefix=False`` runs every
+row whole, which is also what a pool of one document does.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from imsg.embed.batching import plan_batches
@@ -57,6 +77,7 @@ from imsg.mlx_runtime import (
     format_model_id,
     gather_last_token_states,
     import_mlx_core,
+    import_mlx_lm_cache,
     lm_head_logits,
     load_model_and_tokenizer,
     right_pad,
@@ -81,8 +102,18 @@ DEFAULT_RERANK_BATCH_SIZE = 32
 bound that matters; this only stops a pool of very short pairs from
 becoming one enormous batch."""
 
-DEFAULT_RERANK_MAX_BATCH_TOKENS = 1024
-"""Most padded tokens (``rows x longest row``) in one forward pass.
+DEFAULT_RERANK_MAX_BATCH_TOKENS = 8192
+"""Most padded tokens (``rows x longest row``) in one forward pass;
+``retrieval.rerank_max_batch_tokens`` sets it through the factory.
+
+8,192 since 2026-09-25, for Qwen3-Reranker-0.6B. Measured 2026-09-24 on
+an M2 Ultra, 20 synthetic documents of 40-700 tokens cut to 256, 42
+timed pools: p95 0.682 s at 1,024 against 0.619 s at 8,192 for the mxfp8
+build, and 0.552 s against 0.448 s for the bf16 build. A 1,024-token
+budget holds about three ~300-token pairs, so a pool of 20 took about
+seven passes; at 8,192 it takes one or two.
+
+The 8B was fastest at 1,024 (below); pass 1,024 when running it.
 
 Measured 2026-09-16 on an M2 Ultra (the pinned mxfp8 conversion of
 Qwen3-Reranker-8B, synthetic word-salad pairs, fixed seeds): padded
@@ -97,6 +128,14 @@ against pass count. A 50-pair pool of
 order). For pools of 10-20 pairs with documents capped at 128-512
 tokens, 1,024 was the fastest or within 2 % of it in every case; 256
 (one pair per pass) was up to 15 % slower."""
+
+DEFAULT_RERANK_REUSE_PREFIX = True
+"""Whether :meth:`MlxRerankerProvider.score` reads the tokens every row of
+a query shares once (module docstring, "Shared prefix");
+``retrieval.rerank_reuse_prefix`` sets it through the factory. Measured
+2026-09-24 on an M2 Ultra with the bf16 build at 8,192 tokens per batch,
+same pools as above: p95 0.448 s reading every row whole, 0.395 s
+reading the shared prefix once."""
 
 
 def format_reranker_pair(instruction: str, query: str, document: str) -> str:
@@ -122,6 +161,44 @@ def common_prefix_length(a: Sequence[int], b: Sequence[int]) -> int:
             break
         n += 1
     return n
+
+
+def shared_prefix_length(rows: Sequence[Sequence[int]]) -> int:
+    """How many leading tokens every row has in common, stopping one short
+    of the shortest row. The yes/no logits are read at a row's last token,
+    so every row keeps at least that token for its own pass."""
+    if not rows:
+        return 0
+    first = rows[0]
+    shared = min(common_prefix_length(first, row) for row in rows)
+    return max(0, min(shared, min(len(row) for row in rows) - 1))
+
+
+@dataclass(frozen=True, slots=True)
+class RerankPlan:
+    """The forward passes :meth:`MlxRerankerProvider.score` makes for one
+    query's rows: first the ``shared_prefix`` leading tokens every row has,
+    once (0: no such pass, every row is read whole), then one pass per
+    entry of ``batches`` over those rows' remaining tokens, right-padded.
+    ``row_lengths`` are the whole rows' lengths, in input order."""
+
+    shared_prefix: int
+    batches: tuple[tuple[int, ...], ...]
+    row_lengths: tuple[int, ...]
+
+    @property
+    def passes(self) -> int:
+        """Forward passes, the prefix pass included."""
+        return len(self.batches) + (1 if self.shared_prefix else 0)
+
+    @property
+    def padded_tokens(self) -> int:
+        """Token positions the passes compute, padding included: the prefix
+        once, plus each batch's rows times its longest remaining row."""
+        rest = [n - self.shared_prefix for n in self.row_lengths]
+        return self.shared_prefix + sum(
+            len(batch) * max(rest[i] for i in batch) for batch in self.batches
+        )
 
 
 def _single_token_id(tokenizer: Any, token: str) -> int:
@@ -154,9 +231,12 @@ class MlxRerankerProvider:
     ``max_batch_tokens`` its padded tokens; ``max_length`` bounds a whole
     row (prefix + body + suffix) and ``doc_max_tokens`` (``None``: no cap
     beyond ``max_length``) the document part of the body.
-    ``cache_limit_bytes`` bounds MLX's process-wide buffer cache when the
-    weights load, keeping a tighter bound already in place
-    (:func:`imsg.mlx_runtime.bound_buffer_cache`; ``None`` leaves it).
+    ``reuse_prefix`` reads the tokens all of a query's rows share once
+    per query (module docstring, "Shared prefix"); the batch bounds then
+    apply to what is left of each row. ``cache_limit_bytes`` bounds MLX's
+    process-wide buffer cache when the weights load, keeping a tighter
+    bound already in place (:func:`imsg.mlx_runtime.bound_buffer_cache`;
+    ``None`` leaves it).
     """
 
     def __init__(
@@ -169,6 +249,7 @@ class MlxRerankerProvider:
         max_length: int = 8192,
         max_batch_tokens: int = DEFAULT_RERANK_MAX_BATCH_TOKENS,
         doc_max_tokens: int | None = None,
+        reuse_prefix: bool = DEFAULT_RERANK_REUSE_PREFIX,
         cache_limit_bytes: int | None = DEFAULT_CACHE_LIMIT_BYTES,
         model_id: str | None = None,
     ) -> None:
@@ -192,6 +273,7 @@ class MlxRerankerProvider:
         self._max_length = max_length
         self._max_batch_tokens = max_batch_tokens
         self._doc_max_tokens = _checked_doc_max_tokens(doc_max_tokens)
+        self._reuse_prefix = bool(reuse_prefix)
         self._cache_limit_bytes = cache_limit_bytes
         self._model: Any = None
         self._tokenizer: Any = None
@@ -219,6 +301,10 @@ class MlxRerankerProvider:
     @property
     def max_batch_tokens(self) -> int:
         return self._max_batch_tokens
+
+    @property
+    def reuse_prefix(self) -> bool:
+        return self._reuse_prefix
 
     @property
     def doc_max_tokens(self) -> int | None:
@@ -274,14 +360,17 @@ class MlxRerankerProvider:
         if not docs:
             return []
         rows = self.token_rows(query, docs)
-        plan = plan_batches(
-            [len(row) for row in rows],
-            max_batch_size=self._batch_size,
-            max_batch_tokens=self._max_batch_tokens,
-        )
+        plan = self.plan(rows)
+        shared = plan.shared_prefix
+        prefix_cache = self._read_prefix(rows[0][:shared]) if shared else None
         scores: list[float | None] = [None] * len(rows)
-        for group in plan:
-            batch_scores = self.score_token_rows([rows[i] for i in group])
+        for group in plan.batches:
+            if prefix_cache is None:
+                batch_scores = self.score_token_rows([rows[i] for i in group])
+            else:
+                batch_scores = self._score_after_prefix(
+                    prefix_cache, [rows[i][shared:] for i in group]
+                )
             for index, value in zip(group, batch_scores, strict=True):
                 scores[index] = value
         out = [s for s in scores if s is not None]
@@ -290,6 +379,24 @@ class MlxRerankerProvider:
                 f"scored {len(out)} documents out of {len(docs)} (internal batching bug)"
             )
         return out
+
+    def plan(self, rows: Sequence[Sequence[int]]) -> RerankPlan:
+        """The passes :meth:`score` makes for ``rows`` (as
+        :meth:`token_rows` builds them). With ``reuse_prefix`` and two or
+        more rows, the tokens they all share are read in a pass of their
+        own; a single row has nothing to share it with and is read whole.
+        The remaining tokens of each row are packed by
+        :func:`imsg.embed.batching.plan_batches` under the batch bounds:
+        longest first, at most ``batch_size`` rows and ``max_batch_tokens``
+        padded tokens per pass, a row over the token bound alone."""
+        lengths = tuple(len(row) for row in rows)
+        shared = shared_prefix_length(rows) if self._reuse_prefix and len(rows) > 1 else 0
+        batches = plan_batches(
+            [n - shared for n in lengths],
+            max_batch_size=self._batch_size,
+            max_batch_tokens=self._max_batch_tokens,
+        )
+        return RerankPlan(shared, tuple(tuple(batch) for batch in batches), lengths)
 
     def token_rows(self, query: str, documents: Sequence[str]) -> list[list[int]]:
         """The model input for each (query, document) pair, in order:
@@ -322,12 +429,51 @@ class MlxRerankerProvider:
 
     def score_token_rows(self, rows: Sequence[Sequence[int]]) -> list[float]:
         """P(yes) for each already-assembled row (see :meth:`token_rows`),
-        in order, from one right-padded forward pass. :meth:`score` plans
-        the batches; this runs exactly the batch it is given."""
+        in order, from one right-padded forward pass over the whole rows —
+        the model card's computation, and what :meth:`score` runs without
+        ``reuse_prefix``. This runs exactly the batch it is given."""
         self.load()
         mx = import_mlx_core()
         padded, lengths = right_pad(rows, self._pad_id)
         hidden = base_transformer_hidden_states(self._model, mx.array(padded))
+        return self._yes_probabilities(mx, hidden, lengths)
+
+    def _read_prefix(self, prefix: Sequence[int]) -> list[tuple[Any, Any]]:
+        """Run ``prefix`` through the model once and return each layer's
+        keys and values for it, computed, as ``(keys, values)`` of shape
+        ``(1, kv_heads, len(prefix), head_dim)``."""
+        mx = import_mlx_core()
+        caches = import_mlx_lm_cache().make_prompt_cache(self._model)
+        base_transformer_hidden_states(self._model, mx.array([list(prefix)]), cache=caches)
+        state = [tuple(cache.state) for cache in caches]
+        mx.eval([array for pair in state for array in pair])
+        return [(keys, values) for keys, values in state]
+
+    def _score_after_prefix(
+        self, prefix_cache: Sequence[tuple[Any, Any]], rests: Sequence[Sequence[int]]
+    ) -> list[float]:
+        """P(yes) for rows whose shared prefix :meth:`_read_prefix` has
+        read, from one right-padded forward pass over the rest of each row
+        (``rests``, in order). Every row of the batch gets its own copy of
+        the prefix's keys and values, so it continues from the prefix's
+        last position exactly as if it had been read whole; right padding
+        follows each row's real tokens, which never attend to it."""
+        mx = import_mlx_core()
+        caches = import_mlx_lm_cache().make_prompt_cache(self._model)
+        if len(caches) != len(prefix_cache):
+            raise MlxRuntimeError(
+                f"the model has {len(caches)} layer caches but the prefix was read into "
+                f"{len(prefix_cache)}"
+            )
+        rows = len(rests)
+        for cache, (keys, values) in zip(caches, prefix_cache, strict=True):
+            cache.state = (mx.repeat(keys, rows, axis=0), mx.repeat(values, rows, axis=0))
+        padded, lengths = right_pad(rests, self._pad_id)
+        hidden = base_transformer_hidden_states(self._model, mx.array(padded), cache=caches)
+        return self._yes_probabilities(mx, hidden, lengths)
+
+    def _yes_probabilities(self, mx: Any, hidden: Any, lengths: Sequence[int]) -> list[float]:
+        """P(yes) per row from its last real token's hidden state."""
         last = gather_last_token_states(mx, hidden, lengths)  # (batch, 1, hidden)
         logits = lm_head_logits(self._model, last)  # (batch, 1, vocab)
         pair = mx.take(logits, mx.array([self._no_id, self._yes_id]), axis=-1)  # (batch, 1, 2)
@@ -336,8 +482,8 @@ class MlxRerankerProvider:
             if len(row) != 2:
                 raise MlxRuntimeError(f"expected [no, yes] logits per document, got {len(row)}")
             out.append(yes_probability(no_logit=row[0], yes_logit=row[1]))
-        if len(out) != len(rows):
-            raise MlxRuntimeError(f"scored {len(out)} rows out of {len(rows)} in one batch")
+        if len(out) != len(lengths):
+            raise MlxRuntimeError(f"scored {len(out)} rows out of {len(lengths)} in one batch")
         return out
 
     def _encode(self, text: str) -> list[int]:
@@ -354,6 +500,7 @@ __all__ = [
     "DEFAULT_RERANK_BATCH_SIZE",
     "DEFAULT_RERANK_INSTRUCTION",
     "DEFAULT_RERANK_MAX_BATCH_TOKENS",
+    "DEFAULT_RERANK_REUSE_PREFIX",
     "NO_TOKEN",
     "PAIR_TEMPLATE",
     "RERANKER_PREFIX",
@@ -361,7 +508,9 @@ __all__ = [
     "RERANKER_SYSTEM_PROMPT",
     "YES_TOKEN",
     "MlxRerankerProvider",
+    "RerankPlan",
     "common_prefix_length",
     "format_reranker_pair",
+    "shared_prefix_length",
     "yes_probability",
 ]

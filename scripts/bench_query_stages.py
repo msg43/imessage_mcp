@@ -21,19 +21,22 @@ service holds them, and measures after warm-up:
 - `reranker.score` (`--pool-sizes`, `0` to skip): the provider's own
   `score()` over pools of synthetic documents — tokenization, the document
   cap and the provider's planned batches included. The reranker is built
-  the way `imsg.providers.factory.build_reranker` builds it: the provider's
-  own batch bounds (unless `--reranker-batch-size` /
-  `--reranker-max-batch-tokens` override them) and a document cap of
-  `--rerank-doc-max-tokens` (default: the config schema's
-  `retrieval.rerank_doc_max_tokens`). Every call scores a fresh pool — its
-  own query, document token lengths drawn from `--doc-tokens` — so p95
-  covers the variation between pools as well as timing noise; pools of
-  different sizes share their documents (for the same call, the pool of 15
-  is the first 15 of the pool of 30). `--capped-pool-sizes` adds pools whose
-  every document is longer than the cap, the most work a pool of that size
-  can be. Each call's pair tokens, padded tokens, forward passes and capped
-  documents, computed from the provider's own rows and batch plan, are
-  recorded next to its time;
+  the way `imsg.providers.factory.build_reranker` builds it from a config
+  that leaves the reranker settings at their defaults: the config schema's
+  `retrieval.rerank_max_batch_tokens`, `retrieval.rerank_reuse_prefix` and
+  `retrieval.rerank_doc_max_tokens`, unless `--reranker-max-batch-tokens`,
+  `--no-reranker-reuse-prefix` or `--rerank-doc-max-tokens` override them,
+  and the provider's own row bound (`--reranker-batch-size`). Every call
+  scores a fresh pool — its own query, document token lengths drawn from
+  `--doc-tokens` — so p95 covers the variation between pools as well as
+  timing noise; pools of different sizes share their documents (for the
+  same call, the pool of 15 is the first 15 of the pool of 30).
+  `--capped-pool-sizes` adds pools whose every document is longer than the
+  cap, the most work a pool of that size can be. Each call's pair tokens,
+  the shared prefix read once, padded
+  tokens, forward passes and capped documents, computed from the provider's
+  own rows and plan (`MlxRerankerProvider.plan`), are recorded next to its
+  time;
 - memory with all three resident: `mx.get_peak_memory()` / active / cache,
   torch MPS allocations, the process's max RSS and its physical footprint
   (`proc_pid_rusage`; GPU buffers count toward the footprint but mostly not
@@ -116,7 +119,6 @@ import structlog
 
 from imsg import constants, mlx_runtime
 from imsg.config.schema import RetrievalConfig
-from imsg.embed.batching import plan_batches
 from imsg.embed.mlx_text import MlxTextEmbeddingProvider, format_query_text
 from imsg.embed.pe_core_multimodal import PeCoreMultimodalEmbeddingProvider
 from imsg.mlx_runtime import (
@@ -131,12 +133,11 @@ from imsg.mlx_runtime import (
 from imsg.providers.manifest import ARTIFACT_FILE_PATTERNS, artifact_digest
 from imsg.retrieval.mlx_reranker import (
     DEFAULT_RERANK_BATCH_SIZE,
-    DEFAULT_RERANK_MAX_BATCH_TOKENS,
     MlxRerankerProvider,
     format_reranker_pair,
 )
 
-REPORT_SCHEMA = "bench_query_stages/2"
+REPORT_SCHEMA = "bench_query_stages/3"
 GIB = float(2**30)
 
 DEFAULT_QUERY_INSTRUCTION = (
@@ -157,6 +158,14 @@ DEFAULT_RERANK_DOC_MAX_TOKENS: int | None = RetrievalConfig.model_fields[
 """`retrieval.rerank_doc_max_tokens` as the config schema defaults it — the
 cap `imsg.providers.factory.build_reranker` passes when a config leaves it
 unset."""
+
+DEFAULT_RERANK_MAX_BATCH_TOKENS: int = RetrievalConfig.model_fields[
+    "rerank_max_batch_tokens"
+].default
+"""`retrieval.rerank_max_batch_tokens` as the config schema defaults it."""
+
+DEFAULT_RERANK_REUSE_PREFIX: bool = RetrievalConfig.model_fields["rerank_reuse_prefix"].default
+"""`retrieval.rerank_reuse_prefix` as the config schema defaults it."""
 
 SHORT_STAGES = frozenset({"embedder.embed_query", "pe_core.embed_text"})
 PACKAGES = (
@@ -351,24 +360,33 @@ def pool_settings(args: argparse.Namespace) -> dict[str, Any]:
         "rerank_doc_max_tokens": args.rerank_doc_max_tokens,
         "reranker_batch_size": args.reranker_batch_size,
         "reranker_max_batch_tokens": args.reranker_max_batch_tokens,
+        "reranker_reuse_prefix": args.reranker_reuse_prefix,
         "reranker_revision": args.reranker_revision,
     }
 
 
-POOL_WORK_KEYS = ("pair_tokens", "padded_tokens", "batches", "longest_row", "docs_capped")
+POOL_WORK_KEYS = (
+    "pair_tokens",
+    "shared_prefix",
+    "padded_tokens",
+    "batches",
+    "longest_row",
+    "docs_capped",
+)
 
 
 def pool_work(reranker: MlxRerankerProvider, pool: Pool) -> dict[str, int]:
     """What one `score()` call on `pool` computes, from the provider's own
-    rows (`token_rows`, the cap applied) and batch plan (`plan_batches` with
-    the provider's bounds): real pair tokens, padded tokens (`rows x longest
-    row`, summed over batches), forward passes, the longest row, and how
-    many documents the cap shortened."""
+    rows (`token_rows`, the cap applied) and plan (`MlxRerankerProvider.
+    plan`): real pair tokens (every row whole), the leading tokens all rows
+    share and read once (0 when every row is read whole), padded tokens
+    computed (that prefix once, plus each batch's rows x its longest
+    remaining row), forward passes (the prefix pass included), the longest
+    row, and how many documents the cap shortened."""
     documents = list(pool.documents)
-    lengths = [len(row) for row in reranker.token_rows(pool.query, documents)]
-    plan = plan_batches(
-        lengths, max_batch_size=reranker.batch_size, max_batch_tokens=reranker.max_batch_tokens
-    )
+    rows = reranker.token_rows(pool.query, documents)
+    lengths = [len(row) for row in rows]
+    plan = reranker.plan(rows)
     capped = 0
     cap = reranker.doc_max_tokens
     if cap is not None:
@@ -380,8 +398,9 @@ def pool_work(reranker: MlxRerankerProvider, pool: Pool) -> dict[str, int]:
         capped = sum(1 for kept, full in zip(lengths, uncapped, strict=True) if kept < full)
     return {
         "pair_tokens": sum(lengths),
-        "padded_tokens": sum(len(group) * max(lengths[i] for i in group) for group in plan),
-        "batches": len(plan),
+        "shared_prefix": plan.shared_prefix,
+        "padded_tokens": plan.padded_tokens,
+        "batches": plan.passes,
         "longest_row": max(lengths),
         "docs_capped": capped,
     }
@@ -890,6 +909,7 @@ def measure_pool(
             "doc_max_tokens": reranker.doc_max_tokens,
             "batch_size": reranker.batch_size,
             "max_batch_tokens": reranker.max_batch_tokens,
+            "reuse_prefix": reranker.reuse_prefix,
             "doc_target_tokens_mean": round(sum(targets) / len(targets), 1),
             "first_call_work": work[0],
             **{key: [w[key] for w in work[timed]] for key in POOL_WORK_KEYS},
@@ -902,14 +922,15 @@ def measure_pool(
 def make_reranker(args: argparse.Namespace) -> MlxRerankerProvider:
     """The reranker as `imsg.providers.factory.build_reranker` constructs it
     — a local directory with `revision=None` and a `<dir>@<sha>` model id,
-    the document cap, the provider's own batch bounds — except for batch
-    bounds given on the command line."""
+    the document cap, the batch budget and prefix reuse as the config
+    defaults them — except for settings given on the command line."""
     directory = local_dir(args.reranker)
     return MlxRerankerProvider(
         str(directory) if directory else args.reranker,
         None if directory else args.reranker_revision,
         batch_size=args.reranker_batch_size,
         max_batch_tokens=args.reranker_max_batch_tokens,
+        reuse_prefix=args.reranker_reuse_prefix,
         doc_max_tokens=args.rerank_doc_max_tokens,
         model_id=f"{directory.name}@{args.reranker_revision}" if directory else None,
         cache_limit_bytes=int(args.query_cache_limit_gib * 2**30),
@@ -1495,7 +1516,16 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--reranker-max-batch-tokens",
         type=int,
         default=DEFAULT_RERANK_MAX_BATCH_TOKENS,
-        help="most padded tokens in one reranker forward pass (default: the provider's own bound)",
+        help="most padded tokens in one reranker forward pass (default: the config schema's "
+        "retrieval.rerank_max_batch_tokens)",
+    )
+    parser.add_argument(
+        "--reranker-reuse-prefix",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_RERANK_REUSE_PREFIX,
+        help="read the prompt text every candidate shares once per query (default: the config "
+        "schema's retrieval.rerank_reuse_prefix); --no-reranker-reuse-prefix reads every "
+        "candidate's prompt whole",
     )
     parser.add_argument(
         "--rerank-doc-max-tokens",

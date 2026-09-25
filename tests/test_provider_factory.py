@@ -202,6 +202,8 @@ def test_real_backend_resolves_each_class_by_dotted_path(
             (r.reranker_model, r.reranker_revision),
             {
                 "doc_max_tokens": r.rerank_doc_max_tokens,
+                "max_batch_tokens": r.rerank_max_batch_tokens,
+                "reuse_prefix": r.rerank_reuse_prefix,
                 "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
             },
         )
@@ -630,6 +632,8 @@ def test_reranker_directory_under_data_root_builds_with_revision_none_and_a_rela
             {
                 "model_id": f"{LOCAL_DIR}@{UPSTREAM_SHA}",
                 "doc_max_tokens": cfg.retrieval.rerank_doc_max_tokens,
+                "max_batch_tokens": cfg.retrieval.rerank_max_batch_tokens,
+                "reuse_prefix": cfg.retrieval.rerank_reuse_prefix,
                 "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
             },
         )
@@ -650,6 +654,39 @@ def test_reranker_document_cap_flows_from_config_to_the_provider(
     assert [kwargs["doc_max_tokens"] for _, kwargs in calls["reranker"]] == [256, None]
 
 
+def test_reranker_batch_budget_and_prefix_reuse_flow_from_config_to_the_provider(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The defaults are the 2026-09-25 settings; the values from before
+    it (1,024 padded tokens, every prompt read whole) stay one config
+    change away."""
+    calls = _install_stub_modules(monkeypatch)
+    for overrides in ({}, {"rerank_max_batch_tokens": 1024, "rerank_reuse_prefix": False}):
+        raw = config_dict_factory()
+        del raw["models"]  # real backend
+        raw["retrieval"]["reranker_model"] = "example-org/Example-Reranker-8bit"
+        raw["retrieval"]["reranker_revision"] = UPSTREAM_SHA
+        raw["retrieval"].update(overrides)
+        build_reranker(load_config_dict(raw))
+    assert [
+        (kwargs["max_batch_tokens"], kwargs["reuse_prefix"]) for _, kwargs in calls["reranker"]
+    ] == [(8192, True), (1024, False)]
+
+
+def test_reranker_config_defaults_equal_the_providers_own() -> None:
+    """A script that builds the provider directly gets what the factory
+    builds from a config that leaves these settings out."""
+    from imsg.config.schema import RetrievalConfig
+    from imsg.retrieval.mlx_reranker import (
+        DEFAULT_RERANK_MAX_BATCH_TOKENS,
+        DEFAULT_RERANK_REUSE_PREFIX,
+    )
+
+    fields = RetrievalConfig.model_fields
+    assert fields["rerank_max_batch_tokens"].default == DEFAULT_RERANK_MAX_BATCH_TOKENS
+    assert fields["rerank_reuse_prefix"].default is DEFAULT_RERANK_REUSE_PREFIX
+
+
 def test_reranker_repo_id_stays_a_hub_pin_when_no_such_directory_exists(
     config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -662,6 +699,8 @@ def test_reranker_repo_id_stays_a_hub_pin_when_no_such_directory_exists(
             ("example-org/Example-Reranker-8bit", UPSTREAM_SHA),
             {
                 "doc_max_tokens": cfg.retrieval.rerank_doc_max_tokens,
+                "max_batch_tokens": cfg.retrieval.rerank_max_batch_tokens,
+                "reuse_prefix": cfg.retrieval.rerank_reuse_prefix,
                 "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
             },
         )

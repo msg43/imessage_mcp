@@ -106,9 +106,51 @@ models:
       considered: mlx-community/Qwen3-Embedding-8B-4bit-DWQ (affine 4-bit, sha
       885642d6b98742ea03b77a1673579c92ca961efd) — rejected because the spec pins 8-bit.
       Upstream: Qwen/Qwen3-Embedding-8B @ 1d8ad4ca9b3dd8059ad90a75d4983776a23d44af (apache-2.0).
-  qwen3-reranker-0.6b:
+  qwen3-reranker-0.6b-bf16:
     role: [reranker]
     status: resolved
+    source: local_conversion
+    upstream_repo: Qwen/Qwen3-Reranker-0.6B
+    upstream_revision: e61197ed45024b0ed8a2d74b80b4d909f1255473
+    upstream_license: apache-2.0
+    tool: mlx-lm==0.31.3
+    command: >-
+      python -c "from huggingface_hub import snapshot_download; from mlx_lm.convert import
+      convert; src = snapshot_download('Qwen/Qwen3-Reranker-0.6B',
+      revision='e61197ed45024b0ed8a2d74b80b4d909f1255473'); convert(hf_path=src,
+      mlx_path='$DATA_ROOT/models/qwen3-reranker-0.6b-bf16-e61197ed', quantize=False,
+      dtype='bfloat16')"
+    output_dir: models/qwen3-reranker-0.6b-bf16-e61197ed
+    expected_dim: null
+    quantization: none
+    artifact_sha256: '4a78bf8ded560b727a07128f62041268b55a803549372d90008a0fb0bd709192'
+    min_runtime: {mlx: '0.32.2', mlx-lm: '0.31.3', huggingface_hub: '1.31.0'}
+    smoke_test:
+      status: passed
+      date: '2026-09-25'
+      host_class: Apple M2 Ultra, 128 GB unified memory
+      load_seconds: 2.37
+      inference_seconds: 0.07
+      peak_memory_gb: 1.34
+      peak_memory_source: mlx.core.get_peak_memory
+      result: 'P(yes): relevant=0.9978 > irrelevant=0.0000, both in [0, 1]'
+    notes: >-
+      The ACTIVE reranker since 2026-09-25 (owner decision): the same upstream checkpoint
+      as qwen3-reranker-0.6b below, converted by the same recipe without quantization, in
+      bfloat16, the format the model is published in. Measured on an M2 Ultra
+      (2026-09-24, 20 synthetic candidates of 40-700 tokens cut to 256): p95 0.552 s
+      against 0.682 s for the mxfp8 build at 1,024 tokens per batch, and every build
+      below 16 bits was slower than it on this GPU. Its scores are also closer to the
+      published checkpoint run in float32 (mean difference 0.006 against 0.020 for the
+      mxfp8 build, 800 pairs). Retrieval defaults move with it:
+      retrieval.rerank_max_batch_tokens 8192 and retrieval.rerank_reuse_prefix true.
+      Output: 310 tensors, all bfloat16 (595,776,512 parameters, 1,203,035,103 bytes of
+      artifact files), config.json without a quantization block; tie_word_embeddings is
+      true, as upstream. Reproducibility checked 2026-09-25: two runs of the recorded
+      command into fresh directories gave this artifact_sha256, all 7 hashed files equal.
+  qwen3-reranker-0.6b:
+    role: [reranker]
+    status: retained
     source: local_conversion
     upstream_repo: Qwen/Qwen3-Reranker-0.6B
     upstream_revision: e61197ed45024b0ed8a2d74b80b4d909f1255473
@@ -135,8 +177,19 @@ models:
       peak_memory_source: mlx.core.get_peak_memory
       result: 'P(yes): relevant=0.9981 > irrelevant=0.0000, both in [0, 1]'
     notes: >-
-      The ACTIVE reranker since 2026-09-17 (owner decision): search's latency budget is
-      p95 <= 2.0 s for a whole query on the production host, and on the 2026-09-16/17
+      RETAINED, NOT ACTIVE since 2026-09-25: replaced by qwen3-reranker-0.6b-bf16 (above),
+      the same upstream checkpoint in 16 bits, which is faster on the GPU. Kept pinned and
+      digest-checked so that switching back is a config change: set
+      retrieval.reranker_model to this entry's output_dir. For exactly the behaviour
+      before 2026-09-25, also set retrieval.rerank_max_batch_tokens 1024 and
+      retrieval.rerank_reuse_prefix false. Re-running the recorded command on 2026-09-25
+      (mlx 0.32.2, mlx-lm 0.31.3, macOS 26.6.2) gave digest
+      2e14ecadf922ca61cd39a395998955e7aeffc4ba2b3d8e37622c82ae1fd287c2, not the one pinned
+      here (two runs agreed with each other; 507 tensors as before), so a rollback uses a
+      directory already verified against this digest; why a fresh conversion now differs
+      is not established. It was the ACTIVE reranker from 2026-09-17 (owner decision):
+      search's latency budget is p95 <= 2.0 s for a whole query on the production host,
+      and on the 2026-09-16/17
       sweep only this size could score 20 candidates inside it — the 8B at its fastest
       setting (10 candidates, 64-token documents) missed the budget and agreed with the
       8B's full 50-candidate ranking no better than the fused order with no reranker.
@@ -185,8 +238,10 @@ models:
       qwen3-reranker-0.6b (above) for the search latency budget, and kept on disk, with
       this recipe and digest still verified, for the retrieval-quality comparison of the
       two sizes. It claims no role; to use it again, set retrieval.reranker_model /
-      reranker_revision to this entry's output_dir / upstream_revision (and swap the two
-      entries' status to keep the lock's config defaults in step). Its smoke_test record
+      reranker_revision to this entry's output_dir / upstream_revision and
+      retrieval.rerank_max_batch_tokens to 1024, its measured best (and make it the
+      resolved entry, with the active one retained, to keep the lock's config defaults in
+      step). Its smoke_test record
       is from when it was active. Pinned as a LOCAL CONVERSION (owner decision
       2026-09-15): mlx-lm's own 8-bit mxfp8 conversion (group size 32) of upstream
       Qwen/Qwen3-Reranker-8B at the sha

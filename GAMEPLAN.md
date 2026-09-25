@@ -138,7 +138,10 @@ lock). The reranker is pinned as a reproducible local `mlx_lm.convert` of
 the upstream repo since 2026-09-15, because the Hub conversion ships no
 LM head; since 2026-09-17 it is the 0.6B rather than the 8B (owner
 decision, for the p95 <= 2.0 s search budget — the 8B conversion is kept
-in the lock as `status: retained` for the Phase 4 quality comparison).
+in the lock as `status: retained` for the Phase 4 quality comparison), and
+since 2026-09-25 the 0.6B's 16-bit (bf16) build, which reranks in about
+40 % less time with the same ranking quality on a public test (the mxfp8
+build is retained for rollback; not yet deployed on the index host).
 **Search now meets its latency budget end to end on the Studio**: p50
 0.87 s / p95 1.14 s through the real MCP surface, p95 1.61 s estimated
 for the production host from measured per-stage ratios (`CHANGELOG.md`
@@ -184,6 +187,19 @@ accounts).
   `GRANT pg_read_all_settings`, and `VACUUM (ANALYZE)` once after heavy
   work resumes. Optional but recommended: password (SCRAM) auth for TCP
   and `peer` for the owner-only socket.
+
+- **Deploy the bf16 reranker on the index host** (CHANGELOG 2026-09-25):
+  copy `models/qwen3-reranker-0.6b-bf16-e61197ed` under the host's
+  `data_root` (or run the lock's recorded command there) and check it with
+  `imsg models verify --data-root`; if the instance config names
+  `retrieval.reranker_model`, point it at the new directory; restart the
+  query servers. Keep the mxfp8 directory: setting `reranker_model` back to
+  it is the rollback. Then confirm the speed with
+  `scripts/bench_query_stages.py` once heavy work there resumes, and
+  re-measure the query process's memory, whose two configured figures
+  (`memory.model_footprints.public_server_bytes`,
+  `memory.mlx_memory_limits.public_server_bytes`) were measured with the
+  mxfp8 build.
 
 - **Run the real model providers end to end** before trusting Phase 3.
   Done as of 2026-09-14 for the single-input smoke level

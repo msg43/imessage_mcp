@@ -10,6 +10,88 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-25 — Reranking takes 41 % less time with the same ranking quality: bf16 build, 8,192-token batches, shared prompt read once
+
+**Why.** Reranking 20 candidates is the largest step of a search: 1.005 s
+at p95 on the production host (2026-09-17), inside a 2.0 s budget. The
+2026-09-24 reranker study found three changes to the same model,
+Qwen3-Reranker-0.6B, that leave its ranking quality unchanged on a public
+chat test, and the owner approved them ahead of the evaluation baseline
+for that reason.
+
+- **The bf16 build is now the reranker.** New lock entry
+  `qwen3-reranker-0.6b-bf16`: the same upstream revision (`e61197ed`),
+  converted by the lock's recipe with `quantize=False, dtype='bfloat16'`;
+  1.12 GiB; digest `4a78bf8d…`, reproduced byte for byte by two runs;
+  smoke run through the factory passed. Every build below 16 bits was
+  slower than bf16 on the Studio's GPU (2026-09-24 study).
+- **Rolling back is a config change.** The mxfp8 entry stays in the lock
+  as `status: retained`; `retrieval.reranker_model:
+  models/qwen3-reranker-0.6b-mxfp8-e61197ed` switches back to its weights.
+  For exactly the behaviour before today, also set
+  `retrieval.rerank_max_batch_tokens: 1024` and
+  `retrieval.rerank_reuse_prefix: false`.
+- **Up to 8,192 padded tokens per forward pass instead of 1,024**
+  (`retrieval.rerank_max_batch_tokens`, new, default 8,192). A pool of 20
+  took six or seven passes and now takes one after the prefix. The 8B was
+  fastest at 1,024, and its retained entry now says to set that.
+- **The prompt text every candidate shares is read once per query**
+  (`retrieval.rerank_reuse_prefix`, new, default true). The chat prefix,
+  the instruction, the query and `<Document>:` (66 to 72 tokens per query
+  on the benchmark pools) run once; each candidate's remaining tokens
+  attend to a copy of their keys and values (`MlxRerankerProvider.plan`).
+  Scores move by rounding only: with the weights cast to float32 they match
+  scoring each candidate alone to within 1e-5 with no pair reordered; in
+  bf16 they move by up to 0.061, where batching whole rows already moved
+  them by up to 0.070 (45 synthetic pools of 20).
+- **Measured on the Studio** with `scripts/bench_query_stages.py`, both
+  paths on the same pools (seed 20260916, 20 documents of 40-700 tokens
+  cut to 256, 3 warm-up and 42 timed pools, all three query models
+  loaded, two interleaved rounds): the previous commit's code with the
+  mxfp8 build took p50 0.652 s / p95 0.674 s, the new path 0.392 s /
+  0.397 s. The new code run with the old settings took 0.650 s / 0.672 s,
+  so the whole-row path is unchanged. On the production host that is
+  about 0.6 s at p95 [estimate: Studio times 1.47, the 2026-09-17 ratio].
+  The MLX peak with the three query models rose from 8.73 to 10.35 GiB.
+- **Ranking quality unchanged on the public chat stand-in** (1,479
+  questions from REALTALK and LoCoMo, the production embedder's top 20,
+  the study's scripts): nDCG@10 0.6553 for the stored production (mxfp8)
+  scores, 0.6579 for the new path built by the factory, +0.0026 [-0.0006,
+  +0.0060] (95 % paired bootstrap). The study's figure for bf16 alone,
+  +0.001 [-0.003, +0.004], recomputes here as +0.0005 [-0.0028, +0.0039].
+  Individual orderings do move: the top result differs from production's
+  for 116 of the 1,479 questions. Most of that comes with the weights:
+  the bf16 build reading whole rows already differs on 130, and the new
+  path differs from that run on 51, each a near-tie (the two candidates
+  within 0.031 in P(yes), median 0.0003).
+- **Not changed:** the instruction text (the personal-message
+  instruction, +0.012 on the stand-in, waits for the owner's labels), the
+  20 candidates and the model.
+- **Found, not fixed:** re-running the mxfp8 entry's recorded command now
+  gives digest `2e14ecad…`, not the pinned `120fd5c2…` (two runs agree;
+  mlx 0.32.2, mlx-lm 0.31.3). A rollback has to use a directory that
+  still verifies against the lock (the production host's copy did on
+  2026-09-17). The cause is not established. The old-path timing above
+  ran on that reconversion.
+- **To re-measure on the production host:** the query process's
+  `memory.model_footprints.public_server_bytes` (17.2 GiB) and
+  `memory.mlx_memory_limits.public_server_bytes` (12 GiB) were measured
+  with the mxfp8 build. The 10.35 GiB peak above is under that limit.
+- `bench_query_stages.py` builds the reranker with the config's defaults
+  (`--reranker-max-batch-tokens` and `--no-reranker-reuse-prefix` measure
+  the old settings) and records the shared prefix, passes and padded
+  tokens from the provider's own plan (report schema 3).
+  `bench_retrieval_latency.py` counts the same way.
+- **Tests:** 19 new, 11 changed. On the previous code (through a shim that
+  lets the old constructor accept `reuse_prefix`), 21 of them fail: every
+  test of the shared-prefix path, the new budget default, the two new
+  config keys and the lock pin. The other 9 pass there, as they should:
+  they pin the whole-row path and the float32 equivalence.
+  `tests/test_mlx_reranker_real.py` runs real MLX kernels: a tiny random
+  Qwen3 in float32 always, and the real conversion when
+  `IMSG_TEST_RERANKER_DIR` names it; without the `models` extra it skips.
+  Full suite with Postgres and the real conversion: 2,899 passed.
+
 ## 2026-09-25 — Search page: a Details panel shows where each message came from
 
 **Why.** A forensic citation needs more than the time to the minute and the

@@ -153,7 +153,7 @@ retrieval:
   # produce yourself with the command in models/manifest.lock.yaml (also
   # shown verbatim in docs/install-macos.md), not something downloaded
   # as-is from Hugging Face.
-  reranker_model: models/qwen3-reranker-0.6b-mxfp8-e61197ed
+  reranker_model: models/qwen3-reranker-0.6b-bf16-e61197ed
   reranker_revision: e61197ed45024b0ed8a2d74b80b4d909f1255473
   default_limit: 10
   hnsw_ef_search: 1000

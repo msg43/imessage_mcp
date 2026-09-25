@@ -5,17 +5,21 @@ The real runtime is never installed in this repository's test
 environment (and never will be in CI), so the providers are exercised
 against tiny fakes installed into ``sys.modules`` via ``monkeypatch``.
 The fakes model only the surface the providers touch — ``mx.array`` /
-``take_along_axis`` / ``take`` / ``eval`` / ``float32``, ``mlx_lm.load``
-/ ``stream_generate`` / ``sample_utils.make_sampler`` / ``utils.
-get_model_path``, and ``huggingface_hub.snapshot_download`` — and record
-every call so tests can assert on what the providers asked for.
+``take_along_axis`` / ``take`` / ``repeat`` / ``eval`` / ``float32``,
+``mlx_lm.load`` / ``stream_generate`` / ``sample_utils.make_sampler`` /
+``utils.get_model_path`` / ``models.cache.make_prompt_cache``, and
+``huggingface_hub.snapshot_download`` — and record every call so tests
+can assert on what the providers asked for.
 
 Fake numerics are deliberately hand-computable:
 
 - :class:`FakeBaseTransformer` returns hidden states
   ``h[row][pos][k] = prefix_sum(row, pos) + k * pos`` — every position
   depends on all earlier tokens (causal) and on its own position, so
-  reading the wrong position (e.g. a padding slot) is detectable.
+  reading the wrong position (e.g. a padding slot) is detectable. Given
+  per-layer caches (:class:`FakeKVCache`), a row continues after the
+  tokens its cache holds: positions and prefix sums count them, exactly
+  as if the row had been read whole.
 - :class:`FakeLmHead` returns ``logits[v] = weight[v] * sum(state)``.
 """
 
@@ -35,10 +39,15 @@ RUNTIME_MODULE_NAMES = (
     "mlx",
     "mlx.core",
     "mlx_lm",
+    "mlx_lm.models",
+    "mlx_lm.models.cache",
     "mlx_lm.sample_utils",
     "mlx_lm.utils",
     "huggingface_hub",
 )
+
+FAKE_LAYERS = 2
+"""How many per-layer caches the fake ``make_prompt_cache`` returns."""
 
 
 FAKE_RUNTIME_DEFAULT_CACHE_LIMIT = 121 * 2**30
@@ -86,11 +95,17 @@ def _take(a: FakeArray, indices: FakeArray, axis: int) -> FakeArray:
     return FakeArray([[[row[0][i] for i in ids]] for row in a.tolist()])
 
 
+def _repeat(a: FakeArray, repeats: int, axis: int) -> FakeArray:
+    assert axis == 0, "the providers only repeat along the batch axis"
+    return FakeArray([row for row in a.tolist() for _ in range(repeats)])
+
+
 def make_mx_module() -> types.ModuleType:
     module = types.ModuleType("mlx.core")
     module.array = _array  # type: ignore[attr-defined]
     module.take_along_axis = _take_along_axis  # type: ignore[attr-defined]
     module.take = _take  # type: ignore[attr-defined]
+    module.repeat = _repeat  # type: ignore[attr-defined]
     module.eval = lambda *args: None  # type: ignore[attr-defined]
     module.float32 = "float32"  # type: ignore[attr-defined]
     module.int32 = "int32"  # type: ignore[attr-defined]
@@ -123,21 +138,87 @@ def fake_hidden_state(prefix_sum: int, position: int, hidden_size: int) -> list[
     return [float(prefix_sum + k * position) for k in range(hidden_size)]
 
 
+class FakeKVCache:
+    """Stands in for ``mlx_lm.models.cache.KVCache``. ``keys`` / ``values``
+    hold the token ids read so far, shape ``(batch, 1, tokens, 1)``, which
+    is all :class:`FakeBaseTransformer` needs to continue a row after
+    them; ``state`` and ``offset`` behave like the real cache's."""
+
+    def __init__(self) -> None:
+        self.keys: FakeArray | None = None
+        self.values: FakeArray | None = None
+        self.offset = 0
+
+    @property
+    def state(self) -> tuple[FakeArray, FakeArray]:
+        assert self.keys is not None and self.values is not None, "empty cache has no state"
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, value: tuple[FakeArray, FakeArray]) -> None:
+        self.keys, self.values = value
+        self.offset = self.keys.shape[2]
+
+    def token_history(self) -> list[list[int]]:
+        """The token ids each batch row has read, in order."""
+        if self.keys is None:
+            return []
+        return [[int(t[0]) for t in row[0]] for row in self.keys.tolist()]
+
+    def update_and_fetch(self, keys: FakeArray, values: FakeArray) -> tuple[FakeArray, FakeArray]:
+        new_keys, new_values = keys.tolist(), values.tolist()
+        if self.keys is None or self.values is None:
+            self.keys, self.values = FakeArray(new_keys), FakeArray(new_values)
+        else:
+            old_keys, old_values = self.keys.tolist(), self.values.tolist()
+            assert len(old_keys) == len(new_keys), "cache batch differs from the input batch"
+            self.keys = FakeArray([[a[0] + b[0]] for a, b in zip(old_keys, new_keys, strict=True)])
+            self.values = FakeArray(
+                [[a[0] + b[0]] for a, b in zip(old_values, new_values, strict=True)]
+            )
+        self.offset = self.keys.shape[2]
+        return self.keys, self.values
+
+
+def make_prompt_cache(model: Any) -> list[FakeKVCache]:
+    return [FakeKVCache() for _ in range(FAKE_LAYERS)]
+
+
 class FakeBaseTransformer:
-    """Stands in for ``model.model`` (the base transformer)."""
+    """Stands in for ``model.model`` (the base transformer). ``calls``
+    records every batch of token rows it was given and ``cache_offsets``
+    how many tokens the caches held for each (``None``: called without
+    caches)."""
 
     def __init__(self, hidden_size: int) -> None:
         self.hidden_size = hidden_size
         self.calls: list[list[list[int]]] = []
+        self.cache_offsets: list[int | None] = []
         self.embed_tokens = SimpleNamespace(as_linear=None)
 
-    def __call__(self, ids: FakeArray) -> FakeArray:
+    def __call__(self, ids: FakeArray, cache: list[FakeKVCache] | None = None) -> FakeArray:
         rows = ids.tolist()
         self.calls.append(rows)
+        self.cache_offsets.append(None if cache is None else cache[0].offset)
+        histories: list[list[int]] = [[] for _ in rows]
+        if cache is not None:
+            histories = cache[0].token_history() or histories
+            assert len(histories) == len(rows), "one cached history per batch row"
+            assert all(c.token_history() == cache[0].token_history() for c in cache)
         out = []
-        for row in rows:
-            sums = prefix_sums(row)
-            out.append([fake_hidden_state(sums[p], p, self.hidden_size) for p in range(len(row))])
+        for history, row in zip(histories, rows, strict=True):
+            sums = prefix_sums([*history, *row])
+            start = len(history)
+            out.append(
+                [
+                    fake_hidden_state(sums[start + p], start + p, self.hidden_size)
+                    for p in range(len(row))
+                ]
+            )
+        if cache is not None:
+            seen = FakeArray([[[[t] for t in row]] for row in rows])
+            for layer in cache:
+                layer.update_and_fetch(seen, seen)
         return FakeArray(out)
 
 
@@ -366,14 +447,22 @@ class FakeRuntime:
         utils = types.ModuleType("mlx_lm.utils")
         if self.expose_get_model_path:
             utils.get_model_path = self._get_model_path  # type: ignore[attr-defined]
+        models = types.ModuleType("mlx_lm.models")
+        cache = types.ModuleType("mlx_lm.models.cache")
+        cache.KVCache = FakeKVCache  # type: ignore[attr-defined]
+        cache.make_prompt_cache = make_prompt_cache  # type: ignore[attr-defined]
+        models.cache = cache  # type: ignore[attr-defined]
         mlx_lm.sample_utils = sample_utils  # type: ignore[attr-defined]
         mlx_lm.utils = utils  # type: ignore[attr-defined]
+        mlx_lm.models = models  # type: ignore[attr-defined]
         hub = types.ModuleType("huggingface_hub")
         hub.snapshot_download = self._snapshot_download  # type: ignore[attr-defined]
         modules = {
             "mlx": mlx,
             "mlx.core": mx,
             "mlx_lm": mlx_lm,
+            "mlx_lm.models": models,
+            "mlx_lm.models.cache": cache,
             "mlx_lm.sample_utils": sample_utils,
             "mlx_lm.utils": utils,
             "huggingface_hub": hub,

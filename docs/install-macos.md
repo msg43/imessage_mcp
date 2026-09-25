@@ -271,16 +271,16 @@ Model choices and their exact pinned versions are recorded in
 `models/manifest.lock.yaml` — the source of truth `config.yaml` mirrors.
 Most are plain Hugging Face downloads that happen automatically the
 first time a pipeline stage needs them. One — the reranker — is a
-*local conversion*: you run a command once to produce a quantized copy
+*local conversion*: you run a command once to produce an MLX copy of it
 under your `data_root`. That command, copied verbatim from
-`models/manifest.lock.yaml`:
+`models/manifest.lock.yaml` (entry `qwen3-reranker-0.6b-bf16`):
 
 ```bash
 python -c "from huggingface_hub import snapshot_download; from mlx_lm.convert import \
 convert; src = snapshot_download('Qwen/Qwen3-Reranker-0.6B', \
 revision='e61197ed45024b0ed8a2d74b80b4d909f1255473'); convert(hf_path=src, \
-mlx_path='$DATA_ROOT/models/qwen3-reranker-0.6b-mxfp8-e61197ed', quantize=True, \
-q_mode='mxfp8', q_bits=8, q_group_size=32)"
+mlx_path='$DATA_ROOT/models/qwen3-reranker-0.6b-bf16-e61197ed', quantize=False, \
+dtype='bfloat16')"
 ```
 
 Run this with the project's own `python` (i.e. `uv run python -c "..."`,

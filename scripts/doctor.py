@@ -247,7 +247,7 @@ def check_reranker_present(config: Config | None) -> CheckResult:
     # repo id (e.g. "org/model") rather than a local conversion -- that
     # form has nothing to check locally, since the provider downloads
     # it by id. Only the local-conversion form (data-root-relative,
-    # e.g. "models/qwen3-reranker-0.6b-mxfp8-e61197ed") is expected to
+    # e.g. "models/qwen3-reranker-0.6b-bf16-e61197ed") is expected to
     # exist on disk already.
     if not reranker_model.startswith("models/"):
         return _pass(

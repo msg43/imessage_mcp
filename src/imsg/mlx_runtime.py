@@ -109,6 +109,12 @@ def import_mlx_lm() -> ModuleType:
     return _import("mlx_lm")
 
 
+def import_mlx_lm_cache() -> ModuleType:
+    """Lazily import ``mlx_lm.models.cache`` (``make_prompt_cache`` and the
+    per-layer key/value caches a model reads earlier tokens from)."""
+    return _import("mlx_lm.models.cache")
+
+
 def bound_buffer_cache(limit_bytes: int) -> None:
     """Bound MLX's buffer cache to at most ``limit_bytes``, keeping any
     tighter bound already in place — and apply this process's MLX memory
@@ -299,19 +305,27 @@ def right_pad(sequences: Sequence[Sequence[int]], pad_id: int) -> tuple[list[lis
     return padded, lengths
 
 
-def base_transformer_hidden_states(model: Any, token_ids: Any) -> Any:
+def base_transformer_hidden_states(model: Any, token_ids: Any, *, cache: Any = None) -> Any:
     """Run the base transformer only — ``model.model`` on every ``mlx_lm``
     decoder-only class (``Qwen3Model`` for ``qwen3``): token embeddings,
     the causal-masked layer stack, and the final norm — returning
     last-layer hidden states of shape ``(batch, seq, hidden)`` without
-    ever touching the LM head."""
+    ever touching the LM head.
+
+    ``cache`` is one ``mlx_lm`` key/value cache per layer
+    (``mlx_lm.models.cache.make_prompt_cache``). The tokens it already
+    holds come before ``token_ids``: the new tokens are positioned after
+    them and attend to them, and the cache gains the new tokens' keys and
+    values."""
     inner = getattr(model, "model", None)
     if inner is None or not callable(inner):
         raise MlxRuntimeError(
             "mlx_lm model exposes no callable `.model` base transformer; this provider "
             "only supports mlx_lm decoder-only model classes"
         )
-    return inner(token_ids)
+    if cache is None:
+        return inner(token_ids)
+    return inner(token_ids, cache=cache)
 
 
 def gather_last_token_states(mx: ModuleType, hidden: Any, lengths: Sequence[int]) -> Any:
@@ -382,6 +396,7 @@ __all__ = [
     "hidden_size_of",
     "import_mlx_core",
     "import_mlx_lm",
+    "import_mlx_lm_cache",
     "lm_head_logits",
     "load_model_and_tokenizer",
     "process_memory_limit",

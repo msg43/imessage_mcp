@@ -122,8 +122,8 @@ below rely on (positional required args, keyword-only options):
                          timeout_seconds=120.0, shared_runtime=None,
                          cache_limit_bytes=8 GiB)
 - reranker:             (model_repo, revision, *, instruction=None, batch_size=32,
-                         max_length=8192, max_batch_tokens=1024, doc_max_tokens=None,
-                         cache_limit_bytes=8 GiB, model_id=None)
+                         max_length=8192, max_batch_tokens=8192, doc_max_tokens=None,
+                         reuse_prefix=True, cache_limit_bytes=8 GiB, model_id=None)
 - ocr:                  (*, recognition_languages=None, minimum_text_height=None,
                          max_image_pixels=178,956,970, image_dimensions=None)
 - transcription:        (model_repo, revision, *, language=None, temperature=...,
@@ -504,13 +504,18 @@ def build_reranker(cfg: Config) -> RerankerProvider:
     `<value>@<retrieval.reranker_revision>`, the upstream sha — and a Hub
     repo id pinned at `reranker_revision` otherwise. Either way the
     provider reads at most `retrieval.rerank_doc_max_tokens` tokens of
-    each document."""
+    each document, packs at most `retrieval.rerank_max_batch_tokens`
+    padded tokens into one forward pass, and reads the prompt text all
+    candidates share once per query when `retrieval.rerank_reuse_prefix`
+    is on."""
     if cfg.models.backend == "fake":
         return FakeRerankerProvider()
     spec = REAL_PROVIDERS["reranker"]
     model, revision = cfg.retrieval.reranker_model, cfg.retrieval.reranker_revision
     options: dict[str, object] = {
         "doc_max_tokens": cfg.retrieval.rerank_doc_max_tokens,
+        "max_batch_tokens": cfg.retrieval.rerank_max_batch_tokens,
+        "reuse_prefix": cfg.retrieval.rerank_reuse_prefix,
         "cache_limit_bytes": cfg.models.query_cache_limit_bytes,
     }
     local_dir = resolve_local_model_dir(cfg.paths.data_root, model)

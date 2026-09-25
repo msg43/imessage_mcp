@@ -379,26 +379,27 @@ class TimedReranker:
             self._count(query, documents)
 
     def _count(self, query: str, documents: list[str]) -> None:
-        """Token accounting, outside the timed region."""
-        from imsg.embed.batching import padded_tokens, plan_batches
+        """Token accounting, outside the timed region. For the provider's
+        own scoring, the passes its `plan` makes: the shared prompt prefix
+        once when it reuses it, then the batches."""
+        from imsg.embed.batching import padded_tokens
 
         if self._provider is None or not hasattr(self._provider, "token_rows"):
             return  # nothing reranked, or the fake backend (no tokenizer)
-        lengths = [len(row) for row in self._provider.token_rows(query, documents)]
+        rows = self._provider.token_rows(query, documents)
+        lengths = [len(row) for row in rows]
         if not lengths:
             return
-        if self._batching == "old":
-            plan = [list(range(i, min(i + 8, len(lengths)))) for i in range(0, len(lengths), 8)]
-        else:
-            plan = plan_batches(
-                lengths,
-                max_batch_size=self._provider.batch_size,
-                max_batch_tokens=self._provider.max_batch_tokens,
-            )
         self._tally.pairs += len(lengths)
         self._tally.real_tokens += sum(lengths)
-        self._tally.padded_tokens += padded_tokens(lengths, plan)
-        self._tally.batches += len(plan)
+        if self._batching == "old":
+            plan = [list(range(i, min(i + 8, len(lengths)))) for i in range(0, len(lengths), 8)]
+            self._tally.padded_tokens += padded_tokens(lengths, plan)
+            self._tally.batches += len(plan)
+        else:
+            work = self._provider.plan(rows)
+            self._tally.padded_tokens += work.padded_tokens
+            self._tally.batches += work.passes
 
 
 # --------------------------------------------------------------------------

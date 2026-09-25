@@ -20,7 +20,7 @@ from typing import Protocol
 
 class RerankerProvider(Protocol):
     model_id: str
-    """e.g. `'models/qwen3-reranker-0.6b-mxfp8-e61197ed@<upstream sha>'` for a
+    """e.g. `'models/qwen3-reranker-0.6b-bf16-e61197ed@<upstream sha>'` for a
     local conversion, `'<owner>/<repo>@<revision>'` for a Hub pin."""
 
     def score(self, query: str, documents: list[str]) -> list[float]:

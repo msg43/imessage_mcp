@@ -1,8 +1,9 @@
 """`imsg.retrieval.mlx_reranker.MlxRerankerProvider` — Qwen3-Reranker via
 MLX against the `_mlx_fakes` runtime: the model-card prompt format, the
 yes/no probability math, truncation budget and document cap, planned
-(length-sorted, token-budgeted) batching, the buffer-cache bound, and
-every failure path."""
+(length-sorted, token-budgeted) batching, the shared prefix read once per
+query, the buffer-cache bound, and every failure path. The same
+computations on real MLX kernels are in `test_mlx_reranker_real.py`."""
 
 from __future__ import annotations
 
@@ -27,11 +28,15 @@ from imsg.mlx_runtime import (
 )
 from imsg.retrieval.mlx_reranker import (
     DEFAULT_RERANK_INSTRUCTION,
+    DEFAULT_RERANK_MAX_BATCH_TOKENS,
+    DEFAULT_RERANK_REUSE_PREFIX,
     RERANKER_PREFIX,
     RERANKER_SUFFIX,
     MlxRerankerProvider,
+    RerankPlan,
     common_prefix_length,
     format_reranker_pair,
+    shared_prefix_length,
     yes_probability,
 )
 
@@ -130,8 +135,10 @@ def test_yes_probability_is_a_two_way_softmax() -> None:
 
 
 def test_score_returns_p_yes_per_document_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole-row path (`reuse_prefix=False`); the default path, which
+    reads the shared prefix once, is tested under "shared prefix" below."""
     runtime = FakeRuntime(model=_model()).install(monkeypatch)
-    provider = _provider()
+    provider = _provider(reuse_prefix=False)
     docs = ["short", "a much longer document body here", "mid length"]
     scores = provider.score("the query", docs)
 
@@ -150,7 +157,7 @@ def test_score_returns_p_yes_per_document_in_order(monkeypatch: pytest.MonkeyPat
 
 def test_batches_by_batch_size_and_preserves_order(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = FakeRuntime(model=_model()).install(monkeypatch)
-    provider = _provider(batch_size=2)
+    provider = _provider(batch_size=2, reuse_prefix=False)
     docs = ["one", "two words", "three words here", "four", "five words in total"]
     scores = provider.score("q", docs)
     assert [len(call) for call in runtime.model.model.calls] == [2, 2, 1]
@@ -176,9 +183,12 @@ def _real_lengths(call: list[list[int]], pad_id: int, suffix: list[int]) -> list
     return out
 
 
-def test_scores_do_not_depend_on_input_order(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("reuse_prefix", [True, False])
+def test_scores_do_not_depend_on_input_order(
+    monkeypatch: pytest.MonkeyPatch, reuse_prefix: bool
+) -> None:
     FakeRuntime(model=_model()).install(monkeypatch)
-    provider = _provider(batch_size=3, max_batch_tokens=200)
+    provider = _provider(batch_size=3, max_batch_tokens=200, reuse_prefix=reuse_prefix)
     docs = [
         "alpha",
         "bravo charlie delta echo foxtrot golf hotel",
@@ -202,7 +212,7 @@ def test_scores_do_not_depend_on_input_order(monkeypatch: pytest.MonkeyPatch) ->
 def test_batches_respect_the_padded_token_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = FakeRuntime(model=_model()).install(monkeypatch)
     budget = 120
-    provider = _provider(batch_size=32, max_batch_tokens=budget)
+    provider = _provider(batch_size=32, max_batch_tokens=budget, reuse_prefix=False)
     docs = [" ".join(["word"] * n) for n in (1, 30, 4, 12, 2, 25, 7, 3, 18, 9)]
     rows = provider.token_rows("q", docs)
     assert max(len(r) for r in rows) <= budget  # nothing here is oversize on its own
@@ -223,7 +233,7 @@ def test_batches_respect_the_padded_token_budget(monkeypatch: pytest.MonkeyPatch
 def test_an_oversize_pair_is_scored_alone(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = FakeRuntime(model=_model()).install(monkeypatch)
     tokenizer = runtime.tokenizer
-    provider = _provider(batch_size=32, max_batch_tokens=60)
+    provider = _provider(batch_size=32, max_batch_tokens=60, reuse_prefix=False)
     long_doc = " ".join(["word"] * 80)
     docs = ["one", long_doc, "two words", "three words here"]
     scores = provider.score("q", docs)
@@ -274,7 +284,9 @@ def test_document_longer_than_max_length_scores_from_its_last_real_token(
     suffix = tokenizer.encode(RERANKER_SUFFIX, add_special_tokens=False)
     body_budget = 20
     max_length = len(prefix) + len(suffix) + body_budget
-    provider = _provider(max_length=max_length, batch_size=32, max_batch_tokens=10_000)
+    provider = _provider(
+        max_length=max_length, batch_size=32, max_batch_tokens=10_000, reuse_prefix=False
+    )
     long_doc = " ".join(f"w{i}" for i in range(200))
     docs = ["one", long_doc, "two words"]
     scores = provider.score("the query", docs)
@@ -384,6 +396,217 @@ def test_common_prefix_length() -> None:
     assert common_prefix_length([1, 2, 3], [1, 2, 3, 4]) == 3
     assert common_prefix_length([1, 2, 9], [1, 2, 3, 4]) == 2
     assert common_prefix_length([5], [1]) == 0
+
+
+# --- shared prefix: read once per query, every row continues after it ----
+
+
+def _passes(runtime: FakeRuntime) -> list[tuple[int | None, list[list[int]]]]:
+    """Each forward pass as (tokens its caches already held, or None when
+    it ran without caches; the token rows it was given)."""
+    base = runtime.model.model
+    return list(zip(base.cache_offsets, base.calls, strict=True))
+
+
+def _prefix_ids(runtime: FakeRuntime) -> list[int]:
+    return runtime.tokenizer.encode(RERANKER_PREFIX, add_special_tokens=False)
+
+
+def _suffix_ids(runtime: FakeRuntime) -> list[int]:
+    return runtime.tokenizer.encode(RERANKER_SUFFIX, add_special_tokens=False)
+
+
+def _common_start(rows: list[list[int]]) -> int:
+    """The tokens every row starts with, leaving each row its last token —
+    worked out here independently of the provider."""
+    shared = min(common_prefix_length(rows[0], row) for row in rows)
+    return min(shared, min(len(row) for row in rows) - 1)
+
+
+def _padded(rows: list[list[int]], pad_id: int) -> list[list[int]]:
+    width = max(len(r) for r in rows)
+    return [[*r, *([pad_id] * (width - len(r)))] for r in rows]
+
+
+def _distinct_start_docs(lengths: list[int]) -> list[str]:
+    """Documents whose first words all differ in length, so the fake
+    tokenizer (a word's id is its length) makes their rows part at the
+    first document token."""
+    return [" ".join(["y" * (k + 1)] + ["x"] * n) for k, n in enumerate(lengths)]
+
+
+def test_defaults_are_the_measured_budget_and_the_shared_prefix() -> None:
+    provider = MlxRerankerProvider("org/rerank", None)
+    assert provider.max_batch_tokens == DEFAULT_RERANK_MAX_BATCH_TOKENS == 8192
+    assert provider.reuse_prefix is DEFAULT_RERANK_REUSE_PREFIX is True
+    assert _provider(reuse_prefix=False).reuse_prefix is False
+
+
+def test_shared_prefix_length_stops_one_short_of_the_shortest_row() -> None:
+    assert shared_prefix_length([]) == 0
+    assert shared_prefix_length([[1, 2, 3]]) == 2
+    assert shared_prefix_length([[1, 2, 3], [1, 2, 3]]) == 2  # identical rows keep a last token
+    assert shared_prefix_length([[1, 2, 3, 4], [1, 2, 9, 4], [1, 2, 3]]) == 2
+    assert shared_prefix_length([[1, 2], [1, 2, 3, 4]]) == 1  # one row is the other's start
+    assert shared_prefix_length([[5, 1], [1, 5]]) == 0
+    assert shared_prefix_length([[7], [7, 8]]) == 0
+
+
+def test_score_reads_the_shared_prefix_once_and_each_row_continues_after_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = FakeRuntime(model=_model()).install(monkeypatch)
+    tokenizer = runtime.tokenizer
+    pad_id = tokenizer.pad_token_id
+    assert pad_id is not None
+    provider = _provider()
+    docs = ["short", "a much longer document body here", "mid length"]
+    scores = provider.score("the query", docs)
+
+    rows = [_expected_row(tokenizer, DEFAULT_RERANK_INSTRUCTION, "the query", d) for d in docs]
+    # What every row shares: the chat prefix and the pair up to "<Document>:".
+    head = _expected_row(tokenizer, DEFAULT_RERANK_INSTRUCTION, "the query", "")[
+        : -len(_suffix_ids(runtime))
+    ]
+    assert all(row[: len(head)] == head for row in rows)
+    rests = [row[len(head) :] for row in rows]
+    # The prefix alone, into fresh caches; then one right-padded pass over
+    # the rests, longest first, continuing after the prefix's tokens.
+    assert _passes(runtime) == [
+        (0, [head]),
+        (len(head), _padded([rests[1], rests[2], rests[0]], pad_id)),
+    ]
+    assert runtime.model.head.calls == 1
+    assert scores == pytest.approx([_expected_score(row) for row in rows])
+    # Two of the rests were padded; read at a padding slot, the first
+    # would score differently, so the check above would catch it.
+    padded_short = [*head, *_padded([rests[1], rests[0]], pad_id)[1]]
+    assert scores[0] != pytest.approx(_expected_score(padded_short))
+
+
+def test_the_prefix_is_read_once_however_many_batches_follow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = FakeRuntime(model=_model()).install(monkeypatch)
+    budget = 16
+    provider = _provider(batch_size=32, max_batch_tokens=budget)
+    docs = _distinct_start_docs([1, 9, 4, 6, 2, 7, 3])
+    scores = provider.score("q", docs)
+    rows = provider.token_rows("q", docs)
+    shared = _common_start(rows)
+    assert shared > len(_prefix_ids(runtime))  # the instruction and query are in it
+
+    passes = _passes(runtime)
+    assert passes[0] == (0, [rows[0][:shared]])
+    assert len(passes) > 2
+    assert [offset for offset, _ in passes[1:]] == [shared] * (len(passes) - 1)
+    widths = []
+    scored = 0
+    for _, call in passes[1:]:
+        width = len(call[0])
+        assert all(len(row) == width for row in call)
+        assert len(call) * width <= budget or len(call) == 1
+        widths.append(width)
+        scored += len(call)
+    assert scored == len(docs)
+    assert widths == sorted(widths, reverse=True)  # the longest rests come first
+    assert scores == pytest.approx([_expected_score(row) for row in rows])
+
+
+def test_the_shared_prefix_runs_into_the_documents_when_they_start_alike(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rendered segments all open with "Chat:"; tokens every row shares
+    are read once wherever they come from."""
+    runtime = FakeRuntime(model=_model()).install(monkeypatch)
+    provider = _provider()
+    docs = ["Chat: a", "Chat: bb cc", "Chat: ddd eeee fffff"]
+    rows = provider.token_rows("q", docs)
+    head = provider.token_rows("q", ["Chat:"])[0][: -len(_suffix_ids(runtime))]
+    scores = provider.score("q", docs)
+    assert _passes(runtime)[0] == (0, [head])
+    assert scores == pytest.approx([_expected_score(row) for row in rows])
+
+
+def test_a_rest_over_the_budget_is_scored_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = FakeRuntime(model=_model()).install(monkeypatch)
+    provider = _provider(batch_size=32, max_batch_tokens=20)
+    docs = _distinct_start_docs([1, 60, 2, 3])
+    scores = provider.score("q", docs)
+    rows = provider.token_rows("q", docs)
+    shared = _common_start(rows)
+    assert len(rows[1]) - shared > 20
+    passes = _passes(runtime)
+    assert passes[1] == (shared, [rows[1][shared:]])  # alone, unpadded, first after the prefix
+    assert all(rows[1][shared:] not in call for _, call in passes[2:])
+    assert scores == pytest.approx([_expected_score(row) for row in rows])
+
+
+def test_a_cut_document_scores_from_its_last_real_token_after_the_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ~8,600-token segment case of the whole-row test above, on the
+    shared-prefix path: its body is cut to the budget, its suffix kept,
+    and the shorter rests beside it are padded to its length."""
+    runtime = FakeRuntime(model=_model()).install(monkeypatch)
+    tokenizer = runtime.tokenizer
+    prefix = tokenizer.encode(RERANKER_PREFIX, add_special_tokens=False)
+    suffix = tokenizer.encode(RERANKER_SUFFIX, add_special_tokens=False)
+    max_length = len(prefix) + len(suffix) + 20
+    provider = _provider(max_length=max_length, batch_size=32, max_batch_tokens=10_000)
+    docs = ["one", " ".join(f"w{i}" for i in range(200)), "two words"]
+    scores = provider.score("the query", docs)
+    rows = provider.token_rows("the query", docs)
+    assert len(rows[1]) == max_length and rows[1][-len(suffix) :] == suffix
+    [(_, prefix_call), (_, rest_call)] = _passes(runtime)
+    shared = len(prefix_call[0])
+    assert rest_call[0] == rows[1][shared:]
+    assert scores == pytest.approx([_expected_score(row) for row in rows])
+
+
+def test_a_single_document_is_read_whole_in_one_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = FakeRuntime(model=_model()).install(monkeypatch)
+    provider = _provider()
+    [score] = provider.score("q", ["just one"])
+    [row] = provider.token_rows("q", ["just one"])
+    assert _passes(runtime) == [(None, [row])]
+    assert provider.plan([row]) == RerankPlan(0, ((0,),), (len(row),))
+    assert score == pytest.approx(_expected_score(row))
+
+
+def test_without_reuse_prefix_every_row_is_read_whole(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = FakeRuntime(model=_model()).install(monkeypatch)
+    provider = _provider(reuse_prefix=False)
+    docs = ["alpha", "bravo charlie", "delta echo foxtrot"]
+    scores = provider.score("q", docs)
+    rows = provider.token_rows("q", docs)
+    pad_id = runtime.tokenizer.pad_token_id
+    assert pad_id is not None
+    assert _passes(runtime) == [(None, _padded([rows[2], rows[1], rows[0]], pad_id))]
+    assert provider.plan(rows).shared_prefix == 0
+    assert scores == pytest.approx([_expected_score(row) for row in rows])
+
+
+@pytest.mark.parametrize("reuse_prefix", [True, False])
+def test_plan_describes_the_passes_score_makes(
+    monkeypatch: pytest.MonkeyPatch, reuse_prefix: bool
+) -> None:
+    runtime = FakeRuntime(model=_model()).install(monkeypatch)
+    provider = _provider(batch_size=3, max_batch_tokens=60, reuse_prefix=reuse_prefix)
+    docs = _distinct_start_docs([1, 12, 4, 30, 2, 7, 3])
+    rows = provider.token_rows("q", docs)
+    plan = provider.plan(rows)
+    provider.score("q", docs)
+    calls = runtime.model.model.calls
+    assert plan.passes == len(calls)
+    assert plan.padded_tokens == sum(len(call) * len(call[0]) for call in calls)
+    assert plan.row_lengths == tuple(len(row) for row in rows)
+    rest_calls = calls[1:] if plan.shared_prefix else calls
+    assert len(rest_calls) == len(plan.batches)
+    for batch, call in zip(plan.batches, rest_calls, strict=True):
+        assert len(batch) == len(call) <= 3
+        for index, row in zip(batch, call, strict=True):
+            assert row[: len(rows[index]) - plan.shared_prefix] == rows[index][plan.shared_prefix :]
 
 
 def test_bounds_the_mlx_buffer_cache_when_the_weights_load(

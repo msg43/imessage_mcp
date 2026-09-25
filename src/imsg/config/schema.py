@@ -479,6 +479,21 @@ class RetrievalConfig(StrictModel):
     tokens for two participants): at 32 the reranker sees only part of the
     header, and on the benchmark's proxy it then ordered results worse than
     the fused order it replaces."""
+    rerank_max_batch_tokens: int = Field(default=8192, ge=1)
+    """Most padded tokens (`rows x longest row`) in one reranker forward
+    pass. 8,192 is measured for Qwen3-Reranker-0.6B: 20 candidates of
+    40-700 tokens cut to 256 took p95 0.552 s at 1,024 and 0.448 s at
+    8,192 with the bf16 build on an M2 Ultra (2026-09-24). The 8B was
+    fastest at 1,024 (`imsg.retrieval.mlx_reranker.
+    DEFAULT_RERANK_MAX_BATCH_TOKENS`); set 1,024 when switching
+    `reranker_model` to it."""
+    rerank_reuse_prefix: bool = True
+    """Read the tokens every candidate's prompt shares (the chat prefix,
+    the instruction and the query) once per query, and score each
+    candidate from there, rather than reading every prompt whole. Same
+    computation, 12 % faster (p95 0.448 -> 0.395 s, same benchmark); the
+    scores move by bf16 rounding (`imsg.retrieval.mlx_reranker`). `false`
+    reads every prompt whole, as before 2026-09-25."""
     reranker_model: str = Field(default=constants.RERANKER_MODEL, min_length=1)
     """Either form named by `RERANKER_MODEL_FORMS`. `imsg.providers.factory`
     reads the value as a local directory when `<paths.data_root>/<value>`

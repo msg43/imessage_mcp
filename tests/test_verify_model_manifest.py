@@ -888,16 +888,29 @@ def test_main_and_cli_accept_data_root_and_skip_artifacts(local_lock: tuple[Path
     )
 
 
-def test_repo_lock_pins_the_0_6b_as_the_active_reranker_and_retains_the_8b() -> None:
-    """Exactly one reranker is active; the replaced 8B conversion stays in
-    the lock, verified, but claims no role."""
+def test_repo_lock_pins_the_0_6b_bf16_as_the_active_reranker_and_retains_the_others() -> None:
+    """Exactly one reranker is active, the 0.6B's bf16 build; the builds it
+    replaced — the 0.6B's mxfp8 build and the 8B — stay in the lock,
+    verified, but claim no role, so switching back is a config change."""
     lock = load_manifest(default_manifest_path())
     active = entries_by_role(lock)["reranker"]
-    assert (active.name, active.status) == ("qwen3-reranker-0.6b", "resolved")
+    assert (active.name, active.status) == ("qwen3-reranker-0.6b-bf16", "resolved")
     assert active.local_conversion and active.upstream_repo == "Qwen/Qwen3-Reranker-0.6B"
+    assert active.output_dir == "models/qwen3-reranker-0.6b-bf16-e61197ed"
+    assert active.command is not None
+    assert "quantize=False" in active.command and "dtype='bfloat16'" in active.command
     retained = [e for e in lock.entries if e.retained]
-    assert [(e.name, e.roles) for e in retained] == [("qwen3-reranker-8b", ("reranker",))]
-    assert retained[0].local_conversion and retained[0].artifact_sha256 is not None
+    assert [(e.name, e.roles) for e in retained] == [
+        ("qwen3-reranker-0.6b", ("reranker",)),
+        ("qwen3-reranker-8b", ("reranker",)),
+    ]
+    mxfp8 = retained[0]
+    assert mxfp8.output_dir == "models/qwen3-reranker-0.6b-mxfp8-e61197ed"
+    assert (mxfp8.upstream_repo, mxfp8.upstream_revision) == (
+        active.upstream_repo,
+        active.upstream_revision,
+    )
+    assert all(e.local_conversion and e.artifact_sha256 is not None for e in retained)
     assert [e.name for e in lock.entries if "reranker" in e.roles and not e.retained] == [
         active.name
     ]

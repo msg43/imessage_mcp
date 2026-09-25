@@ -416,7 +416,7 @@ invalid result is treated exactly like a failure: scope stays
   not downloaded ready-to-use — it's converted locally from a Hugging
   Face checkpoint using the exact command recorded in
   [`models/manifest.lock.yaml`](models/manifest.lock.yaml) (see the
-  `qwen3-reranker-0.6b` entry). This requires the `models` extra
+  `qwen3-reranker-0.6b-bf16` entry). This requires the `models` extra
   installed first. [`docs/install-macos.md`](docs/install-macos.md) has
   this command spelled out step by step.
 
@@ -518,18 +518,21 @@ notes). The lock therefore pins the reranker as `source: local_conversion`:
 the upstream repo and commit sha, the license, the converter
 (`mlx-lm==0.31.3`), the exact `command` that produces it, its
 `output_dir` relative to `paths.data_root`, and the `artifact_sha256` of
-that directory. The pinned reranker is **Qwen3-Reranker-0.6B** (0.58 GiB
-on disk) since 2026-09-17, for the latency budget below; the 8B
-conversion stays in the lock as `status: retained` — pinned and verified
-exactly like an active entry, claiming no role, kept for a
-retrieval-quality comparison. `imsg models verify` prints which entry is
+that directory. The pinned reranker is **Qwen3-Reranker-0.6B** since
+2026-09-17, for the latency budget below, and since 2026-09-25 its
+unquantized 16-bit (bf16) conversion (1.12 GiB on disk), which runs faster
+on the GPU than the 8-bit mxfp8 conversion before it. Both earlier
+conversions, the 0.6B's mxfp8 build and the 8B, stay in the lock as
+`status: retained` — pinned and verified exactly like an active entry,
+claiming no role; setting `retrieval.reranker_model` to the mxfp8 build's
+directory switches back to it. `imsg models verify` prints which entry is
 active for every role and lists the retained ones separately. To
 reproduce a conversion, run the recorded command with `$DATA_ROOT` set to
 your data root and the `models` extra installed (a few seconds for the
 0.6B, about 16 for the 8B), then
-`scripts/smoke_test_models.py --only qwen3-reranker-0.6b --data-root
-$DATA_ROOT` to confirm the digest — re-running the 0.6B recipe on
-2026-09-17 reproduced its artifact byte for byte. In `config.yaml`,
+`scripts/smoke_test_models.py --only qwen3-reranker-0.6b-bf16 --data-root
+$DATA_ROOT` to confirm the digest — two runs of the bf16 recipe on
+2026-09-25 produced the same artifact byte for byte. In `config.yaml`,
 `retrieval.reranker_model` names that directory (data-root-relative) and
 `retrieval.reranker_revision` the *upstream* commit; the factory reads
 the value as a local directory when it exists under the data root and as
@@ -562,6 +565,13 @@ measurement rather than taste:
   reranking at all. How many candidates are reranked matters more than
   the reranker's size: with 10, the returned top 10 *is* the fused top 10
   in another order, so reranking cannot lift anything from further down.
+  Since 2026-09-25 the 0.6B runs as its bf16 build, with up to 8,192
+  padded tokens per forward pass (`retrieval.rerank_max_batch_tokens`)
+  and the prompt text every candidate shares read once per query
+  (`retrieval.rerank_reuse_prefix`). On the same machine that took
+  reranking 20 candidates of 40-700 tokens, cut to 256, from p95 0.674 s
+  to 0.397 s (`scripts/bench_query_stages.py`, 2026-09-25); the figures
+  above predate it.
 - **How much of the HNSW index each search reads.**
   `retrieval.hnsw_ef_search`, applied with `SET LOCAL` in each channel's
   own transaction, defaults to 1000 — pgvector's maximum. On the live

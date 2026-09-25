@@ -575,10 +575,30 @@ def test_multimodal_batch_size_must_be_positive(config_dict_factory: object) -> 
 
 def test_rerank_defaults_are_the_measured_latency_settings(config_dict_factory: object) -> None:
     raw = config_dict_factory()  # type: ignore[operator]
-    raw["retrieval"].pop("rerank_top", None)
-    raw["retrieval"].pop("rerank_doc_max_tokens", None)
+    for key in ("rerank_top", "rerank_doc_max_tokens", "rerank_max_batch_tokens"):
+        raw["retrieval"].pop(key, None)
+    raw["retrieval"].pop("rerank_reuse_prefix", None)
     retrieval = load_config_dict(raw).retrieval
     assert (retrieval.rerank_top, retrieval.rerank_doc_max_tokens) == (20, 256)
+    assert (retrieval.rerank_max_batch_tokens, retrieval.rerank_reuse_prefix) == (8192, True)
+
+
+def test_rerank_max_batch_tokens_and_reuse_prefix_are_validated(
+    config_dict_factory: object,
+) -> None:
+    raw = config_dict_factory()  # type: ignore[operator]
+    raw["retrieval"]["rerank_max_batch_tokens"] = 1024
+    raw["retrieval"]["rerank_reuse_prefix"] = False
+    retrieval = load_config_dict(raw).retrieval
+    assert (retrieval.rerank_max_batch_tokens, retrieval.rerank_reuse_prefix) == (1024, False)
+    for bad in (0, -1, "many"):
+        raw["retrieval"]["rerank_max_batch_tokens"] = bad
+        with pytest.raises(ConfigError, match=r"retrieval\.rerank_max_batch_tokens"):
+            load_config_dict(raw)
+    raw["retrieval"]["rerank_max_batch_tokens"] = 1024
+    raw["retrieval"]["rerank_reuse_prefix"] = "sometimes"
+    with pytest.raises(ConfigError, match=r"retrieval\.rerank_reuse_prefix"):
+        load_config_dict(raw)
 
 
 def test_hnsw_ef_search_defaults_to_pgvectors_maximum_and_is_bounded_by_it(

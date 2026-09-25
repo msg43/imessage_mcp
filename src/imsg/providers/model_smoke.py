@@ -132,6 +132,7 @@ revision is fetched, so the hashed set is always complete."""
 
 SMOKE_RUN_ORDER: tuple[str, ...] = (
     "qwen3-embedding-8b",
+    "qwen3-reranker-0.6b-bf16",
     "qwen3-reranker-0.6b",
     "qwen3-reranker-8b",
     "whisper-large-v3",

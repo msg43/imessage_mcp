@@ -60,17 +60,21 @@ HALFVEC_INDEX_MAX_DIM = 4_000
 TEXT_EMBEDDING_MODEL_REPO = "mlx-community/Qwen3-Embedding-8B-mxfp8"
 TEXT_EMBEDDING_MODEL_REVISION = "51c773b7464b630a6c67b4f75dbd796b658d6236"
 
-RERANKER_MODEL = "models/qwen3-reranker-0.6b-mxfp8-e61197ed"
+RERANKER_MODEL = "models/qwen3-reranker-0.6b-bf16-e61197ed"
 """The reranker is pinned as a LOCAL CONVERSION (``models/manifest.lock.yaml``
-entry ``qwen3-reranker-0.6b``, ``source: local_conversion``, the active
+entry ``qwen3-reranker-0.6b-bf16``, ``source: local_conversion``, the active
 entry for the ``reranker`` role): this is its ``output_dir``, a directory
 relative to ``paths.data_root`` that the recorded ``mlx_lm.convert``
 command produces from the upstream repo. ``imsg.providers.factory`` reads a
 ``retrieval.reranker_model`` value as a local directory when
 ``<data_root>/<value>`` exists and as a Hugging Face repo id
 (``owner/name``) otherwise. Qwen3-Reranker-0.6B replaced the 8B on
-2026-09-17 for search's latency budget; the 8B conversion stays in the lock
-as ``status: retained`` (not active) for a quality comparison."""
+2026-09-17 for search's latency budget, and its 16-bit (bf16) build
+replaced its 8-bit mxfp8 build on 2026-09-25 because it is faster on the
+GPU. Both earlier conversions stay in the lock as ``status: retained``
+(not active): setting ``retrieval.reranker_model`` to
+``models/qwen3-reranker-0.6b-mxfp8-e61197ed`` switches back to the mxfp8
+build."""
 RERANKER_MODEL_REVISION = "e61197ed45024b0ed8a2d74b80b4d909f1255473"
 """For a local conversion, the UPSTREAM commit it was converted from
 (``Qwen/Qwen3-Reranker-0.6B``); recorded in the provider's ``model_id`` as
