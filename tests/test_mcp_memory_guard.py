@@ -302,14 +302,49 @@ def test_a_refused_load_is_tried_again_only_after_the_retry_interval(
 def test_refusals_in_a_row_are_logged_once_per_interval(model_thread: ModelThread) -> None:
     h = Harness(model_thread, available_gib=20.0)
     h.start()
-    for _ in range(5):
+    # Every try inside one log interval, each refused for the same reason.
+    for _ in range(int(REFUSAL_LOG_INTERVAL_SECONDS // RETRY) - 1):
         h.clock.advance(RETRY)
         h.start()
+    assert h.admission.checks == int(REFUSAL_LOG_INTERVAL_SECONDS // RETRY)
     refusals = [line for line in h.log if line.startswith("not loading the models")]
     assert len(refusals) == 1
     h.clock.advance(REFUSAL_LOG_INTERVAL_SECONDS)
     h.start()
     assert len([line for line in h.log if line.startswith("not loading the models")]) == 2
+
+
+def test_a_refusal_is_logged_again_when_its_cause_changes_and_at_least_once_a_minute(
+    model_thread: ModelThread,
+) -> None:
+    """2026-09-25: a refused public server tried again every 15 s but
+    logged a refusal only every 300 s, so its log read as if it rechecked
+    every ten minutes. Now a changed cause is logged at once, and an
+    unchanged one at least once a minute."""
+    h = Harness(model_thread, available_gib=20.0, public=True, rewarm=True)
+    h.start()
+
+    def refusals() -> list[str]:
+        return [line for line in h.log if line.startswith("not loading the models")]
+
+    assert len(refusals()) == 1
+    h.clock.advance(RETRY)
+    h.start()
+    assert len(refusals()) == 1  # the same wait: not said again yet
+
+    h.admission.pressure = PressureLevel.WARN  # now pressure, not free memory
+    h.clock.advance(RETRY)
+    h.start()
+    assert len(refusals()) == 2
+    assert "warn memory pressure" in refusals()[-1]
+
+    for _ in range(3):
+        h.clock.advance(RETRY)
+        h.start()
+    assert len(refusals()) == 2
+    h.clock.advance(RETRY)  # a minute since the last line
+    h.start()
+    assert len(refusals()) == 3
 
 
 def test_an_admission_check_that_raises_refuses_the_load(model_thread: ModelThread) -> None:

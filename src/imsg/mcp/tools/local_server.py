@@ -55,9 +55,12 @@ each reload — first asks `imsg.memory_admission` whether the host has the
 memory for it. Refused, nothing loads and the warm-up's state becomes
 `memory_busy`; a retrieval call is answered at once with the retryable
 `WARMING_UP` code and a "host memory busy" message naming the numbers
-(`HostMemoryBusyError`), and the next call asks again. The unloader
-also drops loaded models early when the kernel reports critical memory
-pressure (`memory.local_server_release_at`).
+(`HostMemoryBusyError`), and the next call asks again. Background work
+gives way to a refused server: it starts no model load and stops after
+its current unit of work, until the server loads or no call has tried
+the load for two minutes (`imsg.memory_admission.LiveServerAdmission`).
+The unloader also drops loaded models early when the kernel reports
+critical memory pressure (`memory.local_server_release_at`).
 
 **Exiting when the client goes.** The SDK's stdio transport ends
 `server.run` when stdin reaches end-of-file, which is what an SSH client

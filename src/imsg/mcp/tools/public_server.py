@@ -60,10 +60,14 @@ agent is `KeepAlive`, so every crash is followed by another cold load.
 A load the host has no memory for is not started (`imsg.memory_admission`):
 the warm-up waits in `memory_busy`, retrieval calls get `WARMING_UP` with a
 "host memory busy" message in numbers only, and the server tries the load
-again by itself (`imsg.retrieval.idle_unload.PressureRelease`, `rewarm`).
-That answer comes from the same place as every other tool error, inside
-`gate.dispatch`, so an unauthenticated request never learns the host's
-state.
+again by itself every `memory.admission_retry_seconds`
+(`imsg.retrieval.idle_unload.PressureRelease`, `rewarm`). Background work
+gives way to it meanwhile: it starts no model load and stops after its
+current unit of work, and what background jobs were promised stops
+counting against this server after `memory.background_yield_seconds`
+(`imsg.memory_admission.LiveServerAdmission`). That answer comes from the
+same place as every other tool error, inside `gate.dispatch`, so an
+unauthenticated request never learns the host's state.
 
 That the warm-up wait sits *outside* `gate.dispatch` — the one thing in
 this module that is ordered differently from the security layers above —

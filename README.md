@@ -314,10 +314,29 @@ commands wait for a yes, re-checking every 30 s for up to 600 s, then
 exit **75** (`deferred: memory`) with the heavy lock released. An MCP
 server loads nothing and answers retrieval calls with the retryable
 `WARMING_UP` code and a "host memory busy" message; the local server tries
-again on a later call, the public one by itself. Two processes admitted in
-the same second cannot both claim the same free memory: admission runs
-under a short host-wide lock and leaves a reservation in
+again on a later call, the public one by itself every
+`memory.admission_retry_seconds` (15 s). Two processes admitted in the
+same second cannot both claim the same free memory: admission runs under
+a short host-wide lock and leaves a reservation in
 `<data_root>/run/memory-reservations/`.
+
+**MCP servers load before background work.** An MCP server whose load is
+refused posts a notice, `<data_root>/run/live-servers-waiting/<pid>.json`,
+held under a lock for as long as it waits (the kernel drops the lock if
+the server dies). While one is posted, no background command starts a
+model load, and a running one stops after its current unit of work (a
+chat, a batch, a task) and exits **75**, dropping its models and its
+reservation, so the server loads at its next try. What background jobs
+were admitted for and have not loaded yet counts against the server only
+for `memory.background_yield_seconds` (60 s); after that, only the memory
+the host really has, the reserve and the pressure level count, so a job
+that cannot stop soon cannot hold the server off. Other MCP servers'
+reservations always count.
+
+```bash
+uv run imsg status | grep -A3 -E 'live_servers_waiting|mcp_public_waiting_on'   # who waits, on what
+uv run imsg background status                                                  # what background work gives way to
+```
 
 **Heavy background work can be paused.** `imsg background pause`
 stops segment, embed, the enrich worker, backfill-attachments and `sync`'s

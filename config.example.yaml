@@ -213,7 +213,9 @@ mcp:
 # Memory: every model load first asks whether the host has room
 # (imsg.memory_admission), heavy background work stops between units when
 # the host is short or paused (imsg.background_gate), and MCP servers give
-# their models back under critical pressure. Defaults are measured on a
+# their models back under critical pressure. MCP servers load first: while
+# one waits for memory, background work starts no load and stops after its
+# current unit (imsg.live_server_notice). Defaults are measured on a
 # 64 GiB host; each field's docstring in imsg.config.schema names its source.
 memory:
   reserve_bytes: 8589934592         # 8 GiB left for the rest of the host after a load
@@ -221,6 +223,7 @@ memory:
   admission_wait_seconds: 600       # background commands wait this long for memory, then exit 75
   admission_poll_seconds: 30
   admission_retry_seconds: 15       # an MCP server retries a refused load no sooner than this
+  background_yield_seconds: 60      # a waiting MCP server counts background promises this long, then not
   background_stop_at: warn          # warn | critical: workers stop after their current unit
   warn_confirm_seconds: 10          # warn must still be there this long later to stop a worker
   pressure_check_seconds: 5         # MCP watchdog's pressure reading interval

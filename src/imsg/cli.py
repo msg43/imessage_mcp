@@ -147,6 +147,7 @@ from imsg.export import (
 )
 from imsg.heavy_lock import HeavyModelLock, inspect_heavy_lock
 from imsg.host_memory import PressureLevel, format_gib
+from imsg.live_server_notice import waiting_live_servers
 from imsg.log_rotation import LogRotationError, RotationReport, rotate_logs
 from imsg.mcp.audit import (
     PostgresAuditSink,
@@ -177,6 +178,7 @@ from imsg.mcp.warm_up_readiness import (
     readiness_path,
 )
 from imsg.memory_admission import (
+    LiveServerAdmission,
     MemoryAdmission,
     ModelRole,
     ReservationBook,
@@ -773,6 +775,7 @@ def _model_process_status_fields(cfg: Config) -> dict[str, object]:
                 "command": process.command,
                 "footprint_bytes": process.footprint_bytes,
                 "reserved_bytes": reservation.reserved_bytes if reservation else None,
+                "live": reservation.is_live if reservation else None,
             }
         )
     for pid, reservation in sorted(reservations.items()):
@@ -784,6 +787,7 @@ def _model_process_status_fields(cfg: Config) -> dict[str, object]:
                 "command": reservation.command,
                 "footprint_bytes": host_memory.process_footprint_bytes(pid),
                 "reserved_bytes": reservation.reserved_bytes,
+                "live": reservation.is_live,
             }
         )
     total = sum(
@@ -819,8 +823,21 @@ def _describe_model_processes(rows: object) -> list[str]:
         reserved = row.get("reserved_bytes")
         held = format_gib(footprint) if isinstance(footprint, int) else "footprint unreadable"
         extra = f", admitted for {format_gib(reserved)}" if isinstance(reserved, int) else ""
-        lines.append(f"  pid {row.get('pid')} {row.get('command')}: {held}{extra}")
+        live = row.get("live")
+        kind = " (live server)" if live is True else " (background)" if live is False else ""
+        lines.append(f"  pid {row.get('pid')} {row.get('command')}{kind}: {held}{extra}")
     return lines
+
+
+def _live_server_status_fields(cfg: Config) -> dict[str, object]:
+    """Live MCP servers waiting for memory right now, which background
+    work gives way to (`imsg.live_server_notice`): the command name, pid
+    and since when, nothing else."""
+    try:
+        waiting = waiting_live_servers(cfg.paths.data_root)
+    except (ImsgError, OSError) as exc:
+        return {"live_servers_waiting": f"unreadable: {type(exc).__name__}: {exc}"}
+    return {"live_servers_waiting": [server.describe() for server in waiting]}
 
 
 @app.command()
@@ -861,6 +878,7 @@ def status(
     memory_state = _host_memory_status_fields()
     pause_state = _background_pause_status_fields(cfg)
     process_state = _model_process_status_fields(cfg)
+    live_state = _live_server_status_fields(cfg)
 
     report = {
         "models_backend": cfg.models.backend,
@@ -884,8 +902,10 @@ def status(
         "mcp_public_warm_up": public_warm_up.state,
         "mcp_public_warm_up_detail": public_warm_up.detail,
         "mcp_public_pid": public_warm_up.pid,
+        "mcp_public_waiting_on": list(public_warm_up.waiting_on),
         **memory_state,
         **pause_state,
+        **live_state,
         **process_state,
         **heavy_lock_state,
         **_pipeline_status_fields(pipeline, pg),
@@ -910,6 +930,11 @@ def status(
             typer.echo("model_processes:")
             for line in _describe_model_processes(value):
                 typer.echo(line)
+            continue
+        if key in ("mcp_public_waiting_on", "live_servers_waiting") and isinstance(value, list):
+            typer.echo(f"{key}:" if value else f"{key}: none")
+            for line in value:
+                typer.echo(f"  {line}")
             continue
         typer.echo(f"{key}: {value}")
 
@@ -1019,9 +1044,10 @@ def background_status(
     config: ConfigOption = None,
     as_json: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
 ) -> None:
-    """Whether heavy background work is paused, by what, and until when."""
+    """Whether heavy background work is paused, by what, and until when,
+    and which live MCP servers it is giving way to."""
     cfg = _load_config_or_die(config)
-    report = _pause_state_report(cfg)
+    report = {**_pause_state_report(cfg), **_live_server_status_fields(cfg)}
     if as_json:
         typer.echo(json.dumps(report, indent=2))
         return
@@ -1034,6 +1060,15 @@ def background_status(
     typer.echo(
         f"background: host pause file: {host_file}" if host_file else "background: host pause file: off"
     )
+    waiting = report["live_servers_waiting"]
+    if isinstance(waiting, list):
+        for line in waiting:
+            typer.echo(
+                f"background: giving way to a live MCP server waiting for memory: {line} "
+                f"(no background load starts; running work stops after its current unit)"
+            )
+    else:
+        typer.echo(f"background: live MCP servers waiting for memory: {waiting}")
 
 
 @models_app.command("verify")
@@ -3134,10 +3169,18 @@ def mcp_local(config: ConfigOption = None) -> None:
     # Every load — at startup and after every unload — first asks whether
     # the host has the memory (imsg.memory_admission); refused, retrieval
     # calls answer WARMING_UP (host memory busy) and the next call asks
-    # again. This server is never paused: it only ever defers a load.
+    # again. This server is never paused: it only ever defers a load. It
+    # is a live server, so background work gives way to it: refused, it
+    # posts a notice that stops background work between units and holds
+    # back new background loads, until it loads or its client stops
+    # asking (imsg.memory_admission.LiveServerAdmission).
     memory_probe = host_memory.default_probe()
-    admission = MemoryAdmission.for_role(
-        cfg, ModelRole.LOCAL_SERVER, command="imsg mcp local", probe=memory_probe
+    admission = LiveServerAdmission.for_role(
+        cfg,
+        ModelRole.LOCAL_SERVER,
+        command="imsg mcp local",
+        probe=memory_probe,
+        log=lambda line: typer.echo(f"mcp local: {line}", err=True),
     )
     configure_mlx_memory_limit(cfg, ModelRole.LOCAL_SERVER)
     # Not warmed here: the server answers the MCP handshake first, and
@@ -3169,6 +3212,7 @@ def mcp_local(config: ConfigOption = None) -> None:
             check_seconds=cfg.memory.pressure_check_seconds,
         ),
         after_unload=admission.release,
+        on_watchdog_pass=admission.tick,
     )
     audit = PostgresAuditSink(lambda: connect(cfg.database, autocommit=True))
     # Every client session runs its own copy of this server and most never
@@ -3404,13 +3448,23 @@ def mcp_public(
     # file `imsg status` reads (imsg.mcp.warm_up_readiness).
     readiness = WarmUpReadinessFile(readiness_path(cfg.paths.data_root))
     # As on the local surface, every load first asks whether the host has
-    # the memory (imsg.memory_admission). Unlike it, this server loads
-    # again by itself once admitted (rewarm), since it has to stay warm
-    # for its latency budget, and it releases its models only at
+    # the memory (imsg.memory_admission), and background work gives way to
+    # this live server: refused, it posts a notice that stops background
+    # work between units and holds back new background loads, and what
+    # background jobs were promised stops counting against it after
+    # memory.background_yield_seconds (imsg.memory_admission.
+    # LiveServerAdmission). Unlike the local server, it loads again by
+    # itself once admitted (rewarm), trying every
+    # memory.admission_retry_seconds, since it has to stay warm for its
+    # latency budget, and it releases its models only at
     # memory.public_server_release_at (critical by default, or never).
     memory_probe = host_memory.default_probe()
-    admission = MemoryAdmission.for_role(
-        cfg, ModelRole.PUBLIC_SERVER, command="imsg mcp public", probe=memory_probe
+    admission = LiveServerAdmission.for_role(
+        cfg,
+        ModelRole.PUBLIC_SERVER,
+        command="imsg mcp public",
+        probe=memory_probe,
+        log=lambda line: typer.echo(f"mcp public: {line}", err=True),
     )
     configure_mlx_memory_limit(cfg, ModelRole.PUBLIC_SERVER)
     warm_up = BackgroundWarmUp(
@@ -3420,6 +3474,7 @@ def mcp_public(
         on_status=readiness.publish,
         admission=admission.check,
         admission_retry_seconds=cfg.memory.admission_retry_seconds,
+        retries_by_itself=True,
     )
     release_at = cfg.memory.public_server_release_at
     idle_unloader = IdleModelUnloader(
@@ -3436,6 +3491,11 @@ def mcp_public(
             rewarm_cooldown_seconds=cfg.memory.public_rewarm_cooldown_seconds,
         ),
         after_unload=admission.release,
+        # Unloaded under pressure, it loads again by itself after the
+        # cooldown: its notice goes up so background work does not take
+        # the memory meanwhile.
+        after_pressure_unload=admission.release_for_reload,
+        on_watchdog_pass=admission.tick,
     )
     public = PublicMcpServer(
         service=service,

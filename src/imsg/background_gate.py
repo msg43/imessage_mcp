@@ -10,18 +10,23 @@ steps. Each asks this gate three things:
 2. **Before its models load: does the host have the memory?**
    (`imsg.memory_admission`.) Asked after the command holds the
    host-wide heavy-model lock (`imsg.heavy_lock`), so memory freed by
-   the lock's previous holder counts. A refusal is re-checked every
+   the lock's previous holder counts. The answer is also no while a live
+   MCP server is waiting to load its models (`imsg.live_server_notice`):
+   they load first. A refusal is re-checked every
    `memory.admission_poll_seconds`, each wait logged, for up to
    `memory.admission_wait_seconds`; still refused, the command releases
    the lock and exits `EXIT_DEFERRED_MEMORY`.
 3. **Between units of work** (one enrichment task, one embedding batch,
-   one chat's segmentation, one attachment copied): paused again, or
+   one chat's segmentation, one attachment copied): paused again, a live
+   MCP server waiting to load its models (asked only by a command that
+   has loaded models: attachment backfill holds none to give back), or
    the kernel reporting `memory.background_stop_at` pressure (warn by
    default) or worse? If so the command stops after the unit it is on:
    that unit is finished and committed (an enrichment task's lease is
-   released by completing it), nothing new is claimed, the heavy lock is
-   released and the command exits with the matching code. Critical
-   stops at once; a warn reading must still be there
+   released by completing it), nothing new is claimed, the models, the
+   memory reservation and the heavy lock are released, and the command
+   exits with the matching code. A waiting live server and critical
+   pressure stop it at once; a warn reading must still be there
    `memory.warn_confirm_seconds` later, because on the production host
    warn came and went in single samples (2 of 133 in the 2026-09-17
    overlap run). The next scheduled run carries on from the queue and
@@ -42,7 +47,7 @@ status says which it was.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -52,6 +57,7 @@ from imsg import host_memory
 from imsg.background_pause import PauseState, read_pause_state
 from imsg.errors import ImsgError
 from imsg.host_memory import HostMemoryProbe, PressureLevel
+from imsg.live_server_notice import WaitingLiveServer, waiting_live_servers
 
 if TYPE_CHECKING:
     from imsg.config.schema import Config, MemoryConfig
@@ -117,6 +123,7 @@ class BackgroundGate:
         log: Callable[[str], None],
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        live_servers_waiting: Callable[[], Sequence[WaitingLiveServer]] | None = None,
     ) -> None:
         self._data_root = data_root
         self._host_pause_file = host_pause_file
@@ -125,6 +132,12 @@ class BackgroundGate:
         self._log = log
         self._sleep = sleep
         self._clock = clock
+        self._live_servers_waiting = (
+            live_servers_waiting
+            if live_servers_waiting is not None
+            else lambda: waiting_live_servers(data_root)
+        )
+        self._models_admitted = False
 
     @classmethod
     def from_config(
@@ -180,6 +193,7 @@ class BackgroundGate:
             if paused is not None:
                 return paused
             decision = admission.check()
+        self._models_admitted = True
         self._log(f"memory admitted: {decision.reason}")
         return None
 
@@ -190,11 +204,37 @@ class BackgroundGate:
         except Exception as exc:  # unreadable: the caller stops, never guesses
             return None, f"{type(exc).__name__}: {exc}"
 
+    def live_server_waiting(self) -> StopReason | None:
+        """Part of check 3: a live MCP server waiting to load its models
+        stops background work that holds models. A notice directory that
+        cannot be read stops it too, as an unreadable pressure level does:
+        the command never guesses that the host can spare its memory."""
+        try:
+            waiting = self._live_servers_waiting()
+        except Exception as exc:
+            return StopReason(
+                DeferralKind.MEMORY,
+                f"whether a live MCP server is waiting for memory could not be read "
+                f"({type(exc).__name__}: {exc})",
+            )
+        if not waiting:
+            return None
+        who = "; ".join(server.describe() for server in waiting)
+        return StopReason(
+            DeferralKind.MEMORY,
+            f"a live MCP server is waiting to load its models ({who}); background work "
+            f"gives way, stopping after this unit of work",
+        )
+
     def between_units(self) -> StopReason | None:
         """Check 3."""
         paused = self.paused()
         if paused is not None:
             return paused
+        if self._models_admitted:
+            waiting = self.live_server_waiting()
+            if waiting is not None:
+                return waiting
         stop_at = PressureLevel(self._memory.background_stop_at)
         level, error = self._pressure()
         if level is None:

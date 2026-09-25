@@ -727,7 +727,24 @@ class MemoryConfig(StrictModel):
     admission_retry_seconds: float = Field(default=15.0, gt=0)
     """An MCP server whose load was refused tries again no sooner than
     this: the local server on its next retrieval call, the public server
-    by itself. Each try costs one `vm_stat` run."""
+    by itself, as soon as this has passed. Each try costs one `vm_stat`
+    run."""
+
+    background_yield_seconds: float = Field(default=60.0, ge=0)
+    """How long an MCP server whose load was refused counts what background
+    jobs were promised and have not taken up yet (their reservations,
+    `imsg.memory_admission`). Meanwhile those jobs stop after their current
+    unit of work and start no load, so in the normal case the server loads
+    at its next try with nothing set aside. After it, a job that could not
+    stop (a long unit, eval, an older build) no longer holds the server
+    off: only memory the host really has, the reserve and the pressure
+    level count. 60 s is about one model load (the query models' whole
+    warm-up took 41.8-65.4 s over four cold starts on the M2 Ultra host,
+    `imsg.retrieval.service.ESTIMATED_WARM_UP_SECONDS`; no background
+    model's load time has been measured), so a job admitted just before
+    the wait began has most likely finished loading by then, and what it
+    still "promises" is its footprint estimate running high. 0: background
+    promises never count against an MCP server."""
 
     background_stop_at: Literal["warn", "critical"] = "warn"
     """A background worker finishes its current unit and stops when the

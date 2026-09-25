@@ -10,6 +10,99 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-25 — MCP servers load before background work; a refused load is retried every 15 s and says what it waits on
+
+**Why.** On the production host the public MCP server was restarted with
+new code while a scheduled `imsg sync` was segmenting, and it stayed
+without its models for about 12 minutes, so Gemini had no working search.
+Memory admission counted the sync's reservation against it. The server's
+refusal line: 29.4 GiB available, 9.9 GiB of it promised to other model
+processes, and 17.2 GiB needed plus the 8.0 GiB reserve. The sync had
+been admitted for 21.0 GiB (its segmentation footprint) about nine
+minutes earlier and had taken up 11.1 GiB of it (21.0 less 9.9). So 29.4
+covered the server, and 29.4 less the sync's promise did not. Nothing
+asked the sync to stop; it was stopped by hand.
+
+- **Background work gives way to the MCP servers**
+  (`imsg.memory_admission.LiveServerAdmission`, new
+  `imsg.live_server_notice`). The public and local MCP servers answer
+  people. Everything else that loads models (segment, embed, the enrich
+  worker, sync's heavy steps, eval) is background work.
+  - An MCP server whose load is refused posts a notice:
+    `<data_root>/run/live-servers-waiting/<pid>.json`, held under an
+    exclusive `flock` while it waits. The kernel drops the lock when the
+    process exits, so a crashed server holds nothing back, and a leftover
+    file counts for nothing even if its pid is reused.
+  - While a notice is posted, no background load is admitted (the command
+    waits as before, then exits 75). A running background command stops
+    after its current unit of work (one chat, one embedding batch, one
+    enrichment task), drops its models, its reservation and the
+    heavy-model lock, and exits 75. Attachment backfill loads no model and
+    is not stopped.
+  - The server then loads at its next try, with nothing set aside. In the
+    incident, the sync would have stopped after the chat it was on.
+- **A bound for jobs that cannot stop soon** (a long unit; eval, which has
+  no units; a build from before this change): `memory.background_yield_seconds`,
+  60 s. For that long after a server starts waiting, the memory background
+  jobs were admitted for and have not taken up counts against it. After
+  that, only the memory the host really has, the reserve and the pressure
+  level count. Background promises give way; the host's real memory never
+  does. A server that loads past a job's promise keeps its notice up until
+  that job has stopped, so the job cannot grow into that memory afterwards.
+- **Why the promise still counts for the first minute.** A job's promise
+  is real while its model loads, which takes tens of seconds. A server
+  loading into the same memory could push the host to critical pressure,
+  and critical pressure makes the public server unload its own models. So
+  the server first waits for background work to stop, which normally takes
+  one unit of work. 60 s is about one model load: the query models' whole
+  warm-up took 41.8-65.4 s over four cold starts on the M2 Ultra host. No
+  background model's load time has been measured.
+- **Other MCP servers' reservations always count**, so local servers
+  started in the same second are still admitted one at a time.
+- **Emergency release is unchanged:** critical pressure still unloads a
+  server at once, after any call in flight, and the public server still
+  reloads by itself after the 300 s cooldown if admitted. New: the public
+  server's notice stays up through the cooldown until its reload is
+  admitted, so background work does not take that memory meanwhile. A
+  local server does not reload by itself, so it posts nothing when it
+  releases its models. Its notice for a refused load lapses when no call
+  has tried the load for 120 s.
+- **Eval is background work.** It borrows the local server's footprint and
+  now passes `live=False`. Reservation files record `live`; a file written
+  by the previous build is read by its role.
+- **Retry cadence and the log.** The previous build already retried a
+  refused load every `memory.admission_retry_seconds` (15 s): on a fake
+  clock, 41 checks in 10 minutes. But it logged a refusal only every
+  300 s, so its log did not show how often it tried. That is the likely
+  source of the "about every 10 minutes" reading of the incident log [not
+  checked against that host's log or config]. Now a refusal is logged when
+  what the server waits on changes and at least once a minute, each line
+  saying when the load is tried again. The watchdog wakes when a try is
+  due rather than at its next regular pass, so the 15 s holds even with a
+  slower `memory.pressure_check_seconds`.
+- **What a waiting server waits on.** `imsg status` adds
+  `live_servers_waiting` and `mcp_public_waiting_on`: every other
+  reservation the public server's last check saw, with its pid, command,
+  whether it is a live server or background work, what it was admitted
+  for, what it holds, what it has not taken up and whether that counted.
+  `model_processes` rows say live server or background, and
+  `imsg background status` names the server background work gives way
+  to. These show command names (`imsg sync`), pids and byte counts only.
+  The public surface still answers in numbers only.
+- **Config:** `memory.background_yield_seconds` (default 60; 0 means
+  background promises never count against an MCP server).
+- **Tests:** 31 new; one existing test changed for the 60 s log interval.
+  Against the unfixed code all 31 fail. Four fail on what they check:
+  - the incident, reproduced across two processes through `imsg mcp
+    public`: the server stayed `memory_busy`;
+  - a background job was admitted while the server waited;
+  - 1 check in 1.5 s against a 0.2 s retry interval;
+  - a changed refusal cause was not logged.
+
+  The other 27 fail because the new module and names do not exist. Full
+  suite against a real Postgres 17 with pgvector: 3,018 passed, 2 skipped
+  (the real-reranker tests, which need a model directory).
+
 ## 2026-09-25 — Search page: filter by who sent a message and by conversation, search by filters alone, save searches on their own, download every result
 
 **Why.** The owner asked to run a filtered search across the whole corpus,

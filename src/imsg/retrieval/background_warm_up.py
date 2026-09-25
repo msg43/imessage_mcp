@@ -52,8 +52,10 @@ What this module promises:
   is busy (`HostMemoryBusyError`). `start()` from `memory_busy` asks
   again, but no sooner than `admission_retry_seconds` after the last
   refusal, so a stream of calls cannot turn into a stream of
-  measurements; refusals in a row are logged once every
-  `REFUSAL_LOG_INTERVAL_SECONDS`.
+  measurements. A refusal is logged when it is the first, when what the
+  load is waiting on changes (another cause, other processes), and
+  otherwise once every `REFUSAL_LOG_INTERVAL_SECONDS`, each line saying
+  how often the load is tried.
 """
 
 from __future__ import annotations
@@ -82,9 +84,13 @@ DEFAULT_ADMISSION_RETRY_SECONDS = 15.0
 """`memory.admission_retry_seconds`'s default, for callers built without a
 config (tests)."""
 
-REFUSAL_LOG_INTERVAL_SECONDS = 300.0
-"""Refused loads in a row are logged at most this often: the public server
-retries on its own for as long as the host is short, which may be hours."""
+REFUSAL_LOG_INTERVAL_SECONDS = 60.0
+"""Refused loads in a row that wait on the same thing are logged at most
+this often: the public server retries on its own every
+`admission_retry_seconds` for as long as the host is short, which may be
+hours. It was 300 s until 2026-09-25: a public server that tried again
+every 15 s then logged a refusal only every five minutes, so its log did
+not show how often it tried."""
 
 
 class WarmUpPhase(StrEnum):
@@ -216,9 +222,15 @@ class BackgroundWarmUp:
         clock: Callable[[], float] = time.monotonic,
         admission: Callable[[], AdmissionDecision] | None = None,
         admission_retry_seconds: float = DEFAULT_ADMISSION_RETRY_SECONDS,
+        retries_by_itself: bool = False,
     ) -> None:
+        """`retries_by_itself` only words the refusal log line: the public
+        server tries a refused load again on its own
+        (`imsg.retrieval.idle_unload.IdleModelUnloader.rewarm_if_due`), a
+        local server on its next retrieval call."""
         if admission_retry_seconds <= 0:
             raise ValueError(f"admission_retry_seconds must be > 0, got {admission_retry_seconds}")
+        self._retries_by_itself = retries_by_itself
         self._steps = tuple(steps)
         self._model_thread = model_thread
         self._log_line = log
@@ -236,11 +248,17 @@ class BackgroundWarmUp:
         self._refusal: AdmissionDecision | None = None
         self._refused_at: float | None = None
         self._refusal_logged_at: float | None = None
+        self._refusal_logged_key: tuple[object, ...] | None = None
         self._ever_ready = False
 
     @property
     def steps(self) -> tuple[WarmUpStep, ...]:
         return self._steps
+
+    @property
+    def retry_seconds(self) -> float:
+        """How soon after a refusal the load may be tried again."""
+        return self._retry_seconds
 
     def start(self) -> None:
         """Begin warming on the model thread and return at once.
@@ -374,20 +392,29 @@ class BackgroundWarmUp:
                 self._refusal = None
                 self._refused_at = None
                 self._refusal_logged_at = None
+                self._refusal_logged_key = None
             return True
         now = self._clock()
+        key = decision.waiting_key()
         with self._condition:
             due = (
                 self._refusal_logged_at is None
+                or key != self._refusal_logged_key
                 or now - self._refusal_logged_at >= REFUSAL_LOG_INTERVAL_SECONDS
             )
             if due:
                 self._refusal_logged_at = now
+                self._refusal_logged_key = key
         if due:
+            when = (
+                f"every {self._retry_seconds:g} s"
+                if self._retries_by_itself
+                else f"on the next retrieval call, at most every {self._retry_seconds:g} s"
+            )
             self._log(
                 f"not loading the models — {decision.reason}. Retrieval calls answer "
                 f"WARMING_UP (host memory busy) until the host has room; the load is "
-                f"tried again at most every {self._retry_seconds:g} s"
+                f"tried again {when}"
             )
         with self._condition:
             self._phase = WarmUpPhase.MEMORY_BUSY

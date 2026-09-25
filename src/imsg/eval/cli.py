@@ -109,9 +109,12 @@ def _admit_or_exit(cfg: Config, command: str, *, copies: int) -> MemoryAdmission
     to have room like a background command does (`imsg.background_gate`);
     still refused, exits 75 (`deferred: memory`). A pause of heavy
     background work (`imsg background pause`) defers it too, exit 76: eval
-    loads the same models and competes for the same memory."""
+    loads the same models and competes for the same memory. It borrows
+    the local server's footprint but is batch work, not a live server
+    (`live=False`), so it waits while an MCP server waits for memory, and
+    its reservation gives way to one."""
     admission = MemoryAdmission.for_role(
-        cfg, ModelRole.LOCAL_SERVER, command=command, copies=copies
+        cfg, ModelRole.LOCAL_SERVER, command=command, copies=copies, live=False
     )
     gate = BackgroundGate.from_config(cfg, log=lambda line: typer.echo(f"{command}: {line}", err=True))
     reason = gate.admit(admission)

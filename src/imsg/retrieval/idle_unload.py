@@ -50,12 +50,20 @@ which refuses while the host is short, so the call is answered
 A server that must stay warm (the public one, `rewarm=True`) also loads
 again by itself: after a pressure release, once
 `memory.public_rewarm_cooldown_seconds` have passed, and after a refused
-load, whenever the retry interval allows — each time only if admitted.
-The local server waits for its next call instead: nobody may be asking.
+load, as soon as the retry interval allows — each time only if admitted.
+The watchdog wakes when that time comes rather than on its next regular
+check, so a refused load is tried every `memory.admission_retry_seconds`
+exactly. The local server waits for its next call instead: nobody may be
+asking.
 
-After every unload, `after_unload` runs (the CLI passes the admission's
-`release`, so the memory this server was admitted for stops counting
-against other processes' loads).
+After every unload, `after_unload` runs (the CLI passes the live-server
+admission's `release`, so the memory this server was admitted for stops
+counting against other processes' loads). After an unload for pressure,
+`after_pressure_unload` runs instead when given: for the public server it
+posts the notice that the server is waiting to load again, so background
+work does not take the memory during the cooldown
+(`imsg.memory_admission.LiveServerAdmission`). `on_watchdog_pass` runs
+once per pass of the watchdog (the CLI passes the admission's `tick`).
 """
 
 from __future__ import annotations
@@ -86,6 +94,11 @@ queries of one conversation would cost more than it saves."""
 MAX_CHECK_INTERVAL_SECONDS = 15.0
 """The watchdog checks at least this often, so an unload happens at most
 this long after the idle period ends."""
+
+MIN_WAKE_SECONDS = 0.05
+"""The shortest the watchdog sleeps when a retry or a reload is due
+(`IdleModelUnloader.next_check_in`), so a clock that has not quite reached
+the due time cannot make it spin."""
 
 _GIB = 2**30
 
@@ -171,6 +184,8 @@ class IdleModelUnloader:
         clock: Callable[[], float] = time.monotonic,
         pressure_release: PressureRelease | None = None,
         after_unload: Callable[[], object] | None = None,
+        after_pressure_unload: Callable[[], object] | None = None,
+        on_watchdog_pass: Callable[[], object] | None = None,
     ) -> None:
         if idle_seconds < 0:
             raise ValueError(f"idle_seconds must be >= 0, got {idle_seconds}")
@@ -178,6 +193,8 @@ class IdleModelUnloader:
         self._model_thread = model_thread
         self._unload = unload
         self._after_unload = after_unload
+        self._after_pressure_unload = after_pressure_unload
+        self._on_watchdog_pass = on_watchdog_pass
         self._idle_seconds = float(idle_seconds)
         self._pressure_release = pressure_release
         self._log_line = log
@@ -201,9 +218,13 @@ class IdleModelUnloader:
 
     @property
     def watching(self) -> bool:
-        """Whether the watchdog has anything to do: idle unloading, or
-        watching the host's memory pressure."""
-        return self.enabled or self._pressure_release is not None
+        """Whether the watchdog has anything to do: idle unloading,
+        watching the host's memory pressure, or an `on_watchdog_pass`."""
+        return (
+            self.enabled
+            or self._pressure_release is not None
+            or self._on_watchdog_pass is not None
+        )
 
     @property
     def pressure_releases(self) -> int:
@@ -281,7 +302,7 @@ class IdleModelUnloader:
                 f"idle for {idle:.0f} s with no tool call: unloading the models; "
                 f"the next tool call reloads them"
             )
-            self._queue_unload()
+            self._queue_unload(for_pressure=False)
             return True
 
     def release_if_under_pressure(self) -> bool:
@@ -326,7 +347,7 @@ class IdleModelUnloader:
                 f"now, without waiting for the idle timer; they load again only when the "
                 f"host has room for them"
             )
-            self._queue_unload()
+            self._queue_unload(for_pressure=True)
             return True
 
     def rewarm_if_due(self) -> bool:
@@ -356,21 +377,30 @@ class IdleModelUnloader:
 
     def check_once(self) -> None:
         """One watchdog pass: pressure first (it can unload early), then
-        the idle timer, then a warm server's reload."""
-        for check in (self.release_if_under_pressure, self.unload_if_idle, self.rewarm_if_due):
+        the idle timer, then a warm server's reload, then
+        `on_watchdog_pass`."""
+        checks: list[Callable[[], object]] = [
+            self.release_if_under_pressure,
+            self.unload_if_idle,
+            self.rewarm_if_due,
+        ]
+        if self._on_watchdog_pass is not None:
+            checks.append(self._on_watchdog_pass)
+        for check in checks:
             try:
                 check()
             except Exception as exc:  # the watchdog must outlive one bad check
-                self._log(f"{check.__name__} failed: {type(exc).__name__}: {exc}")
+                name = getattr(check, "__name__", "on_watchdog_pass")
+                self._log(f"{name} failed: {type(exc).__name__}: {exc}")
 
-    def _queue_unload(self) -> None:
+    def _queue_unload(self, *, for_pressure: bool) -> None:
         """Caller holds the lock."""
         try:
-            self._model_thread.submit(self._run_unload)
+            self._model_thread.submit(lambda: self._run_unload(for_pressure=for_pressure))
         except RuntimeError as exc:  # the model thread is closed: the server is exiting
             self._log(f"unload not queued: {exc}")
 
-    def _run_unload(self) -> None:
+    def _run_unload(self, *, for_pressure: bool) -> None:
         """On the model thread."""
         started = time.perf_counter()
         try:
@@ -382,9 +412,12 @@ class IdleModelUnloader:
         detail = release_freed_memory()
         suffix = f"; {detail}" if detail else ""
         self._log(f"models unloaded in {time.perf_counter() - started:.1f} s{suffix}")
-        if self._after_unload is not None:
+        after = self._after_unload
+        if for_pressure and self._after_pressure_unload is not None:
+            after = self._after_pressure_unload
+        if after is not None:
             try:
-                self._after_unload()
+                after()
             except Exception as exc:
                 self._log(f"after-unload step failed ({type(exc).__name__}: {exc})")
 
@@ -397,6 +430,33 @@ class IdleModelUnloader:
         if self._pressure_release is not None:
             intervals.append(self._pressure_release.check_seconds)
         return min(intervals) if intervals else MAX_CHECK_INTERVAL_SECONDS
+
+    def next_check_in(self) -> float:
+        """How long the watchdog sleeps before its next pass: the regular
+        interval, or less when a server that reloads by itself has a
+        refused load to try again or a cooldown ending sooner, so the try
+        happens when it is due and not up to one interval later. While a
+        load is starting or running, a refusal can come at any moment and
+        its retry is due one retry interval after it, so the watchdog
+        sleeps no longer than that."""
+        interval = self.check_interval_seconds()
+        release = self._pressure_release
+        if release is None or not release.rewarm:
+            return interval
+        with self._lock:
+            status = self._warm_up.status()
+            due: float | None = None
+            if status.phase is WarmUpPhase.MEMORY_BUSY:
+                due = status.seconds_remaining  # what is left of the retry interval
+            elif status.phase is WarmUpPhase.UNLOADED and self._released_for_pressure_at is not None:
+                due = release.rewarm_cooldown_seconds - (
+                    self._clock() - self._released_for_pressure_at
+                )
+            elif status.phase in (WarmUpPhase.NOT_STARTED, WarmUpPhase.WARMING):
+                due = self._warm_up.retry_seconds
+        if due is None:
+            return interval
+        return max(MIN_WAKE_SECONDS, min(interval, due))
 
     def start_watchdog(self) -> None:
         """Start the daemon thread that calls :meth:`check_once`
@@ -414,9 +474,15 @@ class IdleModelUnloader:
         self._stop.set()
 
     def _watch(self) -> None:
-        interval = self.check_interval_seconds()
-        while not self._stop.wait(interval):
+        while not self._stop.wait(self._next_wait()):
             self.check_once()
+
+    def _next_wait(self) -> float:
+        try:
+            return self.next_check_in()
+        except Exception as exc:  # never let the schedule kill the watchdog
+            self._log(f"next_check_in failed: {type(exc).__name__}: {exc}")
+            return self.check_interval_seconds()
 
     def _log(self, line: str) -> None:
         with contextlib.suppress(Exception):
@@ -427,6 +493,7 @@ __all__ = [
     "DEFAULT_IDLE_UNLOAD_SECONDS",
     "MAX_CHECK_INTERVAL_SECONDS",
     "MIN_IDLE_UNLOAD_SECONDS",
+    "MIN_WAKE_SECONDS",
     "IdleModelUnloader",
     "PressureRelease",
     "release_freed_memory",
