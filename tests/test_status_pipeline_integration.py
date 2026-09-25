@@ -279,15 +279,11 @@ def test_rolled_up_rejections_are_counted_when_the_rollup_table_exists(
     db: psycopg.Connection, status_cli: Callable[..., Path]
 ) -> None:
     """Rejections the public server counts in memory, and rows retention
-    rolls up, live in `mcp_audit_rollup` with a `request_count` each; the
-    7-day count must include them."""
+    rolls up, live in `mcp_audit_rollup` (migration 0010) with a
+    `request_count` each; the 7-day count must include them."""
     db.execute(
-        "CREATE TABLE mcp_audit_rollup (period_start timestamptz NOT NULL, period_end timestamptz "
-        "NOT NULL, source text NOT NULL, surface text NOT NULL, subject_ok boolean NOT NULL, tool "
-        "text, error text, request_count int NOT NULL)"
-    )
-    db.execute(
-        "INSERT INTO mcp_audit_rollup VALUES "
+        "INSERT INTO mcp_audit_rollup (period_start, period_end, source, surface, subject_ok, "
+        "tool, error, request_count) VALUES "
         "(now() - interval '2 hours', now() - interval '1 hour', 'unauthenticated', 'public', "
         "false, NULL, 'UNAUTHORIZED', 31), "
         "(now() - interval '9 days', now() - interval '8 days', 'retention', 'public', false, "

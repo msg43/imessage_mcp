@@ -13,6 +13,7 @@ import io
 import json
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -164,10 +165,12 @@ def test_absent_or_malformed_authorization_is_401(header: str | None) -> None:
     verdict = gate.authorize(header)
     assert_rejected(verdict, 401)
     assert intro.calls == []  # nothing malformed ever reaches the network
+    # No token was judged, so there is no subject to record: the refusal is
+    # counted in memory and written as an aggregate row, never one row per
+    # request (imsg.mcp.audit.RejectionTally; QA review 2026-09-24).
     assert isinstance(sink, MemoryAuditSink)
-    (row,) = sink.snapshot()
-    assert row.subject is None and row.subject_ok is False
-    assert row.error == "UNAUTHORIZED"
+    assert sink.snapshot() == ()
+    assert gate.rejection_tally.pending() == {"UNAUTHORIZED": 1}
 
 
 def test_oversized_token_is_401_without_introspection() -> None:
@@ -293,10 +296,11 @@ def test_introspection_network_failure_is_503_never_allow() -> None:
     intro.outcomes[OWNER_TOKEN] = IntrospectionUnavailableError("down")
     verdict = gate.authorize(bearer(OWNER_TOKEN))
     assert_rejected(verdict, 503)
+    # Google could not say whose token it was, so there is no subject to
+    # record: counted, like every refusal that judged no token.
     assert isinstance(sink, MemoryAuditSink)
-    (row,) = sink.snapshot()
-    assert row.subject_ok is False
-    assert row.error == "UNAVAILABLE"
+    assert sink.snapshot() == ()
+    assert gate.rejection_tally.pending() == {"UNAVAILABLE": 1}
 
 
 def test_no_local_validation_fallback_exists() -> None:
@@ -442,9 +446,21 @@ def test_cached_owner_token_keeps_working_while_failure_budget_is_exhausted() ->
 
 
 def test_audit_failure_denies_rejections_with_503() -> None:
+    """A rejection that needs its row (a token was judged) and cannot get
+    it answers 503, as before."""
+    gate, _, _, _ = make_gate(audit=FailingSink())
+    verdict = gate.authorize(bearer(OTHER_TOKEN))
+    assert_rejected(verdict, 503)
+
+
+def test_a_refusal_that_judged_no_token_never_touches_the_audit_store() -> None:
+    """A token-less request is counted in memory, so a broken audit store
+    cannot turn it into a 503 — and a flood of them cannot reach the
+    store at all."""
     gate, _, _, _ = make_gate(audit=FailingSink())
     verdict = gate.authorize(None)
-    assert_rejected(verdict, 503)
+    assert_rejected(verdict, 401)
+    assert gate.rejection_tally.pending() == {"UNAUTHORIZED": 1}
 
 
 def test_audit_failure_withholds_payload_on_accept_path() -> None:
@@ -670,6 +686,29 @@ def test_build_gate_resolves_env_ref_client_id(
     )
     intro = StubIntrospector()
     intro.outcomes[OWNER_TOKEN] = claims()  # aud == the resolved CLIENT_ID
+    gate = build_public_gate(cfg, audit=MemoryAuditSink(), introspector=intro)
+    assert isinstance(gate.authorize(bearer(OWNER_TOKEN)), AuthorizedRequest)
+
+
+def test_build_gate_resolves_a_file_ref_client_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Secrets may live in owner-only files (`file:<absolute path>`); a
+    client id given that way must be read, not compared literally — which
+    would reject every token for the wrong audience."""
+    secret = tmp_path / "oauth-client-id"
+    secret.write_text(CLIENT_ID + "\n")
+    secret.chmod(0o600)
+    monkeypatch.setenv("IMSG_TEST_OWNER_SUBJECT", OWNER_SUB)
+    cfg = _public_config(
+        oauth={
+            "issuer": "google",
+            "client_id": f"file:{secret}",
+            "owner_subject": "env:IMSG_TEST_OWNER_SUBJECT",
+        }
+    )
+    intro = StubIntrospector()
+    intro.outcomes[OWNER_TOKEN] = claims()  # aud == the client id in the file
     gate = build_public_gate(cfg, audit=MemoryAuditSink(), introspector=intro)
     assert isinstance(gate.authorize(bearer(OWNER_TOKEN)), AuthorizedRequest)
 

@@ -104,14 +104,17 @@ def lp_db() -> Iterator[LeastPrivilegeDb]:
 
 
 def _migrate_and_seed(db: LeastPrivilegeDb) -> None:
-    """Migrations 0001-0009 as the non-superuser owner, then rows whose
+    """Every migration as the non-superuser owner, then rows whose
     rendered text is long and incompressible enough to live out of line,
     in the TOAST relation the prewarm has to reach."""
     with psycopg.connect(db.dsn) as conn:
         assert not _is_superuser(conn)
         applied = PostgresMigrationRunner(conn, REAL_MIGRATIONS_DIR).apply_pending()
         conn.commit()
-        assert [m.version for m in applied] == list(range(1, 10))
+        # Counted from the directory, so a new migration is exercised here
+        # as the non-superuser too rather than breaking the count.
+        migration_count = len(sorted(REAL_MIGRATIONS_DIR.glob("*.sql")))
+        assert [m.version for m in applied] == list(range(1, migration_count + 1))
         from datetime import UTC, datetime
 
         now = datetime.now(UTC)

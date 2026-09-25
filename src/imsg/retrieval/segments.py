@@ -216,7 +216,11 @@ def _latest_segment_start(conn: psycopg.Connection, chat_id: int) -> datetime | 
 
 
 def resolve_anchor(
-    conn: psycopg.Connection, resolution: ThreadResolution, anchor: str | None
+    conn: psycopg.Connection,
+    resolution: ThreadResolution,
+    anchor: str | None,
+    *,
+    timezone: str,
 ) -> datetime:
     """Resolve `get_conversation`'s `anchor` argument (SPEC §10.2: "an
     opaque `message_key`, or an ISO-8601 timestamp within the thread")
@@ -233,7 +237,15 @@ def resolve_anchor(
     segment), this build's judgment call is the chat's *most recent*
     segment start — showing the tail of the conversation by default
     reads as more useful than its very first message ever, and the
-    spec does not define a default for that case."""
+    spec does not define a default for that case.
+
+    A timestamp without an offset is read in `timezone`
+    (`render.timezone`, the zone every rendered timestamp is shown in),
+    the rule `after`/`before` already follow (`imsg.retrieval.filters`).
+    Returned naive, it was compared with `timestamptz` columns in the
+    database session's `TimeZone`, which nothing here sets: right on a
+    host whose Postgres happened to share the render zone, hours off on
+    any other (QA review 2026-09-24)."""
     if anchor is None:
         if resolution.default_anchor is not None:
             return resolution.default_anchor
@@ -243,9 +255,13 @@ def resolve_anchor(
         raise NotFoundError(f"thread {resolution.thread_key!r} has no segments to anchor on")
 
     try:
-        return datetime.fromisoformat(anchor)
+        parsed = datetime.fromisoformat(anchor)
     except ValueError:
         pass
+    else:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo(timezone))
+        return parsed
 
     with conn.cursor() as cur:
         cur.execute(

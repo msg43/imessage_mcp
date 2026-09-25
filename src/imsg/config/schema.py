@@ -866,6 +866,19 @@ class McpPublicConfig(StrictModel):
         default_factory=lambda: ["2025-11-25", "2026-07-28"]
     )
     rate_limit_per_minute: int = Field(default=60, ge=1)
+    """Requests per minute the owner's subject may make — each HTTP
+    request once, so a tool call costs one."""
+    failure_budget_per_minute: int = Field(default=600, ge=1)
+    """Failed token checks per minute across every client before a token
+    not already cached is refused 429 without asking Google (D7.3). Also
+    the budget shared by requests with no identifiable client address."""
+    client_failure_budget_per_minute: int = Field(default=10, ge=1)
+    """Rejected requests per minute one client address may make before it
+    is answered 429 with no further work (no token check, no audit row).
+    A token already cached as the owner's is never refused this way."""
+    rejection_write_interval_seconds: int = Field(default=60, ge=1)
+    """How often the counts of requests refused before any token was
+    judged are written to `mcp_audit_rollup` (one row per code)."""
     oauth: McpPublicOauthConfig = Field(default_factory=McpPublicOauthConfig)
     idle_unload_seconds: int = Field(default=0, ge=0)
     """As `mcp.local.idle_unload_seconds`, but off by default: the public
@@ -911,6 +924,11 @@ class McpPublicConfig(StrictModel):
 class McpConfig(StrictModel):
     local: McpLocalConfig = Field(default_factory=McpLocalConfig)
     public: McpPublicConfig
+    audit_retention_days: int = Field(default=90, ge=1)
+    """How many days of detailed `mcp_audit` rows `imsg mcp audit-prune`
+    keeps. Older rows become one `mcp_audit_rollup` row per day and
+    outcome; accepted public rows are always kept whole, since AT-1's
+    standing check reads the table's whole history."""
 
 
 # --------------------------------------------------------------------------

@@ -85,18 +85,34 @@ never showed this (stdio, one client, one call at a time); this surface
 serves a hosted assistant over StreamableHTTP, where concurrent tool
 calls are ordinary. `anyio.to_thread.run_sync` moves it off.
 
-Note what that does *not* buy. `imsg.retrieval.service.RetrievalService`
-holds one `psycopg.Connection` and one `apsw.Connection`, neither of
-which tolerates two threads at once (that module's docstring has the two
-driver errors), so it serializes whole calls behind its own lock —
-concurrent queries queue there rather than overlapping. What the worker
-thread fixes is the event loop, which is what everything *other* than a
-second query needs.
+What that buys depends on how the service was built
+(`imsg.retrieval.service`, "shared or pooled"). `imsg mcp public` builds
+it pooled (2026-09-24): each call borrows its own connections, so a
+second call overlaps the first except where both need the single model
+thread. A service built on one shared connection pair serializes whole
+calls behind its own lock instead — neither driver tolerates two threads
+on one connection — and then the worker thread fixes only the event loop.
+
+**Nothing that waits on I/O runs on the event loop (QA review
+2026-09-24).** The transport guard decides what memory can decide in
+place — a missing or malformed token, a throttled client, a cached
+verdict — and hands everything else (a tokeninfo call, an audit row) to
+a worker thread of its own, bounded by `MAX_CONCURRENT_AUTH_CHECKS`. A
+refusal that judged no token is counted in memory
+(`imsg.mcp.audit.RejectionTally`), never written row by row, so a flood
+of scanner requests costs the loop a dictionary update each and the
+database nothing. `PublicAuthGate` throttles each client address that
+keeps being refused (`client_key`); the tool call's rate-limit event is
+charged once, at the transport, and the receipt travels to
+`gate.dispatch` through the request's ASGI scope
+(`TRANSPORT_CHARGE_SCOPE_KEY`).
 """
 
 from __future__ import annotations
 
 import contextlib
+import functools
+import ipaddress
 import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
@@ -117,6 +133,7 @@ from imsg.mcp.auth import (
     RESPONSE_CACHE_HEADERS,
     AuthorizedRequest,
     PublicAuthGate,
+    RateLimitCharge,
     Rejection,
     ToolOutcome,
 )
@@ -183,9 +200,10 @@ WARM_UP_POLL_SECONDS = 0.1
 MAX_CONCURRENT_TOOL_CALLS = 4
 """How many tool calls may occupy a worker thread at once.
 
-Not a throughput knob — `imsg.retrieval.service.RetrievalService`
-serializes queries behind its connection lock, so calls past the first
-are queueing whatever this number is. It bounds two other things:
+With the pooled service `imsg mcp public` builds, this many calls run at
+once, each on its own connections, sharing only the single model thread;
+with a service on one shared connection pair, calls past the first queue
+behind its lock whatever this number is. Either way it bounds:
 
 - **Threads.** Without a limiter of our own, `anyio.to_thread.run_sync`
   draws on anyio's default limiter, which is 40 tokens and shared with
@@ -204,7 +222,7 @@ Memory is *not* what this bounds, despite being the obvious candidate:
 and every model call in this process runs on the single
 `imsg.retrieval.model_thread.ModelThread`, so concurrent tool calls do
 not multiply it. What they multiply is the Python-side working set of a
-query, and the connection lock already admits one of those at a time."""
+query — four of those at most."""
 
 _RETRIEVAL_HANDLERS: dict[
     str, Callable[[RetrievalService, AccessContext, dict[str, Any]], dict[str, Any]]
@@ -415,6 +433,7 @@ class PublicMcpServer:
         name = params.name
         arguments = dict(params.arguments or {})
         authorization = _authorization_header(context)
+        charge = _take_transport_charge(context)
 
         # A call that can never run — unknown tool, arguments that fail the
         # schema — is answered without waiting: no amount of warming makes
@@ -447,7 +466,11 @@ class PublicMcpServer:
                 # thread.
                 result = await anyio.to_thread.run_sync(
                     lambda: self.gate.dispatch(
-                        authorization, tool=name, params=arguments, handler=handler
+                        authorization,
+                        tool=name,
+                        params=arguments,
+                        handler=handler,
+                        charge=charge,
                     ),
                     limiter=self._limiter(),
                 )
@@ -528,12 +551,81 @@ def _with_cache_headers(send: Send) -> Send:
 
     async def wrapped(message: Message) -> None:
         if message["type"] == "http.response.start":
-            headers = list(message.get("headers", []))
+            # Replace, never add: the SDK's metadata handler sets its own
+            # `public, max-age=3600`, and appending ours after it sent two
+            # contradictory Cache-Control headers (QA review 2026-09-24).
+            headers = [
+                (name, value)
+                for name, value in message.get("headers", [])
+                if name.lower() != b"cache-control"
+            ]
             headers.extend(_cache_header_pairs())
             message = {**message, "headers": headers}
         await send(message)
 
     return wrapped
+
+
+def client_key(scope: Scope) -> str | None:
+    """Who sent this request, as far as the throttle is concerned — an
+    address, or `None` when nothing reliable says.
+
+    The socket peer is always loopback: this server binds 127.0.0.1 and
+    Tailscale's serve/Funnel proxy connects from there, adding the real
+    client's address to `X-Forwarded-For` (the access log shows public
+    addresses, QA review 2026-09-24). uvicorn trusts that header from
+    loopback only (`public_uvicorn_options`) and takes the rightmost
+    address not in `TRUSTED_PROXY_ADDRESSES` — the one the proxy added — into
+    `scope["client"]` before this app runs, so an address a client wrote
+    into the header itself is not the one used. A peer that is *still*
+    loopback here had no forwarded address: a direct local connection, or
+    a proxy that did not say. Those share one budget (`None`) rather than
+    each counting as a fresh client. An IPv6 client is keyed by its /64,
+    the block one host is normally given, so rotating addresses inside it
+    buys nothing."""
+    client = scope.get("client")
+    if not client:
+        return None
+    host = client[0]
+    if not isinstance(host, str):
+        return None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    if address.is_loopback or address.is_unspecified:
+        return None
+    if isinstance(address, ipaddress.IPv6Address):
+        return str(ipaddress.IPv6Network((address, 64), strict=False))
+    return str(address)
+
+
+TRANSPORT_CHARGE_SCOPE_KEY = "imsg.public.rate_limit_charge"
+"""Where `TransportGuardASGIApp` leaves the admitted request's
+`imsg.mcp.auth.RateLimitCharge` in the ASGI scope, for
+`PublicMcpServer.on_call_tool` to hand to `gate.dispatch`: the MCP SDK
+builds the request object a tool call sees from this same scope."""
+
+MAX_CONCURRENT_AUTH_CHECKS = 4
+"""Worker threads for token checks that need Google or an audit write.
+Separate from the tool-call limiter, so a burst of bad tokens queues
+behind itself and never behind (or in front of) the owner's searches;
+a check that memory can decide never takes one."""
+
+
+def _take_transport_charge(context: ServerRequestContext[None]) -> RateLimitCharge | None:
+    """The rate-limit receipt the transport left for this request, taken
+    so a second tool call in the same request cannot reuse it. `None` when
+    the request did not come through `TransportGuardASGIApp` (then
+    `dispatch` charges, as before)."""
+    request: Any = context.request
+    scope = getattr(request, "scope", None)
+    if not isinstance(scope, dict):
+        return None
+    charge = scope.pop(TRANSPORT_CHARGE_SCOPE_KEY, None)
+    return charge if isinstance(charge, RateLimitCharge) else None
 
 
 class TransportGuardASGIApp:
@@ -560,12 +652,22 @@ class TransportGuardASGIApp:
         allowed_hosts: Sequence[str],
         allowed_origins: Sequence[str],
         unauthenticated_paths: frozenset[str] = frozenset(),
+        max_concurrent_auth_checks: int = MAX_CONCURRENT_AUTH_CHECKS,
     ) -> None:
         self._inner = inner
         self._gate = gate
         self._allowed_hosts = tuple(allowed_hosts)
         self._allowed_origins = tuple(allowed_origins)
         self._unauthenticated_paths = unauthenticated_paths
+        self._max_concurrent_auth_checks = max_concurrent_auth_checks
+        self._auth_limiter: anyio.CapacityLimiter | None = None
+
+    def _limiter(self) -> anyio.CapacityLimiter:
+        """Created on first use, inside the event loop, for the same reason
+        as `PublicMcpServer._limiter`."""
+        if self._auth_limiter is None:
+            self._auth_limiter = anyio.CapacityLimiter(self._max_concurrent_auth_checks)
+        return self._auth_limiter
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -577,23 +679,43 @@ class TransportGuardASGIApp:
             await self._inner(scope, receive, send)
             return
 
+        client = client_key(scope)
         raw_headers: RawHeaders = scope.get("headers", [])
 
         duplicate = find_duplicate_header(raw_headers)
         if duplicate is not None:
+            self._gate.count_unauthenticated_rejection(client)
             await self._respond(send, 400, f"UNAUTHORIZED\nduplicate {duplicate!r} header")
             return
 
         headers = Headers(raw=list(raw_headers))
         if not validate_host(headers.get("host"), self._allowed_hosts):
+            self._gate.count_unauthenticated_rejection(client)
             await self._respond(send, 403, "UNAUTHORIZED\ninvalid Host header")
             return
         if not validate_origin(headers.get("origin"), self._allowed_origins):
+            self._gate.count_unauthenticated_rejection(client)
             await self._respond(send, 403, "UNAUTHORIZED\ninvalid Origin header")
             return
 
         if scope["path"] not in self._unauthenticated_paths:
-            verdict = self._gate.authorize(headers.get("authorization"))
+            authorization = headers.get("authorization")
+            # Whatever memory can decide is decided here, on the event
+            # loop, in microseconds: a missing or malformed token, a
+            # throttled client, a cached verdict. Only a token that needs
+            # Google, or a rejection that needs an audit row, goes to a
+            # worker thread — so a flood of token-less requests costs the
+            # loop almost nothing and never waits for a thread.
+            verdict = self._gate.admit(authorization, client=client, io_allowed=False)
+            if verdict is None:
+                verdict = await anyio.to_thread.run_sync(
+                    functools.partial(
+                        self._gate.admit, authorization, client=client, io_allowed=True
+                    ),
+                    limiter=self._limiter(),
+                )
+            if verdict is None:  # pragma: no cover - io_allowed=True always decides
+                raise AssertionError("the gate could not decide with I/O allowed")
             if isinstance(verdict, Rejection):
                 extra = (
                     {"WWW-Authenticate": verdict.www_authenticate}
@@ -602,6 +724,10 @@ class TransportGuardASGIApp:
                 )
                 await self._respond(send, verdict.status, verdict.code, extra_headers=extra)
                 return
+            # This request's rate-limit event is paid; the tool call it
+            # carries (if any) hands the receipt to `gate.dispatch`
+            # instead of paying twice.
+            scope[TRANSPORT_CHARGE_SCOPE_KEY] = verdict.charge
 
         await self._inner(scope, receive, _with_cache_headers(send))
 
@@ -667,11 +793,13 @@ def _resource_metadata_routes(external_url: str) -> list[Route]:
     from mcp.shared.auth import ProtectedResourceMetadata
     from starlette.routing import Route
 
+    # No `resource_name`: it is optional (RFC 9728 §2), and naming the
+    # software told every scanner which public repository answers here
+    # (QA review 2026-09-24). The SDK omits unset fields from the JSON.
     metadata = ProtectedResourceMetadata(
         resource=external_url,  # pydantic coerces str -> AnyHttpUrl
         authorization_servers=[GOOGLE_OAUTH_ISSUER],
         scopes_supported=list(PUBLIC_OAUTH_SCOPES),
-        resource_name="imessage-index",
     )
     handler = ProtectedResourceMetadataHandler(metadata)
     return [
@@ -730,6 +858,43 @@ def build_public_asgi_app(
     )
 
 
+PUBLIC_KEEP_ALIVE_SECONDS = 60
+"""How long uvicorn holds an idle client connection open. Its default is
+5 s, and a connection the Funnel has to open afresh cost 0.31-1.19 s
+against 0.085 s reused (curl from another host through the Funnel, QA
+review 2026-09-24): a hosted client that pauses more than 5 s between
+calls paid the fresh cost every time. An idle connection costs one file
+descriptor."""
+
+TRUSTED_PROXY_ADDRESSES: tuple[str, ...] = ("127.0.0.1", "::1")
+"""The only peers whose `X-Forwarded-For` uvicorn believes: the local
+proxy (Tailscale serve/Funnel). Stated here rather than left to
+uvicorn's default and its `FORWARDED_ALLOW_IPS` environment variable,
+because `client_key` depends on it."""
+
+
+def public_uvicorn_options(*, host: str, port: int) -> dict[str, Any]:
+    """The keyword arguments `imsg mcp public` runs uvicorn with
+    (`uvicorn.run(app, **...)`, or `uvicorn.Config(app, **...)`).
+
+    - `timeout_keep_alive` 60 s (`PUBLIC_KEEP_ALIVE_SECONDS`).
+    - `server_header=False`: no `server: uvicorn` on any response. The
+      endpoint is on the public internet; the header told scanners what
+      answers here (QA review 2026-09-24).
+    - `proxy_headers` from `TRUSTED_PROXY_ADDRESSES` only, which is what
+      puts the real client address in `scope["client"]` (`client_key`).
+    """
+    return {
+        "host": host,
+        "port": port,
+        "log_level": "info",
+        "timeout_keep_alive": PUBLIC_KEEP_ALIVE_SECONDS,
+        "server_header": False,
+        "proxy_headers": True,
+        "forwarded_allow_ips": list(TRUSTED_PROXY_ADDRESSES),
+    }
+
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
 
@@ -760,12 +925,19 @@ def parse_bind_address(bind: str) -> tuple[str, int]:
 __all__ = [
     "DEFAULT_STREAMABLE_HTTP_PATH",
     "GOOGLE_OAUTH_ISSUER",
+    "MAX_CONCURRENT_AUTH_CHECKS",
+    "MAX_CONCURRENT_TOOL_CALLS",
+    "PUBLIC_KEEP_ALIVE_SECONDS",
     "PUBLIC_OAUTH_SCOPES",
     "SERVER_NAME",
     "TOOL_CALL_WARM_UP_WAIT_SECONDS",
+    "TRANSPORT_CHARGE_SCOPE_KEY",
+    "TRUSTED_PROXY_ADDRESSES",
     "WELL_KNOWN_METADATA_PATH",
     "PublicMcpServer",
     "TransportGuardASGIApp",
     "build_public_asgi_app",
+    "client_key",
     "parse_bind_address",
+    "public_uvicorn_options",
 ]

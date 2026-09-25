@@ -300,8 +300,9 @@ def test_missing_authorization_is_401_before_inner_runs() -> None:
     assert inner.called is False
     header_map = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in response_headers}
     assert "www-authenticate" in header_map
-    rows = audit.snapshot()
-    assert len(rows) == 1 and rows[0].subject_ok is False
+    # Counted, not written row by row: no token, no subject to record.
+    assert audit.snapshot() == ()
+    assert gate.rejection_tally.pending() == {"UNAUTHORIZED": 1}
 
 
 def test_foreign_subject_is_401_before_inner_runs_and_is_audited() -> None:

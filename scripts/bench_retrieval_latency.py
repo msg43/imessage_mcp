@@ -63,6 +63,21 @@ once, empty, so it measures something only once `allowlist_person` has
 rows. It cannot be combined with `--rerank-only`, whose captured pools
 are the stored segment texts.
 
+`--pooled` runs the sweep the way `imsg mcp public` runs searches since
+2026-09-24: every call borrows its own Postgres connection and a search's
+five candidate channels run side by side on connections of their own
+(`imsg.retrieval.connections`). Without it, the service runs on one shared
+connection pair, channels one after another, as before. Stage times then
+overlap, so under `--pooled` they add up to more than the total and
+"other" goes negative; the total is the number to compare.
+
+`--fake-model-delays EMBED,MM,RERANK` (milliseconds) is for measuring on a
+host without the models (`models.backend: fake` in the config): each fake
+provider call sleeps that long first — for example the production host's
+measured p50s — so the database stages overlap with model time the way
+they would with real models. The fake backend's search results are
+meaningless; use it for timing only.
+
 `--rerank-only` isolates the reranker from the database: one pass of the
 real service per query (a pass-through reranker, a 50-candidate pool, and
 channel C on or off as the configurations need) records each query's
@@ -367,8 +382,8 @@ class TimedReranker:
         """Token accounting, outside the timed region."""
         from imsg.embed.batching import padded_tokens, plan_batches
 
-        if self._provider is None:
-            return
+        if self._provider is None or not hasattr(self._provider, "token_rows"):
+            return  # nothing reranked, or the fake backend (no tokenizer)
         lengths = [len(row) for row in self._provider.token_rows(query, documents)]
         if not lengths:
             return
@@ -507,8 +522,11 @@ def load_providers(cfg: Any) -> tuple[Any, Any, Any]:
     reranker: Any = build_reranker(cfg)
     multimodal: Any = build_multimodal_provider(cfg)
     for name, provider in (("text", text), ("reranker", reranker)):
+        load = getattr(provider, "load", None)
+        if not callable(load):
+            continue  # the fake backend holds no weights
         started = time.perf_counter()
-        provider.load()
+        load()
         print(f"loaded {name} in {time.perf_counter() - started:.1f} s", flush=True)
     if multimodal is not None:
         started = time.perf_counter()
@@ -540,6 +558,81 @@ def load_alternate_rerankers(cfg: Any, specs: Sequence[str]) -> dict[str, Any]:
     return out
 
 
+class DelayedProvider:
+    """A provider whose every call sleeps `seconds` first
+    (`--fake-model-delays`); everything else passes through."""
+
+    def __init__(self, inner: Any, seconds: float) -> None:
+        self._inner = inner
+        self._seconds = seconds
+        self.model_id = getattr(inner, "model_id", "delayed")
+        self.dim = getattr(inner, "dim", None)
+
+    def embed_query(self, text: str, *, instruction: str) -> list[float]:
+        time.sleep(self._seconds)
+        return list(self._inner.embed_query(text, instruction=instruction))
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return list(self._inner.embed_documents(texts))
+
+    def embed_text(self, text: str) -> list[float]:
+        time.sleep(self._seconds)
+        return list(self._inner.embed_text(text))
+
+    def embed_images(self, image_paths: list[Path]) -> list[list[float]]:
+        return list(self._inner.embed_images(image_paths))
+
+    def score(self, query: str, documents: list[str]) -> list[float]:
+        time.sleep(self._seconds)
+        return list(self._inner.score(query, documents))
+
+
+def delay_fake_providers(
+    cfg: Any, text: Any, reranker: Any, multimodal: Any, spec: str
+) -> tuple[Any, Any, Any]:
+    if cfg.models.backend != "fake":
+        raise SystemExit("--fake-model-delays is for the fake backend only (models.backend: fake)")
+    try:
+        embed_ms, mm_ms, rerank_ms = (float(part) for part in spec.split(","))
+    except ValueError as exc:
+        raise SystemExit("--fake-model-delays expects EMBED,MM,RERANK in milliseconds") from exc
+    return (
+        DelayedProvider(text, embed_ms / 1000),
+        DelayedProvider(reranker, rerank_ms / 1000),
+        DelayedProvider(multimodal, mm_ms / 1000) if multimodal is not None else None,
+    )
+
+
+BENCH_POOL_PG_CONNECTIONS = 10
+BENCH_POOL_FTS_CONNECTIONS = 4
+
+
+def open_pooled_connections(cfg: Any) -> Any:
+    """`--pooled`: connections opened exactly like `open_connections`'s —
+    read-only sessions after the data-directory check, the sidecar
+    immutable — sized like `imsg mcp public`'s pools."""
+    from imsg.db.connection import connect
+    from imsg.db.fingerprint import verify_data_directory
+    from imsg.db.pool import postgres_pool
+    from imsg.retrieval.connections import RetrievalConnections, fts_pool
+    from imsg.sqlite_readonly import open_readonly_immutable
+
+    def open_pg() -> Any:
+        conn = connect(cfg.database)
+        with conn.cursor() as cur:
+            cur.execute("SET SESSION default_transaction_read_only = on")
+        verify_data_directory(conn, cfg.paths.data_root)
+        return conn
+
+    fts_path = cfg.paths.data_root / "fts" / "fts.db"
+    return RetrievalConnections(
+        pg=postgres_pool(open_pg, max_size=BENCH_POOL_PG_CONNECTIONS, name="bench"),
+        fts=fts_pool(
+            lambda: open_readonly_immutable(fts_path), max_size=BENCH_POOL_FTS_CONNECTIONS
+        ),
+    )
+
+
 def with_retrieval(cfg: Any, **updates: Any) -> Any:
     return cfg.model_copy(update={"retrieval": cfg.retrieval.model_copy(update=updates)})
 
@@ -560,6 +653,13 @@ class Bench:
     clock: StageClock
     alternates: dict[str, Any] = field(default_factory=dict)
     scope: str = "full"
+    connections: Any = None
+    """`--pooled`: an `imsg.retrieval.connections.RetrievalConnections`."""
+
+    def pooled(self) -> dict[str, Any]:
+        """The keyword that makes a service pooled — none at all without
+        `--pooled`, so the script also runs against code from before it."""
+        return {} if self.connections is None else {"connections": self.connections}
 
     def context(self) -> Any:
         """The `AccessContext` every sweep search runs under (`--scope`)."""
@@ -599,6 +699,7 @@ class Bench:
                 if self.multimodal is not None and config.multimodal
                 else None
             ),
+            **self.pooled(),
         )
 
     def run(
@@ -674,6 +775,7 @@ class Bench:
                 if self.multimodal is not None and multimodal
                 else None
             ),
+            **self.pooled(),
         )
         pools: list[CapturedPool] = []
         records: list[QueryRecord] = []
@@ -892,6 +994,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="run the sweep under the local surface's full scope (default) or the public "
         "surface's allowlist scope",
     )
+    parser.add_argument(
+        "--pooled",
+        action="store_true",
+        help="each call borrows its own connections and a search's candidate channels run "
+        "side by side, as `imsg mcp public` does (see the module docstring)",
+    )
+    parser.add_argument(
+        "--fake-model-delays",
+        metavar="EMBED,MM,RERANK",
+        help="with models.backend: fake, delay each fake model call by these milliseconds",
+    )
     parser.add_argument("--report-json", type=Path, help="write the aggregate numbers here")
     args = parser.parse_args(argv)
     if args.rerank_only and args.scope != "full":
@@ -907,6 +1020,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg = load_config(args.config)
     pg, fts = open_connections(cfg)
     text, reranker, multimodal = load_providers(cfg)
+    if args.fake_model_delays:
+        text, reranker, multimodal = delay_fake_providers(
+            cfg, text, reranker, multimodal, args.fake_model_delays
+        )
+    connections = open_pooled_connections(cfg) if args.pooled else None
     alternates = load_alternate_rerankers(cfg, args.reranker)
     missing = {c.reranker for c in configs if c.reranker is not None} - set(alternates)
     if missing:
@@ -915,7 +1033,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     instrument_service_modules(clock)
     if not hasattr(fts_search.search_segment_fts, "__wrapped__"):
         raise SystemExit("stage instrumentation did not reach the service's modules")
-    bench = Bench(cfg, pg, fts, text, reranker, multimodal, clock, alternates, args.scope)
+    bench = Bench(
+        cfg, pg, fts, text, reranker, multimodal, clock, alternates, args.scope, connections
+    )
 
     if args.rerank_only:
         return rerank_only_main(bench, configs, queries, args.warmup, args.report_json)
@@ -927,7 +1047,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         for label in alternates:
             bench.run(parse_config(f"new@{label}:50:none"), warm[:1], 1, f"warm-up {label}")
 
-    report: dict[str, Any] = {"queries": len(queries), "passes": args.passes, "scope": args.scope}
+    report: dict[str, Any] = {
+        "queries": len(queries),
+        "passes": args.passes,
+        "scope": args.scope,
+        "pooled": bool(args.pooled),
+        "fake_model_delays_ms": args.fake_model_delays,
+    }
     if not args.no_first_touch:
         pinned = [c for c in configs if c.batching == "new" and c.reranker is None] or [
             parse_config("new:10:256")

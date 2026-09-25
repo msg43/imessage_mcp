@@ -11,6 +11,20 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-09-24 public endpoint fixes from the QA review (not yet deployed):**
+requests refused before any token was judged are counted in memory and
+written as one `mcp_audit_rollup` row per code per minute instead of a
+row each; an address with 10 failures a minute is throttled; the global
+failure budget is 600, so one source can no longer lock the owner's next
+token out; a tool call costs one rate-limit event; token checks, audit
+writes and searches run off the event loop, and a search's five channels
+run side by side on pooled connections (same results; p50 154 → 70 ms
+for the database stages on the Studio's synthetic corpus); the metadata
+document and uvicorn no longer name the software; keep-alive 60 s; a
+naive `get_conversation` anchor is read in `render.timezone`. New
+command `imsg mcp audit-prune`. Deploying needs `imsg migrate` (0010)
+and a restart of `imsg mcp public` on the index host; see `CHANGELOG.md`.
+
 **2026-09-24 private local search page (D14), built, not deployed:**
 `imsg search-page serve` returns every viable hit grouped by conversation,
 full text first and semantic above a similarity floor after, with threads

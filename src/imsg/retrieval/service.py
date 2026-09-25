@@ -11,10 +11,15 @@ already-open `psycopg.Connection` / `apsw.Connection` pair it never
 owns the lifecycle of, matching every other DB-touching module in this
 codebase.
 
-**One call at a time per service.** Both connections are single
-objects shared by every method, and neither driver tolerates two
-threads using one connection at once — this is a measured property of
-the drivers, not a precaution:
+**Connections: shared and locked, or pooled.** A service is built one
+of two ways, and every method behaves the same either way — only what
+runs at the same time differs.
+
+*Shared* (`pg_conn`/`fts_conn` only — `imsg mcp local`, the bench and
+eval scripts, most tests): both connections are single objects shared
+by every method, and neither driver tolerates two threads using one
+connection at once — a measured property of the drivers, not a
+precaution:
 
 - `psycopg.Connection` (3.3.4) serializes individual operations behind
   its own lock, but `Connection.transaction()` — which every query here
@@ -31,24 +36,32 @@ the drivers, not a precaution:
   `ThreadingViolationError: Cursor couldn't run because the Connection
   is busy in another thread`.
 
-So every public method below holds `_connections` for its whole
-duration. A lock rather than a connection pool, and the per-stage split
-says by how much: `scripts/bench_retrieval_latency.py --configs
-new:20:256` on the production host (2026-09-18, 20 queries x 2 passes
-against the real index, warm) puts **89 % of a search in the models and
-10 % in the databases** — rerank 611 ms, query embedding 54 ms, PE-Core
-text 20 ms, against 74 ms for every Postgres and SQLite stage together,
-of a 767 ms call.
+So every public method holds a lock over the shared pair for its whole
+duration, and the channels of a search run one after another, as they
+always did.
 
-Every one of those model milliseconds runs on
-`imsg.retrieval.model_thread`, which is single by construction (MLX
-gives each OS thread its own default GPU stream). So a pool could
-overlap one query's 74 ms of database work with another's model work
-and nothing else: about 5 % on two concurrent queries, for a Postgres
-pool plus a SQLite one, since that connection is equally exclusive. The
-lock costs almost exactly what the reranker already costs. If that
-changes — a cheaper reranker, a bigger corpus moving vector search up —
-re-run that command before reopening this.
+*Pooled* (`connections=` a `imsg.retrieval.connections.
+RetrievalConnections` — `imsg mcp public` since 2026-09-24): each call
+borrows a Postgres connection of its own, so calls no longer queue
+behind each other's model time (a `get_conversation` does not wait for a
+search's reranker), and a search's five candidate channels each borrow
+their own connections and run side by side on worker threads — the two
+FTS channels while the query is embedded, the vector channels together
+after it (QA review 2026-09-24). Results are the same as the shared
+build's, byte for byte (`tests/test_retrieval_concurrent_channels_
+integration.py`): every channel is its own transaction on either build,
+fusion takes the lists in a fixed order whatever order they finish in,
+and a channel that finds no free connection runs on the call's own,
+after the others.
+
+What pooling cannot overlap is the models: every model call runs on the
+single `imsg.retrieval.model_thread` (MLX gives each OS thread its own
+default GPU stream). On the production host that is most of a search:
+`scripts/bench_retrieval_latency.py --configs new:20:256` (2026-09-18,
+20 queries x 2 passes against the real index, warm) measured rerank
+611 ms, query embedding 54 ms and PE-Core text 20 ms, against 74 ms for
+every Postgres and SQLite stage together, of a 767 ms call. The channels
+are the part of those 74 ms that can run at once.
 """
 
 from __future__ import annotations
@@ -56,9 +69,11 @@ from __future__ import annotations
 import contextlib
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future
+from concurrent.futures import wait as wait_for_futures
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from imsg.db.enrichment_yield_locks import QueryInFlightMarker
 from imsg.db.prewarm import prewarm_query_path
@@ -79,6 +94,7 @@ if TYPE_CHECKING:
     import psycopg
 
     from imsg.config.schema import Config
+    from imsg.retrieval.connections import RetrievalConnections
     from imsg.retrieval.model_thread import ModelThread
 
 WARM_UP_QUERY = "warm-up query"
@@ -124,6 +140,124 @@ class SearchMessagesResult:
     scan_cap_reached: bool
 
 
+class _Pending[R]:
+    """One candidate channel's result, however it ran: already computed
+    (shared build), running on a worker (`future`), or deferred to run on
+    the call's own connection when asked for (no connection was free)."""
+
+    __slots__ = ("future", "has_value", "needs_fts", "value", "work")
+
+    def __init__(
+        self,
+        work: Callable[[psycopg.Connection, apsw.Connection | None], R],
+        *,
+        needs_fts: bool,
+    ) -> None:
+        self.work = work
+        self.needs_fts = needs_fts
+        self.future: Future[R] | None = None
+        self.has_value = False
+        self.value: R | None = None
+
+
+class _ChannelRun:
+    """Runs one search's candidate channels (module docstring).
+
+    Shared build (`pools is None`): each channel runs the moment it is
+    submitted, on the call's own connections — exactly the old sequential
+    order. Pooled build: a channel that can borrow a Postgres connection
+    (and a sidecar connection, for FTS) without waiting runs on a worker
+    thread; one that cannot is deferred and runs on the call's own
+    Postgres connection when its result is asked for. Borrowing never
+    waits, so a call that already holds a connection can never wait for
+    another held by a call waiting for its own — the pool cannot
+    deadlock a search.
+
+    :meth:`finish` waits for every worker, so none is still running when
+    the call returns or raises."""
+
+    def __init__(
+        self,
+        pools: RetrievalConnections | None,
+        pg: psycopg.Connection,
+        fts: apsw.Connection | None,
+    ) -> None:
+        self._pools = pools
+        self._pg = pg
+        self._fts = fts
+        self._outstanding: list[Future[Any]] = []
+
+    def submit_pg[R](self, work: Callable[[psycopg.Connection], R]) -> _Pending[R]:
+        return self._submit(lambda pg, _fts: work(pg), needs_fts=False)
+
+    def submit_fts[R](
+        self, work: Callable[[psycopg.Connection, apsw.Connection], R]
+    ) -> _Pending[R]:
+        def with_sidecar(pg: psycopg.Connection, fts: apsw.Connection | None) -> R:
+            assert fts is not None  # needs_fts=True always supplies one
+            return work(pg, fts)
+
+        return self._submit(with_sidecar, needs_fts=True)
+
+    def _submit[R](
+        self,
+        work: Callable[[psycopg.Connection, apsw.Connection | None], R],
+        *,
+        needs_fts: bool,
+    ) -> _Pending[R]:
+        pending = _Pending(work, needs_fts=needs_fts)
+        pools = self._pools
+        if pools is None:
+            pending.value = work(self._pg, self._fts)
+            pending.has_value = True
+            return pending
+
+        pg = pools.pg.acquire_if_free()
+        if pg is None:
+            return pending
+        fts: apsw.Connection | None = None
+        if needs_fts:
+            fts = pools.fts.acquire_if_free()
+            if fts is None:
+                pools.pg.release(pg)
+                return pending
+
+        def run(pg: psycopg.Connection = pg, fts: apsw.Connection | None = fts) -> R:
+            try:
+                return work(pg, fts)
+            finally:
+                pools.pg.release(pg)
+                if fts is not None:
+                    pools.fts.release(fts)
+
+        try:
+            future = pools.submit(run)
+        except RuntimeError:  # the executor is shutting down: run it here instead
+            pools.pg.release(pg)
+            if fts is not None:
+                pools.fts.release(fts)
+            return pending
+        self._outstanding.append(future)
+        pending.future = future
+        return pending
+
+    def result[R](self, pending: _Pending[R]) -> R:
+        if pending.has_value:
+            return pending.value  # type: ignore[return-value]  # set with has_value
+        if pending.future is not None:
+            return pending.future.result()
+        if not pending.needs_fts:
+            return pending.work(self._pg, None)
+        if self._fts is not None:
+            return pending.work(self._pg, self._fts)
+        assert self._pools is not None  # the pooled build has no call-owned sidecar
+        with self._pools.fts.lease() as fts:
+            return pending.work(self._pg, fts)
+
+    def finish(self) -> None:
+        wait_for_futures(self._outstanding)
+
+
 class RetrievalService:
     """One instance per MCP server process — holds the (long-lived)
     connections and model providers every tool call needs. Every
@@ -143,8 +277,14 @@ class RetrievalService:
         multimodal_provider: MultimodalEmbeddingProvider | None = None,
         model_thread: ModelThread | None = None,
         query_marker: QueryInFlightMarker | None = None,
+        connections: RetrievalConnections | None = None,
     ) -> None:
-        """`model_thread`, when given, is where every model call runs —
+        """`connections`, when given, is where every call borrows its
+        connections, and `pg_conn`/`fts_conn` go unused by calls (module
+        docstring: shared or pooled). The caller opened both and closes
+        both.
+
+        `model_thread`, when given, is where every model call runs —
         the warm-up and every query alike (`imsg.retrieval.model_thread`
         explains why a server that warms up in the background needs
         that). Without one, models run on the calling thread.
@@ -164,20 +304,31 @@ class RetrievalService:
         self._multimodal_provider = multimodal_provider
         self._model_thread = model_thread
         self._query_marker = query_marker
-        self._connections = threading.RLock()
+        self._pools = connections
+        self._shared_lock = threading.RLock()
 
     def _exclusive(self) -> AbstractContextManager[object]:
-        """Hold the connections for the caller's whole scope — the module
-        docstring has the two driver errors this prevents.
+        """Hold the shared connections for the caller's whole scope — the
+        module docstring has the two driver errors this prevents.
 
-        Re-entrant because `get_conversation` reaches the database both
-        directly and through `_assert_chat_authorized`; making that a
-        deadlock would be a worse failure than the one being fixed. It is
-        held across `_run_model` too, so a query keeps the connections
-        while it waits on the model thread: that is the cost of the lock,
-        and it is bounded by the model thread already being the serial
-        stage."""
-        return self._connections
+        Re-entrant so that a method reaching the database twice cannot
+        deadlock itself. It is held across `_run_model` too, so a query
+        keeps the connections while it waits on the model thread: that is
+        the cost of the lock, and it is bounded by the model thread
+        already being the serial stage. Only the shared build takes it."""
+        return self._shared_lock
+
+    @contextlib.contextmanager
+    def _call_connection(self) -> Iterator[psycopg.Connection]:
+        """The Postgres connection one call uses for its own steps: the
+        shared one under the lock, or one borrowed from the pool for the
+        length of the call."""
+        if self._pools is None:
+            with self._exclusive():
+                yield self._pg
+        else:
+            with self._pools.pg.lease() as pg:
+                yield pg
 
     def _marking(self) -> AbstractContextManager[object]:
         """Publish "a query is in flight" for this scope, when a marker
@@ -237,8 +388,8 @@ class RetrievalService:
         steps.append(WarmUpStep(RERANKER_STEP, estimate[RERANKER_STEP], reranker))
 
         def buffer_pool() -> str:
-            with self._exclusive():
-                return prewarm_query_path(self._pg).summary
+            with self._call_connection() as pg:
+                return prewarm_query_path(pg).summary
 
         steps.append(WarmUpStep(BUFFER_POOL_STEP, estimate[BUFFER_POOL_STEP], buffer_pool))
         return tuple(steps)
@@ -283,8 +434,9 @@ class RetrievalService:
         marker, so an enrichment worker that checks between tasks sees the
         gap between this search's embedding and its rerank as busy rather
         than idle."""
-        with self._marking(), self._exclusive():
+        with self._marking(), self._call_connection() as pg:
             return self._search_messages(
+                pg,
                 context,
                 query=query,
                 people=people,
@@ -296,6 +448,7 @@ class RetrievalService:
 
     def _search_messages(
         self,
+        pg: psycopg.Connection,
         context: AccessContext,
         *,
         query: str,
@@ -314,9 +467,9 @@ class RetrievalService:
         if not (1 <= effective_limit <= MAX_SEARCH_LIMIT):
             raise InvalidArgumentError(f"'limit' must be between 1 and {MAX_SEARCH_LIMIT}")
 
-        scope = resolve_request_scope(self._pg, context)
+        scope = resolve_request_scope(pg, context)
         filters = resolve_filters(
-            self._pg,
+            pg,
             scope,
             people=people,
             after=after,
@@ -349,29 +502,54 @@ class RetrievalService:
         k_vector = self._config.retrieval.k_vector
         ef_search = self._config.retrieval.hnsw_ef_search
 
-        seg_fts = fts_search.search_segment_fts(self._fts, self._pg, analyzed, predicate, k_fts)
-        att_fts = fts_search.search_attachment_chunk_fts(
-            self._fts, self._pg, analyzed, predicate, k_fts
-        )
-
-        instruction = self._config.embedding.query_instruction
-        query_vec = self._run_model(
-            lambda: self._text_provider.embed_query(analyzed.phrase, instruction=instruction)
-        )
-        seg_vec = vector_search.search_segment_vector(
-            self._pg, query_vec, predicate, k_vector, ef_search=ef_search
-        )
-        att_vec = vector_search.search_attachment_chunk_vector(
-            self._pg, query_vec, predicate, k_vector, ef_search=ef_search
-        )
-
-        mm_channel = None
-        multimodal = self._multimodal_provider
-        if self._config.embedding.multimodal.enabled and multimodal is not None:
-            mm_query_vec = self._run_model(lambda: multimodal.embed_text(analyzed.phrase))
-            mm_channel = vector_search.search_multimodal_vector(
-                self._pg, mm_query_vec, predicate, k_vector, ef_search=ef_search
+        # The five candidate channels (module docstring: shared or
+        # pooled). Submitted in the old sequential order, collected in
+        # it, and fused from a dict built in it — so neither which
+        # connection a channel ran on nor the order channels finish in
+        # can change a result.
+        channels = _ChannelRun(self._pools, pg, self._fts if self._pools is None else None)
+        try:
+            seg_fts_run = channels.submit_fts(
+                lambda cpg, fts: fts_search.search_segment_fts(fts, cpg, analyzed, predicate, k_fts)
             )
+            att_fts_run = channels.submit_fts(
+                lambda cpg, fts: fts_search.search_attachment_chunk_fts(
+                    fts, cpg, analyzed, predicate, k_fts
+                )
+            )
+
+            instruction = self._config.embedding.query_instruction
+            query_vec = self._run_model(
+                lambda: self._text_provider.embed_query(analyzed.phrase, instruction=instruction)
+            )
+            seg_vec_run = channels.submit_pg(
+                lambda cpg: vector_search.search_segment_vector(
+                    cpg, query_vec, predicate, k_vector, ef_search=ef_search
+                )
+            )
+            att_vec_run = channels.submit_pg(
+                lambda cpg: vector_search.search_attachment_chunk_vector(
+                    cpg, query_vec, predicate, k_vector, ef_search=ef_search
+                )
+            )
+
+            mm_run = None
+            multimodal = self._multimodal_provider
+            if self._config.embedding.multimodal.enabled and multimodal is not None:
+                mm_query_vec = self._run_model(lambda: multimodal.embed_text(analyzed.phrase))
+                mm_run = channels.submit_pg(
+                    lambda cpg: vector_search.search_multimodal_vector(
+                        cpg, mm_query_vec, predicate, k_vector, ef_search=ef_search
+                    )
+                )
+
+            seg_fts = channels.result(seg_fts_run)
+            att_fts = channels.result(att_fts_run)
+            seg_vec = channels.result(seg_vec_run)
+            att_vec = channels.result(att_vec_run)
+            mm_channel = channels.result(mm_run) if mm_run is not None else None
+        finally:
+            channels.finish()
 
         lists: dict[str, tuple[int, ...]] = {
             "segment_fts": seg_fts.segment_ids,
@@ -391,7 +569,7 @@ class RetrievalService:
         # reranking them.
         rerank_top = max(self._config.retrieval.rerank_top, effective_limit)
         pool = fused[:rerank_top]
-        summaries = segments.fetch_segment_summaries(self._pg, [r.segment_id for r in pool])
+        summaries = segments.fetch_segment_summaries(pg, [r.segment_id for r in pool])
         # A fused id can vanish between fusion and this fetch (concurrent
         # delete/re-segmentation) — drop rather than crash; RRF already
         # ranked the survivors correctly relative to each other.
@@ -403,7 +581,7 @@ class RetrievalService:
             # scope both the reranker and the caller see only the
             # re-rendered, gated text (imsg.retrieval.access).
             texts = segments.render_segment_texts(
-                self._pg,
+                pg,
                 scope,
                 [r.segment_id for r in pool],
                 timezone=self._config.render.timezone,
@@ -477,16 +655,21 @@ class RetrievalService:
         if not (1 <= window <= MAX_CONVERSATION_WINDOW):
             raise InvalidArgumentError(f"'window' must be between 1 and {MAX_CONVERSATION_WINDOW}")
 
-        with self._exclusive():
-            resolution = segments.resolve_thread(self._pg, thread_id)
-            scope = resolve_request_scope(self._pg, context, among_chat_ids=[resolution.chat_id])
+        with self._call_connection() as pg:
+            resolution = segments.resolve_thread(pg, thread_id)
+            scope = resolve_request_scope(pg, context, among_chat_ids=[resolution.chat_id])
             if not scope.admits_chat(resolution.chat_id):
                 # The same error, word for word, as an identifier that matches
                 # nothing (segments.THREAD_NOT_FOUND_MESSAGE).
                 raise NotFoundError(segments.THREAD_NOT_FOUND_MESSAGE)
-            anchor_dt = segments.resolve_anchor(self._pg, resolution, anchor)
+            # A naive anchor means the owner's local time, as `after` and
+            # `before` do (`imsg.retrieval.filters`), never the database
+            # session's time zone.
+            anchor_dt = segments.resolve_anchor(
+                pg, resolution, anchor, timezone=self._config.render.timezone
+            )
             messages = segments.fetch_conversation_window(
-                self._pg,
+                pg,
                 resolution,
                 anchor_dt,
                 window,
@@ -515,10 +698,10 @@ class RetrievalService:
             # public schema omits the property; this holds even if a
             # caller reaches the service some other way.
             raise InvalidArgumentError("'include_handles' is available on the local surface only")
-        with self._exclusive():
-            scope = resolve_request_scope(self._pg, context)
+        with self._call_connection() as pg:
+            scope = resolve_request_scope(pg, context)
             listings = directory.list_people(
-                self._pg, scope, query=query, limit=limit, include_handles=include_handles
+                pg, scope, query=query, limit=limit, include_handles=include_handles
             )
         people: list[dict[str, object]] = []
         for p in listings:
@@ -544,8 +727,8 @@ class RetrievalService:
             raise InvalidArgumentError(
                 "'attachment_key' must be between 16 and 128 characters"
             )
-        with self._exclusive():
-            result = directory.get_attachment_text(self._pg, context, attachment_key)
+        with self._call_connection() as pg:
+            result = directory.get_attachment_text(pg, context, attachment_key)
         return {
             "attachment_key": result.attachment_key,
             "filename": result.filename,

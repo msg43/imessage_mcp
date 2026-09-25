@@ -171,6 +171,10 @@ mcp:
     # is what stops idle sessions from exhausting memory. 0 = never unload;
     # otherwise at least 60.
     idle_unload_seconds: 600
+  # Days of detailed mcp_audit rows `imsg mcp audit-prune` keeps; older rows
+  # become one mcp_audit_rollup row per day and outcome. Accepted public
+  # rows are always kept whole (AT-1's standing check reads all of them).
+  audit_retention_days: 90
   public:
     enabled: false                # flip on only at Phase 6, after AT-1 passes
     bind: 127.0.0.1:8700
@@ -180,7 +184,16 @@ mcp:
     allowed_origins: []
     allowed_hosts: []
     protocol_versions: ["2025-11-25", "2026-07-28"]
-    rate_limit_per_minute: 60
+    rate_limit_per_minute: 60      # the owner's requests per minute; a tool call costs one
+    # Failed token checks per minute across all clients before a token not
+    # already cached is refused without asking Google.
+    failure_budget_per_minute: 600
+    # Refused requests per minute one client address may make before it is
+    # answered 429 with no further work. The owner's cached token is exempt.
+    client_failure_budget_per_minute: 10
+    # How often counts of requests refused before any token was judged
+    # (no token, a throttled client) are written, one row per code.
+    rejection_write_interval_seconds: 60
     # Off by default: a public call waits only 20 s for the models, less
     # than a reload, so the first call after an unload answers WARMING_UP.
     idle_unload_seconds: 0

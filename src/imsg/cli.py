@@ -99,6 +99,7 @@ from imsg.db.enrichment_yield_locks import (
 )
 from imsg.db.fingerprint import ensure_cluster_fingerprint, verify_data_directory
 from imsg.db.migrations import PostgresMigrationRunner, format_mismatches
+from imsg.db.pool import postgres_pool
 from imsg.diagnostics import (
     PIPELINE_FIELDS,
     BufferPoolCheck,
@@ -146,7 +147,13 @@ from imsg.export import (
 from imsg.heavy_lock import HeavyModelLock, inspect_heavy_lock
 from imsg.host_memory import PressureLevel, format_gib
 from imsg.log_rotation import LogRotationError, RotationReport, rotate_logs
-from imsg.mcp.audit import PostgresAuditSink
+from imsg.mcp.audit import (
+    PostgresAuditSink,
+    RejectionTally,
+    RejectionTallyWriter,
+    prune_audit,
+    retention_cutoff,
+)
 from imsg.mcp.auth import build_public_gate
 from imsg.mcp.probe import run_auth_probe
 from imsg.mcp.probe_cli import (
@@ -157,7 +164,12 @@ from imsg.mcp.probe_cli import (
     verdict_exit_code,
 )
 from imsg.mcp.tools.local_server import LocalMcpServer, run_local_server
-from imsg.mcp.tools.public_server import PublicMcpServer, build_public_asgi_app, parse_bind_address
+from imsg.mcp.tools.public_server import (
+    PublicMcpServer,
+    build_public_asgi_app,
+    parse_bind_address,
+    public_uvicorn_options,
+)
 from imsg.mcp.warm_up_readiness import (
     WarmUpReadinessFile,
     read_warm_up_readiness,
@@ -187,6 +199,7 @@ from imsg.providers.factory import (
 )
 from imsg.providers.manifest import verify_manifest
 from imsg.retrieval.background_warm_up import BackgroundWarmUp
+from imsg.retrieval.connections import RetrievalConnections, fts_pool, open_fts_reader
 from imsg.retrieval.idle_unload import IdleModelUnloader, PressureRelease, release_freed_memory
 from imsg.retrieval.model_thread import ModelThread
 from imsg.retrieval.service import RetrievalService
@@ -341,6 +354,37 @@ def _connect_and_verify_or_die(cfg: Config) -> psycopg.Connection:
 
 def _fts_db_path(cfg: Config) -> Path:
     return cfg.paths.data_root / "fts" / "fts.db"
+
+
+PUBLIC_RETRIEVAL_PG_CONNECTIONS = 10
+"""Postgres connections `imsg mcp public` may hold for retrieval. One search
+uses up to six at once — its own and one per candidate channel — so ten
+lets a search run every channel side by side with another call in flight;
+past that, a channel runs on its call's own connection instead
+(`imsg.retrieval.connections`). Opened as needed, kept open once opened."""
+
+PUBLIC_FTS_CONNECTIONS = 4
+"""FTS-sidecar connections for the same: two per search (segment and
+attachment FTS), so two searches' channels at once."""
+
+PUBLIC_AUDIT_CONNECTIONS = 2
+"""Postgres connections `imsg mcp public` keeps for audit writes, instead of
+opening one per row (8.2-10.1 ms each on the index host, QA review
+2026-09-24). A write holds one for about a millisecond."""
+
+
+def _open_verified_connection(cfg: Config) -> psycopg.Connection:
+    """Another connection to the dedicated instance, checked like the
+    process's first (`_connect_and_verify_or_die`): the two-sided cluster
+    fingerprint has no bypass, pooled connections included. Raises
+    instead of exiting — a pool opens these while serving."""
+    conn = connect(cfg.database)
+    try:
+        verify_data_directory(conn, cfg.paths.data_root)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def _open_fts_conn(cfg: Config) -> apsw.Connection:
@@ -3300,6 +3344,18 @@ def mcp_public(
     # than fast.
     model_thread = ModelThread()
     query_marker = _query_marker(cfg)
+    # Each tool call borrows its own connections, and a search's candidate
+    # channels run side by side on more of them (imsg.retrieval.
+    # connections): calls are answered on worker threads, off the event
+    # loop, and a connection cannot be shared between threads.
+    retrieval_connections = RetrievalConnections(
+        pg=postgres_pool(
+            lambda: _open_verified_connection(cfg),
+            max_size=PUBLIC_RETRIEVAL_PG_CONNECTIONS,
+            name="retrieval",
+        ),
+        fts=fts_pool(lambda: open_fts_reader(_fts_db_path(cfg)), max_size=PUBLIC_FTS_CONNECTIONS),
+    )
     service = RetrievalService(
         pg_conn=conn,
         fts_conn=fts_conn,
@@ -3309,18 +3365,35 @@ def mcp_public(
         multimodal_provider=multimodal_provider,
         model_thread=model_thread,
         query_marker=query_marker,
+        connections=retrieval_connections,
     )
-    audit = PostgresAuditSink(lambda: connect(cfg.database, autocommit=True))
+    audit_pool = postgres_pool(
+        lambda: _open_verified_connection(cfg),
+        max_size=PUBLIC_AUDIT_CONNECTIONS,
+        name="audit",
+    )
+    audit = PostgresAuditSink(audit_pool.lease)
+    # Requests refused before any token was judged are counted in memory
+    # and written as one row per code per interval (imsg.mcp.audit), not a
+    # row each.
+    rejection_tally = RejectionTally()
     try:
         # `build_public_gate` refuses to construct (raises, never
         # allow-all) if `owner_subject`/`client_id` are missing or
         # unresolvable — hard requirement 4's fail-closed startup.
-        gate = build_public_gate(cfg.mcp.public, audit=audit)
+        gate = build_public_gate(cfg.mcp.public, audit=audit, rejection_tally=rejection_tally)
     except ImsgError as exc:
+        retrieval_connections.close()
+        audit_pool.close()
         fts_conn.close()
         conn.close()
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
+    rejection_writer = RejectionTallyWriter(
+        rejection_tally,
+        audit,
+        interval_seconds=cfg.mcp.public.rejection_write_interval_seconds,
+    )
 
     # The models load in the background while the transport serves. There
     # is no unauthenticated readiness endpoint to ask — adding one would
@@ -3404,17 +3477,79 @@ def mcp_public(
         idle_unloader=idle_unloader,
         log=lambda line: typer.echo(f"mcp public: {line}", err=True),
     )
+    rejection_writer.start()
     try:
-        uvicorn.run(asgi_app, host=host, port=port, log_level="info")
+        # 60 s keep-alive, no `server` header, client addresses from the
+        # local proxy only (imsg.mcp.tools.public_server.public_uvicorn_options).
+        uvicorn.run(asgi_app, **public_uvicorn_options(host=host, port=port))
     finally:
         if model_api is not None:
             model_api.stop()
         idle_unloader.stop()
+        rejection_writer.stop()
         model_thread.close()
         admission.release()
         query_marker.close()
+        retrieval_connections.close()
+        audit_pool.close()
         fts_conn.close()
         conn.close()
+
+
+@mcp_app.command("audit-prune")
+def mcp_audit_prune(
+    config: ConfigOption = None,
+    days: Annotated[
+        int | None,
+        typer.Option(
+            "--days",
+            min=1,
+            help="Keep this many days of detailed audit rows "
+            "(default: mcp.audit_retention_days, 90).",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Report what would change, and change nothing."),
+    ] = False,
+) -> None:
+    """Shrink the MCP audit log: rows older than the retention window become
+    daily counts.
+
+    Every detailed row in `mcp_audit` older than `--days` (whole UTC days)
+    is counted into one `mcp_audit_rollup` row per day and outcome, then
+    deleted. Accepted public requests are always kept in full: the
+    isolation test's standing check (no accepted request from anyone but
+    the owner, ever) reads the whole history. Counts of refused requests
+    older than the window are merged into one row per day. Nothing in
+    `mcp_audit_rollup` is ever deleted. Safe to run while the servers are
+    up, and as often as you like.
+    """
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    keep_days = days if days is not None else cfg.mcp.audit_retention_days
+    cutoff = retention_cutoff(datetime.now(UTC), keep_days)
+    conn = _connect_and_verify_or_die(cfg)
+    try:
+        report = prune_audit(conn, cutoff=cutoff, dry_run=dry_run)
+    except psycopg.Error as exc:
+        typer.echo(f"imsg: audit prune failed, nothing changed: {type(exc).__name__}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+    prefix = "audit-prune (dry run, nothing changed)" if report.dry_run else "audit-prune"
+    typer.echo(f"{prefix}: kept {keep_days} days; cutoff {report.cutoff.isoformat()}")
+    typer.echo(
+        f"  detailed rows rolled into daily counts: {report.detail_rows_rolled_up} "
+        f"(into {report.daily_rows_written} daily rows)"
+    )
+    typer.echo(
+        f"  accepted public rows kept in full: {report.accepted_public_rows_kept}"
+    )
+    typer.echo(
+        f"  refused-request counts merged by day: {report.interval_rows_merged} rows "
+        f"(into {report.merged_rows_written})"
+    )
 
 
 # --------------------------------------------------------------------------

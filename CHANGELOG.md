@@ -10,6 +10,129 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-24 — The public MCP endpoint counts refused requests instead of logging each one, throttles repeat offenders, and keeps all I/O off the event loop
+
+**Why.** The QA review of 2026-09-24 found that every request with no
+token — which internet scanners were already sending — opened a new
+Postgres connection and wrote an `mcp_audit` row on the event loop, with
+no throttle, so a cheap flood slowed the owner's own calls and grew the
+table without bound. A tool call spent two rate-limit events. Sixty bad
+tokens a minute from anywhere got the owner's next token refused without
+being checked. The unauthenticated metadata document and the `server`
+header named the software. The search, the token check and the audit
+writes all ran on the event loop, and a search's five candidate channels
+ran one after another on one connection.
+
+- **Refusals that judged no token are counted, not written row by row**
+  (`imsg.mcp.audit.RejectionTally`, `RejectionTallyWriter`). No token, a
+  malformed one, a bad `Host`/`Origin`, a throttled client, the failure
+  budget spent, the tokeninfo breaker open: an in-memory count per code,
+  written as one row per code every `mcp.public.rejection_write_interval_seconds`
+  (60) to the new `mcp_audit_rollup` table (**migration 0010**). A request
+  whose token was judged — accepted, rejected, a foreign subject, the
+  owner over the rate limit — keeps its own `mcp_audit` row, which is
+  what AT-1 reads.
+- **Per-client throttle** (`imsg.mcp.ratelimit.ClientFailureThrottle`).
+  An address with `mcp.public.client_failure_budget_per_minute` (10)
+  failures it caused itself (no token, a malformed or rejected one) in
+  the last minute is answered 429 before any tokeninfo call or audit
+  write. The address is the one Tailscale's proxy forwards, which uvicorn
+  now trusts from loopback only; requests with no forwarded address share
+  the global budget; IPv6 is keyed by /64. A token already cached as the
+  owner's is never throttled. 503s during a Google outage and the
+  throttle's own 429s do not count, so neither keeps an address out after
+  its cause has gone.
+- **One source cannot lock the owner out.** The global failure budget
+  (`mcp.public.failure_budget_per_minute`) goes from 60 to 600 behind the
+  per-client budget: 61 bad tokens from one address, then the owner's
+  new token from another, is now checked and admitted (it got 429).
+  Still true, as D7.3 accepted: failures spread over at least 60
+  addresses can use up the global budget and delay the owner's *next*
+  token; a working session is unaffected.
+- **One rate-limit event per tool call.** The transport charges the
+  owner's limit once per HTTP request and hands `gate.dispatch` a
+  single-use receipt (`imsg.mcp.auth.RateLimitCharge`) through the ASGI
+  scope; `dispatch` still re-validates the token. A limit of 2 now
+  admits two tool calls (it admitted one). `dispatch` without a receipt
+  (the AT-1 probe) charges as before.
+- **Audit retention: `imsg mcp audit-prune [--days N] [--dry-run]`.**
+  `mcp_audit` rows older than `mcp.audit_retention_days` (90) become one
+  `mcp_audit_rollup` row per UTC day and outcome, then are deleted;
+  refusal-count intervals older than that merge into one row per day;
+  nothing in `mcp_audit_rollup` is deleted. Accepted public rows are kept
+  whole, because AT-1's standing check reads the whole history. Not yet
+  scheduled on the index host.
+- **Headers.** The metadata document drops `resource_name` (it named the
+  software) and sends one `Cache-Control: private, no-store` (the SDK's
+  `public, max-age=3600` is replaced, not appended to). uvicorn runs with
+  `server_header=False` and `timeout_keep_alive` 60 s (was 5 s; a reused
+  connection through the Funnel cost 0.085 s against 0.31-1.19 s fresh,
+  per the review) — `public_uvicorn_options`.
+- **Nothing that waits on I/O runs on the event loop.** Restores
+  2026-09-18's worker-thread dispatch (commits `Serve concurrent public
+  MCP requests` and `Record the measured model-vs-database split`,
+  dropped by the history rewrite, re-applied with their tests). New on
+  top: the transport decides what memory can decide in place and sends
+  a token check that needs Google, or a rejection that needs its row, to
+  a separate pool of 4 threads (`MAX_CONCURRENT_AUTH_CHECKS`); audit rows
+  go through a pool of 2 open connections instead of a new connection
+  each (`imsg.db.pool`); refusal counts are written by their own thread.
+- **The five candidate channels run side by side** (`imsg.retrieval.
+  connections`, `RetrievalService(connections=...)`). `imsg mcp public`
+  gives each call its own Postgres connection and each channel its own
+  connections and a worker thread when the pools have one free (10
+  Postgres, 4 FTS); a channel that finds none runs on its call's own
+  connection, so a busy pool slows a search and never deadlocks it.
+  Results are unchanged, byte for byte: 39 searches over a generated
+  corpus (BM25, quoted, emoji, people/date/attachment filters, all three
+  scopes) give identical results and identical serialized payloads
+  shared, pooled and pool-starved. Calls no longer queue behind each
+  other's model time. Measured on the Studio with
+  `scripts/bench_retrieval_latency.py --configs new:20:256 --queries 20
+  --passes 3`, a synthetic corpus (30,000 segments, 20,006 attachment
+  chunks, 6,000 multimodal vectors) and the fake backend, two rounds
+  each: database stages only, p50 154.2 / 151.5 ms before, 69.8 / 69.8
+  ms pooled; with each model call delayed to the index host's measured
+  medians (`--fake-model-delays 54,20,611`), p50 860.1 / 861.0 ms before,
+  746.9 / 749.4 ms pooled. The index host's own numbers are not measured
+  (heavy work there is paused).
+- **Flood, measured** (`scripts/bench_public_flood.py`, the review's
+  check: 200 token-less requests a second while timing the owner's
+  requests through real uvicorn, two rounds each). Before: owner p95 1.7
+  ms quiet, 55.9 / 56.4 ms flooded, one `mcp_audit` row per flood
+  request (1,586 and 1,580). After: 1.8 / 2.0 ms quiet, 4.3 / 5.5 ms
+  flooded, no `mcp_audit` rows, every flood request counted in
+  `mcp_audit_rollup`, each address throttled after its tenth refusal.
+- **The payload still goes out twice.** The MCP specification says a
+  tool returning structured content SHOULD also return it as JSON text;
+  Gemini Enterprise's documentation does not say which block it reads,
+  and at least one MCP client fails without the text block. Measured
+  for ten results of about 1,800 characters each: 60,069 bytes with both
+  blocks, 28,933 with structured content only, 0.18 against 0.06 ms to
+  build and serialize (`bench_public_flood.py --payload`). Dropping the
+  text block needs evidence from Gemini first; a test pins both.
+- **`get_conversation`'s anchor without an offset is read in
+  `render.timezone`** (as `after`/`before` are), not the Postgres
+  session's time zone, which nothing sets.
+- **`mcp.public.oauth.client_id` accepts a `file:` reference**, like
+  every other secret since today's owner-only-file change. It was still
+  compared literally, so a `file:` client id would have rejected every
+  token as the wrong audience.
+- **Tests.** 74 new: `test_mcp_public_hardening.py` (23),
+  `test_mcp_rejection_counting.py` (24), `test_db_pool.py` (7),
+  `test_retrieval_concurrent_channels_integration.py` (5),
+  `test_retrieval_anchor_timezone.py` (6),
+  `test_mcp_audit_retention_integration.py` (7), two in
+  `test_mcp_auth.py`; 5 existing tests changed to the new behaviour, and
+  two of today's tests that assumed no migration 0010 now count the
+  migrations and use the migrated table. Against the code before this
+  change, 39 of the new and changed test cases fail and 4 of the new
+  files cannot import it. Suite: 2,816 passed, 0 skipped, with a scratch
+  Postgres.
+- **To deploy:** `imsg migrate` (0010) before restarting `imsg mcp
+  public`; the restart picks up the pools, the throttle and the uvicorn
+  settings. Then schedule `imsg mcp audit-prune`.
+
 ## 2026-09-24 — A private local search page (D14): every hit, grouped by conversation, local network only
 
 **Why.** Owner decision D14: an always-on search page for the owner alone,
