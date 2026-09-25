@@ -127,11 +127,29 @@ Here rather than in `imsg.db.enrichment_yield_locks` because
 `imsg.config.schema` defaults to both values and cannot import from
 `imsg.db` — `imsg.db.connection` imports the schema."""
 
+DEFAULT_MAX_IMAGE_PIXELS = 178_956_970
+"""`enrichment.limits.max_image_pixels`'s default: the most pixels an
+image handed to Apple Vision OCR may declare, and the most a PDF page is
+rendered to for OCR (`imsg.enrich.vision_ocr`, `imsg.enrich.pdf_render`).
+It is the ceiling Pillow already puts on the caption path: Pillow raises
+`DecompressionBombError` above twice `PIL.Image.MAX_IMAGE_PIXELS`
+(89,478,485, read from Pillow 12.3.0 on 2026-09-24), so OCR and
+captioning refuse the same images. A 48-megapixel phone photo is about a
+quarter of it."""
+
+DEFAULT_MAX_DECODER_MEMORY_BYTES = 4 * 2**30
+"""`enrichment.limits.max_decoder_memory_bytes`'s default: a decoder
+subprocess (`pdftoppm`, `ffmpeg`, ...) is stopped once its physical
+footprint passes it (`imsg.enrich.sandboxed_decoder`, which records the
+measurements behind the figure)."""
+
 __all__ = [
     "BOUNDARY_MODEL_REPO",
     "BOUNDARY_MODEL_REVISION",
     "CAPTION_MODEL_REPO",
     "CAPTION_MODEL_REVISION",
+    "DEFAULT_MAX_DECODER_MEMORY_BYTES",
+    "DEFAULT_MAX_IMAGE_PIXELS",
     "ENRICHMENT_YIELD_MAX_PAUSE_SECONDS",
     "ENRICHMENT_YIELD_POLL_INTERVAL_SECONDS",
     "HALFVEC_INDEX_MAX_DIM",

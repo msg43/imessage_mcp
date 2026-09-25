@@ -7,11 +7,26 @@ model-backed providers (OCR/caption/transcription), writes
 (`imsg.segment.pipeline.refresh_segment_rendering`), and emits the FTS
 outbox events for both segment and attachment_chunk content.
 
+**Each task's decoders are fenced in (2026-09-24, QA review).** A task
+gets its own work directory under `<data_root>/artifacts/enrich-work/`
+(`enrich_work_root`), on the encrypted volume with everything else the
+index derives from the corpus (SPEC §5.3 puts OCR page images under
+`artifacts/`; they used to go to the system temp directory on the boot
+volume). Every decoder the task runs is sandboxed to write only there,
+and runs inside one budget for the whole task — wall clock, work-directory
+bytes, decoder memory (`imsg.enrich.sandboxed_decoder`). A ceiling hit is
+an `UntrustedAttachmentError`, recorded `failed` on the task at once.
+The directory is removed when the task ends; one left by a killed process
+is removed by the next worker (`sweep_stale_work_dirs`).
+
 Takes an already-open `psycopg.Connection`, never owns its lifecycle.
 """
 
 from __future__ import annotations
 
+import math
+import os
+import shutil
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -32,14 +47,56 @@ from imsg.enrich.queue import (
     skip_task,
 )
 from imsg.enrich.router import PDF_MIME, document_format_for_mime
+from imsg.enrich.sandboxed_decoder import DecoderBudget
 from imsg.errors import EnrichmentError, UnsupportedEnrichmentTypeError, UntrustedAttachmentError
 from imsg.hashing import sha256_text
-from imsg.paths import is_contained_in, resolve_path
+from imsg.memory_admission import pid_is_running
+from imsg.paths import is_contained_in, join_under_root, resolve_path
 from imsg.segment.pipeline import find_segment_ids_for_attachment, refresh_segment_rendering
 from imsg.tokens import estimate_tokens
 
 if TYPE_CHECKING:
     import psycopg
+
+ENRICH_WORK_SUBDIR = Path("artifacts") / "enrich-work"
+
+
+def enrich_work_root(data_root: Path) -> Path:
+    """`<data_root>/artifacts/enrich-work`, where each task's work
+    directory is made; refused if it resolves outside `data_root` (an
+    `artifacts` symlink pointing elsewhere)."""
+    root = join_under_root(data_root, ENRICH_WORK_SUBDIR)
+    if not is_contained_in(root, data_root):
+        raise EnrichmentError(
+            f"the enrichment work directory '{root}' resolves outside data_root '{data_root}'"
+        )
+    return resolve_path(root)
+
+
+def _work_dir_prefix(task: EnrichmentTask) -> str:
+    """`<pid>-<attachment>-<kind>-`: the owning process id comes first, so
+    a directory whose process is gone can be recognized and removed."""
+    return f"{os.getpid()}-{task.attachment_id}-{task.kind}-"
+
+
+def sweep_stale_work_dirs(data_root: Path) -> int:
+    """Remove the work directories of processes that no longer exist (a
+    worker killed mid-task leaves its directory behind). Directories whose
+    names do not start with a process id are not this module's and are
+    left alone. Returns how many were removed."""
+    root = enrich_work_root(data_root)
+    if not root.is_dir():
+        return 0
+    removed = 0
+    for entry in root.iterdir():
+        pid_text = entry.name.split("-", 1)[0]
+        if not entry.is_dir() or entry.is_symlink() or not pid_text.isdigit():
+            continue
+        if pid_is_running(int(pid_text)):
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,10 +165,12 @@ def _persist_sniffed_mime_type(conn: psycopg.Connection, attachment_id: int, mim
 # --------------------------------------------------------------------------
 
 
-def _run_pdf_text(cache_path: Path, config: Config) -> EnrichmentResult:
+def _run_pdf_text(cache_path: Path, config: Config, budget: DecoderBudget) -> EnrichmentResult:
     limits_cfg = config.enrichment.limits
     check_file_size(cache_path, max_bytes=limits_cfg.max_file_bytes)
-    result = pdf_text.extract_pdf_text(cache_path, timeout_seconds=limits_cfg.task_timeout_seconds)
+    result = pdf_text.extract_pdf_text(
+        cache_path, budget=budget, max_pages=limits_cfg.max_pdf_pages
+    )
     check_pdf_page_count(result.page_count, max_pages=limits_cfg.max_pdf_pages)
     scanned = pdf_text.is_scanned(
         result, threshold_chars_per_page=config.enrichment.pdf_scanned_threshold_chars_per_page
@@ -129,27 +188,50 @@ def _run_pdf_text(cache_path: Path, config: Config) -> EnrichmentResult:
     )
 
 
+def _run_pdf_ocr(
+    cache_path: Path, config: Config, providers: EnrichmentProviders, budget: DecoderBudget
+) -> EnrichmentResult:
+    """Render and read one page at a time (`imsg.enrich.pdf_render.
+    rendered_pages`): the page count is checked before anything renders,
+    each page fits `max_image_pixels`, and each page image is deleted
+    before the next one renders. `detail.downscaled_pages` lists the pages
+    rendered below 300 dpi to fit."""
+    limits_cfg = config.enrichment.limits
+    texts: list[str] = []
+    downscaled: list[int] = []
+    for page in pdf_render.rendered_pages(
+        cache_path,
+        budget=budget,
+        max_pages=limits_cfg.max_pdf_pages,
+        max_pixels=limits_cfg.max_image_pixels,
+    ):
+        if page.dpi < pdf_render.DEFAULT_DPI:
+            downscaled.append(page.number)
+        texts.append(providers.ocr.recognize_text(page.path))
+    if not texts:
+        raise EnrichmentError(f"'{cache_path}' has no pages to render for OCR")
+    detail: dict[str, object] = {"page_count": len(texts)}
+    if downscaled:
+        detail["downscaled_pages"] = downscaled
+    return EnrichmentResult(
+        model=providers.ocr.model_id,
+        model_version=None,
+        text="\n\n".join(texts),
+        detail=detail,
+    )
+
+
 def _run_ocr(
     cache_path: Path,
     mime_type: str,
     config: Config,
     providers: EnrichmentProviders,
-    work_dir: Path,
+    budget: DecoderBudget,
 ) -> EnrichmentResult:
     limits_cfg = config.enrichment.limits
     check_file_size(cache_path, max_bytes=limits_cfg.max_file_bytes)
     if mime_type == PDF_MIME:
-        pages = pdf_render.render_pdf_pages_to_png(
-            cache_path, work_dir, timeout_seconds=limits_cfg.task_timeout_seconds
-        )
-        check_pdf_page_count(len(pages), max_pages=limits_cfg.max_pdf_pages)
-        texts = [providers.ocr.recognize_text(p) for p in pages]
-        return EnrichmentResult(
-            model=providers.ocr.model_id,
-            model_version=None,
-            text="\n\n".join(texts),
-            detail={"page_count": len(pages)},
-        )
+        return _run_pdf_ocr(cache_path, config, providers, budget)
     if mime_type.startswith("image/"):
         return EnrichmentResult(
             model=providers.ocr.model_id,
@@ -208,34 +290,42 @@ def _sample_and_run(
     config: Config,
     frames_dir: Path,
     per_frame_fn: Callable[[Path], str],
+    budget: DecoderBudget,
 ) -> tuple[list[dict[str, object]], float]:
     limits_cfg = config.enrichment.limits
     check_file_size(cache_path, max_bytes=limits_cfg.max_file_bytes)
-    if not audio.has_stream(cache_path, "v", timeout_seconds=limits_cfg.task_timeout_seconds):
+    if not audio.has_stream(cache_path, "v", budget=budget):
         raise UnsupportedEnrichmentTypeError(
             "no video stream to sample frames from (an audio-only file in a video container)"
         )
-    duration = audio.probe_duration_seconds(cache_path, timeout_seconds=limits_cfg.task_timeout_seconds)
+    duration = audio.probe_duration_seconds(cache_path, budget=budget)
     check_media_duration(duration, max_seconds=limits_cfg.max_media_seconds)
     frames = video.sample_keyframes(
         cache_path,
         frames_dir,
         max_frames=config.enrichment.video_max_frames,
-        timeout_seconds=limits_cfg.task_timeout_seconds,
+        budget=budget,
     )
-    per_frame: list[dict[str, object]] = [
-        {"timestamp_seconds": f.timestamp_seconds, "text": per_frame_fn(f.path), "path": str(f.path)}
-        for f in frames
-    ]
+    per_frame: list[dict[str, object]] = []
+    for f in frames:
+        # Each frame's model call runs outside any subprocess watch.
+        budget.check_deadline(f"reading frame {f.path.name} of '{cache_path}'")
+        per_frame.append(
+            {"timestamp_seconds": f.timestamp_seconds, "text": per_frame_fn(f.path), "path": str(f.path)}
+        )
     return per_frame, duration
 
 
 def _run_frame_ocr(
-    cache_path: Path, config: Config, providers: EnrichmentProviders, attachment_id: int
+    cache_path: Path,
+    config: Config,
+    providers: EnrichmentProviders,
+    attachment_id: int,
+    budget: DecoderBudget,
 ) -> EnrichmentResult:
     frames_dir = frames_dir_for_attachment(config.paths.data_root, attachment_id)
     per_frame, duration = _sample_and_run(
-        cache_path, config, frames_dir, providers.ocr.recognize_text
+        cache_path, config, frames_dir, providers.ocr.recognize_text, budget
     )
     text = "\n\n".join(f"[{f['timestamp_seconds']:.1f}s] {f['text']}" for f in per_frame)
     return EnrichmentResult(
@@ -247,10 +337,16 @@ def _run_frame_ocr(
 
 
 def _run_caption_video(
-    cache_path: Path, config: Config, providers: EnrichmentProviders, attachment_id: int
+    cache_path: Path,
+    config: Config,
+    providers: EnrichmentProviders,
+    attachment_id: int,
+    budget: DecoderBudget,
 ) -> EnrichmentResult:
     frames_dir = frames_dir_for_attachment(config.paths.data_root, attachment_id)
-    per_frame, duration = _sample_and_run(cache_path, config, frames_dir, providers.caption.caption)
+    per_frame, duration = _sample_and_run(
+        cache_path, config, frames_dir, providers.caption.caption, budget
+    )
     text = "\n\n".join(f"[{f['timestamp_seconds']:.1f}s] {f['text']}" for f in per_frame)
     return EnrichmentResult(
         model=providers.caption.model_id,
@@ -265,19 +361,21 @@ def _run_caption_video(
 
 
 def _run_transcript(
-    cache_path: Path, config: Config, providers: EnrichmentProviders, work_dir: Path
+    cache_path: Path, config: Config, providers: EnrichmentProviders, budget: DecoderBudget
 ) -> EnrichmentResult:
     """Shared by audio *and* video attachments — `ffmpeg` extracts the
     audio track from a video input exactly the same way it normalizes a
     standalone audio file, so no branching on mime type is needed here."""
     limits_cfg = config.enrichment.limits
     check_file_size(cache_path, max_bytes=limits_cfg.max_file_bytes)
-    if not audio.has_stream(cache_path, "a", timeout_seconds=limits_cfg.task_timeout_seconds):
+    if not audio.has_stream(cache_path, "a", budget=budget):
         raise UnsupportedEnrichmentTypeError("no audio stream to transcribe")
-    duration = audio.probe_duration_seconds(cache_path, timeout_seconds=limits_cfg.task_timeout_seconds)
+    duration = audio.probe_duration_seconds(cache_path, budget=budget)
     check_media_duration(duration, max_seconds=limits_cfg.max_media_seconds)
-    wav_path = work_dir / "audio.wav"
-    audio.convert_to_whisper_wav(cache_path, wav_path, timeout_seconds=limits_cfg.task_timeout_seconds)
+    wav_path = budget.work_dir / "audio.wav"
+    audio.convert_to_whisper_wav(
+        cache_path, wav_path, budget=budget, max_seconds=limits_cfg.max_media_seconds
+    )
     return EnrichmentResult(
         model=providers.transcription.model_id,
         model_version=None,
@@ -287,7 +385,7 @@ def _run_transcript(
 
 
 def _run_doc_text(
-    cache_path: Path, mime_type: str, config: Config, work_dir: Path
+    cache_path: Path, mime_type: str, config: Config, budget: DecoderBudget
 ) -> EnrichmentResult:
     """Text-bearing documents that are not PDFs (`imsg.enrich.doc_text`):
     contact cards, plain text, HTML and SVG, Office and RTF documents,
@@ -300,8 +398,12 @@ def _run_doc_text(
         )
     limits_cfg = config.enrichment.limits
     check_file_size(cache_path, max_bytes=limits_cfg.max_file_bytes)
+    budget.check_deadline(f"reading '{cache_path}' as {fmt}")
     result = doc_text.extract_document_text(
-        cache_path, fmt, work_dir=work_dir, timeout_seconds=limits_cfg.task_timeout_seconds
+        cache_path,
+        fmt,
+        work_dir=budget.work_dir,
+        timeout_seconds=max(1, math.ceil(budget.remaining_seconds())),
     )
     return EnrichmentResult(
         model=result.extractor,
@@ -322,18 +424,18 @@ def _dispatch(
     mime_type: str,
     config: Config,
     providers: EnrichmentProviders,
-    work_dir: Path,
+    budget: DecoderBudget,
     attachment_id: int,
 ) -> EnrichmentResult:
     if kind == "pdf_text":
-        return _run_pdf_text(cache_path, config)
+        return _run_pdf_text(cache_path, config, budget)
     if kind == "doc_text":
-        return _run_doc_text(cache_path, mime_type, config, work_dir)
+        return _run_doc_text(cache_path, mime_type, config, budget)
     if kind == "ocr":
-        return _run_ocr(cache_path, mime_type, config, providers, work_dir)
+        return _run_ocr(cache_path, mime_type, config, providers, budget)
     if kind == "caption":
         if mime_type.startswith("video/"):
-            return _run_caption_video(cache_path, config, providers, attachment_id)
+            return _run_caption_video(cache_path, config, providers, attachment_id, budget)
         if mime_type.startswith("image/"):
             return _run_caption_image(cache_path, config, providers)
         raise UnsupportedEnrichmentTypeError(
@@ -341,13 +443,13 @@ def _dispatch(
         )
     if kind == "transcript":
         if mime_type.startswith("audio/") or mime_type.startswith("video/"):
-            return _run_transcript(cache_path, config, providers, work_dir)
+            return _run_transcript(cache_path, config, providers, budget)
         raise UnsupportedEnrichmentTypeError(
             f"'transcript' has no route for mime type {mime_type!r}"
         )
     if kind == "frame_ocr":
         if mime_type.startswith("video/"):
-            return _run_frame_ocr(cache_path, config, providers, attachment_id)
+            return _run_frame_ocr(cache_path, config, providers, attachment_id, budget)
         raise UnsupportedEnrichmentTypeError(f"'frame_ocr' has no route for mime type {mime_type!r}")
     raise EnrichmentError(f"no dispatch handler for enrichment kind {kind!r}")
 
@@ -440,11 +542,12 @@ def process_one_task(
         mime_type = mime_sniffer(cache_path)
         _persist_sniffed_mime_type(conn, task.attachment_id, mime_type)
 
-        with tempfile.TemporaryDirectory(
-            prefix=f"imsg-enrich-{task.attachment_id}-{task.kind}-"
-        ) as tmp:
+        work_root = enrich_work_root(config.paths.data_root)
+        work_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=_work_dir_prefix(task), dir=work_root) as tmp:
+            budget = DecoderBudget.for_task(Path(tmp), config.enrichment.limits)
             result = _dispatch(
-                task.kind, cache_path, mime_type, config, providers, Path(tmp), task.attachment_id
+                task.kind, cache_path, mime_type, config, providers, budget, task.attachment_id
             )
 
             with conn.transaction():
@@ -484,9 +587,12 @@ def process_one_task(
 
 
 __all__ = [
+    "ENRICH_WORK_SUBDIR",
     "AttachmentRecord",
     "EnrichmentProviders",
     "EnrichmentResult",
+    "enrich_work_root",
     "frames_dir_for_attachment",
     "process_one_task",
+    "sweep_stale_work_dirs",
 ]

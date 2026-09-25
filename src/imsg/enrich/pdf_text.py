@@ -4,17 +4,33 @@ scanned-PDF detection that decides whether OCR also needs to run
 enqueue ocr"). Not a model — a deterministic subprocess tool,
 implemented for real (see `imsg.enrich.provider`'s docstring for the
 line between "model" and "tool" this build draws).
+
+**Bounded (2026-09-24, QA review).** The text used to be read whole into
+memory with `capture_output=True`, and only then was the page count
+checked, so a PDF whose content streams inflate to gigabytes of text
+reached memory before any ceiling. Now the page count is read first
+(`imsg.enrich.pdf_info`), `pdftotext` is told to stop at
+`enrichment.limits.max_pdf_pages`, and its output streams into a file in
+the task's work directory, stopped once it passes `MAX_PDF_TEXT_BYTES`
+(the same ceiling `textutil` has). It runs sandboxed like every decoder
+(`imsg.enrich.sandboxed_decoder`).
 """
 
 from __future__ import annotations
 
-import subprocess
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from imsg.enrich.pdf_info import read_pdf_info
+from imsg.enrich.sandboxed_decoder import MAX_DECODER_OUTPUT_BYTES, DecoderBudget, run_decoder
 from imsg.errors import EnrichmentError
 
 _FORM_FEED = "\x0c"  # pdftotext's default page separator (no -nopgbrk)
+
+MAX_PDF_TEXT_BYTES = MAX_DECODER_OUTPUT_BYTES
+"""`pdftotext` is stopped once its text passes this: a typed permanent
+failure, not a truncation. Read at call time, so a test can lower it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,25 +52,25 @@ class PdfTextResult:
         return sum(len(p) for p in self.pages) / len(self.pages)
 
 
-def extract_pdf_text(pdf_path: Path, *, timeout_seconds: int) -> PdfTextResult:
-    try:
-        proc = subprocess.run(
-            ["pdftotext", "-layout", str(pdf_path), "-"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise EnrichmentError(
-            f"pdftotext timed out after {timeout_seconds}s on '{pdf_path}'"
-        ) from exc
-    except OSError as exc:
-        raise EnrichmentError(f"pdftotext could not run: {exc}") from exc
-    if proc.returncode != 0:
-        raise EnrichmentError(f"pdftotext failed on '{pdf_path}': {proc.stderr.strip()}")
-
-    pages = proc.stdout.split(_FORM_FEED)
+def extract_pdf_text(pdf_path: Path, *, budget: DecoderBudget, max_pages: int) -> PdfTextResult:
+    """The text layer, one entry per page. Refuses a PDF over `max_pages`
+    before extracting anything, and a text layer over `MAX_PDF_TEXT_BYTES`
+    while extracting it (`UntrustedAttachmentError`, permanent); a
+    `pdftotext` that fails is an `EnrichmentError`, retried."""
+    read_pdf_info(pdf_path, budget=budget, max_pages=max_pages)
+    run = run_decoder(
+        ["pdftotext", "-layout", "-l", str(max_pages), os.fspath(pdf_path.absolute()), "-"],
+        budget=budget,
+        name="pdftotext",
+        subject=pdf_path,
+        stdout_name="pdftotext.txt",
+        max_stdout_bytes=MAX_PDF_TEXT_BYTES,
+    )
+    if run.returncode != 0:
+        raise EnrichmentError(f"pdftotext failed on '{pdf_path}': {run.stderr_tail()}")
+    assert run.stdout_path is not None
+    text = run.stdout_path.read_bytes().decode("utf-8", errors="replace")
+    pages = text.split(_FORM_FEED)
     if pages and pages[-1] == "":  # trailing form-feed after the last page
         pages = pages[:-1]
     return PdfTextResult(pages=tuple(pages))
@@ -70,4 +86,4 @@ def is_scanned(result: PdfTextResult, *, threshold_chars_per_page: int) -> bool:
     return result.avg_chars_per_page < threshold_chars_per_page
 
 
-__all__ = ["PdfTextResult", "extract_pdf_text", "is_scanned"]
+__all__ = ["MAX_PDF_TEXT_BYTES", "PdfTextResult", "extract_pdf_text", "is_scanned"]

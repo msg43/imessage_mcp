@@ -53,8 +53,20 @@ def check_media_duration(seconds: float, *, max_seconds: int) -> None:
         )
 
 
+def check_image_pixels(width: int, height: int, *, max_pixels: int, subject: Path | str) -> None:
+    """Refuse an image whose declared size is over `max_pixels`, before
+    anything decodes it: a small file can declare a size that decodes to
+    gigabytes (a decompression bomb)."""
+    if width * height > max_pixels:
+        raise UntrustedAttachmentError(
+            f"'{subject}' is {width}x{height} = {width * height} pixels, exceeding "
+            f"enrichment.limits.max_image_pixels ({max_pixels})"
+        )
+
+
 __all__ = [
     "check_file_size",
+    "check_image_pixels",
     "check_media_duration",
     "check_path_containment",
     "check_pdf_page_count",

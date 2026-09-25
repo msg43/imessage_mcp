@@ -217,6 +217,7 @@ def test_real_backend_resolves_each_class_by_dotted_path(
             {
                 "recognition_languages": en.ocr_languages,
                 "minimum_text_height": en.ocr_minimum_text_height,
+                "max_image_pixels": en.limits.max_image_pixels,
             },
         )
     ]
@@ -267,6 +268,7 @@ def test_real_backend_passes_operator_settings_through(
     assert calls["ocr"][0][1] == {
         "recognition_languages": ["en-US", "fr-FR"],
         "minimum_text_height": 0.05,
+        "max_image_pixels": cfg.enrichment.limits.max_image_pixels,
     }
     assert calls["transcription"][0][1] == {
         "language": "en",

@@ -10,19 +10,30 @@ usual home video — and frame OCR and the video caption then finish
 `done` with empty text, which reads as success (checked 2026-09-23 on a
 continuous synthetic 1080p clip: 0 frames without the first-frame term,
 1 with it).
+
+**Sandboxed (2026-09-24).** `ffmpeg` runs inside the task's budget
+(`imsg.enrich.sandboxed_decoder`) and may write only into the task's
+work directory, so it samples into `<work dir>/frames`, and the frames
+are moved into `output_dir` (the attachment's durable frames directory,
+which S6 reads back) once it has exited. The frames an earlier run left
+in `output_dir` are removed first, so a re-run that keeps fewer frames
+leaves no stale ones behind.
 """
 
 from __future__ import annotations
 
+import os
 import re
-import subprocess
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from imsg.enrich.sandboxed_decoder import DecoderBudget, run_decoder
 from imsg.errors import EnrichmentError
 
 SCENE_CHANGE_THRESHOLD = 0.3
 _PTS_TIME_RE = re.compile(r"pts_time:([\d.]+)")
+_FRAME_GLOB = "frame_*.png"
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,48 +43,56 @@ class VideoFrame:
 
 
 def sample_keyframes(
-    video_path: Path, output_dir: Path, *, max_frames: int, timeout_seconds: int
+    video_path: Path, output_dir: Path, *, max_frames: int, budget: DecoderBudget
 ) -> list[VideoFrame]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    pattern = output_dir / "frame_%04d.png"
-    try:
-        proc = subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(video_path),
-                "-vf",
-                f"select='eq(n,0)+gt(scene,{SCENE_CHANGE_THRESHOLD})',showinfo",
-                "-fps_mode",
-                "vfr",
-                "-frames:v",
-                str(max_frames),
-                str(pattern),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise EnrichmentError(
-            f"ffmpeg timed out after {timeout_seconds}s sampling '{video_path}'"
-        ) from exc
-    except OSError as exc:
-        raise EnrichmentError(f"ffmpeg could not run: {exc}") from exc
-    if proc.returncode != 0:
-        raise EnrichmentError(
-            f"ffmpeg failed sampling '{video_path}': {proc.stderr.strip()[-500:]}"
-        )
+    staging = budget.work_dir / "frames"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    run = run_decoder(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-nostats",
+            "-y",
+            "-i",
+            os.fspath(video_path.absolute()),
+            "-vf",
+            f"select='eq(n,0)+gt(scene,{SCENE_CHANGE_THRESHOLD})',showinfo",
+            "-fps_mode",
+            "vfr",
+            "-frames:v",
+            str(max_frames),
+            os.fspath(staging / "frame_%04d.png"),
+        ],
+        budget=budget,
+        name="ffmpeg",
+        subject=video_path,
+    )
+    if run.returncode != 0:
+        raise EnrichmentError(f"ffmpeg failed sampling '{video_path}': {run.stderr_tail()}")
 
-    timestamps = [float(m.group(1)) for m in _PTS_TIME_RE.finditer(proc.stderr)]
-    frame_paths = sorted(output_dir.glob("frame_*.png"))
-
-    return [
-        VideoFrame(path=path, timestamp_seconds=(timestamps[i] if i < len(timestamps) else float("nan")))
-        for i, path in enumerate(frame_paths)
+    timestamps = [
+        float(match.group(1))
+        for line in run.stderr_lines()
+        for match in _PTS_TIME_RE.finditer(line)
     ]
+    staged = sorted(staging.glob(_FRAME_GLOB))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for stale in output_dir.glob(_FRAME_GLOB):
+        stale.unlink()
+    frames: list[VideoFrame] = []
+    for i, frame in enumerate(staged):
+        kept = output_dir / frame.name
+        shutil.move(frame, kept)
+        frames.append(
+            VideoFrame(
+                path=kept,
+                timestamp_seconds=(timestamps[i] if i < len(timestamps) else float("nan")),
+            )
+        )
+    return frames
 
 
 __all__ = ["SCENE_CHANGE_THRESHOLD", "VideoFrame", "sample_keyframes"]

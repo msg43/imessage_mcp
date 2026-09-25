@@ -42,6 +42,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from xml.etree import ElementTree
 
+from imsg.enrich.sandboxed_decoder import MAX_DECODER_OUTPUT_BYTES
 from imsg.errors import EnrichmentError, UnsupportedEnrichmentTypeError, UntrustedAttachmentError
 from imsg.textnorm import strip_nul
 
@@ -55,8 +56,9 @@ MAX_DOCUMENT_TEXT_CHARS = 1_000_000
 the text is cut and `detail.truncated` says so; every chunk still gets
 embedded, so this bounds the embedding work one attachment can cause."""
 
-MAX_DECODER_OUTPUT_BYTES = 64 * 1024 * 1024
-"""`textutil` is stopped once its output passes this."""
+# `textutil` is stopped once its output passes `MAX_DECODER_OUTPUT_BYTES`,
+# the ceiling every decoder's read-back output shares
+# (`imsg.enrich.sandboxed_decoder`; `pdftotext` has it too).
 
 MAX_OOXML_MEMBER_BYTES = 64 * 1024 * 1024
 MAX_OOXML_MEMBERS = 20_000

@@ -223,11 +223,25 @@ class EnrichmentConcurrency(StrictModel):
 
 
 class EnrichmentLimits(StrictModel):
+    """Untrusted-attachment ceilings (SPEC §8 S5b, D6). Each one hit is a
+    typed permanent failure on the task, not a hang or a retry."""
+
     max_file_bytes: int = Field(default=1_073_741_824, gt=0)
     max_pdf_pages: int = Field(default=1000, gt=0)
+    """Checked with `pdfinfo` before `pdftotext` or `pdftoppm` runs."""
     max_media_seconds: int = Field(default=14400, gt=0)
     task_timeout_seconds: int = Field(default=1800, gt=0)
+    """Wall clock for the whole task, every decoder in it together."""
     temp_bytes_per_task: int = Field(default=10_737_418_240, gt=0)
+    """Most bytes the task's work directory may hold at once; a decoder
+    that passes it is stopped (`imsg.enrich.sandboxed_decoder`)."""
+    max_image_pixels: int = Field(default=constants.DEFAULT_MAX_IMAGE_PIXELS, gt=0)
+    """Most pixels an image handed to Vision OCR may declare, read from its
+    header before decoding; also the most a PDF page is rendered to for
+    OCR (a larger page renders below 300 dpi)."""
+    max_decoder_memory_bytes: int = Field(default=constants.DEFAULT_MAX_DECODER_MEMORY_BYTES, gt=0)
+    """A decoder subprocess is stopped once its physical memory footprint
+    passes this."""
 
 
 _WINDOW_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")

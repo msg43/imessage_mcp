@@ -109,7 +109,9 @@ enrichment:
     max_pdf_pages: 1000
     max_media_seconds: 14400
     task_timeout_seconds: 1800
-    temp_bytes_per_task: 10737418240
+    temp_bytes_per_task: 10737418240       # most bytes a task's work directory may hold
+    max_image_pixels: 178956970            # images for OCR, and PDF pages rendered for it
+    max_decoder_memory_bytes: 4294967296   # a decoder subprocess is stopped past this
   transcription_model: mlx-community/whisper-large-v3-mlx
   transcription_revision: 49e6aa286ad60c14352c404340ded53710378a11
   transcription_language: null

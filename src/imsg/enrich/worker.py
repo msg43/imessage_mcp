@@ -20,6 +20,11 @@ pipeline does not handle — Ctrl-C, launchd's SIGTERM surfacing as an
 exception, a bug — has its lease released before the exception goes on
 (`release_task`: back to `pending`, its attempt not counted). It would
 otherwise sit `running` until the lease expired, 30 minutes by default.
+
+**Work directories left behind.** Each task works in its own directory
+under `<data_root>/artifacts/enrich-work` (`imsg.enrich.pipeline`). A
+worker killed mid-task leaves its directory behind, so each run first
+removes those whose process is gone (`sweep_stale_work_dirs`).
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ from typing import TYPE_CHECKING, Protocol
 import structlog
 
 from imsg.background_gate import StopCheck, StopReason
-from imsg.enrich.pipeline import EnrichmentProviders, process_one_task
+from imsg.enrich.pipeline import EnrichmentProviders, process_one_task, sweep_stale_work_dirs
 from imsg.enrich.queue import EnrichmentTask, claim_tasks, release_task
 
 if TYPE_CHECKING:
@@ -79,6 +84,9 @@ def run_enrich_worker(
     `process` are the queue's and the pipeline's own functions unless a
     caller substitutes them."""
     report = WorkerReport()
+    swept = sweep_stale_work_dirs(config.paths.data_root)
+    if swept:
+        logger.info("enrich.stale_work_dirs_removed", count=swept)
 
     def should_stop() -> bool:
         if stop_check is None:

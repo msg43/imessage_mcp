@@ -1474,7 +1474,7 @@ def test_synthesize_speech_wav_runs_say_then_ffmpeg(
 
     converted: list[tuple[Path, Path]] = []
 
-    def fake_convert(source: Path, output: Path, *, timeout_seconds: int) -> Path:
+    def fake_convert(source: Path, output: Path, *, budget: Any) -> Path:
         converted.append((source, output))
         output.write_bytes(b"RIFF")
         return output

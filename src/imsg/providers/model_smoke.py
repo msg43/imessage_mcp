@@ -95,6 +95,7 @@ from imsg.config.schema import (
     SyncSourceConfig,
 )
 from imsg.enrich.audio import convert_to_whisper_wav
+from imsg.enrich.sandboxed_decoder import DecoderBudget
 from imsg.errors import ImsgError
 from imsg.providers.factory import (
     build_boundary_provider,
@@ -306,7 +307,10 @@ def synthesize_speech_wav(
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise SmokeError(f"could not synthesise speech with `say`: {exc}") from exc
-    return convert_to_whisper_wav(aiff, work_dir / "smoke_speech_16k_mono.wav", timeout_seconds=120)
+    # The smoke test's own synthetic speech, converted by the same sandboxed
+    # decoder the pipeline uses, with its work directory as the budget's.
+    budget = DecoderBudget.start(work_dir, timeout_seconds=120, max_temp_bytes=2**30)
+    return convert_to_whisper_wav(aiff, work_dir / "smoke_speech_16k_mono.wav", budget=budget)
 
 
 # --------------------------------------------------------------------------

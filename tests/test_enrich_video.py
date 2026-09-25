@@ -9,8 +9,13 @@ from pathlib import Path
 
 import pytest
 
+from imsg.enrich.sandboxed_decoder import DecoderBudget
 from imsg.enrich.video import sample_keyframes
 from imsg.errors import EnrichmentError
+
+
+def _budget(tmp_path: Path) -> DecoderBudget:
+    return DecoderBudget.start(tmp_path / "work", timeout_seconds=60, max_temp_bytes=2**30)
 
 
 def _write_two_scene_video(path: Path) -> None:
@@ -45,7 +50,7 @@ def test_scene_change_produces_at_least_one_frame(tmp_path: Path) -> None:
     _write_two_scene_video(video)
     out_dir = tmp_path / "frames"
 
-    frames = sample_keyframes(video, out_dir, max_frames=20, timeout_seconds=30)
+    frames = sample_keyframes(video, out_dir, max_frames=20, budget=_budget(tmp_path))
 
     assert len(frames) >= 1
     for f in frames:
@@ -58,13 +63,13 @@ def test_frame_count_never_exceeds_max_frames(tmp_path: Path) -> None:
     _write_two_scene_video(video)
     out_dir = tmp_path / "frames"
 
-    frames = sample_keyframes(video, out_dir, max_frames=1, timeout_seconds=30)
+    frames = sample_keyframes(video, out_dir, max_frames=1, budget=_budget(tmp_path))
     assert len(frames) <= 1
 
 
 def test_nonexistent_video_raises(tmp_path: Path) -> None:
     with pytest.raises(EnrichmentError):
-        sample_keyframes(tmp_path / "missing.mp4", tmp_path / "out", max_frames=5, timeout_seconds=10)
+        sample_keyframes(tmp_path / "missing.mp4", tmp_path / "out", max_frames=5, budget=_budget(tmp_path))
 
 
 def test_a_clip_with_no_scene_change_still_yields_its_first_frame(tmp_path: Path) -> None:
@@ -82,7 +87,7 @@ def test_a_clip_with_no_scene_change_still_yields_its_first_frame(tmp_path: Path
         timeout=30,
     )
 
-    frames = sample_keyframes(video, tmp_path / "frames", max_frames=20, timeout_seconds=30)
+    frames = sample_keyframes(video, tmp_path / "frames", max_frames=20, budget=_budget(tmp_path))
 
     assert len(frames) >= 1
     assert frames[0].timestamp_seconds == 0.0

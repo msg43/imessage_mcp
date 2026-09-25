@@ -124,7 +124,8 @@ below rely on (positional required args, keyword-only options):
 - reranker:             (model_repo, revision, *, instruction=None, batch_size=32,
                          max_length=8192, max_batch_tokens=1024, doc_max_tokens=None,
                          cache_limit_bytes=8 GiB, model_id=None)
-- ocr:                  (*, recognition_languages=None, minimum_text_height=None)
+- ocr:                  (*, recognition_languages=None, minimum_text_height=None,
+                         max_image_pixels=178,956,970, image_dimensions=None)
 - transcription:        (model_repo, revision, *, language=None, temperature=...,
                          cache_limit_bytes=None)
 - caption:              (model_repo, revision, prompt: str, *, max_tokens=256,
@@ -567,6 +568,7 @@ def build_enrichment_providers(
         REAL_PROVIDERS["ocr"],
         recognition_languages=enrichment.ocr_languages,
         minimum_text_height=enrichment.ocr_minimum_text_height,
+        max_image_pixels=enrichment.limits.max_image_pixels,
     )
     transcription = _construct(
         REAL_PROVIDERS["transcription"],

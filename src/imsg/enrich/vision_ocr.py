@@ -14,19 +14,37 @@ column detection is deliberately out of scope for a search index.
 The frameworks are imported on first use (see
 `imsg.enrich.model_runtime`); constructing the provider needs nothing
 installed.
+
+**A pixel ceiling before decoding (2026-09-24, QA review).** Vision
+decodes whatever the file declares, and a PNG of a few hundred kilobytes
+can declare 50,000 x 50,000 pixels, which decodes to gigabytes. So
+`recognize_text` first reads the image's dimensions from its header with
+ImageIO, the framework Vision itself decodes with, without decoding any
+pixels (`read_image_dimensions`: a 2.5-gigapixel bomb read in 6 ms with
+about 1 MiB of memory growth, measured 2026-09-24), and refuses an image
+over `max_image_pixels` (`enrichment.limits.max_image_pixels`) with a
+typed permanent failure. The default is the ceiling Pillow already puts
+on the caption path (twice `PIL.Image.MAX_IMAGE_PIXELS`: 178,956,970), so
+OCR and captioning refuse the same images. An image ImageIO cannot read
+the size of is refused too: Vision could not decode it either.
 """
 
 from __future__ import annotations
 
+import os
 import platform
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from imsg import constants
+from imsg.enrich.limits import check_image_pixels
 from imsg.enrich.model_runtime import import_runtime_module
-from imsg.errors import EnrichmentError, ImsgError
+from imsg.errors import EnrichmentError, ImsgError, UntrustedAttachmentError
 from imsg.textnorm import strip_nul
+
+ImageDimensionsFn = Callable[[Path], tuple[int, int]]
 
 _INSTALL_HINT = (
     "install `pyobjc-framework-Vision` (it brings the Quartz and CoreML bridges with it) "
@@ -86,6 +104,43 @@ def _macos_product_version() -> str:
     return version or "unknown"
 
 
+def read_image_dimensions(image_path: Path) -> tuple[int, int]:
+    """The width and height of the image Vision would decode from
+    `image_path`, read from the file's header by ImageIO without decoding
+    its pixels. For a file holding several images (HEIC, TIFF, GIF) the
+    larger of the first and the primary image is reported. Raises
+    `UntrustedAttachmentError` when ImageIO cannot read a size at all."""
+    quartz = import_runtime_module("Quartz", install_hint=_INSTALL_HINT)
+    options = {quartz.kCGImageSourceShouldCache: False}
+    provider = quartz.CGDataProviderCreateWithFilename(os.fsencode(image_path))
+    source = (
+        quartz.CGImageSourceCreateWithDataProvider(provider, options)
+        if provider is not None
+        else None
+    )
+    count = quartz.CGImageSourceGetCount(source) if source is not None else 0
+    if source is None or count < 1:
+        raise UntrustedAttachmentError(
+            f"'{image_path}' is not an image ImageIO can read; not handing it to Vision"
+        )
+    indices = {0, int(quartz.CGImageSourceGetPrimaryImageIndex(source))}
+    best: tuple[int, int] | None = None
+    for index in sorted(i for i in indices if 0 <= i < count):
+        props = quartz.CGImageSourceCopyPropertiesAtIndex(source, index, options)
+        width = props.get(quartz.kCGImagePropertyPixelWidth) if props is not None else None
+        height = props.get(quartz.kCGImagePropertyPixelHeight) if props is not None else None
+        if width is None or height is None:
+            raise UntrustedAttachmentError(
+                f"ImageIO reports no pixel size for image {index} of '{image_path}'; "
+                f"not handing it to Vision"
+            )
+        size = (int(width), int(height))
+        if best is None or size[0] * size[1] > best[0] * best[1]:
+            best = size
+    assert best is not None
+    return best
+
+
 class AppleVisionOcrProvider:
     """`OcrProvider` backed by `VNRecognizeTextRequest` in accurate mode
     with language correction on.
@@ -99,6 +154,10 @@ class AppleVisionOcrProvider:
     `automaticallyDetectsLanguage` is switched on — Vision's own default
     is a fixed en-US list with detection off, which is not what
     `enrichment.ocr_languages: null` promises.
+
+    `max_image_pixels` is the ceiling checked before Vision sees an image
+    (module docstring); `None` turns it off. `image_dimensions` reads an
+    image's size and defaults to `read_image_dimensions`.
     """
 
     def __init__(
@@ -106,16 +165,33 @@ class AppleVisionOcrProvider:
         *,
         recognition_languages: list[str] | None = None,
         minimum_text_height: float | None = None,
+        max_image_pixels: int | None = constants.DEFAULT_MAX_IMAGE_PIXELS,
+        image_dimensions: ImageDimensionsFn | None = None,
     ) -> None:
+        if max_image_pixels is not None and max_image_pixels < 1:
+            raise ValueError(f"max_image_pixels must be positive or None, got {max_image_pixels}")
         self.recognition_languages = list(recognition_languages) if recognition_languages else None
         self.minimum_text_height = minimum_text_height
+        self.max_image_pixels = max_image_pixels
+        self._image_dimensions = image_dimensions or read_image_dimensions
         self.model_id = f"apple/vision-recognize-text@{_macos_product_version()}"
 
     def recognize_text(self, image_path: Path) -> str:
         """Every recognized line, one per line, in reading order; the
-        empty string when Vision finds no text at all."""
+        empty string when Vision finds no text at all. An image over the
+        pixel ceiling is refused before Vision is involved."""
         if not image_path.is_file():
             raise EnrichmentError(f"OCR input is not a file: '{image_path}'")
+        if self.max_image_pixels is not None:
+            try:
+                width, height = self._image_dimensions(image_path)
+            except ImsgError:
+                raise
+            except Exception as exc:
+                raise EnrichmentError(
+                    f"could not read the pixel size of '{image_path}' before OCR: {exc}"
+                ) from exc
+            check_image_pixels(width, height, max_pixels=self.max_image_pixels, subject=image_path)
         vision = import_runtime_module("Vision", install_hint=_INSTALL_HINT)
         foundation = import_runtime_module("Foundation", install_hint=_INSTALL_HINT)
         try:
@@ -176,4 +252,11 @@ class AppleVisionOcrProvider:
         return lines
 
 
-__all__ = ["ROW_OVERLAP_FRACTION", "AppleVisionOcrProvider", "RecognizedLine", "order_lines"]
+__all__ = [
+    "ROW_OVERLAP_FRACTION",
+    "AppleVisionOcrProvider",
+    "ImageDimensionsFn",
+    "RecognizedLine",
+    "order_lines",
+    "read_image_dimensions",
+]

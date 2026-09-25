@@ -1,11 +1,17 @@
 """Apple Vision OCR provider (`imsg.enrich.vision_ocr`), driven through
-a fake `Vision`/`Foundation` pair stood in `sys.modules` — no pyobjc
-framework, no macOS, no image decoding involved."""
+a fake `Vision`/`Foundation` pair stood in `sys.modules`, plus a fake
+`Quartz` (ImageIO) answering the pixel-size check that runs before Vision
+— no pyobjc framework, no macOS, no image decoding involved. The last
+tests read real image headers with the real ImageIO, and skip where
+pyobjc's Quartz bridge is not installed."""
 
 from __future__ import annotations
 
+import importlib.util
+import os
 import platform
 import sys
+import time
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,11 +20,13 @@ from typing import Any
 
 import pytest
 
+from _hostile_attachments import write_png, write_png_bomb
 from _model_runtime_stubs import block_module
+from imsg import constants
 from imsg.enrich.model_runtime import ModelRuntimeUnavailableError
 from imsg.enrich.provider import OcrProvider
 from imsg.enrich.vision_ocr import AppleVisionOcrProvider, RecognizedLine, order_lines
-from imsg.errors import EnrichmentError
+from imsg.errors import EnrichmentError, UntrustedAttachmentError
 
 ACCURATE_LEVEL = object()  # the stub's VNRequestTextRecognitionLevelAccurate constant
 
@@ -63,6 +71,9 @@ class VisionStub:
     requests: list[Any] = field(default_factory=list)
     handlers: list[Any] = field(default_factory=list)
     file_url_paths: list[str] = field(default_factory=list)
+    image_size: tuple[int, int] | None = (1000, 800)
+    """What the fake ImageIO reports; `None` means it cannot read one."""
+    size_reads: list[str] = field(default_factory=list)
 
 
 @pytest.fixture
@@ -131,6 +142,30 @@ def vision(monkeypatch: pytest.MonkeyPatch) -> VisionStub:
         def fileURLWithPath_(path: str) -> tuple[str, str]:
             stub.file_url_paths.append(path)
             return ("file-url", path)
+
+    quartz_module = types.ModuleType("Quartz")
+    quartz_module.kCGImageSourceShouldCache = "kCGImageSourceShouldCache"  # type: ignore[attr-defined]
+    quartz_module.kCGImagePropertyPixelWidth = "PixelWidth"  # type: ignore[attr-defined]
+    quartz_module.kCGImagePropertyPixelHeight = "PixelHeight"  # type: ignore[attr-defined]
+
+    def data_provider(path: bytes) -> Any:
+        stub.size_reads.append(os.fsdecode(path))
+        return ("provider", path)
+
+    def image_source(provider: Any, options: Any) -> Any:
+        return None if stub.image_size is None else ("source", provider)
+
+    def properties(source: Any, index: int, options: Any) -> Any:
+        assert stub.image_size is not None
+        width, height = stub.image_size
+        return {"PixelWidth": width, "PixelHeight": height}
+
+    quartz_module.CGDataProviderCreateWithFilename = data_provider  # type: ignore[attr-defined]
+    quartz_module.CGImageSourceCreateWithDataProvider = image_source  # type: ignore[attr-defined]
+    quartz_module.CGImageSourceGetCount = lambda source: 1  # type: ignore[attr-defined]
+    quartz_module.CGImageSourceGetPrimaryImageIndex = lambda source: 0  # type: ignore[attr-defined]
+    quartz_module.CGImageSourceCopyPropertiesAtIndex = properties  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "Quartz", quartz_module)
 
     vision_module = types.ModuleType("Vision")
     vision_module.VNImageRequestHandler = Handler  # type: ignore[attr-defined]
@@ -321,7 +356,10 @@ def test_missing_image_is_an_enrichment_error_without_touching_the_framework(
 def test_missing_vision_runtime_is_a_clear_error_naming_the_package(
     monkeypatch: pytest.MonkeyPatch, image: Path
 ) -> None:
+    # Without pyobjc-framework-Vision there is no Quartz bridge either (it
+    # brings it), and the pixel-size check imports Quartz first.
     block_module(monkeypatch, "Vision")
+    block_module(monkeypatch, "Quartz")
     provider = AppleVisionOcrProvider()  # construction never imports the framework
     with pytest.raises(ModelRuntimeUnavailableError) as excinfo:
         provider.recognize_text(image)
@@ -333,3 +371,100 @@ def test_satisfies_the_ocr_provider_protocol() -> None:
     provider: OcrProvider = AppleVisionOcrProvider()
     assert isinstance(provider.model_id, str)
     assert provider.model_id.startswith("apple/vision-recognize-text@")
+
+
+# --------------------------------------------------------------------------
+# the pixel ceiling, checked before Vision sees an image
+# --------------------------------------------------------------------------
+
+
+def test_an_image_over_the_pixel_ceiling_is_refused_before_vision_sees_it(
+    vision: VisionStub, image: Path
+) -> None:
+    """A decompression bomb: the header declares 2.5 gigapixels. It is
+    refused from its header alone, with the typed permanent failure, and
+    Vision is never asked to decode it."""
+    vision.image_size = (50_000, 50_000)
+    with pytest.raises(UntrustedAttachmentError, match="max_image_pixels"):
+        AppleVisionOcrProvider().recognize_text(image)
+    assert vision.handlers == []
+    assert vision.file_url_paths == []
+    assert vision.size_reads == [str(image)]
+
+
+def test_an_image_at_the_ceiling_is_read(vision: VisionStub, image: Path) -> None:
+    vision.image_size = (constants.DEFAULT_MAX_IMAGE_PIXELS, 1)
+    AppleVisionOcrProvider().recognize_text(image)
+    assert len(vision.handlers) == 1
+
+
+def test_an_image_whose_size_cannot_be_read_is_refused(vision: VisionStub, image: Path) -> None:
+    vision.image_size = None
+    with pytest.raises(UntrustedAttachmentError, match="not an image ImageIO can read"):
+        AppleVisionOcrProvider().recognize_text(image)
+    assert vision.handlers == []
+
+
+def test_the_ceiling_comes_from_configuration_and_can_be_turned_off(
+    vision: VisionStub, image: Path
+) -> None:
+    vision.image_size = (2000, 2000)
+    with pytest.raises(UntrustedAttachmentError):
+        AppleVisionOcrProvider(max_image_pixels=1_000_000).recognize_text(image)
+    AppleVisionOcrProvider(max_image_pixels=None).recognize_text(image)
+    assert len(vision.handlers) == 1
+    assert vision.size_reads == [str(image)]  # no size read at all once turned off
+
+
+def test_an_unexpected_error_reading_the_size_is_an_ordinary_failure(
+    vision: VisionStub, image: Path
+) -> None:
+    def broken(path: Path) -> tuple[int, int]:
+        raise RuntimeError("bridge exploded")
+
+    with pytest.raises(EnrichmentError) as excinfo:
+        AppleVisionOcrProvider(image_dimensions=broken).recognize_text(image)
+    assert not isinstance(excinfo.value, UntrustedAttachmentError)
+    assert vision.handlers == []
+
+
+# --------------------------------------------------------------------------
+# the real ImageIO header read (skips without pyobjc's Quartz bridge)
+# --------------------------------------------------------------------------
+
+
+def _real_quartz_available() -> bool:
+    return importlib.util.find_spec("Quartz") is not None
+
+
+needs_quartz = pytest.mark.skipif(
+    not _real_quartz_available(), reason="needs pyobjc-framework-Quartz (the models extra)"
+)
+
+
+@needs_quartz
+def test_imageio_reads_a_bombs_size_without_decoding_it(tmp_path: Path) -> None:
+    from imsg.enrich.vision_ocr import read_image_dimensions
+
+    bomb = write_png_bomb(tmp_path / "bomb.png", 50_000, 50_000)
+    assert bomb.stat().st_size < 1_000_000
+    started = time.monotonic()
+    assert read_image_dimensions(bomb) == (50_000, 50_000)
+    assert time.monotonic() - started < 2.0
+
+
+@needs_quartz
+def test_imageio_reads_an_ordinary_images_size(tmp_path: Path) -> None:
+    from imsg.enrich.vision_ocr import read_image_dimensions
+
+    assert read_image_dimensions(write_png(tmp_path / "small.png", 64, 48)) == (64, 48)
+
+
+@needs_quartz
+def test_imageio_refuses_a_file_that_is_not_an_image(tmp_path: Path) -> None:
+    from imsg.enrich.vision_ocr import read_image_dimensions
+
+    junk = tmp_path / "junk.png"
+    junk.write_bytes(b"not an image at all")
+    with pytest.raises(UntrustedAttachmentError):
+        read_image_dimensions(junk)

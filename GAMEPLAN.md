@@ -11,6 +11,13 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-09-24 enrichment decoder limits (not yet deployed):** every
+enrichment decoder runs sandboxed (no network, writes only in the task's
+work directory, now under `data_root`) inside one budget per task (wall
+clock, temp bytes, decoder memory, output size); PDFs are counted and
+sized before they render; Vision refuses images over `max_image_pixels`.
+See `CHANGELOG.md`.
+
 **2026-09-24 operations fixes (built, not yet deployed):** the public
 server's PE-Core query load reads a 2.0 GiB text-tower checkpoint
 instead of building the whole model (3.6-3.8 s against 25.4-25.9 s on

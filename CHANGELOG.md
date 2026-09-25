@@ -10,6 +10,51 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-24 — Enrichment decoders run sandboxed, inside one budget per task
+
+**Why.** The QA review (2026-09-24) found that anyone who can send the
+owner an iMessage chooses the bytes the enrichment decoders read, and
+only `textutil` was sandboxed. `pdftotext`'s whole output was read into
+memory before the page count was checked, `pdftoppm` rendered every page
+before refusing a long PDF, `temp_bytes_per_task` was read by no code,
+and Vision decoded any image whatever size it declared.
+
+- **Every decoder runs sandboxed** (`imsg.enrich.sandboxed_decoder`):
+  `pdfinfo`, `pdftotext`, `pdftoppm`, `ffprobe` and `ffmpeg` run under
+  `sandbox-exec` with no network and writes allowed only in the task's
+  work directory. Tested with the real binaries against unsandboxed
+  controls: an `http://` input opens no connection, and a write outside
+  the directory fails with "Operation not permitted".
+- **One budget per task, watched while each decoder runs**: the wall
+  clock for the whole task (`task_timeout_seconds`, no longer per call),
+  the work directory's bytes (`temp_bytes_per_task`, now enforced), the
+  decoder's memory footprint (new `max_decoder_memory_bytes`, 4 GiB; the
+  largest legitimate footprint measured was 689 MiB), and the size of any
+  output read back (64 MiB, as for `textutil`). The first ceiling passed
+  stops the decoder with SIGKILL, and the task is recorded `failed` on its
+  first attempt with the ceiling named in `last_error`. A timeout used to
+  be retried five times.
+- **PDFs**: the page count and page sizes are read with `pdfinfo` before
+  anything else. `pdftotext` streams to a file and is stopped past 64
+  MiB. OCR renders one page at a time, deleting each image before the
+  next, and a page larger than the new `max_image_pixels` (178,956,970,
+  Pillow's own decompression-bomb ceiling) renders below 300 dpi so it
+  fits; `detail.downscaled_pages` says which. The size comes from the
+  media box, because `pdfinfo`'s "Page size" is the crop box while
+  `pdftoppm` renders the media box.
+- **Images**: the Vision OCR provider reads an image's size from its
+  header with ImageIO before Vision sees it, and refuses one over
+  `max_image_pixels`. A 50,000 x 50,000 PNG bomb of 303,851 bytes is
+  refused in milliseconds.
+- **Task work directories moved to `<data_root>/artifacts/enrich-work`**,
+  on the encrypted volume, from the system temp directory on the boot
+  volume (SPEC §5.3 puts OCR page images under `artifacts/`). One left by
+  a killed worker is removed when the next worker starts.
+- **Remaining, not changed here:** `file` (MIME sniffing) still runs
+  unsandboxed, with a timeout and one line of output; the caption
+  provider still writes its scaled copy of a photo to the system temp
+  directory.
+
 ## 2026-09-24 — Operations fixes from the QA review: fast reload, supervision, least privilege, log rotation, full status
 
 **Why.** The 2026-09-24 QA review found that a cold or emergency reload
