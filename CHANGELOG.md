@@ -10,6 +10,38 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-25 — Search page: browse a day's messages on a Timeline, and files in a Media grid
+
+**Why.** The page could not answer "what happened on Fri 7 Apr" or "the
+voice note Bob sent in early April" without a search word: a search with a
+date or a person and no words went back to the home page (design review of
+2026-09-24, change 5).
+
+- **Timeline** (`/timeline`): every message across all conversations in
+  time order, to the second, for a day or a range of local days, 200 at a
+  time with endless scroll, a count per day (each day a link to that day
+  alone), and the words from an optional "Highlight" field marked. Filters:
+  With (conversations every listed person is in, as the search page's
+  People filter) and Sent by (one person, or "me"). With no date it opens
+  on the day of the latest message. A search with a date or a person and
+  no words now opens the Timeline.
+- **Media** (`/media`): photos, videos, voice notes and other audio, PDFs
+  and other files, newest first, 60 at a time, filtered by With, Sent by,
+  dates and type, with a count per type; stickers are left out. Each tile
+  shows its kind until its thumbnail arrives (thumbnails are made on first
+  request: 50-266 ms each, two at a time, measured by the design review);
+  voice notes play in place.
+- Both open the conversation at the chosen message, and both keep their
+  place on Back. The type test in SQL mirrors the page's own
+  (`attachment_kind`); a test checks that they agree.
+- A top-bar link reaches Timeline, Media and Labels from every page.
+- **Measured** on the synthetic full-size corpus (675,000 messages, 100,000
+  files), curl median of 3: a day's Timeline (33 messages) 4 ms, a month's
+  first 200 rows 7 ms; the Media grid 107 ms with no filter (counting every
+  file by type is most of it), 4 ms for one month.
+- **Tests:** 19 new; all fail on the previous code (13 of them check the SQL
+  file-type test against the page's, one case each).
+
 ## 2026-09-25 — Search page grading mode: grade every candidate of a search, and keep the list for scoring rerankers offline
 
 **Why.** Choosing between rerankers needs about 100 real queries with every

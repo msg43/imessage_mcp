@@ -182,14 +182,14 @@ def chat_by_thread_key(pg: psycopg.Connection, thread_key: str) -> ChatView | No
 # messages
 # --------------------------------------------------------------------------
 
-_MESSAGE_COLUMNS = """
+MESSAGE_COLUMNS = """
     m.message_id, m.message_key, m.source_guid, m.chat_id, m.sent_at, m.is_from_me,
     m.text_original, m.is_unsent, m.is_edited, m.deleted_at, m.has_attachments,
     m.reply_to_guid, p.display_name
 """
 
 
-def _row_to_view(row: Sequence[Any]) -> MessageView:
+def row_to_view(row: Sequence[Any]) -> MessageView:
     (
         message_id,
         message_key,
@@ -230,13 +230,13 @@ def messages_by_id(pg: psycopg.Connection, message_ids: Iterable[int]) -> dict[i
     with pg.cursor() as cur:
         cur.execute(
             f"""
-            SELECT {_MESSAGE_COLUMNS}
+            SELECT {MESSAGE_COLUMNS}
             FROM message m LEFT JOIN person p ON p.person_id = m.sender_person_id
             WHERE m.message_id = ANY(%(ids)s::bigint[])
             """,
             {"ids": ids},
         )
-        return {int(r[0]): _row_to_view(r) for r in cur.fetchall()}
+        return {int(r[0]): row_to_view(r) for r in cur.fetchall()}
 
 
 def segment_messages(
@@ -249,7 +249,7 @@ def segment_messages(
     with pg.cursor() as cur:
         cur.execute(
             f"""
-            SELECT sm.segment_id, {_MESSAGE_COLUMNS}
+            SELECT sm.segment_id, {MESSAGE_COLUMNS}
             FROM segment_message sm
             JOIN message m ON m.message_id = sm.message_id
             LEFT JOIN person p ON p.person_id = m.sender_person_id
@@ -261,7 +261,7 @@ def segment_messages(
         )
         out: dict[int, list[MessageView]] = {}
         for segment_id, *row in cur.fetchall():
-            out.setdefault(int(segment_id), []).append(_row_to_view(row))
+            out.setdefault(int(segment_id), []).append(row_to_view(row))
     return out
 
 
@@ -425,7 +425,7 @@ def _fetch_side(
     with pg.cursor() as cur:
         cur.execute(
             f"""
-            SELECT {_MESSAGE_COLUMNS}
+            SELECT {MESSAGE_COLUMNS}
             FROM message m LEFT JOIN person p ON p.person_id = m.sender_person_id
             WHERE {" AND ".join(where)}
             ORDER BY m.sent_at {order}, m.message_id {order}
@@ -433,7 +433,7 @@ def _fetch_side(
             """,
             params,
         )
-        rows = [_row_to_view(r) for r in cur.fetchall()]
+        rows = [row_to_view(r) for r in cur.fetchall()]
     if older:
         rows.reverse()
     return rows
@@ -509,6 +509,7 @@ def thread_page(
 
 __all__ = [
     "MAX_WINDOW",
+    "MESSAGE_COLUMNS",
     "AttachmentView",
     "ChatView",
     "MessageView",
@@ -520,6 +521,7 @@ __all__ = [
     "decorate",
     "is_opaque_key",
     "messages_by_id",
+    "row_to_view",
     "segment_messages",
     "tapback_symbol",
     "thread_page",

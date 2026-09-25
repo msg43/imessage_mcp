@@ -421,9 +421,14 @@
   // ---------------------------------------------------------------- people autocomplete
 
   function setupPeople() {
-    const input = document.querySelector(".people-input");
+    // Every people field (the search bar's, the Timeline's and the
+    // Media view's) shares the one suggestion list in the search bar.
     const list = document.getElementById("people-list");
-    if (!input || !list) return;
+    if (!list) return;
+    document.querySelectorAll(".people-input").forEach((input) => watchPeople(input, list));
+  }
+
+  function watchPeople(input, list) {
     let timer = null;
     input.addEventListener("input", () => {
       clearTimeout(timer);
@@ -514,6 +519,19 @@
     }, { rootMargin: "600px 0px" });
     thread.querySelectorAll(".sentinel").forEach((el) => observer.observe(el));
   }
+
+  // ---------------------------------------------------------------- media thumbnails
+
+  // A tile shows its kind ("Photo", "Video") until its thumbnail arrives;
+  // thumbnails are made on first request, 50-270 ms each, two at a time.
+  document.addEventListener("load", (event) => {
+    const img = event.target;
+    if (img instanceof HTMLImageElement && img.closest(".tile-thumb")) img.classList.add("ready");
+  }, true);
+  document.addEventListener("error", (event) => {
+    const img = event.target;
+    if (img instanceof HTMLImageElement && img.closest(".tile-thumb")) img.remove();
+  }, true);
 
   // ---------------------------------------------------------------- keyboard
 

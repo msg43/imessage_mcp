@@ -19,6 +19,7 @@ from datetime import datetime
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
+from imsg.search_page.browse import MediaItem
 from imsg.search_page.details import FILED_BY, MessageDetails
 from imsg.search_page.grading import (
     GRADE_LABELS,
@@ -38,7 +39,7 @@ from imsg.search_page.labels import (
 from imsg.search_page.search import CHANNEL_LABELS, Hit
 from imsg.search_page.threads import AttachmentView, ChatView, MessageView
 
-STATIC_VERSION = "4"
+STATIC_VERSION = "5"
 _URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
@@ -203,7 +204,7 @@ def search_form(form: FormState, *, semantic_available: bool, csrf_token: str) -
         f'{"autofocus" if not form.query else ""} required maxlength="1000">'
         '<button type="submit">Search</button>'
         "</div>"
-        '<details class="filters"'
+        '<div class="row second-row"><details class="filters"'
         + (" open" if (form.people or form.date_from or form.date_to or form.attachments != "any") else "")
         + "><summary>Filters</summary>"
         '<div class="row filter-row">'
@@ -221,7 +222,9 @@ def search_form(form: FormState, *, semantic_available: bool, csrf_token: str) -
         '<label>Order <select name="sort">'
         + "".join(_option(v, label, form.sort) for v, label in sorts)
         + "</select></label>"
-        "</div></details></form>"
+        "</div></details>"
+        '<nav class="views" aria-label="Views"><a href="/timeline">Timeline</a>'
+        '<a href="/media">Media</a><a href="/labels">Labels</a></nav></div></form>'
         '<form class="logout" method="post" action="/logout">'
         f'<input type="hidden" name="csrf_token" value="{esc(csrf_token)}">'
         '<button type="submit" class="link">Sign out</button></form>'
@@ -1099,12 +1102,216 @@ def labels_page(
     return layout(ctx, body, body_class="page-labels", topbar=topbar)
 
 
+# --------------------------------------------------------------------------
+# browse views: timeline and media
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class BrowseForm:
+    """The Timeline and Media filters, as the owner typed them."""
+
+    date_from: str = ""
+    date_to: str = ""
+    people: str = ""
+    sender: str = ""
+    query: str = ""
+    media_type: str = "all"
+
+    def params(self, **overrides: str) -> dict[str, str]:
+        values = {
+            "from": self.date_from,
+            "to": self.date_to,
+            "people": self.people,
+            "sender": self.sender,
+            "q": self.query,
+            "type": self.media_type,
+        }
+        values.update(overrides)
+        return {k: v for k, v in values.items() if v and not (k == "type" and v == "all")}
+
+    def url(self, path: str, **overrides: str) -> str:
+        params = self.params(**overrides)
+        return f"{path}?{urlencode(params)}" if params else path
+
+
+def _browse_filters(form: BrowseForm, *, action: str, media: bool) -> str:
+    words = (
+        ""
+        if media
+        else f'<label>Highlight <input type="search" name="q" value="{esc(form.query)}" '
+        'placeholder="words" maxlength="1000"></label>'
+    )
+    type_field = (
+        f'<input type="hidden" name="type" value="{esc(form.media_type)}">' if media and form.media_type != "all" else ""
+    )
+    return (
+        f'<form class="browse-form" method="get" action="{esc(action)}"><div class="row filter-row">'
+        f'<label>From <input type="date" name="from" value="{esc(form.date_from)}"></label>'
+        f'<label>To <input type="date" name="to" value="{esc(form.date_to)}"></label>'
+        f'<label>With <input type="text" name="people" list="people-list" class="people-input" '
+        f'value="{esc(form.people)}" placeholder="name, name" autocomplete="off"></label>'
+        f'<label>Sent by <input type="text" name="sender" value="{esc(form.sender)}" '
+        'placeholder="name, or me" autocomplete="off"></label>'
+        f"{words}{type_field}"
+        '<button type="submit">Show</button></div></form>'
+    )
+
+
+def timeline_rows_html(
+    messages: Sequence[MessageView],
+    *,
+    chats: dict[int, ChatView],
+    tz: str,
+    matcher: QueryMatcher | None,
+    previous_day: str | None,
+) -> str:
+    """Timeline rows with a break at each new day."""
+    out: list[str] = []
+    day = previous_day
+    for message in messages:
+        this_day = fmt_date(message.sent_at, tz)
+        if this_day != day:
+            out.append(f'<div class="day-break" data-day="{esc(this_day)}"><span>{esc(this_day)}</span></div>')
+            day = this_day
+        chat = chats.get(message.chat_id)
+        title = chat.title if chat is not None else "Conversation"
+        key = esc(message.message_key)
+        href = (
+            f"/thread/{esc(chat.thread_key)}?anchor={key}#m-{key}" if chat is not None else "#"
+        )
+        text = display_text(message.text) if message.text else ""
+        body = matcher.highlight(text) if matcher is not None else esc(text)
+        body = linkify(body).replace("\n", "<br>")
+        badges = ""
+        if message.is_deleted:
+            badges += '<span class="badge deleted">Deleted</span>'
+        if message.is_unsent:
+            badges += '<span class="badge">Unsent</span>'
+        if message.is_edited:
+            badges += '<span class="badge">Edited</span>'
+        atts = "".join(_attachment_html(att, matched=False) for att in message.attachments)
+        out.append(
+            f'<article class="tl-row{" me" if message.is_from_me else ""}" id="m-{key}" data-key="{key}">'
+            f'<time class="tl-when" datetime="{esc(message.sent_at.isoformat())}">'
+            f"{esc(_fmt(message.sent_at, tz, '%H:%M:%S'))}</time>"
+            f'<div class="tl-main"><div class="tl-head"><a class="tl-chat" href="{href}">{esc(title)}</a>'
+            f' \u00b7 <span class="sender">{esc(message.sender_name)}</span>{badges}</div>'
+            + (f'<div class="tl-text">{body}</div>' if body else "")
+            + atts
+            + message_actions(message, conversation=title, tz=tz)
+            + "</div></article>"
+        )
+    return "".join(out)
+
+
+def timeline_page(
+    ctx: PageContext,
+    *,
+    form: BrowseForm,
+    heading: str,
+    day_counts: Sequence[tuple[str, str, int]],
+    rows_html: str,
+    next_url: str | None,
+    error: str | None,
+) -> str:
+    """Every message across conversations in time order, for a day or a
+    range. `day_counts` is `(label, url, count)` per day."""
+    error_html = f'<p class="error" role="alert">{esc(error)}</p>' if error else ""
+    days = "".join(
+        f'<li><a href="{esc(url)}">{esc(label)}</a> <span class="muted">{n:,} message{"s" if n != 1 else ""}</span></li>'
+        for label, url, n in day_counts
+    )
+    days_html = f'<ul class="day-counts">{days}</ul>' if len(day_counts) > 1 else ""
+    sentinel = (
+        f'<div class="sentinel" data-next="{esc(next_url)}"><a href="{esc(next_url)}" class="load-more">Later messages</a></div>'
+        if next_url
+        else ""
+    )
+    body = (
+        f'<section class="browse"><h1>Timeline</h1>{_browse_filters(form, action="/timeline", media=False)}'
+        f"{error_html}<p class=\"browse-heading\">{esc(heading)}</p>{days_html}"
+        f'<div id="results" class="results timeline">{rows_html}{sentinel}</div></section>'
+    )
+    topbar = search_form(FormState(), semantic_available=ctx.semantic_available, csrf_token=ctx.csrf_token)
+    return layout(ctx, body, body_class="page-timeline", topbar=topbar)
+
+
+_TILE_LABELS = {"image": "Photo", "video": "Video", "audio": "Voice note", "pdf": "PDF", "other": "File"}
+
+
+def media_tiles_html(items: Sequence[MediaItem], *, chats: dict[int, ChatView], tz: str) -> str:
+    out: list[str] = []
+    for item in items:
+        att = item.attachment
+        chat = chats.get(item.chat_id)
+        mkey = esc(item.message_key)
+        key = esc(att.attachment_key)
+        href = f"/thread/{esc(chat.thread_key)}?anchor={mkey}#m-{mkey}" if chat is not None else "#"
+        label = _TILE_LABELS.get(att.kind, "File")
+        thumb = ""
+        if att.available and att.kind in ("image", "video"):
+            thumb = f'<img src="/att/{key}/thumb" alt="" loading="lazy" decoding="async">'
+        player = ""
+        if att.available and att.kind == "audio":
+            player = f'<audio controls preload="none" src="/att/{key}/audio"></audio>'
+        missing = "" if att.available else f' <span class="muted">(not available: {esc(att.state)})</span>'
+        name = att.filename or label
+        download = f' \u00b7 <a href="/att/{key}?download=1">Download</a>' if att.available else ""
+        out.append(
+            f'<figure class="tile tile-{esc(att.kind)}" data-key="{key}">'
+            f'<a class="tile-open" href="{href}" title="Open the conversation at this message">'
+            f'<span class="tile-thumb"><span class="tile-kind">{esc(label)}</span>{thumb}</span></a>'
+            f"{player}"
+            f'<figcaption><span class="tile-when">{esc(fmt_datetime(item.sent_at, tz))}</span>'
+            f' \u00b7 {esc(item.sender_name)}<br><span class="tile-name">{esc(name)}</span>'
+            f"{missing}{download}</figcaption></figure>"
+        )
+    return "".join(out)
+
+
+def media_page(
+    ctx: PageContext,
+    *,
+    form: BrowseForm,
+    counts: dict[str, int],
+    labels: dict[str, str],
+    tiles_html: str,
+    next_url: str | None,
+    error: str | None,
+) -> str:
+    error_html = f'<p class="error" role="alert">{esc(error)}</p>' if error else ""
+    total = sum(counts.values())
+    chips = [
+        f'<a class="chip{" on" if form.media_type == "all" else ""}" href="{esc(form.url("/media", type="all"))}">All {total:,}</a>'
+    ]
+    for kind, label in labels.items():
+        chips.append(
+            f'<a class="chip{" on" if form.media_type == kind else ""}" '
+            f'href="{esc(form.url("/media", type=kind))}">{esc(label)} {counts.get(kind, 0):,}</a>'
+        )
+    sentinel = (
+        f'<div class="sentinel" data-next="{esc(next_url)}"><a href="{esc(next_url)}" class="load-more">More</a></div>'
+        if next_url
+        else ""
+    )
+    empty = "" if tiles_html else '<p class="empty">No files match.</p>'
+    body = (
+        f'<section class="browse"><h1>Media</h1>{_browse_filters(form, action="/media", media=True)}'
+        f'{error_html}<nav class="chips" aria-label="Type">{"".join(chips)}</nav>{empty}'
+        f'<div id="results" class="results media-grid">{tiles_html}{sentinel}</div></section>'
+    )
+    topbar = search_form(FormState(), semantic_available=ctx.semantic_available, csrf_token=ctx.csrf_token)
+    return layout(ctx, body, body_class="page-media", topbar=topbar)
+
+
 def error_page(ctx: PageContext, *, status: int, message: str) -> str:
     body = f'<section class="error-page"><h1>{status}</h1><p>{esc(message)}</p><p><a href="/">Search</a></p></section>'
     return layout(ctx, body, body_class="page-error")
 
 
 __all__ = [
+    "BrowseForm",
     "FormState",
     "HitView",
     "PageContext",
@@ -1122,6 +1329,8 @@ __all__ = [
     "labels_page",
     "linkify",
     "login_page",
+    "media_page",
+    "media_tiles_html",
     "message_html",
     "messages_with_day_breaks",
     "results_fragment",
@@ -1129,4 +1338,6 @@ __all__ = [
     "status_html",
     "thread_page",
     "thread_result_html",
+    "timeline_page",
+    "timeline_rows_html",
 ]

@@ -24,6 +24,7 @@ Access logging is off on purpose: a search URL carries the search text.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import logging
 import queue
@@ -60,8 +61,11 @@ from imsg.eval.runner import (
     AT4_MIN_QUERIES_WITH_A_POSITIVE,
 )
 from imsg.mcp.transport import find_duplicate_header, validate_host
+from imsg.retrieval.errors import PersonAmbiguousError, PersonNotFoundError
+from imsg.retrieval.filters import MAX_PEOPLE_FILTER
+from imsg.retrieval.people import resolve_people
 from imsg.retrieval.query import analyze_query
-from imsg.search_page import grading
+from imsg.search_page import browse, grading
 from imsg.search_page import html as views
 from imsg.search_page import labels as label_store
 from imsg.search_page.attachments import (
@@ -90,6 +94,7 @@ from imsg.search_page.errors import ModelApiUnavailable, SearchInputError, Secre
 from imsg.search_page.highlight import QueryMatcher
 from imsg.search_page.search import (
     CHANNEL_ATTACHMENT_TEXT,
+    FULL_SCOPE,
     SORT_ORDERS,
     Hit,
     QueryVectors,
@@ -789,6 +794,13 @@ def search_view(request: Request) -> Response:
     ctx = _page_ctx(request, session, title="Search · Messages")
     form = _form_state(request)
     if not form.query.strip():
+        # A date or a person with no words: that is browsing, and the
+        # Timeline shows it.
+        if form.date_from or form.date_to or form.people:
+            target = views.BrowseForm(
+                date_from=form.date_from, date_to=form.date_to, people=form.people
+            ).url("/timeline")
+            return RedirectResponse(target, status_code=303)
         return RedirectResponse("/", status_code=303)
     started = time.perf_counter()
     try:
@@ -1192,6 +1204,249 @@ def message_details_view(request: Request) -> Response:
     return HTMLResponse(views.details_html(details, tz=deps.timezone))
 
 
+# --------------------------------------------------------------------------
+# routes: timeline and media
+# --------------------------------------------------------------------------
+
+
+def _browse_form(request: Request) -> views.BrowseForm:
+    params = request.query_params
+    media_type = params.get("type", "all")
+    return views.BrowseForm(
+        date_from=params.get("from", "")[:10],
+        date_to=params.get("to", "")[:10],
+        people=params.get("people", "")[:500],
+        sender=params.get("sender", "")[:200],
+        query=params.get("q", "")[:1000],
+        media_type=media_type[:20],
+    )
+
+
+def _parse_day(value: str, label: str) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise SearchInputError(f"The '{label}' date is not a valid date.") from exc
+
+
+def _resolve_browse_filters(
+    pg: psycopg.Connection, form: views.BrowseForm, timezone: str
+) -> tuple[browse.BrowseFilters, date | None, date | None]:
+    """People and sender resolved with the retrieval layer's own person
+    matching; dates parsed but not yet defaulted."""
+    first = _parse_day(form.date_from, "from")
+    last = _parse_day(form.date_to, "to")
+    first, last = (first or last), (last or first)  # one date alone is that one day
+    if first is not None and last is not None and first > last:
+        raise SearchInputError("The 'from' date must be before the 'to' date.")
+    names = [p.strip() for p in form.people.split(",") if p.strip()]
+    if len(names) > MAX_PEOPLE_FILTER:
+        raise SearchInputError(f"Filter by at most {MAX_PEOPLE_FILTER} people.")
+    try:
+        people = resolve_people(pg, FULL_SCOPE, names) if names else ()
+        sender: int | None = None
+        sender_is_owner = form.sender.strip().lower() in ("me", "owner")
+        if form.sender.strip() and not sender_is_owner:
+            [sender] = resolve_people(pg, FULL_SCOPE, [form.sender.strip()])
+    except PersonAmbiguousError as exc:
+        found = ", ".join(f"{c.display_name} ({c.short_name})" for c in exc.candidates)
+        raise SearchInputError(f"More than one person matches {exc.query!r}: {found}. Pick one.") from exc
+    except PersonNotFoundError as exc:
+        raise SearchInputError(f"No person matches {exc.query!r}.") from exc
+    start = end = None
+    if first is not None and last is not None:
+        start, end = browse.day_bounds(first, last, timezone)
+    return (
+        browse.BrowseFilters(
+            people=tuple(people), sender=sender, sender_is_owner=sender_is_owner, start=start, end=end
+        ),
+        first,
+        last,
+    )
+
+
+def _range_heading(first: date, last: date, total: int, conversations: int) -> str:
+    def label(d: date) -> str:
+        return d.strftime("%a %d %b %Y")
+
+    span = label(first) if first == last else f"{label(first)} \u2013 {label(last)}"
+    return (
+        f"{span} \u00b7 {total:,} message{'s' if total != 1 else ''}"
+        + (f" in {conversations:,} conversation{'s' if conversations != 1 else ''}" if total else "")
+    )
+
+
+def timeline_view(request: Request) -> Response:
+    session = _session(request)
+    if session is None:
+        return _login_redirect(request)
+    deps = _deps(request)
+    ctx = _page_ctx(request, session, title="Timeline · Messages")
+    form = _browse_form(request)
+    tz = deps.timezone
+    try:
+        with deps.pool.connection() as pg:
+            filters, first, last = _resolve_browse_filters(pg, form, tz)
+            if first is None and last is None:
+                latest = browse.latest_day(pg, filters, index_unsent=deps.settings.index_unsent, timezone=tz)
+                if latest is None:
+                    return HTMLResponse(
+                        views.timeline_page(
+                            ctx, form=form, heading="No messages match.", day_counts=[],
+                            rows_html="", next_url=None, error=None,
+                        )
+                    )
+                first = last = latest
+                start, end = browse.day_bounds(latest, latest, tz)
+                filters = dataclasses.replace(filters, start=start, end=end)
+                form = dataclasses.replace(form, date_from=latest.isoformat(), date_to=latest.isoformat())
+            assert first is not None and last is not None
+            counts = browse.day_counts(pg, filters, index_unsent=deps.settings.index_unsent, timezone=tz)
+            page = browse.timeline_page(pg, filters, index_unsent=deps.settings.index_unsent, cursor=None)
+            chats = chat_views(pg, {m.chat_id for m in page.messages})
+            conversations = browse.conversation_count(
+                pg, filters, index_unsent=deps.settings.index_unsent
+            )
+    except SearchInputError as exc:
+        return HTMLResponse(
+            views.timeline_page(
+                ctx, form=form, heading="", day_counts=[], rows_html="", next_url=None, error=str(exc)
+            ),
+            status_code=400,
+        )
+    total = sum(n for _d, n in counts)
+    matcher = QueryMatcher.for_query(analyze_query(form.query)) if form.query.strip() else None
+    rows = views.timeline_rows_html(page.messages, chats=chats, tz=tz, matcher=matcher, previous_day=None)
+    day_links = [
+        (
+            d.strftime("%a %d %b %Y"),
+            dataclasses.replace(form, date_from=d.isoformat(), date_to=d.isoformat()).url("/timeline"),
+            n,
+        )
+        for d, n in counts
+    ]
+    next_url = form.url("/timeline/page", cursor=page.next_cursor) if page.next_cursor else None
+    return HTMLResponse(
+        views.timeline_page(
+            ctx,
+            form=form,
+            heading=_range_heading(first, last, total, conversations),
+            day_counts=day_links,
+            rows_html=rows,
+            next_url=next_url,
+            error=None,
+        )
+    )
+
+
+def timeline_more(request: Request) -> Response:
+    """The next 200 timeline rows, for the page script's endless scroll."""
+    session = _session(request)
+    if session is None:
+        return _unauthorized()
+    deps = _deps(request)
+    form = _browse_form(request)
+    cursor = request.query_params.get("cursor", "")
+    position = browse.decode_cursor(cursor, 1)
+    if position is None:
+        return PlainTextResponse("bad cursor", status_code=400)
+    tz = deps.timezone
+    try:
+        with deps.pool.connection() as pg:
+            filters, first, last = _resolve_browse_filters(pg, form, tz)
+            if first is None and last is None:
+                return PlainTextResponse("a date range is required", status_code=400)
+            page = browse.timeline_page(pg, filters, index_unsent=deps.settings.index_unsent, cursor=cursor)
+            chats = chat_views(pg, {m.chat_id for m in page.messages})
+    except SearchInputError as exc:
+        return PlainTextResponse(str(exc), status_code=400)
+    matcher = QueryMatcher.for_query(analyze_query(form.query)) if form.query.strip() else None
+    previous_day = views.fmt_date(position[0], tz)
+    body = views.timeline_rows_html(
+        page.messages, chats=chats, tz=tz, matcher=matcher, previous_day=previous_day
+    )
+    if page.next_cursor:
+        next_url = form.url("/timeline/page", cursor=page.next_cursor)
+        body += (
+            f'<div class="sentinel" data-next="{views.esc(next_url)}"><a href="{views.esc(next_url)}" '
+            'class="load-more">Later messages</a></div>'
+        )
+    return HTMLResponse(body)
+
+
+def _media_kind(form: views.BrowseForm) -> str | None:
+    if form.media_type == "all":
+        return None
+    if form.media_type not in browse.MEDIA_KINDS:
+        raise SearchInputError("Unknown file type.")
+    return form.media_type
+
+
+def media_view(request: Request) -> Response:
+    session = _session(request)
+    if session is None:
+        return _login_redirect(request)
+    deps = _deps(request)
+    ctx = _page_ctx(request, session, title="Media · Messages")
+    form = _browse_form(request)
+    try:
+        kind = _media_kind(form)
+        with deps.pool.connection() as pg:
+            filters, _first, _last = _resolve_browse_filters(pg, form, deps.timezone)
+            counts = browse.media_counts(pg, filters, index_unsent=deps.settings.index_unsent)
+            page = browse.media_page(
+                pg, filters, kind=kind, index_unsent=deps.settings.index_unsent, cursor=None
+            )
+            chats = chat_views(pg, {item.chat_id for item in page.items})
+    except SearchInputError as exc:
+        return HTMLResponse(
+            views.media_page(
+                ctx, form=form, counts={}, labels=browse.MEDIA_KIND_LABELS, tiles_html="",
+                next_url=None, error=str(exc),
+            ),
+            status_code=400,
+        )
+    tiles = views.media_tiles_html(page.items, chats=chats, tz=deps.timezone)
+    next_url = form.url("/media/page", cursor=page.next_cursor) if page.next_cursor else None
+    return HTMLResponse(
+        views.media_page(
+            ctx, form=form, counts=counts, labels=browse.MEDIA_KIND_LABELS, tiles_html=tiles,
+            next_url=next_url, error=None,
+        )
+    )
+
+
+def media_more(request: Request) -> Response:
+    session = _session(request)
+    if session is None:
+        return _unauthorized()
+    deps = _deps(request)
+    form = _browse_form(request)
+    cursor = request.query_params.get("cursor", "")
+    if browse.decode_cursor(cursor, 2) is None:
+        return PlainTextResponse("bad cursor", status_code=400)
+    try:
+        kind = _media_kind(form)
+        with deps.pool.connection() as pg:
+            filters, _first, _last = _resolve_browse_filters(pg, form, deps.timezone)
+            page = browse.media_page(
+                pg, filters, kind=kind, index_unsent=deps.settings.index_unsent, cursor=cursor
+            )
+            chats = chat_views(pg, {item.chat_id for item in page.items})
+    except SearchInputError as exc:
+        return PlainTextResponse(str(exc), status_code=400)
+    body = views.media_tiles_html(page.items, chats=chats, tz=deps.timezone)
+    if page.next_cursor:
+        next_url = form.url("/media/page", cursor=page.next_cursor)
+        body += (
+            f'<div class="sentinel" data-next="{views.esc(next_url)}"><a href="{views.esc(next_url)}" '
+            'class="load-more">More</a></div>'
+        )
+    return HTMLResponse(body)
+
+
 def people_api(request: Request) -> Response:
     session = _session(request)
     if session is None:
@@ -1497,6 +1752,10 @@ def build_app(deps: AppDeps) -> ASGIApp:
         Route("/api/label", label_api, methods=["POST"]),
         Route("/api/people", people_api, methods=["GET"]),
         Route("/labels", labels_view, methods=["GET"]),
+        Route("/timeline", timeline_view, methods=["GET"]),
+        Route("/timeline/page", timeline_more, methods=["GET"]),
+        Route("/media", media_view, methods=["GET"]),
+        Route("/media/page", media_more, methods=["GET"]),
         Route("/message/{message_key}/details", message_details_view, methods=["GET"]),
         Route("/grade", grade_start, methods=["POST"]),
         Route("/grade/{list_id}", grade_view, methods=["GET"]),

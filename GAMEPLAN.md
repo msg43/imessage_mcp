@@ -22,8 +22,10 @@ a Details panel on every message shows its exact times, sender, edits,
 deletion, filing and sources (earlier text and raw handles each behind a
 `search_page.details` switch, off by default); a grading mode grades every
 one of a search's top 20 in random order for the reranker evaluation and
-stores the whole fused list (migration 0011). Deploying needs `imsg
-migrate` and a restart of the search page only. See `CHANGELOG.md`.
+stores the whole fused list (migration 0011); a Timeline shows every
+message across conversations for a day or range, and a Media grid shows the
+files, both opening the conversation at the chosen message. Deploying needs
+`imsg migrate` and a restart of the search page only. See `CHANGELOG.md`.
 
 **2026-09-24 public endpoint fixes from the QA review (not yet deployed):**
 requests refused before any token was judged are counted in memory and
