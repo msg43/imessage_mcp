@@ -20,6 +20,11 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import subprocess
+import sys
+import textwrap
+import time
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -420,6 +425,105 @@ def test_enrich_stops_after_the_task_in_hand_when_paused_mid_run(
     assert "enrich: deferred: paused — heavy background work is paused: import starting" in (
         result.output
     )
+
+
+_WAITS_LIKE_SYNC = textwrap.dedent(
+    """
+    import json, sys, time
+    from pathlib import Path
+    from imsg.heavy_lock import HeavyModelLock
+
+    data_root, out = Path(sys.argv[1]), Path(sys.argv[2])
+    lock = HeavyModelLock(data_root, command="imsg sync")
+    started = time.time()
+    lock.acquire()
+    acquired = time.time()
+    reservations = sorted(
+        p.name for p in (data_root / "run" / "memory-reservations").glob("*.json")
+    )
+    time.sleep(0.6)  # sync's segmentation and embedding
+    released = time.time()
+    lock.release()
+    out.write_text(json.dumps({
+        "started": started, "acquired": acquired, "released": released,
+        "reservations": reservations,
+    }))
+    """
+)
+
+
+def test_a_waiting_sync_gets_the_heavy_lock_between_enrichment_tasks(
+    env: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """QA review 2026-09-24: one 5,000-task enrichment run held the lock
+    from 22:36 to 05:04 and the 15-minute sync waited behind it, so new
+    messages were not searchable for hours. Here a second process waits
+    for the lock exactly as `imsg sync` does, starting while the first of
+    eight enrichment tasks runs. It must get the lock between two tasks,
+    not after the run; no task may run while it holds the lock; and
+    before handing over, enrichment must have dropped its models and its
+    memory reservation."""
+    from imsg.enrich.queue import EnrichmentTask
+
+    served = iter(range(1, 1000))
+    monkeypatch.setattr(
+        cli_module,
+        "claim_tasks",
+        lambda conn, **kw: [EnrichmentTask(attachment_id=next(served), kind="ocr", attempts=0)],
+    )
+    tasks: list[tuple[float, float]] = []
+    waiting: list[subprocess.Popen[bytes]] = []
+    record_file = tmp_path / "sync.json"
+
+    def process(conn: Any, config: Any, providers: Any, task: Any) -> str:
+        started = time.time()
+        if not waiting:  # enrichment holds the lock now: start the "sync"
+            waiting.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", _WAITS_LIKE_SYNC, str(env["data_root"]), str(record_file)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            )
+            time.sleep(0.5)  # long enough for it to start waiting
+        time.sleep(0.3)
+        tasks.append((started, time.time()))
+        return "done"
+
+    monkeypatch.setattr(cli_module, "process_one_task", process)
+
+    unloads: list[float] = []
+    from imsg.providers.factory import build_enrichment_providers as real_build
+
+    def build(cfg: Any, **kwargs: Any) -> Any:
+        providers = real_build(cfg, **kwargs)
+        transcription: Any = providers.transcription
+        transcription.unload = lambda: unloads.append(time.time())
+        return providers
+
+    monkeypatch.setattr(cli_module, "build_enrichment_providers", build)
+
+    result = runner.invoke(app, ["enrich", "--config", str(env["config"]), "--limit", "8"])
+    assert waiting, "no enrichment task ran"
+    waiting[0].wait(timeout=30)
+    record = json.loads(record_file.read_text())
+
+    assert result.exit_code == 0, result.output
+    assert "enrich: claimed=8 done=8" in result.output
+    assert record["acquired"] < tasks[-1][0], (
+        f"the sync got the lock only after the whole run: acquired at {record['acquired']:.2f}, "
+        f"last task started at {tasks[-1][0]:.2f}"
+    )
+    for started, ended in tasks:
+        assert ended <= record["acquired"] or started >= record["released"], (
+            "an enrichment task ran while the sync held the lock"
+        )
+    assert record["acquired"] - record["started"] < 5.0
+    assert unloads and unloads[0] <= record["acquired"], "the models were not dropped first"
+    assert f"{os.getpid()}.json" not in record["reservations"], (
+        "enrichment's memory reservation was still held during the hand-over"
+    )
+    assert "handed the heavy-model lock to a waiting command 1 time(s)" in result.output
 
 
 # --------------------------------------------------------------------------

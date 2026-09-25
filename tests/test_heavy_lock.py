@@ -14,6 +14,7 @@ import sys
 import textwrap
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -264,3 +265,122 @@ def test_a_child_outliving_a_killed_holder_does_not_keep_the_lock(data_root: Pat
         _stop(holder)
         with contextlib.suppress(ProcessLookupError):
             os.kill(child_pid, signal.SIGKILL)
+
+
+# --------------------------------------------------------------------------
+# waiting commands go first (QA review 2026-09-24): a holder created with
+# yields_to_waiters=True sees a waiting command, and never takes the lock
+# ahead of one
+# --------------------------------------------------------------------------
+
+
+def _start_waiter(data_root: Path, command: str = "imsg sync") -> tuple[subprocess.Popen[str], threading.Event]:
+    """A child that waits for the lock the way `imsg sync` does, holds it
+    until told to release, and reports each step on stdout. The event is
+    set once it prints "acquired"."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _HOLDER, str(data_root), command],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    acquired = threading.Event()
+    stdout = proc.stdout
+    assert stdout is not None
+
+    def _read() -> None:
+        for line in stdout:
+            if line.strip() == "acquired":
+                acquired.set()
+
+    threading.Thread(target=_read, daemon=True).start()
+    return proc, acquired
+
+
+def _until(predicate: Callable[[], bool], timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_the_holder_sees_a_command_waiting_for_the_lock(data_root: Path) -> None:
+    lock = HeavyModelLock(data_root, command="imsg enrich", yields_to_waiters=True)
+    lock.acquire()
+    waiter, acquired = _start_waiter(data_root)
+    try:
+        assert _until(lock.waiter_present), "the waiting command never announced itself"
+        assert not acquired.is_set()
+        lock.release()
+        assert acquired.wait(timeout=10), "the waiting command never got the lock"
+        # Once it holds the lock it is no longer waiting.
+        assert _until(lambda: not lock.waiter_present())
+    finally:
+        lock.release()
+        _stop(waiter)
+
+
+def test_nobody_waiting_is_the_ordinary_answer(data_root: Path) -> None:
+    lock = HeavyModelLock(data_root, command="imsg enrich", yields_to_waiters=True)
+    with lock:
+        assert not lock.waiter_present()
+
+
+def test_a_yielding_command_never_takes_the_lock_ahead_of_a_waiting_one(data_root: Path) -> None:
+    """Three processes: an embed holds the lock, a sync is waiting for it,
+    and the enrichment worker (this process) asks for it too. When the
+    embed finishes the sync must get the lock, and the worker only once
+    the sync is done. Plain `flock` would let either of the two waiters
+    win."""
+    holder = _start_holder(data_root, "imsg embed")
+    waiter, waiter_acquired = _start_waiter(data_root)
+    worker = HeavyModelLock(
+        data_root, command="imsg enrich", yields_to_waiters=True, yield_poll_seconds=0.02
+    )
+    worker_acquired = threading.Event()
+
+    def _take() -> None:
+        worker.acquire()
+        worker_acquired.set()
+
+    try:
+        assert _until(worker.waiter_present), "the sync never announced itself"
+        taker = threading.Thread(target=_take, daemon=True)
+        taker.start()
+        time.sleep(0.2)
+        assert holder.stdin is not None
+        holder.stdin.write("\n")
+        holder.stdin.flush()
+        assert waiter_acquired.wait(timeout=10), "the waiting sync did not get the lock"
+        assert not worker_acquired.wait(timeout=1.0), "the worker took the lock ahead of the sync"
+        status = inspect_heavy_lock(data_root)
+        assert status.holder is not None and status.holder.command == "imsg sync"
+        assert waiter.stdin is not None
+        waiter.stdin.write("\n")
+        waiter.stdin.flush()
+        assert worker_acquired.wait(timeout=10), "the worker never got the lock back"
+        taker.join(timeout=5)
+    finally:
+        worker.release()
+        _stop(holder)
+        _stop(waiter)
+
+
+def test_a_yielding_command_told_not_to_wait_is_busy_while_another_command_waits(
+    data_root: Path,
+) -> None:
+    holder = _start_holder(data_root, "imsg embed")
+    waiter, _ = _start_waiter(data_root)
+    worker = HeavyModelLock(
+        data_root, command="imsg enrich", wait=False, yields_to_waiters=True
+    )
+    try:
+        assert _until(worker.waiter_present)
+        with pytest.raises(HeavyModelLockBusyError, match="--no-wait"):
+            worker.acquire()
+        assert not worker.held
+    finally:
+        _stop(holder)
+        _stop(waiter)

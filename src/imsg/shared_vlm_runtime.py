@@ -160,6 +160,21 @@ class SharedVlmRuntime:
     def is_loaded(self, model_repo: str, revision: str | None) -> bool:
         return (model_repo, revision) in self._loaded
 
+    def release_all(self) -> tuple[str, ...]:
+        """Forget every loaded model, returning their ids; the next
+        `acquire` loads again. The memory comes back once nothing else
+        references the model and the caller returns freed memory to the
+        system (`imsg.retrieval.idle_unload.release_freed_memory`). Only
+        the runtime's owner should call this: a provider still holding its
+        own reference keeps the model alive, and the runtime would then
+        load a second copy."""
+        with self._lock:
+            released = tuple(v.model_id for v in self._loaded.values())
+            self._loaded.clear()
+        if released:
+            logger.info("shared_vlm.released", model_ids=list(released))
+        return released
+
     def acquire(self, model_repo: str, revision: str | None) -> LoadedVlm:
         """The loaded model for this pin, loading it on the first ask.
 

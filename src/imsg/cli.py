@@ -113,7 +113,7 @@ from imsg.diagnostics import (
 from imsg.embed.fts.schema import assert_schema_current, create_schema
 from imsg.embed.fts.sync import sync_fts
 from imsg.embed.pipeline import EmbedRunReport, run_embed
-from imsg.enrich.pipeline import process_one_task
+from imsg.enrich.pipeline import EnrichmentProviders, process_one_task
 from imsg.enrich.planner import EnrichmentPlanReport, plan_enrichment
 from imsg.enrich.queue import (
     claim_tasks,
@@ -122,7 +122,7 @@ from imsg.enrich.queue import (
     reset_failed_tasks,
 )
 from imsg.enrich.router import DEFAULT_CLAIM_ORDER, ENRICHMENT_KINDS, parse_kinds
-from imsg.enrich.worker import run_enrich_worker
+from imsg.enrich.worker import HeavyLockHandoff, run_enrich_worker
 from imsg.errors import AgentInstallError, ImsgError
 from imsg.eval.cli import eval_app
 from imsg.export import (
@@ -402,12 +402,21 @@ def _build_or_die[T](build: Callable[[], T]) -> T:
         raise typer.Exit(code=1) from exc
 
 
-def _heavy_lock_or_die(cfg: Config, command: str, *, no_wait: bool) -> HeavyModelLock:
+def _heavy_lock_or_die(
+    cfg: Config, command: str, *, no_wait: bool, yields_to_waiters: bool = False
+) -> HeavyModelLock:
     """The host-wide heavy-model lock for `command`, not yet taken
     (`imsg.heavy_lock`). One model-heavy process at a time: two of them
-    together exhausted a 64 GiB host's memory (2026-09-24)."""
+    together exhausted a 64 GiB host's memory (2026-09-24).
+    `yields_to_waiters` is for the enrichment worker, which hands the lock
+    to a waiting command between tasks."""
     try:
-        return HeavyModelLock(cfg.paths.data_root, command=command, wait=not no_wait)
+        return HeavyModelLock(
+            cfg.paths.data_root,
+            command=command,
+            wait=not no_wait,
+            yields_to_waiters=yields_to_waiters,
+        )
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -467,6 +476,23 @@ def _release_models(*providers: object) -> None:
             dropped = True
     if dropped:
         release_freed_memory()
+
+
+def _unload_enrichment_models(providers: EnrichmentProviders) -> None:
+    """Drop every enrichment model this process holds before it hands the
+    host-wide lock to a waiting command: the captioner's weights (released
+    from the runtime it loads through, which nothing else in `imsg enrich`
+    uses), Whisper's, and then the freed memory itself. The next task that
+    needs a model loads it again."""
+    runtime = getattr(providers.caption, "shared_runtime", None)
+    release_all = getattr(runtime, "release_all", None)
+    if callable(release_all):
+        release_all()
+    for provider in (providers.transcription, providers.ocr, providers.caption):
+        unload = getattr(provider, "unload", None)
+        if callable(unload):
+            unload()
+    release_freed_memory()
 
 
 def _query_marker(cfg: Config) -> QueryInFlightMarker:
@@ -2404,6 +2430,9 @@ def enrich(
 
     A worker run holds the host-wide heavy-model lock (`imsg.heavy_lock`),
     taken before the first claim so no task sits leased while it waits.
+    Between tasks it hands the lock to any command waiting for it, such as
+    the scheduled sync: it unloads its models, lets that command run, then
+    takes the lock back and checks memory again before the next task.
     `--plan` and `--dry-run` load no model and take no lock.
 
     A worker run is heavy background work (`imsg.background_gate`): it
@@ -2509,9 +2538,24 @@ def enrich(
         poll_interval_seconds=cfg.enrichment.yield_poll_interval_seconds,
         max_pause_seconds=cfg.enrichment.yield_max_pause_seconds,
     )
-    heavy_lock = _heavy_lock_or_die(cfg, "imsg enrich", no_wait=no_wait)
+    heavy_lock = _heavy_lock_or_die(cfg, "imsg enrich", no_wait=no_wait, yields_to_waiters=True)
     admission = MemoryAdmission.for_role(
         cfg, ModelRole.ENRICH, command="imsg enrich", probe=gate.probe
+    )
+
+    def _readmit() -> StopReason | None:
+        refused = gate.admit(admission)
+        if refused is None:
+            configure_mlx_memory_limit(cfg, ModelRole.ENRICH)
+        return refused
+
+    enrich_providers = providers
+    handoff = HeavyLockHandoff(
+        lock=heavy_lock,
+        unload_models=lambda: _unload_enrichment_models(enrich_providers),
+        release_reservation=admission.release,
+        readmit=_readmit,
+        log=lambda line: typer.echo(f"enrich: {line}", err=True),
     )
     try:
         # Before any claim or reset: waiting here holds no lease.
@@ -2534,6 +2578,7 @@ def enrich(
             stop_check=gate.between_units,
             claim=claim_tasks,
             process=process_one_task,
+            lock_handoff=handoff,
         )
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
@@ -2549,6 +2594,11 @@ def enrich(
         typer.echo(
             f"enrich: yielded to in-flight queries {worker.yield_pauses} time(s), "
             f"{worker.yielded_seconds:.1f}s total"
+        )
+    if handoff.handoffs:
+        typer.echo(
+            f"enrich: handed the heavy-model lock to a waiting command {handoff.handoffs} "
+            f"time(s), {handoff.seconds_away:.1f}s away"
         )
     if worker.stopped is not None:
         _exit_deferred("enrich", worker.stopped)

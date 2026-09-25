@@ -34,6 +34,7 @@ internally, so it is applied on the first transcription.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,20 @@ class MlxWhisperTranscriptionProvider:
         self._model_path: str | None = None
         self._cache_limit_bytes = cache_limit_bytes
         self._cache_bounded = False
+
+    def unload(self) -> None:
+        """Drop the weights `mlx_whisper` keeps between calls (its
+        `transcribe.ModelHolder` class attributes, read from mlx-whisper
+        0.4.3), so handing the host-wide lock to another command returns
+        their memory; the next transcription loads them again. Nothing to
+        do when `mlx_whisper` was never imported. The caller returns the
+        freed memory to the system (`imsg.retrieval.idle_unload.
+        release_freed_memory`)."""
+        module = sys.modules.get("mlx_whisper.transcribe")
+        holder = getattr(module, "ModelHolder", None)
+        if holder is not None:
+            holder.model = None
+            holder.model_path = None
 
     def _resolved_model_path(self) -> str:
         model_path = self._model_path

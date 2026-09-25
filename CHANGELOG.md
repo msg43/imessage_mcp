@@ -10,6 +10,28 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-24 — Enrichment hands the heavy-model lock to a waiting sync between tasks
+
+**Why.** `imsg enrich` held the host-wide heavy-model lock for its whole
+run. One 5,000-task run held it from 22:36 to 05:04 (QA review
+2026-09-24), so the 15-minute `imsg sync` could not segment or embed new
+messages, and they were not searchable, for hours.
+
+- **A waiting command announces itself.** A command that must wait for
+  the lock holds `<data_root>/run/heavy-models.waiting` while it waits.
+- **Enrichment checks before each claim.** If a command is waiting, the
+  worker unloads its models (the caption VLM and Whisper), drops its
+  memory reservation, releases the lock, takes it back when that command
+  is done, and passes memory admission and the pause check again before
+  the next task. It never takes the lock ahead of a waiting command.
+- **A waiting sync now waits for the task in hand, not the run.** The
+  worst case is one task's wall clock (`task_timeout_seconds`, 30
+  minutes by default); a caption took 14.2 s on the production host
+  (measured 2026-09-17, recorded in the 2026-09-23 queue entry below).
+- Only one model-heavy process holds the lock at a time, as before: the
+  lock is released only after the enrichment models are dropped, and
+  taken back before any of them load again.
+
 ## 2026-09-24 — Enrichment decoders run sandboxed, inside one budget per task
 
 **Why.** The QA review (2026-09-24) found that anyone who can send the
