@@ -1,18 +1,22 @@
-"""Renders the 7 `com.imsgindex.*` LaunchAgent plists (SPEC §5.5).
+"""Renders the `com.imsgindex.*` LaunchAgent plists (SPEC §5.5).
 
 launchd only discovers user agents from `~/Library/LaunchAgents`, so
-installation writes **thin, content-free plists** there: each one
-invokes a fixed core wrapper (the installed `imsg` binary, or a raw
-`postgres`/`cloudflared` binary gated by an explicit `imsg guard-mount`
-shell wrapper) that reads real config/runtime files from
-`$DATA_ROOT` at run time. Every `ProgramArguments` list built here MUST
-be assembled from generic, fixed bootstrap values only — no literal
-hostname, secret, person name, or GCP identifier anywhere in the
-rendered dict (SPEC §5.5: "the plist MUST contain no secret, hostname,
-person name, GCP identifier, or message path beyond the fixed
-bootstrap paths"). Real values live only in the config.yaml the
-rendered plist points at via `--config <path>`, which this module
-never reads the contents of.
+installation writes **thin, content-free plists** there. Since
+2026-09-24 every one of them runs the same program: the supervisor,
+`imsg/agents/supervise.py`, under one fixed interpreter, wrapping the
+service's command. The supervisor waits for the encrypted volume, passes
+`imsg guard-mount`, reads the service's `env:` secrets from 0600 files
+under `data_root`, opens the service's logs on the volume, and keeps the
+service as its child so launchd's `KeepAlive` restarts it after a crash
+(QA review 2026-09-24: the public server, Postgres and the backups had
+no supervisor).
+
+Every `ProgramArguments` list built here MUST be assembled from generic,
+fixed bootstrap values only — no literal hostname, secret, person name,
+or GCP identifier anywhere in the rendered dict (SPEC §5.5: "the plist
+MUST contain no secret, hostname, person name, GCP identifier, or message
+path beyond the fixed bootstrap paths"). A secret reference contributes
+its variable NAME and the path of the file holding it, never a value.
 
 Everything here is a pure function: build a `dict` shaped for
 `plistlib.dumps(..., fmt=plistlib.FMT_XML)`, no filesystem writes, no
@@ -27,6 +31,9 @@ from __future__ import annotations
 
 import plistlib
 import re
+import sys
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -92,215 +99,142 @@ def calendar_intervals_for_window(window: str, *, every_minutes: int = 30) -> li
     return intervals
 
 
-def _log_paths(data_root: Path, agent_name: str) -> tuple[Path, Path]:
-    """SPEC §5.3: `logs/` lives under `data_root` ("all derived state
-    on the encrypted volume" — CLAUDE.md non-negotiable #2). Unlike the
-    mount gate's own off-mount failure log (the one deliberate
-    exception, SPEC §5.4), a LaunchAgent's stdout/stderr capture is
-    ordinary pipeline output and belongs on the encrypted volume."""
-    logs_dir = data_root / "logs"
-    return (
-        logs_dir / f"imsgindex-{agent_name}.out.log",
-        logs_dir / f"imsgindex-{agent_name}.err.log",
-    )
+LOGS_NOTE = (
+    "launchd's own standard output and error go to /dev/null: the supervisor "
+    "(imsg.agents.supervise) opens <data_root>/logs/imsgindex-<service>.{out,err}.log "
+    "itself, for appending, once the mount gate has passed — so nothing is written "
+    "before the encrypted volume is there, and the size rotation can truncate them"
+)
+
+AGENT_NAMES: tuple[str, ...] = ("pg", "sync", "enrich", "mcp-public", "tunnel", "report", "backup")
+"""SPEC §5.5's table, in its order."""
+
+THROTTLE_SECONDS = 60
+"""SPEC §5.4: agents "use ThrottleInterval 60 and simply retry until the
+mount appears" — also the least time between two starts of a KeepAlive
+service that keeps exiting."""
+
+PG_EXIT_TIMEOUT_SECONDS = 120
+"""How long launchd waits after the stop signal before it kills Postgres.
+The supervisor turns launchd's TERM into Postgres's fast shutdown (INT),
+which ends with a checkpoint of up to `shared_buffers` of dirty pages."""
+
+MCP_EXIT_TIMEOUT_SECONDS = 30
+POSTGRES_HOST = "127.0.0.1"
+
+DEFAULT_ENV_DIR = "private/env"
+"""Where, under `data_root`, the supervisor looks for the file holding an
+`env:NAME` secret when the installer names no other: `private/env/NAME`,
+mode 0600. `render_agent_plists(env_files=...)` points a name elsewhere
+(an existing 0600 file, say)."""
+
+SYSTEM_PATH: tuple[str, ...] = (
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+)
 
 
-def _guard_mount_and_exec(*, imsg_binary: Path, config_path: Path, exec_cmd: str) -> list[str]:
-    """The explicit `sh -c "imsg guard-mount ... && exec ..."` wrapper
-    SPEC §5.5 requires for agents that invoke a **raw** binary
-    (`postgres`, `cloudflared`) with no `imsg` CLI wrapper of its own
-    to gate itself. Agents that shell out to `imsg <subcommand>`
-    directly do NOT need this: every real `imsg` stage command already
-    runs the mount gate itself before touching `data_root` (see
-    `imsg.cli`'s per-command `run_guard_mount_or_exit` calls, and
-    `imsg.stages.sync.run_sync`'s own internal `guard_mount` call for
-    `imsg sync` specifically) — SPEC §5.4's "every CLI entry point ...
-    runs guard-mount" already covers those.
-    """
-    return [
-        "/bin/sh",
-        "-c",
-        f"{imsg_binary} guard-mount --config {config_path} && exec {exec_cmd}",
+@dataclass(frozen=True, slots=True)
+class AgentBinaries:
+    """Fixed bootstrap paths every plist is built from — never read from
+    the config's contents, never a secret or hostname (SPEC §5.5)."""
+
+    interpreter: Path
+    """The interpreter launchd starts. Grant Full Disk Access to this
+    binary (SPEC §5.1a): the services run as its children."""
+    supervisor: Path
+    """`imsg/agents/supervise.py` — standard library only, so
+    `interpreter` needs no virtual environment to run it."""
+    imsg: Path
+    postgres: Path
+    cloudflared: Path | None = None
+
+
+def default_interpreter() -> Path:
+    """The interpreter running this process, symlinks resolved: for a
+    virtual environment, the base interpreter its `python` links to —
+    one stable binary to hold the Full Disk Access grant."""
+    return Path(sys.executable).resolve()
+
+
+def default_supervisor() -> Path:
+    return (Path(__file__).resolve().parent / "supervise.py").resolve()
+
+
+def env_secret_names(config: Config, *, public: bool) -> list[str]:
+    """The `env:NAME` secrets a service built from `config` resolves at
+    start: the database password for every service that connects, plus
+    the public surface's OAuth references for `mcp-public`. Names only —
+    their values are read by the supervisor from 0600 files."""
+    refs: list[str] = []
+    if config.database.password.kind == "env":
+        refs.append(config.database.password.name)
+    if public:
+        oauth = config.mcp.public.oauth
+        if oauth.client_id is not None and oauth.client_id.startswith("env:"):
+            refs.append(oauth.client_id.removeprefix("env:"))
+        for ref in (oauth.owner_subject, oauth.client_secret):
+            if ref is not None and ref.kind == "env":
+                refs.append(ref.name)
+    return list(dict.fromkeys(refs))
+
+
+def _search_path(binaries: AgentBinaries) -> str:
+    dirs = [str(binaries.postgres.parent), str(binaries.imsg.parent), *SYSTEM_PATH]
+    return ":".join(dict.fromkeys(dirs))
+
+
+def _supervised(
+    name: str,
+    *,
+    binaries: AgentBinaries,
+    data_root: Path,
+    guard_config: Path,
+    command: list[str],
+    env_names: Sequence[str] = (),
+    env_files: Mapping[str, str] | None = None,
+    wait_for_postgres: bool = False,
+    stop_signal: str = "TERM",
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """One plist whose program is the supervisor wrapping `command`."""
+    overrides = env_files or {}
+    arguments = [
+        str(binaries.interpreter),
+        str(binaries.supervisor),
+        "--service",
+        name,
+        "--data-root",
+        str(data_root),
+        "--imsg",
+        str(binaries.imsg),
+        "--config",
+        str(guard_config),
     ]
-
-
-def _base_plist(
-    label: str, *, program_arguments: list[str], data_root: Path, agent_name: str
-) -> dict[str, object]:
-    out_log, err_log = _log_paths(data_root, agent_name)
+    for env_name in env_names:
+        relative = overrides.get(env_name, f"{DEFAULT_ENV_DIR}/{env_name}")
+        arguments += ["--env", f"{env_name}={relative}"]
+    if wait_for_postgres:
+        arguments += [
+            "--wait-for-postgres",
+            f"{POSTGRES_HOST}:{REQUIRED_DB_PORT}",
+            "--pg-isready",
+            str(binaries.postgres.parent / "pg_isready"),
+        ]
+    if stop_signal != "TERM":
+        arguments += ["--stop-signal", stop_signal]
     return {
-        "Label": label,
-        "ProgramArguments": program_arguments,
-        "StandardOutPath": str(out_log),
-        "StandardErrorPath": str(err_log),
+        "Label": f"{LABEL_PREFIX}{name}",
+        "ProgramArguments": [*arguments, "--", *command],
+        "EnvironmentVariables": {"PATH": _search_path(binaries), **(environment or {})},
+        "StandardOutPath": "/dev/null",
+        "StandardErrorPath": "/dev/null",
+        "ThrottleInterval": THROTTLE_SECONDS,
     }
-
-
-def _pg_plist(
-    *, data_root: Path, imsg_binary: Path, postgres_binary: Path, config_path: Path
-) -> dict[str, object]:
-    """`…pg` — KeepAlive; gated (raw binary, no `imsg` wrapper of its
-    own) then invokes `postgres` directly with the dedicated
-    instance's fixed flags (SPEC §5.2: port 5433, `pg17` data dir under
-    `data_root`, unix sockets under `data_root/run`)."""
-    pg_data_dir = data_root / PG_DATA_SUBDIR
-    run_dir = data_root / "run"
-    exec_cmd = (
-        f"{postgres_binary} -D {pg_data_dir} -p {REQUIRED_DB_PORT} "
-        f"-c listen_addresses=127.0.0.1 -k {run_dir}"
-    )
-    plist = _base_plist(
-        f"{LABEL_PREFIX}pg",
-        program_arguments=_guard_mount_and_exec(
-            imsg_binary=imsg_binary, config_path=config_path, exec_cmd=exec_cmd
-        ),
-        data_root=data_root,
-        agent_name="pg",
-    )
-    plist["KeepAlive"] = True
-    return plist
-
-
-def _sync_plist(
-    *, data_root: Path, imsg_binary: Path, config_path: Path, interval_seconds: int
-) -> dict[str, object]:
-    """`…sync` — `StartInterval` from `config.sync.interval_seconds`;
-    `imsg sync` gates itself (see `_guard_mount_and_exec`'s docstring),
-    so no extra shell wrapper is needed here."""
-    plist = _base_plist(
-        f"{LABEL_PREFIX}sync",
-        program_arguments=[str(imsg_binary), "sync", "--config", str(config_path)],
-        data_root=data_root,
-        agent_name="sync",
-    )
-    plist["StartInterval"] = interval_seconds
-    return plist
-
-
-def _enrich_plist(
-    *, data_root: Path, imsg_binary: Path, config_path: Path, window: str
-) -> dict[str, object]:
-    """`…enrich` — nightly window (default `01:00-07:00`), periodic
-    `StartCalendarInterval` array via `calendar_intervals_for_window`;
-    `imsg enrich` gates itself the same way `imsg sync` does.
-
-    **Residency constraint this agent shares with `…sync` (D10.3).** The
-    pinned captioning model and the pinned boundary-detection model are
-    the same checkpoint (`imsg.constants` sets `CAPTION_MODEL_REPO =
-    BOUNDARY_MODEL_REPO`), ~19 GiB resident. Within one process they now
-    load once, through `imsg.shared_vlm_runtime.SharedVlmRuntime`. Across
-    processes nothing can share them, and these are two processes: this
-    agent builds the captioner, while boundary detection lives in
-    `…sync`'s segment step, and `…sync` fires every
-    `sync.interval_seconds` (900 s by default) straight through this
-    window.
-
-    What keeps that bounded, and what does not:
-
-    - Both providers load their weights **lazily, on first use**. A
-      `…sync` run with no chat needing topical boundaries never loads
-      the model at all, and `…sync` is a `StartInterval` agent that
-      exits when its run finishes — so the second copy is resident only
-      while a sync run is actually detecting boundaries, not for the
-      whole window.
-    - On a 64 GB host two copies plus the query side measured 80.4 GiB
-      of demand, critical memory pressure and search p95 at 8.73 s
-      against a 2.0 s budget, and on 2026-09-24 an `imsg embed` and an
-      `imsg sync` running together exhausted memory and hung the host.
-      The overlap is now prevented, not scheduled around: every
-      model-heavy command takes the host-wide lock in `imsg.heavy_lock`
-      before its models load, so this agent's worker and `…sync`'s
-      segment/embed steps run one after the other. A `…sync` run that
-      finds the lock held still snapshots and extracts, then waits.
-      The shared runtime above and enrichment yielding to in-flight
-      queries (`imsg.db.enrichment_yield_locks`) still apply.
-    - Moving the window away from `…sync`'s interval is not an option:
-      `StartInterval` has no window, and pausing sync for six hours
-      would stall extraction of everything that arrives overnight.
-    """
-    plist = _base_plist(
-        f"{LABEL_PREFIX}enrich",
-        program_arguments=[str(imsg_binary), "enrich", "--config", str(config_path)],
-        data_root=data_root,
-        agent_name="enrich",
-    )
-    plist["StartCalendarInterval"] = calendar_intervals_for_window(window)
-    return plist
-
-
-def _mcp_public_plist(*, data_root: Path, imsg_binary: Path, config_path: Path) -> dict[str, object]:
-    """`…mcp-public` — KeepAlive; invokes `imsg mcp public --config
-    <path>`. That subcommand is being built in parallel this same wave
-    (`src/imsg/mcp/*`, someone else's territory) — this function only
-    references the command name/args; it will exist by the time
-    everything is integrated (SPEC §10.4)."""
-    plist = _base_plist(
-        f"{LABEL_PREFIX}mcp-public",
-        program_arguments=[str(imsg_binary), "mcp", "public", "--config", str(config_path)],
-        data_root=data_root,
-        agent_name="mcp-public",
-    )
-    plist["KeepAlive"] = True
-    return plist
-
-
-def _tunnel_plist(
-    *, data_root: Path, imsg_binary: Path, cloudflared_binary: Path, config_path: Path
-) -> dict[str, object]:
-    """`…tunnel` — KeepAlive; gated (raw binary, no `imsg` wrapper of
-    its own), then `cloudflared tunnel --config <rendered config> run`.
-    The cloudflared config path is itself a generic, fixed bootstrap
-    path under `data_root` (SPEC §5.3 `private/` — "instance config /
-    overlay checkout") — never a literal hostname; the real tunnel
-    hostname lives inside that rendered config file, which this module
-    never reads or writes."""
-    cloudflared_config_path = data_root / "private" / "cloudflared.yaml"
-    exec_cmd = f"{cloudflared_binary} tunnel --config {cloudflared_config_path} run"
-    plist = _base_plist(
-        f"{LABEL_PREFIX}tunnel",
-        program_arguments=_guard_mount_and_exec(
-            imsg_binary=imsg_binary, config_path=config_path, exec_cmd=exec_cmd
-        ),
-        data_root=data_root,
-        agent_name="tunnel",
-    )
-    plist["KeepAlive"] = True
-    return plist
-
-
-def _report_plist(*, data_root: Path, imsg_binary: Path, config_path: Path) -> dict[str, object]:
-    """`…report` — weekly, Monday 08:00 (launchd's `Weekday` is
-    0/7=Sunday, so Monday is `1`). Invokes `imsg export
-    unclassified-report --config <path>`, a CLI subcommand that does
-    not exist yet as of this build (`src/imsg/export/unclassified.py`
-    has the logic; wiring `imsg export` is a parallel agent's scope
-    this wave, out of bounds to touch here) — the plist is still
-    rendered correctly; the target command's existence is a separate,
-    already-flagged gap."""
-    plist = _base_plist(
-        f"{LABEL_PREFIX}report",
-        program_arguments=[
-            str(imsg_binary), "export", "unclassified-report", "--config", str(config_path)
-        ],
-        data_root=data_root,
-        agent_name="report",
-    )
-    plist["StartCalendarInterval"] = {"Weekday": 1, "Hour": 8, "Minute": 0}
-    return plist
-
-
-def _backup_plist(*, data_root: Path, imsg_binary: Path, config_path: Path) -> dict[str, object]:
-    """`…backup` — daily 04:00. Invokes `imsg backup --config <path>`
-    (SPEC §5.3/§14: "backups/ nightly local recovery copies, 14
-    kept")."""
-    plist = _base_plist(
-        f"{LABEL_PREFIX}backup",
-        program_arguments=[str(imsg_binary), "backup", "--config", str(config_path)],
-        data_root=data_root,
-        agent_name="backup",
-    )
-    plist["StartCalendarInterval"] = {"Hour": 4, "Minute": 0}
-    return plist
 
 
 def render_agent_plists(
@@ -308,62 +242,217 @@ def render_agent_plists(
     *,
     imsg_binary: Path,
     postgres_binary: Path,
-    cloudflared_binary: Path,
+    cloudflared_binary: Path | None,
     config_path: Path,
+    interpreter: Path | None = None,
+    supervisor: Path | None = None,
+    mcp_public_config: Config | None = None,
+    mcp_public_config_path: Path | None = None,
+    env_files: Mapping[str, str] | None = None,
+    only: Collection[str] | None = None,
 ) -> dict[str, bytes]:
-    """Render all 7 `com.imsgindex.*` plists (SPEC §5.5's table) as
-    `label -> XML plist bytes`, fully unit-testable without touching
-    the filesystem: pass paths in, get bytes out (round-trip through
-    `plistlib.loads` to assert on the dict; grep the bytes for
-    forbidden substrings).
+    """Render SPEC §5.5's `com.imsgindex.*` plists as `label -> XML bytes`,
+    fully unit-testable: paths in, bytes out, nothing written.
 
-    `config` supplies `config.sync.interval_seconds` and
-    `config.enrichment.window`; every other value here is a fixed
-    bootstrap path derived from `config.paths.data_root` or the
-    explicitly-passed binary/config paths — never a literal hostname,
-    secret, or person name (SPEC §5.5).
+    Every agent runs `interpreter supervisor … -- <service command>`
+    (`imsg.agents.supervise`): the supervisor waits for the encrypted
+    volume, passes `imsg guard-mount`, loads the service's `env:` secrets
+    from 0600 files under `data_root` (`env_files` maps a name to a file
+    other than `private/env/NAME`), and keeps the service as its child.
+    Nothing in a plist comes from the config's *values* except
+    `data_root`, the sync interval and the enrichment window; secret
+    references contribute their variable *names* only (SPEC §5.5).
+
+    `mcp_public_config`/`_path` let the public server run from its own
+    config file (the instance renders one with the public hostname);
+    both default to `config`/`config_path`. `only` renders a subset of
+    `AGENT_NAMES`; the tunnel needs `cloudflared_binary`.
+
+    Service by service:
+
+    - `pg` — KeepAlive; `postgres` in the foreground on port 5433, data in
+      `data_root/pg17`, TCP on 127.0.0.1 only, its Unix socket in
+      `data_root/run` (not the world-writable `/tmp`); `LC_ALL=C` (or
+      the postmaster dies at startup on macOS); launchd's TERM becomes a
+      fast shutdown; `ProcessType` Interactive, since every query waits on it.
+    - `mcp-public` — KeepAlive; waits for Postgres, then `imsg mcp public`;
+      Interactive.
+    - `backup` — daily 04:00; waits for Postgres, then `imsg backup` with
+      the `pg_dump` beside `postgres`, which also rotates the logs;
+      `ProcessType` Background.
+    - `sync`, `enrich`, `report` — their schedules, unchanged in shape.
+    - `tunnel` — KeepAlive `cloudflared`, only when asked for.
     """
     data_root = config.paths.data_root
-    builders: dict[str, dict[str, object]] = {
-        f"{LABEL_PREFIX}pg": _pg_plist(
-            data_root=data_root,
-            imsg_binary=imsg_binary,
-            postgres_binary=postgres_binary,
-            config_path=config_path,
-        ),
-        f"{LABEL_PREFIX}sync": _sync_plist(
-            data_root=data_root,
-            imsg_binary=imsg_binary,
-            config_path=config_path,
-            interval_seconds=config.sync.interval_seconds,
-        ),
-        f"{LABEL_PREFIX}enrich": _enrich_plist(
-            data_root=data_root,
-            imsg_binary=imsg_binary,
-            config_path=config_path,
-            window=config.enrichment.window,
-        ),
-        f"{LABEL_PREFIX}mcp-public": _mcp_public_plist(
-            data_root=data_root, imsg_binary=imsg_binary, config_path=config_path
-        ),
-        f"{LABEL_PREFIX}tunnel": _tunnel_plist(
-            data_root=data_root,
-            imsg_binary=imsg_binary,
-            cloudflared_binary=cloudflared_binary,
-            config_path=config_path,
-        ),
-        f"{LABEL_PREFIX}report": _report_plist(
-            data_root=data_root, imsg_binary=imsg_binary, config_path=config_path
-        ),
-        f"{LABEL_PREFIX}backup": _backup_plist(
-            data_root=data_root, imsg_binary=imsg_binary, config_path=config_path
-        ),
+    binaries = AgentBinaries(
+        interpreter=interpreter or default_interpreter(),
+        supervisor=supervisor or default_supervisor(),
+        imsg=imsg_binary,
+        postgres=postgres_binary,
+        cloudflared=cloudflared_binary,
+    )
+    selected = list(AGENT_NAMES) if only is None else [n for n in AGENT_NAMES if n in set(only)]
+    unknown = set(only or ()) - set(AGENT_NAMES)
+    if unknown:
+        raise ValueError(f"unknown agent(s) {sorted(unknown)}; choose from {list(AGENT_NAMES)}")
+    public_config = mcp_public_config or config
+    public_path = mcp_public_config_path or config_path
+    db_env = env_secret_names(config, public=False)
+    imsg = str(imsg_binary)
+    cfg = str(config_path)
+
+    builders: dict[str, Callable[[], dict[str, object]]] = {
+        "pg": lambda: _pg_plist(binaries, data_root, config_path),
+        "sync": lambda: {
+            **_supervised(
+                "sync",
+                binaries=binaries,
+                data_root=data_root,
+                guard_config=config_path,
+                command=[imsg, "sync", "--config", cfg],
+                env_names=db_env,
+                env_files=env_files,
+            ),
+            "StartInterval": config.sync.interval_seconds,
+        },
+        "enrich": lambda: {
+            **_supervised(
+                "enrich",
+                binaries=binaries,
+                data_root=data_root,
+                guard_config=config_path,
+                command=[imsg, "enrich", "--config", cfg],
+                env_names=db_env,
+                env_files=env_files,
+            ),
+            "StartCalendarInterval": calendar_intervals_for_window(config.enrichment.window),
+        },
+        "mcp-public": lambda: {
+            **_supervised(
+                "mcp-public",
+                binaries=binaries,
+                data_root=data_root,
+                guard_config=public_path,
+                command=[imsg, "mcp", "public", "--config", str(public_path)],
+                env_names=env_secret_names(public_config, public=True),
+                env_files=env_files,
+                wait_for_postgres=True,
+            ),
+            "KeepAlive": True,
+            "RunAtLoad": True,
+            "ExitTimeOut": MCP_EXIT_TIMEOUT_SECONDS,
+            "ProcessType": "Interactive",
+        },
+        "tunnel": lambda: _tunnel_plist(binaries, data_root, config_path),
+        "report": lambda: {
+            **_supervised(
+                "report",
+                binaries=binaries,
+                data_root=data_root,
+                guard_config=config_path,
+                command=[imsg, "export", "unclassified-report", "--config", cfg],
+                env_names=db_env,
+                env_files=env_files,
+                wait_for_postgres=True,
+            ),
+            # launchd's Weekday is 0/7 = Sunday, so Monday is 1.
+            "StartCalendarInterval": {"Weekday": 1, "Hour": 8, "Minute": 0},
+        },
+        "backup": lambda: {
+            **_supervised(
+                "backup",
+                binaries=binaries,
+                data_root=data_root,
+                guard_config=config_path,
+                command=[
+                    imsg,
+                    "backup",
+                    "--config",
+                    cfg,
+                    "--pg-dump",
+                    str(postgres_binary.parent / "pg_dump"),
+                ],
+                env_names=db_env,
+                env_files=env_files,
+                wait_for_postgres=True,
+            ),
+            "StartCalendarInterval": {"Hour": 4, "Minute": 0},
+            "ProcessType": "Background",
+        },
     }
-    return {label: plistlib.dumps(plist, fmt=plistlib.FMT_XML) for label, plist in builders.items()}
+    return {
+        f"{LABEL_PREFIX}{name}": plistlib.dumps(builders[name](), fmt=plistlib.FMT_XML)
+        for name in selected
+    }
+
+
+def _pg_plist(binaries: AgentBinaries, data_root: Path, config_path: Path) -> dict[str, object]:
+    """`…pg` — the dedicated instance (SPEC §5.2) under launchd as its only
+    owner. `postgres` itself refuses to start while another postmaster
+    holds the data directory's `postmaster.pid`, so a start that overlaps
+    an old instance fails and retries; it never runs two."""
+    plist = _supervised(
+        "pg",
+        binaries=binaries,
+        data_root=data_root,
+        guard_config=config_path,
+        command=[
+            str(binaries.postgres),
+            "-D",
+            str(data_root / PG_DATA_SUBDIR),
+            "-p",
+            str(REQUIRED_DB_PORT),
+            "-c",
+            f"listen_addresses={POSTGRES_HOST}",
+            "-k",
+            str(data_root / "run"),
+        ],
+        stop_signal="INT",
+        environment={"LC_ALL": "C"},
+    )
+    plist.update(
+        {
+            "KeepAlive": True,
+            "RunAtLoad": True,
+            "ExitTimeOut": PG_EXIT_TIMEOUT_SECONDS,
+            "ProcessType": "Interactive",
+        }
+    )
+    return plist
+
+
+def _tunnel_plist(binaries: AgentBinaries, data_root: Path, config_path: Path) -> dict[str, object]:
+    """`…tunnel` — KeepAlive `cloudflared tunnel --config <rendered> run`.
+    The cloudflared config is a fixed path under `data_root/private`; the
+    tunnel hostname lives inside it, never here."""
+    if binaries.cloudflared is None:
+        raise ValueError("the tunnel agent needs the cloudflared binary")
+    plist = _supervised(
+        "tunnel",
+        binaries=binaries,
+        data_root=data_root,
+        guard_config=config_path,
+        command=[
+            str(binaries.cloudflared),
+            "tunnel",
+            "--config",
+            str(data_root / "private" / "cloudflared.yaml"),
+            "run",
+        ],
+    )
+    plist.update({"KeepAlive": True, "RunAtLoad": True})
+    return plist
 
 
 __all__ = [
+    "AGENT_NAMES",
+    "DEFAULT_ENV_DIR",
     "LABEL_PREFIX",
+    "LOGS_NOTE",
+    "AgentBinaries",
     "calendar_intervals_for_window",
+    "default_interpreter",
+    "default_supervisor",
+    "env_secret_names",
     "render_agent_plists",
 ]

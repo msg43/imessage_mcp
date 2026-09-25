@@ -27,7 +27,7 @@ from imsg.embed.pe_core_multimodal import resolve_weights_repo
 from imsg.embed.provider import FakeMultimodalEmbeddingProvider, FakeTextEmbeddingProvider
 from imsg.enrich.pipeline import EnrichmentProviders
 from imsg.enrich.provider import FakeCaptionProvider, FakeOcrProvider, FakeTranscriptionProvider
-from imsg.errors import ImsgError, ProviderUnavailableError
+from imsg.errors import ConfigError, ImsgError, ProviderUnavailableError
 from imsg.providers import factory
 from imsg.providers.factory import (
     REAL_PROVIDERS,
@@ -568,6 +568,19 @@ def test_config_defaults_mirror_the_manifest_lock(config_dict_factory: Any) -> N
         f"{resolve_weights_repo(multimodal.repo)!r} — pin the repo the bytes come from"
     )
 
+    # The query side's text tower is a local conversion cut from exactly
+    # the multimodal pin (imsg.embed.pe_core_text_tower): the config names
+    # its output_dir, and it has no revision of its own to drift.
+    text_tower = by_role["multimodal_text_embedding"]
+    assert text_tower.local_conversion
+    assert cfg.embedding.multimodal.text_tower_model == text_tower.output_dir
+    assert text_tower.output_dir == constants.MULTIMODAL_TEXT_TOWER_MODEL
+    assert (text_tower.upstream_repo, text_tower.upstream_revision) == (
+        multimodal.repo,
+        multimodal.revision,
+    )
+    assert text_tower.expected_dim == constants.MULTIMODAL_EMBEDDING_DIM
+
     assert by_role["ocr"].status == "system"
     assert set(REAL_PROVIDERS) == {
         "text_embedding",
@@ -855,3 +868,82 @@ def test_an_unshared_boundary_provider_gets_the_query_side_bound(
     build_boundary_provider(cfg, "PROMPT TEMPLATE")
     assert calls["boundary"][0][1]["shared_runtime"] is None
     assert calls["boundary"][0][1]["cache_limit_bytes"] == cfg.models.query_cache_limit_bytes
+
+
+# --------------------------------------------------------------------------
+# the PE-Core text-tower checkpoint: handed to the provider when present
+# --------------------------------------------------------------------------
+
+
+def _real_config(config_dict_factory: Any, **multimodal: Any) -> Config:
+    raw = config_dict_factory()
+    del raw["models"]  # real backend
+    raw["embedding"]["multimodal"].update(multimodal)
+    return load_config_dict(raw)
+
+
+def test_multimodal_provider_is_given_the_text_tower_checkpoint_when_it_exists(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _install_stub_modules(monkeypatch)
+    cfg = _real_config(config_dict_factory)
+    directory = cfg.paths.data_root / constants.MULTIMODAL_TEXT_TOWER_MODEL
+    directory.mkdir(parents=True)
+    build_multimodal_provider(cfg)
+    [(_, kwargs)] = calls["multimodal_embedding"]
+    assert kwargs == {"batch_size": cfg.embedding.multimodal.batch_size, "text_tower_dir": directory.resolve()}
+
+
+def test_missing_text_tower_checkpoint_warns_and_builds_the_whole_model_provider(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host that has not run the conversion keeps serving: same vectors,
+    slower load. The warning names the fix."""
+    from structlog.testing import capture_logs
+
+    calls = _install_stub_modules(monkeypatch)
+    cfg = _real_config(config_dict_factory)
+    with capture_logs() as logs:
+        build_multimodal_provider(cfg)
+    [(_, kwargs)] = calls["multimodal_embedding"]
+    assert "text_tower_dir" not in kwargs
+    [warning] = [e for e in logs if e["event"] == "pe_core.text_tower_checkpoint_missing"]
+    assert warning["log_level"] == "warning"
+    assert "convert_pe_core_text_tower.py" in warning["fix"]
+
+
+def test_null_text_tower_model_always_builds_the_whole_model_quietly(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from structlog.testing import capture_logs
+
+    calls = _install_stub_modules(monkeypatch)
+    cfg = _real_config(config_dict_factory, text_tower_model=None)
+    with capture_logs() as logs:
+        build_multimodal_provider(cfg)
+    [(_, kwargs)] = calls["multimodal_embedding"]
+    assert "text_tower_dir" not in kwargs
+    assert not [e for e in logs if e["event"] == "pe_core.text_tower_checkpoint_missing"]
+
+
+def test_text_tower_directory_symlinked_outside_data_root_is_refused(
+    config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_stub_modules(monkeypatch)
+    cfg = _real_config(config_dict_factory, text_tower_model="models/escape")
+    outside = tmp_path / "outside-data-root"
+    outside.mkdir()
+    (cfg.paths.data_root / "models").mkdir(parents=True, exist_ok=True)
+    (cfg.paths.data_root / "models" / "escape").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ProviderUnavailableError, match=r"outside paths\.data_root"):
+        build_multimodal_provider(cfg)
+
+
+@pytest.mark.parametrize("value", ["/abs/text-tower", "~/text-tower", "models/../../escape", "  "])
+def test_text_tower_model_must_be_a_data_root_relative_directory(
+    config_dict_factory: Any, value: str
+) -> None:
+    raw = config_dict_factory()
+    raw["embedding"]["multimodal"]["text_tower_model"] = value
+    with pytest.raises(ConfigError, match="text_tower_model"):
+        load_config_dict(raw)

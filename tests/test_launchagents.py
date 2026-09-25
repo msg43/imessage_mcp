@@ -13,6 +13,7 @@ import pytest
 
 from conftest import ConfigDictFactory
 from imsg.agents.plists import (
+    AGENT_NAMES,
     LABEL_PREFIX,
     calendar_intervals_for_window,
     render_agent_plists,
@@ -78,27 +79,51 @@ def config(config_dict_factory: ConfigDictFactory) -> Config:
     return load_config_dict(config_dict_factory(**{"paths.data_root": _FIXED_DATA_ROOT}))
 
 
+INTERPRETER = Path("/opt/example/python3.12")
+SUPERVISOR = Path("/opt/example/imsg/agents/supervise.py")
+IMSG = Path("/usr/local/bin/imsg")
+POSTGRES = Path("/opt/homebrew/opt/postgresql@17/bin/postgres")
+CONFIG_PATH = Path("/Volumes/IMSG-Data/imsgindex/private/config.yaml")
+
+
+def _render(config: Config, **kwargs: object) -> dict[str, bytes]:
+    options: dict[str, object] = {
+        "imsg_binary": IMSG,
+        "postgres_binary": POSTGRES,
+        "cloudflared_binary": Path("/opt/homebrew/bin/cloudflared"),
+        "config_path": CONFIG_PATH,
+        "interpreter": INTERPRETER,
+        "supervisor": SUPERVISOR,
+    }
+    options.update(kwargs)
+    return render_agent_plists(config, **options)  # type: ignore[arg-type]
+
+
 @pytest.fixture
 def rendered(config: Config) -> dict[str, bytes]:
-    return render_agent_plists(
-        config,
-        imsg_binary=Path("/usr/local/bin/imsg"),
-        postgres_binary=Path("/opt/homebrew/bin/postgres"),
-        cloudflared_binary=Path("/opt/homebrew/bin/cloudflared"),
-        config_path=Path("/Volumes/IMSG-Data/imsgindex/private/config.yaml"),
-    )
+    return _render(config)
+
+
+def _parsed(rendered: dict[str, bytes], name: str) -> dict[str, object]:
+    parsed: dict[str, object] = plistlib.loads(rendered[f"{LABEL_PREFIX}{name}"])
+    return parsed
+
+
+def _split(parsed: dict[str, object]) -> tuple[list[str], list[str]]:
+    """`(supervisor arguments, service command)` — either side of `--`."""
+    arguments = parsed["ProgramArguments"]
+    assert isinstance(arguments, list)
+    cut = arguments.index("--")
+    return arguments[:cut], arguments[cut + 1 :]
+
+
+def _option_values(arguments: list[str], flag: str) -> list[str]:
+    return [arguments[i + 1] for i, arg in enumerate(arguments) if arg == flag]
 
 
 def test_renders_exactly_seven_labeled_agents(rendered: dict[str, bytes]) -> None:
-    assert set(rendered.keys()) == {
-        f"{LABEL_PREFIX}pg",
-        f"{LABEL_PREFIX}sync",
-        f"{LABEL_PREFIX}enrich",
-        f"{LABEL_PREFIX}mcp-public",
-        f"{LABEL_PREFIX}tunnel",
-        f"{LABEL_PREFIX}report",
-        f"{LABEL_PREFIX}backup",
-    }
+    assert set(rendered.keys()) == {f"{LABEL_PREFIX}{name}" for name in AGENT_NAMES}
+    assert len(rendered) == 7
 
 
 def test_every_plist_round_trips_and_has_a_label_and_program_arguments(
@@ -112,82 +137,166 @@ def test_every_plist_round_trips_and_has_a_label_and_program_arguments(
         assert all(isinstance(arg, str) for arg in parsed["ProgramArguments"])
 
 
+def test_every_agent_runs_the_supervisor_with_the_mount_gate(
+    rendered: dict[str, bytes], config: Config
+) -> None:
+    """One program for every agent: the interpreter that holds the Full
+    Disk Access grant, running the supervisor, which gates on the mount
+    (`--data-root`, `--imsg ... guard-mount --config`) before the service."""
+    for label, content in rendered.items():
+        parsed = plistlib.loads(content)
+        supervisor, command = _split(parsed)
+        assert supervisor[:2] == [str(INTERPRETER), str(SUPERVISOR)], label
+        assert _option_values(supervisor, "--service") == [label.removeprefix(LABEL_PREFIX)]
+        assert _option_values(supervisor, "--data-root") == [str(config.paths.data_root)]
+        assert _option_values(supervisor, "--imsg") == [str(IMSG)]
+        assert _option_values(supervisor, "--config") == [str(CONFIG_PATH)]
+        assert command, label
+        assert parsed["ThrottleInterval"] == 60, "SPEC §5.4: retry every 60 s until the mount appears"
+
+
+def test_launchd_output_goes_nowhere_and_the_supervisor_logs_on_the_volume(
+    rendered: dict[str, bytes],
+) -> None:
+    """launchd opens StandardOutPath before anything runs — before the
+    volume is mounted — so the supervisor opens the logs itself, on the
+    volume, after the gate."""
+    for content in rendered.values():
+        parsed = plistlib.loads(content)
+        assert parsed["StandardOutPath"] == "/dev/null"
+        assert parsed["StandardErrorPath"] == "/dev/null"
+
+
 def test_pg_agent_is_keepalive_and_uses_dedicated_port_and_pg17_dir(
     rendered: dict[str, bytes], config: Config
 ) -> None:
-    parsed = plistlib.loads(rendered[f"{LABEL_PREFIX}pg"])
-    assert parsed["KeepAlive"] is True
-    joined = " ".join(parsed["ProgramArguments"])
-    assert "guard-mount" in joined  # raw binary -> explicit guard-mount wrapper
-    assert "/opt/homebrew/bin/postgres" in joined
+    parsed = _parsed(rendered, "pg")
+    assert parsed["KeepAlive"] is True and parsed["RunAtLoad"] is True
+    supervisor, command = _split(parsed)
+    assert command[0] == str(POSTGRES)
+    joined = " ".join(command)
     assert "-p 5433" in joined
-    assert str(config.paths.data_root / PG_DATA_SUBDIR) in joined
-    assert str(config.paths.data_root / "run") in joined
+    assert f"-D {config.paths.data_root / PG_DATA_SUBDIR}" in joined
+    assert f"-k {config.paths.data_root / 'run'}" in joined
+    assert "listen_addresses=127.0.0.1" in joined
+    # launchd's TERM would be a smart shutdown that waits on every client.
+    assert _option_values(supervisor, "--stop-signal") == ["INT"]
+    assert _option_values(supervisor, "--env") == [], "Postgres gets no secrets"
+    environment = parsed["EnvironmentVariables"]
+    assert isinstance(environment, dict)
+    assert environment["LC_ALL"] == "C"
+    assert str(POSTGRES.parent) in environment["PATH"].split(":")
+    assert parsed["ExitTimeOut"] >= 60  # type: ignore[operator]
+    assert parsed["ProcessType"] == "Interactive"
 
 
-def test_sync_agent_uses_configured_interval_and_no_guard_mount_wrapper(
-    rendered: dict[str, bytes], config: Config
-) -> None:
-    parsed = plistlib.loads(rendered[f"{LABEL_PREFIX}sync"])
+def test_sync_agent_uses_configured_interval(rendered: dict[str, bytes], config: Config) -> None:
+    parsed = _parsed(rendered, "sync")
     assert parsed["StartInterval"] == config.sync.interval_seconds
-    assert parsed["ProgramArguments"][0] == "/usr/local/bin/imsg"
-    assert parsed["ProgramArguments"][1] == "sync"
-    # imsg sync gates itself internally -> no extra guard-mount shell wrapper.
-    assert "/bin/sh" not in parsed["ProgramArguments"]
+    supervisor, command = _split(parsed)
+    assert command == [str(IMSG), "sync", "--config", str(CONFIG_PATH)]
+    assert _option_values(supervisor, "--env") == [
+        "IMSG_TEST_PG_PASSWORD=private/env/IMSG_TEST_PG_PASSWORD"
+    ]
 
 
 def test_enrich_agent_uses_configured_window(rendered: dict[str, bytes], config: Config) -> None:
-    parsed = plistlib.loads(rendered[f"{LABEL_PREFIX}enrich"])
+    parsed = _parsed(rendered, "enrich")
     assert parsed["StartCalendarInterval"] == calendar_intervals_for_window(config.enrichment.window)
-    assert "enrich" in parsed["ProgramArguments"]
+    _, command = _split(parsed)
+    assert command[1] == "enrich"
 
 
-def test_mcp_public_agent_references_command_not_yet_built(rendered: dict[str, bytes]) -> None:
-    parsed = plistlib.loads(rendered[f"{LABEL_PREFIX}mcp-public"])
-    assert parsed["KeepAlive"] is True
-    assert parsed["ProgramArguments"][1:3] == ["mcp", "public"]
+def test_mcp_public_agent_is_keepalive_and_waits_for_postgres(rendered: dict[str, bytes]) -> None:
+    parsed = _parsed(rendered, "mcp-public")
+    assert parsed["KeepAlive"] is True and parsed["RunAtLoad"] is True
+    assert parsed["ProcessType"] == "Interactive"
+    supervisor, command = _split(parsed)
+    assert command == [str(IMSG), "mcp", "public", "--config", str(CONFIG_PATH)]
+    assert _option_values(supervisor, "--wait-for-postgres") == ["127.0.0.1:5433"]
+    assert _option_values(supervisor, "--pg-isready") == [str(POSTGRES.parent / "pg_isready")]
 
 
-def test_tunnel_agent_is_keepalive_gated_and_uses_bootstrap_config_path(
+def test_mcp_public_agent_names_its_secrets_and_never_holds_their_values(
+    config_dict_factory: ConfigDictFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The public server's `env:` references become `--env NAME=FILE`
+    pairs; the values — present in this process's environment here, as
+    they would be on an operator's shell — never reach a plist."""
+    monkeypatch.setenv("IMSG_OWNER_SUB", "sentinel-subject-value")
+    monkeypatch.setenv("IMSG_OAUTH_CLIENT_ID", "sentinel-client-value")
+    monkeypatch.setenv("IMSG_TEST_PG_PASSWORD", "sentinel-password-value")
+    base = load_config_dict(config_dict_factory(**{"paths.data_root": _FIXED_DATA_ROOT}))
+    public = load_config_dict(
+        config_dict_factory(
+            **{
+                "paths.data_root": _FIXED_DATA_ROOT,
+                "mcp.public.oauth": {
+                    "client_id": "env:IMSG_OAUTH_CLIENT_ID",
+                    "owner_subject": "env:IMSG_OWNER_SUB",
+                },
+            }
+        )
+    )
+    public_path = Path(_FIXED_DATA_ROOT) / "private" / "config.public.yaml"
+    rendered = _render(
+        base,
+        mcp_public_config=public,
+        mcp_public_config_path=public_path,
+        env_files={"IMSG_OWNER_SUB": "private/owner-sub"},
+    )
+    supervisor, command = _split(_parsed(rendered, "mcp-public"))
+    assert command[-1] == str(public_path)
+    assert _option_values(supervisor, "--config") == [str(public_path)]
+    assert _option_values(supervisor, "--env") == [
+        "IMSG_TEST_PG_PASSWORD=private/env/IMSG_TEST_PG_PASSWORD",
+        "IMSG_OAUTH_CLIENT_ID=private/env/IMSG_OAUTH_CLIENT_ID",
+        "IMSG_OWNER_SUB=private/owner-sub",
+    ]
+    for content in rendered.values():
+        assert b"sentinel-" not in content
+
+
+def test_tunnel_agent_is_keepalive_and_uses_bootstrap_config_path(
     rendered: dict[str, bytes], config: Config
 ) -> None:
-    parsed = plistlib.loads(rendered[f"{LABEL_PREFIX}tunnel"])
+    parsed = _parsed(rendered, "tunnel")
     assert parsed["KeepAlive"] is True
-    joined = " ".join(parsed["ProgramArguments"])
-    assert "guard-mount" in joined
-    assert "/opt/homebrew/bin/cloudflared" in joined
-    assert str(config.paths.data_root / "private" / "cloudflared.yaml") in joined
+    _, command = _split(parsed)
+    assert command[0] == "/opt/homebrew/bin/cloudflared"
+    assert str(config.paths.data_root / "private" / "cloudflared.yaml") in command
 
 
 def test_report_agent_fires_monday_eight_am(rendered: dict[str, bytes]) -> None:
-    parsed = plistlib.loads(rendered[f"{LABEL_PREFIX}report"])
+    parsed = _parsed(rendered, "report")
     assert parsed["StartCalendarInterval"] == {"Weekday": 1, "Hour": 8, "Minute": 0}
-    assert parsed["ProgramArguments"][1:3] == ["export", "unclassified-report"]
+    _, command = _split(parsed)
+    assert command[1:3] == ["export", "unclassified-report"]
 
 
-def test_backup_agent_fires_daily_four_am(rendered: dict[str, bytes]) -> None:
-    parsed = plistlib.loads(rendered[f"{LABEL_PREFIX}backup"])
+def test_backup_agent_fires_daily_four_am_with_the_matching_pg_dump(rendered: dict[str, bytes]) -> None:
+    parsed = _parsed(rendered, "backup")
     assert parsed["StartCalendarInterval"] == {"Hour": 4, "Minute": 0}
-    assert parsed["ProgramArguments"][1] == "backup"
+    assert parsed["ProcessType"] == "Background"
+    assert "KeepAlive" not in parsed
+    supervisor, command = _split(parsed)
+    assert command[1] == "backup"
+    assert command[-2:] == ["--pg-dump", str(POSTGRES.parent / "pg_dump")]
+    assert _option_values(supervisor, "--wait-for-postgres") == ["127.0.0.1:5433"]
 
 
-def test_all_agents_log_under_data_root_logs(rendered: dict[str, bytes], config: Config) -> None:
-    logs_dir = config.paths.data_root / "logs"
-    for content in rendered.values():
-        parsed = plistlib.loads(content)
-        assert str(parsed["StandardOutPath"]).startswith(str(logs_dir))
-        assert str(parsed["StandardErrorPath"]).startswith(str(logs_dir))
+def test_only_renders_the_requested_agents_and_the_tunnel_needs_cloudflared(config: Config) -> None:
+    subset = _render(config, cloudflared_binary=None, only=["pg", "mcp-public", "backup"])
+    assert set(subset) == {f"{LABEL_PREFIX}{n}" for n in ("pg", "mcp-public", "backup")}
+    with pytest.raises(ValueError, match="cloudflared"):
+        _render(config, cloudflared_binary=None, only=["tunnel"])
+    with pytest.raises(ValueError, match="unknown agent"):
+        _render(config, only=["pg", "nonsense"])
 
 
 def _render_with_data_root(config_dict_factory: ConfigDictFactory, data_root: str) -> dict[str, bytes]:
     config = load_config_dict(config_dict_factory(**{"paths.data_root": data_root}))
-    return render_agent_plists(
-        config,
-        imsg_binary=Path("/usr/local/bin/imsg"),
-        postgres_binary=Path("/opt/homebrew/bin/postgres"),
-        cloudflared_binary=Path("/opt/homebrew/bin/cloudflared"),
-        config_path=Path(f"{data_root}/private/config.yaml"),
-    )
+    return _render(config, config_path=Path(f"{data_root}/private/config.yaml"))
 
 
 def test_plists_are_config_driven_not_hardcoded(

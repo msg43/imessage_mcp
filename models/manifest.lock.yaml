@@ -348,3 +348,53 @@ models:
       Resolved via GET https://huggingface.co/api/models/timm/PE-Core-bigG-14-448 on
       2026-09-14: sha 17aa0c25addfa14198fa2ff73d845a22d433432e, license apache-2.0,
       open_clip_config.json declares embed_dim 1280. Runs on torch/MPS (fp32 weights).
+  pe-core-g14-448-text-tower:
+    role: [multimodal_text_embedding]
+    status: resolved
+    source: local_conversion
+    upstream_repo: timm/PE-Core-bigG-14-448
+    upstream_revision: 17aa0c25addfa14198fa2ff73d845a22d433432e
+    upstream_license: apache-2.0
+    tool: open_clip_torch==3.3.0
+    command: >-
+      python scripts/convert_pe_core_text_tower.py --upstream-repo timm/PE-Core-bigG-14-448
+      --revision 17aa0c25addfa14198fa2ff73d845a22d433432e
+      --out $DATA_ROOT/models/pe-core-bigG-14-448-text-17aa0c25
+    output_dir: models/pe-core-bigG-14-448-text-17aa0c25
+    expected_dim: 1280
+    quantization: none
+    artifact_sha256: '38736cc65671e2bae30d06c25428bad641de717be4a4e8dac4795a5fc332c3da'
+    min_runtime: {torch: '2.14.0', open_clip_torch: '3.0.0', huggingface_hub: '1.31.0'}
+    smoke_test:
+      status: passed
+      date: '2026-09-24'
+      host_class: Apple M2 Ultra, 128 GB unified memory
+      load_seconds: 2.9
+      inference_seconds: 0.09
+      peak_memory_gb: 0.57
+      peak_memory_source: resource.getrusage(RUSAGE_SELF).ru_maxrss
+      result: dim=1280, unit-norm, loaded from the text-tower checkpoint; cos(text, paraphrase)=0.9555 > cos(text,
+        unrelated)=0.5432
+    notes: >-
+      The query side's PE-Core load (2026-09-24): the 293 text.* tensors of the
+      pe-core-g14-448 entry's open_clip_model.safetensors (537,233,920 fp32
+      parameters; upstream file sha256
+      d46f61f93c4c8533d2550ed929effe9ec5b096ec48f78f42a17a050f43093a6a, the Hub's LFS
+      oid), copied byte for byte with the text. prefix removed, plus open_clip's
+      non-persistent causal attn_mask, a byte-for-byte copy of open_clip_config.json
+      and imsg_text_tower.json (provenance: upstream repo, revision, file sha256,
+      tensor and parameter counts, the non-persistent buffer names). The MCP servers
+      build the text tower alone on torch's meta device and assign every tensor from
+      this directory (imsg.embed.pe_core_text_tower), instead of letting open_clip
+      randomly initialise both towers on the CPU, read 9.01 GiB and drop the vision
+      tower. scripts/verify_pe_core_text_tower.py on an M2 Ultra (2026-09-24): 11 of 11
+      fixed query texts give bit-identical vectors on mps and on cpu, all 294 tensors
+      equal; load 3.64-3.81 s against 25.44-25.90 s (mps, three runs each, warm page
+      cache, imports included), peak footprint 3.40 GiB against 12.68 GiB. The
+      conversion reads only the text tensors, needs no GPU (peak footprint 2.4 GiB,
+      13.4 s) and is byte-reproducible: two runs gave this artifact_sha256. The
+      provider refuses a directory whose provenance names another repo or revision
+      than the multimodal pin, since its vectors would not share a space with the
+      stored image vectors; a missing directory falls back to the whole model with a
+      warning. Not active for image embedding: the S6 image path still loads
+      pe-core-g14-448 whole and drops the text tower.

@@ -98,6 +98,18 @@ asked the mirror for the canonical repo's sha, which the mirror cannot
 resolve (found 2026-09-14 by resolving both ids against the Hugging
 Face API; the canonical repo holds only Meta's own ``.pt`` layout)."""
 
+MULTIMODAL_TEXT_TOWER_MODEL = "models/pe-core-bigG-14-448-text-17aa0c25"
+"""The query side's PE-Core text tower, pinned as a LOCAL CONVERSION
+(``models/manifest.lock.yaml`` entry ``pe-core-g14-448-text-tower``, role
+``multimodal_text_embedding``): its ``output_dir``, relative to
+``paths.data_root``, which ``scripts/convert_pe_core_text_tower.py``
+cuts from ``MULTIMODAL_EMBEDDING_MODEL_REPO`` at
+``MULTIMODAL_EMBEDDING_MODEL_REVISION``. A checkpoint holding only the
+text tower, so the MCP servers load 2.0 GiB instead of building and
+reading the whole 9.01 GiB model (``imsg.embed.pe_core_text_tower``).
+It has no revision of its own: the provider checks that the directory
+was cut from exactly the multimodal pin before using it."""
+
 ENRICHMENT_YIELD_POLL_INTERVAL_SECONDS = 0.25
 """How often an enrichment worker paused behind an in-flight query
 re-checks (`imsg.db.enrichment_yield_locks`). Reached only while a query
@@ -127,6 +139,7 @@ __all__ = [
     "MULTIMODAL_EMBEDDING_DIM",
     "MULTIMODAL_EMBEDDING_MODEL_REPO",
     "MULTIMODAL_EMBEDDING_MODEL_REVISION",
+    "MULTIMODAL_TEXT_TOWER_MODEL",
     "PRIMARY_EMBEDDING_DIM",
     "RERANKER_MODEL",
     "RERANKER_MODEL_REVISION",

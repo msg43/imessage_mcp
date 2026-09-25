@@ -104,6 +104,24 @@ Deciding on first use (not at construction) is what keeps a process that
 does both working: asking for a tower that was dropped rebuilds the model
 and keeps both, logging that it did. Nothing about precision changes here
 — fp16 is a separate question with its own accuracy evidence to gather.
+
+Query side: the text tower from its own checkpoint
+--------------------------------------------------
+
+Dropping the vision tower after the load still pays for building it:
+open_clip allocates and randomly initialises both towers on the CPU
+before the checkpoint overwrites them, which was 20.3 s of a 22.9 s load
+on the development host and 102.8 s end to end on the production host.
+When `text_tower_dir` names a text-tower checkpoint
+(`imsg.embed.pe_core_text_tower`, a `local_conversion` in
+`models/manifest.lock.yaml`) and the first call is `embed_text`, the
+provider builds only the text tower, on torch's `meta` device, and
+assigns every tensor from that 2.0 GiB file: no vision tower, no random
+initialisation, no read of the 9 GiB checkpoint.
+`scripts/verify_pe_core_text_tower.py` proves the query vectors are
+bit-identical to the full-model path's. The `model_id` is the same on
+both paths, because the vectors are. An image call after a text-only
+load rebuilds the full model with both towers, exactly as before.
 """
 
 from __future__ import annotations
@@ -120,6 +138,7 @@ from typing import Any, Literal
 
 import structlog
 
+from imsg.embed.pe_core_text_tower import load_text_tower
 from imsg.errors import EmbeddingError, ImageEmbeddingError, UnreadableImageError
 
 logger = structlog.get_logger(__name__)
@@ -267,6 +286,9 @@ class _Runtime:
     towers: frozenset[Tower]
     """Which towers are resident. A call needing one that is not forces a
     rebuild that keeps both (`PeCoreMultimodalEmbeddingProvider._load`)."""
+    source: str = "full_model"
+    """`full_model` (open_clip built the whole checkpoint) or
+    `text_tower_checkpoint` (`_bring_up_text_tower`)."""
 
 
 class PeCoreMultimodalEmbeddingProvider:
@@ -287,7 +309,10 @@ class PeCoreMultimodalEmbeddingProvider:
     run on CPU (correct, much slower). `batch_size` caps how many
     images share one forward pass. `cache_dir` is where
     `huggingface_hub` keeps the snapshot (its default cache when
-    `None`).
+    `None`). `text_tower_dir` is a text-tower checkpoint cut from the
+    same `weights_repo@revision` (module docstring); when set, a process
+    whose first call is `embed_text` loads only that. It is checked
+    against this provider's pin at load time and refused on a mismatch.
 
     Nothing is loaded until the first `embed_images`/`embed_text`
     call; `_load()` runs once per instance (thread-safe).
@@ -303,6 +328,7 @@ class PeCoreMultimodalEmbeddingProvider:
         batch_size: int = 16,
         allow_cpu_fallback: bool = False,
         cache_dir: Path | None = None,
+        text_tower_dir: Path | None = None,
     ) -> None:
         if dim <= 0:
             raise EmbeddingError(f"dim must be a positive integer, got {dim}")
@@ -317,6 +343,7 @@ class PeCoreMultimodalEmbeddingProvider:
         self._batch_size = batch_size
         self._allow_cpu_fallback = allow_cpu_fallback
         self._cache_dir = cache_dir
+        self.text_tower_dir = text_tower_dir
         self._runtime: _Runtime | None = None
         self._load_lock = threading.Lock()
 
@@ -330,7 +357,8 @@ class PeCoreMultimodalEmbeddingProvider:
         The first call decides which tower a process needs and drops the
         other; a later call for the tower that was dropped rebuilds with
         both, so a process that embeds text *and* images still works — it
-        just pays the full 9 GiB it actually uses.
+        just pays the full 9 GiB it actually uses. A first text call with
+        `text_tower_dir` set loads that checkpoint alone instead.
         """
         runtime = self._runtime
         if runtime is not None and tower in runtime.towers:
@@ -340,7 +368,10 @@ class PeCoreMultimodalEmbeddingProvider:
             if current is not None and tower in current.towers:
                 return current
             if current is None:
-                self._runtime = self._bring_up(frozenset({tower}))
+                if tower == "text" and self.text_tower_dir is not None:
+                    self._runtime = self._bring_up_text_tower(self.text_tower_dir)
+                else:
+                    self._runtime = self._bring_up(frozenset({tower}))
             else:
                 logger.info(
                     "pe_core.reloading_with_both_towers",
@@ -365,6 +396,14 @@ class PeCoreMultimodalEmbeddingProvider:
     @property
     def is_loaded(self) -> bool:
         return self._runtime is not None
+
+    @property
+    def loaded_source(self) -> str | None:
+        """Where the resident runtime came from — `full_model` or
+        `text_tower_checkpoint` — or `None` before the first load. Lets a
+        smoke check or a status line prove which load path ran."""
+        runtime = self._runtime
+        return runtime.source if runtime is not None else None
 
     def unload(self) -> None:
         """Drop the resident towers (idempotent); the next embed call
@@ -438,6 +477,54 @@ class PeCoreMultimodalEmbeddingProvider:
             device=device,
             dim=self.dim,
             towers=sorted(towers),
+        )
+        return runtime
+
+    def _bring_up_text_tower(self, text_dir: Path) -> _Runtime:
+        """The query side's runtime from a text-tower checkpoint
+        (`imsg.embed.pe_core_text_tower.load_text_tower`): the text tower
+        alone, every tensor read from `text_dir`, nothing randomly
+        initialised, the vision tower never built. No network: the
+        checkpoint is a local directory."""
+        torch = _import_runtime("torch")
+        open_clip = _import_runtime("open_clip")
+        open_clip_model = _import_runtime("open_clip.model")
+        safetensors_torch = _import_runtime("safetensors.torch")
+        pil_image = _import_runtime("PIL.Image")
+        pil_image_ops = _import_runtime("PIL.ImageOps")
+        device = self._resolve_device(torch)
+        model, tokenizer = load_text_tower(
+            text_dir,
+            device=device,
+            weights_repo=self.weights_repo,
+            revision=self.revision,
+            dim=self.dim,
+            torch=torch,
+            open_clip=open_clip,
+            open_clip_model=open_clip_model,
+            safetensors_torch=safetensors_torch,
+        )
+        runtime = _Runtime(
+            torch=torch,
+            model=model,
+            preprocess=None,
+            tokenizer=tokenizer,
+            pil_image=pil_image,
+            pil_image_ops=pil_image_ops,
+            device=device,
+            towers=frozenset({"text"}),
+            source="text_tower_checkpoint",
+        )
+        self._embed_text_with(runtime, WIDTH_CHECK_TEXT)
+        logger.info(
+            "pe_core.loaded",
+            model_id=self.model_id,
+            weights_repo=self.weights_repo,
+            device=device,
+            dim=self.dim,
+            towers=["text"],
+            source="text_tower_checkpoint",
+            text_tower_dir=str(text_dir),
         )
         return runtime
 

@@ -11,6 +11,17 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-09-24 operations fixes (built, not yet deployed):** the public
+server's PE-Core query load reads a 2.0 GiB text-tower checkpoint
+instead of building the whole model (3.6-3.8 s against 25.4-25.9 s on
+the development host, bit-identical vectors); every LaunchAgent runs a
+mount-gated supervisor that reads secrets from 0600 files, so Postgres,
+the public server and the nightly backup can run under launchd with
+`KeepAlive`; the database role works without superuser (prewarm fixed
+for TOAST relations); logs rotate at 50 MB from the nightly backup;
+`imsg status` reports every SPEC §14 field. Deployment is the owner
+to-do below. See `CHANGELOG.md`.
+
 **2026-09-24 public readiness + host memory fixes:** git history
 rewritten to remove real contact data used as fixtures; install guide,
 examples, setup doctor, Postgres bootstrap, CI with a public-safety
@@ -110,6 +121,21 @@ numbers. That dependency is the whole reason the eval harness exists.
 Deployment is a human-gated sequence; the step-by-step guide lives in
 the private design-record repo, not here (it names real hosts and
 accounts).
+
+- **Deploy the 2026-09-24 operations fixes on the index host** (CHANGELOG
+  2026-09-24), in this order: produce the text-tower directory
+  (`scripts/convert_pe_core_text_tower.py`, the lock's recorded command,
+  or copy it and check `imsg models verify --data-root`); render
+  `imsg install-agents --only pg --only mcp-public --only backup` to a
+  scratch directory and review it; hand Postgres over to launchd (stop
+  the old postmaster with `pg_ctl stop -m fast` and confirm it is gone
+  before loading `com.imsgindex.pg`; Postgres's own `postmaster.pid`
+  interlock refuses a second one regardless); load `mcp-public` and
+  `backup`; make the login script ask launchd instead of starting
+  services itself; then `ALTER ROLE <role> NOSUPERUSER` with
+  `GRANT pg_read_all_settings`, and `VACUUM (ANALYZE)` once after heavy
+  work resumes. Optional but recommended: password (SCRAM) auth for TCP
+  and `peer` for the owner-only socket.
 
 - **Run the real model providers end to end** before trusting Phase 3.
   Done as of 2026-09-14 for the single-input smoke level

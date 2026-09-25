@@ -80,7 +80,7 @@ the catalog, `hnsw_index_bytes` / `_hnsw_indexes_sql`)."""
 MIB = float(2**20)
 
 _HNSW_INDEXES_SQL = """
-SELECT c.oid::regclass::text, pg_relation_size(c.oid)
+SELECT c.oid::regclass::text, pg_relation_size(c.oid), c.oid
 FROM pg_class c
 JOIN pg_am am ON am.oid = c.relam
 JOIN pg_index i ON i.indexrelid = c.oid
@@ -95,7 +95,10 @@ SELECT c.relname,
        t.oid::regclass::text,
        pg_relation_size(t.oid),
        ti.indexrelid::regclass::text,
-       pg_relation_size(ti.indexrelid)
+       pg_relation_size(ti.indexrelid),
+       c.oid,
+       t.oid,
+       ti.indexrelid
 FROM pg_class c
 LEFT JOIN pg_class t ON t.oid = c.reltoastrelid
 LEFT JOIN pg_index ti ON ti.indrelid = t.oid
@@ -129,11 +132,23 @@ PREWARM_UNAVAILABLE = (
 
 @dataclass(frozen=True, slots=True)
 class PrewarmRelation:
-    """One relation to pull into the pool: `name` as `pg_prewarm` takes it
-    (schema-qualified for TOAST), `size_bytes` from the catalog."""
+    """One relation to pull into the pool: `name` for reports
+    (schema-qualified for TOAST), `size_bytes` from the catalog, and
+    `oid`, which is what `pg_prewarm` is given.
+
+    By OID, not by name: turning the name `pg_toast.pg_toast_1234` back
+    into a relation checks USAGE on the `pg_toast` schema, which only a
+    superuser has. Run by the database's owner without superuser (the
+    least-privilege role, QA review 2026-09-24), a name-based prewarm
+    skipped every TOAST relation and its index with "permission denied
+    for schema pg_toast" (measured on a scratch cluster, 6 of 27
+    relations). Casting an OID to `regclass` looks nothing up;
+    `pg_prewarm` then checks only SELECT on the relation, which the
+    owner of the table holds on its TOAST relation too."""
 
     name: str
     size_bytes: int
+    oid: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,7 +179,9 @@ def hnsw_indexes(conn: psycopg.Connection) -> list[PrewarmRelation]:
     catalog so an index a later migration adds is covered."""
     with conn.cursor() as cur:
         cur.execute(_HNSW_INDEXES_SQL)
-        return [PrewarmRelation(str(name), int(size)) for name, size in cur.fetchall()]
+        return [
+            PrewarmRelation(str(name), int(size), int(oid)) for name, size, oid in cur.fetchall()
+        ]
 
 
 def hnsw_index_bytes(conn: psycopg.Connection) -> int:
@@ -194,11 +211,15 @@ def query_path_relations(conn: psycopg.Connection) -> list[PrewarmRelation]:
             row = by_name.get(name)
             if row is None:
                 continue
-            for relation, size in ((row[1], row[2]), (row[3], row[4]), (row[5], row[6])):
+            for relation, size, oid in (
+                (row[1], row[2], row[7]),
+                (row[3], row[4], row[8]),
+                (row[5], row[6], row[9]),
+            ):
                 if relation is None or str(relation) in seen:
                     continue
                 seen.add(str(relation))
-                relations.append(PrewarmRelation(str(relation), int(size or 0)))
+                relations.append(PrewarmRelation(str(relation), int(size or 0), int(oid)))
         cur.execute(_NAMED_RELATIONS_SQL, {"names": list(QUERY_PATH_INDEXES)})
         index_rows = {str(row[0]): row for row in cur.fetchall()}
     for name in QUERY_PATH_INDEXES:
@@ -206,7 +227,7 @@ def query_path_relations(conn: psycopg.Connection) -> list[PrewarmRelation]:
         if row is None or str(row[1]) in seen:
             continue
         seen.add(str(row[1]))
-        relations.append(PrewarmRelation(str(row[1]), int(row[2] or 0)))
+        relations.append(PrewarmRelation(str(row[1]), int(row[2] or 0), int(row[7])))
     return relations
 
 
@@ -237,7 +258,7 @@ def prewarm_query_path(
             continue  # an empty table has nothing to read
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT pg_prewarm(%(name)s::regclass)", {"name": relation.name})
+                cur.execute("SELECT pg_prewarm(%(oid)s::oid::regclass)", {"oid": relation.oid})
                 result = cur.fetchone()
             blocks += int(result[0]) if result and result[0] is not None else 0
             done += 1

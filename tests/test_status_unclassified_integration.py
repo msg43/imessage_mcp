@@ -153,9 +153,13 @@ def test_status_no_longer_claims_the_field_is_unwired(
     db: psycopg.Connection, status_cli: Callable[..., Path]
 ) -> None:
     """The old note said every listed field reports None until wired. A
-    stale note on a live field is how an operator learns to ignore the note."""
+    stale note on a live field is how an operator learns to ignore the note.
+    Since 2026-09-24 every SPEC §14 field is wired, so there is no note at
+    all; a None carries its own reason instead."""
     report = _status(status_cli())
-    assert "unclassified_thread_count IS live" in report["pipeline_note"]
+    assert "pipeline_note" not in report
+    assert "unclassified_thread_count" in report
+    assert "pipeline_reasons" in report
 
 
 # ---------------------------------------------------------------------------

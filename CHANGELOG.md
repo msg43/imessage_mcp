@@ -10,6 +10,66 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-24 — Operations fixes from the QA review: fast reload, supervision, least privilege, log rotation, full status
+
+**Why.** The 2026-09-24 QA review found that a cold or emergency reload
+of the public server took 124 s (103 s of it the PE-Core text tower),
+that the public server, Postgres and the backups had no supervisor, that
+the database role every process uses was a superuser on a
+trust-authenticated instance, that nothing rotated the logs, and that
+`imsg status` printed `None` for most of the fields it exists to show.
+
+- **PE-Core text tower as its own checkpoint** (`imsg.embed.pe_core_text_tower`,
+  lock entry `pe-core-g14-448-text-tower`, role `multimodal_text_embedding`).
+  Timed on an M2 Ultra: the old query-side load spent 13.3 s randomly
+  initialising the vision tower and 7.0 s the text tower before the
+  checkpoint overwrote both (22.9 s warm). The new artifact holds the 293
+  `text.*` tensors (2.0 GiB) byte for byte plus open_clip's causal mask;
+  the loader builds the text tower on torch's `meta` device and assigns
+  every tensor from the file, so nothing is initialised and the 9 GiB
+  checkpoint is not read. `scripts/verify_pe_core_text_tower.py`: 11 of 11
+  query vectors bit-identical on mps and on cpu, all 294 tensors equal;
+  load 3.64-3.81 s against 25.44-25.90 s (three runs each, imports
+  included), peak footprint 3.40 against 12.68 GiB. The conversion
+  (`scripts/convert_pe_core_text_tower.py`) needs no GPU and is
+  byte-reproducible. A host without the directory warns and loads the
+  whole model; a directory cut from another revision is refused.
+- **Supervision** (`imsg.agents.supervise`, `imsg install-agents`). Every
+  rendered agent now runs one standard-library supervisor under the
+  interpreter that holds Full Disk Access: it waits for the volume
+  sentinel, passes `imsg guard-mount`, reads `env:` secrets from 0600
+  files named in the plist (`--env NAME=RELPATH`, never a value), logs to
+  the volume, and keeps the service as its child, so `KeepAlive` restarts
+  it and nothing is orphaned. Postgres gets `LC_ALL=C`, its socket in
+  `data_root/run` and launchd's stop turned into a fast shutdown;
+  `mcp-public` waits for Postgres; the daily backup uses the `pg_dump`
+  beside `postgres`. Checked under real launchd on the development host:
+  a killed service is restarted, a killed supervisor takes its child with
+  it, `bootout` stops both. `ProcessType Interactive` for Postgres and the
+  public server because launchd's default class ran a CPU-bound model
+  load in 38.2-48.4 s against 25.8-27.1 s (three runs each).
+  `install-agents` gains `--only`, `--interpreter`, `--mcp-public-config`
+  and `--env-file`, and skips the tunnel agent when `cloudflared` is absent.
+- **Least-privilege role.** The whole suite ran as a role that owns its
+  databases with only `CREATEDB` and `pg_read_all_settings`: 2,444 passed,
+  3 failed, none of them a normal operation (restoring into a database
+  whose extensions another role owns; a test that creates the untrusted
+  `vector` extension itself; one plist-shape test fixed here). It found
+  one real defect: prewarm named each relation, and naming a `pg_toast.`
+  relation needs a superuser, so every TOAST relation failed. Prewarm now
+  passes OIDs (`tests/test_least_privilege_integration.py`).
+- **Log rotation** (`imsg.log_rotation`, `imsg logs rotate`): `*.log`
+  files under `data_root/logs` are copied into `<name>.1.gz` and
+  truncated in place at `logging.rotate_bytes` (50 MB), generations kept
+  `logging.rotate_keep` (10) and at most `logging.retention_days` (90).
+  The nightly `imsg backup` rotates after every run, successful or not.
+- **`imsg status`** reads every SPEC §14 field: watermarks per source,
+  last sync (stale after 1 h), enrichment queue depths, FTS applied event
+  and outbox lag, unresolved identities, attachment coverage, last export,
+  last backup (stale after 26 h) and the 7-day audit-rejection count,
+  which includes `mcp_audit_rollup` when that table exists. A field that
+  cannot be read is `None` with its reason in `pipeline_reasons`.
+
 ## 2026-09-24 — Re-landed: S2 refuses a run whose shim went quiet
 
 - The 2026-09-17 fix of that name (entry below) was dropped from `main`

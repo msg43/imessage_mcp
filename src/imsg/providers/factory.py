@@ -42,6 +42,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+import structlog
+
 from imsg.embed.provider import (
     FakeMultimodalEmbeddingProvider,
     FakeTextEmbeddingProvider,
@@ -65,6 +67,8 @@ from imsg.shared_vlm_runtime import SharedVlmRuntime
 
 if TYPE_CHECKING:
     from imsg.config.schema import Config
+
+logger = structlog.get_logger(__name__)
 
 MODELS_EXTRA = "models"
 """Name of the `[project.optional-dependencies]` extra that carries every
@@ -113,7 +117,7 @@ below rely on (positional required args, keyword-only options):
 - text_embedding:       (model_repo, revision, dim, *, batch_size=32, max_length=8192,
                          max_batch_tokens=2048, cache_limit_bytes=8 GiB, model_id=None)
 - multimodal_embedding: (model_repo, revision, dim, *, device="mps", batch_size=16,
-                         allow_cpu_fallback=False)
+                         allow_cpu_fallback=False, text_tower_dir=None)
 - boundary:             (model_repo, revision, prompt_template: str, *, max_tokens=512,
                          timeout_seconds=120.0, shared_runtime=None,
                          cache_limit_bytes=8 GiB)
@@ -413,17 +417,52 @@ def build_text_provider(cfg: Config) -> TextEmbeddingProvider:
     return cast("TextEmbeddingProvider", provider)
 
 
+def resolve_text_tower_dir(cfg: Config) -> Path | None:
+    """The PE-Core text-tower checkpoint `embedding.multimodal.
+    text_tower_model` names, resolved under `paths.data_root`, or `None`.
+
+    `None` when the field is null, or when the directory does not exist —
+    then with one warning naming the command that produces it, because a
+    missing checkpoint costs load time, not correctness: the provider
+    loads the whole model and embeds the identical vectors. A directory
+    that resolves outside `data_root` is refused (`resolve_local_model_dir`).
+    Whether the directory was cut from the configured pin is the
+    provider's check, at load time (`imsg.embed.pe_core_text_tower`)."""
+    value = cfg.embedding.multimodal.text_tower_model
+    if value is None:
+        return None
+    directory = resolve_local_model_dir(cfg.paths.data_root, value)
+    if directory is None:
+        logger.warning(
+            "pe_core.text_tower_checkpoint_missing",
+            text_tower_model=value,
+            data_root=str(cfg.paths.data_root),
+            effect="the whole PE-Core model will be built and read to embed query text "
+            "(same vectors, slower load)",
+            fix="run the `command` recorded for this output_dir in models/manifest.lock.yaml "
+            "(scripts/convert_pe_core_text_tower.py), or set "
+            "embedding.multimodal.text_tower_model to null",
+        )
+    return directory
+
+
 def build_multimodal_provider(cfg: Config) -> MultimodalEmbeddingProvider | None:
     """The secondary visual embedder (D3a: PE-Core-G14-448, 1280-dim), or
     `None` when `embedding.multimodal.enabled` is false — callers already
-    treat `None` as "channel C disabled"."""
+    treat `None` as "channel C disabled". With a text-tower checkpoint on
+    disk (`resolve_text_tower_dir`), the provider is given it, and a
+    process whose first call embeds text loads only that."""
     if not cfg.embedding.multimodal.enabled:
         return None
     mm = cfg.embedding.multimodal
     if cfg.models.backend == "fake":
         return FakeMultimodalEmbeddingProvider(dim=mm.dim)
     spec = REAL_PROVIDERS["multimodal_embedding"]
-    provider = _construct(spec, mm.model, mm.revision, mm.dim, batch_size=mm.batch_size)
+    options: dict[str, object] = {"batch_size": mm.batch_size}
+    text_tower_dir = resolve_text_tower_dir(cfg)
+    if text_tower_dir is not None:
+        options["text_tower_dir"] = text_tower_dir
+    provider = _construct(spec, mm.model, mm.revision, mm.dim, **options)
     _check_dim(spec, provider, mm.dim)
     return cast("MultimodalEmbeddingProvider", provider)
 
@@ -578,4 +617,5 @@ __all__ = [
     "resolve_caption_prompt",
     "resolve_local_model_dir",
     "resolve_prompt_path",
+    "resolve_text_tower_dir",
 ]

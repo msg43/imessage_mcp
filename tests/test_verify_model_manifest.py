@@ -385,6 +385,7 @@ EXPECTED_ROLES = {
     "transcription",
     "ocr",
     "multimodal_embedding",
+    "multimodal_text_embedding",
 }
 
 

@@ -349,6 +349,31 @@ class MultimodalEmbeddingConfig(StrictModel):
     revision: str = Field(min_length=1)
     dim: int = constants.MULTIMODAL_EMBEDDING_DIM
     batch_size: int = Field(default=16, ge=1)
+    text_tower_model: str | None = constants.MULTIMODAL_TEXT_TOWER_MODEL
+    """A directory relative to `paths.data_root` holding the text tower
+    alone, cut from `model`@`revision` by
+    `scripts/convert_pe_core_text_tower.py` (the lock's
+    `pe-core-g14-448-text-tower` entry). A process whose first PE-Core
+    call embeds text — the MCP servers — loads that instead of the whole
+    model; the vectors are bit-identical. `null` always loads the whole
+    model. When the directory does not exist the provider warns once and
+    loads the whole model, so a host that has not run the conversion yet
+    keeps serving; `imsg models verify --data-root` reports it missing."""
+
+    @field_validator("text_tower_model", mode="after")
+    @classmethod
+    def _text_tower_is_a_data_root_relative_dir(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        value = v.strip()
+        path = Path(value)
+        if not value or path.is_absolute() or value.startswith("~") or ".." in path.parts:
+            raise ValueError(
+                "embedding.multimodal.text_tower_model must be a directory relative to "
+                "paths.data_root (e.g. 'models/<conversion>', the lock's output_dir) with no "
+                f"'..' segments, or null; got {v!r}"
+            )
+        return value
 
     @field_validator("dim", mode="after")
     @classmethod
@@ -917,6 +942,13 @@ _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 class LoggingConfig(StrictModel):
     level: str = "INFO"
     allow_content_debug: bool = False
+    rotate_bytes: int = Field(default=50 * 10**6, ge=10**6)
+    """SPEC §14: a `*.log` under `<data_root>/logs` is rotated once it
+    reaches this size (`imsg.log_rotation`; the nightly backup runs it)."""
+    rotate_keep: int = Field(default=10, ge=1)
+    """Compressed generations kept per log (`<name>.1.gz` newest)."""
+    retention_days: int = Field(default=90, ge=1)
+    """SPEC §14: rotated generations older than this are deleted."""
 
     @field_validator("level", mode="after")
     @classmethod

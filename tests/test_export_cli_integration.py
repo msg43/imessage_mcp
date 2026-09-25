@@ -593,8 +593,10 @@ def test_unclassified_report_command_matches_the_launchagent(
         for label, content in plists.items()
         if label.endswith("report")
     )
+    # Every agent runs the supervisor; the service command follows `--`.
     args = report_plist["ProgramArguments"]
-    assert args[1:3] == ["export", "unclassified-report"]
+    command = args[args.index("--") + 1 :]
+    assert command[1:3] == ["export", "unclassified-report"]
 
     # ...and that spelling really resolves, rather than merely looking right.
     assert _run("export", "unclassified-report", "--help").exit_code == 0

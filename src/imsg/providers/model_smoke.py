@@ -134,6 +134,7 @@ SMOKE_RUN_ORDER: tuple[str, ...] = (
     "qwen3-reranker-0.6b",
     "qwen3-reranker-8b",
     "whisper-large-v3",
+    "pe-core-g14-448-text-tower",
     "pe-core-g14-448",
     "apple-vision-ocr",
     "qwen3.5-35b-a3b",
@@ -727,6 +728,42 @@ def check_multimodal(provider: Any, image_path: Path, *, dim: int) -> str:
     )
 
 
+MULTIMODAL_PARAPHRASE_TEXT = "a white background with a red circle on it"
+
+
+def check_multimodal_text(provider: Any, *, dim: int) -> str:
+    """The query side's PE-Core load: three texts through `embed_text`
+    only, so a provider given a text-tower checkpoint loads that alone.
+    `dim` components, unit norm, a paraphrase closer than an unrelated
+    text, and — the point of the entry — proof the checkpoint path ran
+    rather than the whole-model fallback."""
+    matching = _require_unit_vector(
+        provider.embed_text(MULTIMODAL_MATCHING_TEXT), dim, "matching text"
+    )
+    paraphrase = _require_unit_vector(
+        provider.embed_text(MULTIMODAL_PARAPHRASE_TEXT), dim, "paraphrase"
+    )
+    unrelated = _require_unit_vector(
+        provider.embed_text(MULTIMODAL_UNRELATED_TEXT), dim, "unrelated text"
+    )
+    source = getattr(provider, "loaded_source", None)
+    if source != "text_tower_checkpoint":
+        raise SmokeCheckFailed(
+            f"the provider loaded from {source!r}, not the text-tower checkpoint — is "
+            f"embedding.multimodal.text_tower_model's directory present under data_root?"
+        )
+    cos_para, cos_unrelated = _cosine(matching, paraphrase), _cosine(matching, unrelated)
+    if not cos_para > cos_unrelated:
+        raise SmokeCheckFailed(
+            f"the paraphrase did not outscore the unrelated text: cos={cos_para:.4f} <= "
+            f"{cos_unrelated:.4f}"
+        )
+    return (
+        f"dim={dim}, unit-norm, loaded from the text-tower checkpoint; cos(text, paraphrase)="
+        f"{cos_para:.4f} > cos(text, unrelated)={cos_unrelated:.4f}"
+    )
+
+
 # --------------------------------------------------------------------------
 # config from the lock, providers from the factory
 # --------------------------------------------------------------------------
@@ -774,6 +811,8 @@ def config_from_manifest(
     boundary_repo, boundary_revision = _pin(by_role, "segment_boundaries")
     caption_repo, caption_revision = _pin(by_role, "image_caption")
     whisper_repo, whisper_revision = _pin(by_role, "transcription")
+    text_tower = by_role.get("multimodal_text_embedding")
+    text_tower_model = text_tower.output_dir if text_tower is not None else None
     return Config.model_construct(
         paths=PathsConfig(data_root=data_root),
         database=DatabaseConfig.model_validate({"password": "env:IMSG_SMOKE_TEST_UNUSED"}),
@@ -795,7 +834,9 @@ def config_from_manifest(
             model=text_repo,
             revision=text_revision,
             query_instruction=SMOKE_QUERY_INSTRUCTION,
-            multimodal=MultimodalEmbeddingConfig(model=mm_repo, revision=mm_revision),
+            multimodal=MultimodalEmbeddingConfig(
+                model=mm_repo, revision=mm_revision, text_tower_model=text_tower_model
+            ),
         ),
         retrieval=RetrievalConfig(
             reranker_model=reranker_repo, reranker_revision=reranker_revision
@@ -897,6 +938,15 @@ ROLE_SPECS: dict[str, RoleSpec] = {
         _build_multimodal,
         lambda provider, cfg, prepared: check_multimodal(
             provider, prepared, dim=cfg.embedding.multimodal.dim
+        ),
+    ),
+    "multimodal_text_embedding": RoleSpec(
+        "multimodal_text_embedding",
+        "rss",
+        _no_input,
+        _build_multimodal,
+        lambda provider, cfg, prepared: check_multimodal_text(
+            provider, dim=cfg.embedding.multimodal.dim
         ),
     ),
 }
@@ -1731,6 +1781,7 @@ __all__ = [
     "EMBED_DOCUMENTS",
     "EMBED_QUERY",
     "MLX_ROLES",
+    "MULTIMODAL_PARAPHRASE_TEXT",
     "OCR_LINES",
     "RERANK_DOCUMENTS",
     "RERANK_QUERY",
@@ -1754,6 +1805,7 @@ __all__ = [
     "check_boundaries",
     "check_caption",
     "check_multimodal",
+    "check_multimodal_text",
     "check_ocr",
     "check_reranker",
     "check_text_embedding",

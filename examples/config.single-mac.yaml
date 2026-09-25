@@ -139,6 +139,7 @@ embedding:
     revision: 17aa0c25addfa14198fa2ff73d845a22d433432e
     dim: 1280
     batch_size: 16
+    text_tower_model: models/pe-core-bigG-14-448-text-17aa0c25   # null to always load the whole model
 
 retrieval:
   k_fts: 100

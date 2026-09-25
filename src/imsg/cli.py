@@ -60,7 +60,7 @@ import typer
 import uvicorn
 
 from imsg import host_memory
-from imsg.agents.plists import render_agent_plists
+from imsg.agents.plists import AGENT_NAMES, LOGS_NOTE, render_agent_plists
 from imsg.backfill.fetch import LocationFetchReport, access_from_config, settings_from_config
 from imsg.backfill.locate import CoverageReport, LocatedFile, build_coverage, run_locate
 from imsg.backfill.pipeline import DEFAULT_RATE_PER_MINUTE, run_backfill
@@ -95,12 +95,17 @@ from imsg.db.enrichment_yield_locks import (
 from imsg.db.fingerprint import ensure_cluster_fingerprint, verify_data_directory
 from imsg.db.migrations import PostgresMigrationRunner, format_mismatches
 from imsg.diagnostics import (
+    PIPELINE_FIELDS,
     BufferPoolCheck,
+    PipelineStatus,
+    PostgresCheck,
     check_at_rest_posture,
+    check_backups,
     check_buffer_pool,
     check_enrichment_yield,
     check_full_disk_access,
     check_mount,
+    check_pipeline_status,
     check_postgres,
     check_unclassified_threads,
     disk_free_bytes,
@@ -135,6 +140,7 @@ from imsg.export import (
 )
 from imsg.heavy_lock import HeavyModelLock, inspect_heavy_lock
 from imsg.host_memory import PressureLevel, format_gib
+from imsg.log_rotation import LogRotationError, RotationReport, rotate_logs
 from imsg.mcp.audit import PostgresAuditSink
 from imsg.mcp.auth import build_public_gate
 from imsg.mcp.probe import run_auth_probe
@@ -707,6 +713,22 @@ def _model_process_status_fields(cfg: Config) -> dict[str, object]:
     return {"model_processes": rows, "model_processes_footprint_bytes": total}
 
 
+def _pipeline_status_fields(
+    pipeline: PipelineStatus | None, pg: PostgresCheck
+) -> dict[str, object]:
+    """`imsg status`'s SPEC §14 pipeline fields, plus `pipeline_reasons`
+    for any that could not be read. Postgres being unreachable is one
+    reason for all of them, not a crash."""
+    if pipeline is None:
+        reason = f"Postgres unreachable: {pg.reason}"
+        return {
+            **dict.fromkeys(PIPELINE_FIELDS),
+            "pipeline_reasons": dict.fromkeys(PIPELINE_FIELDS, reason),
+        }
+    fields = {name: getattr(pipeline, name) for name in PIPELINE_FIELDS}
+    return {**fields, "pipeline_reasons": dict(pipeline.reasons)}
+
+
 def _describe_model_processes(rows: object) -> list[str]:
     if not isinstance(rows, list) or not rows:
         return ["  none running"]
@@ -727,7 +749,11 @@ def status(
     config: ConfigOption = None,
     as_json: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
 ) -> None:
-    """Mount, Postgres, disk free, at-rest posture. Pipeline fields report as unavailable until built."""
+    """Mount, Postgres, pipeline freshness and queues, backups, disk free, at-rest posture.
+
+    Every pipeline field is read from the table (or, for the full-text
+    index and the backups, the file) that holds it; a `None` means it
+    could not be read, and `pipeline_reasons` says why."""
     cfg = _load_config_or_die(config)
 
     mount = check_mount(cfg.paths.data_root)
@@ -740,6 +766,9 @@ def status(
     # reachability and bounded by a statement timeout inside the check —
     # a busy or absent database yields None plus a reason, never a crash.
     unclassified = check_unclassified_threads(cfg) if pg.reachable else None
+    # SPEC §14's pipeline fields, each read from the table that holds it.
+    pipeline = check_pipeline_status(cfg) if pg.reachable else None
+    backups = check_backups(cfg)
     free_bytes = disk_free_bytes(cfg.paths.data_root)
     # The public MCP surface's own readiness. Read from a file the server
     # publishes rather than from the server itself: its transport requires
@@ -780,24 +809,14 @@ def status(
         **pause_state,
         **process_state,
         **heavy_lock_state,
-        "watermarks_per_source": None,
-        "enrichment_queue_depths": None,
-        "fts_applied_event_id": None,
-        "fts_outbox_lag": None,
-        "unresolved_identity_count": None,
-        "attachment_materialization_coverage": None,
-        "last_sync_at": None,
-        "last_export_at": None,
-        "last_backup_at": None,
-        "audit_rejection_count_7d": None,
+        **_pipeline_status_fields(pipeline, pg),
+        "last_backup_at": backups.last_backup_at,
+        "backup_stale": backups.backup_stale,
+        "backup_complete_sets": backups.complete_sets,
+        "backup_partial_sets": backups.partial_sets,
+        "backup_reason": backups.reason,
         "unclassified_thread_count": unclassified.count if unclassified else None,
         "unclassified_thread_reason": unclassified.reason if unclassified else None,
-        "pipeline_note": "the remaining None fields above are not yet wired to the "
-        "now-built pipeline stages (a later revision of this command's own scope) — "
-        "'imsg check-permissions'/the MCP check_permissions tool already reports "
-        "last_sync_at/watermarks. unclassified_thread_count IS live (SPEC §11.5); "
-        "None there means the count could not be read, and "
-        "unclassified_thread_reason says why",
     }
 
     if as_json:
@@ -3779,10 +3798,19 @@ def backup(
     instance, insufficient free space, a dump that fails its read-back,
     or a corrupt FTS sidecar each abort with one `imsg: …` line and
     leave `backups/` exactly as it was.
+
+    Then, whether or not the backup succeeded, the logs under
+    `<data_root>/logs` are rotated (`imsg.log_rotation`: 50 MB, 90 days): this is the nightly job, and logs grow whether or not a
+    backup could be taken. A failed rotation fails the run (exit 1), so
+    it shows in launchd's last exit status rather than only in a log.
     """
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
-    conn = _connect_and_verify_or_die(cfg)
+    try:
+        conn = _connect_and_verify_or_die(cfg)
+    except typer.Exit:
+        _rotate_logs_after_backup(cfg, dry_run=dry_run)
+        raise
     try:
         report = run_backup(
             conn=conn,
@@ -3793,6 +3821,7 @@ def backup(
         )
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
+        _rotate_logs_after_backup(cfg, dry_run=dry_run)
         raise typer.Exit(code=1) from exc
     finally:
         conn.close()
@@ -3842,6 +3871,67 @@ def backup(
         )
     typer.echo(f"backup: {OUT_OF_SCOPE_NOTE}")
     typer.echo(f"backup: {SAME_DEVICE_CAVEAT}")
+    if not _rotate_logs_after_backup(cfg, dry_run=dry_run):
+        raise typer.Exit(code=1)
+
+
+def _run_log_rotation(cfg: Config, *, dry_run: bool) -> RotationReport:
+    logging_cfg = cfg.logging
+    return rotate_logs(
+        cfg.paths.data_root,
+        rotate_bytes=logging_cfg.rotate_bytes,
+        keep=logging_cfg.rotate_keep,
+        retention_days=logging_cfg.retention_days,
+        dry_run=dry_run,
+    )
+
+
+def _rotate_logs_after_backup(cfg: Config, *, dry_run: bool) -> bool:
+    """The nightly job's second duty. Prints what it did; returns whether
+    it succeeded. Never raises: the backup's own outcome is reported
+    separately and must not be masked by this one."""
+    try:
+        rotation = _run_log_rotation(cfg, dry_run=dry_run)
+    except (LogRotationError, OSError) as exc:
+        typer.echo(f"backup: WARNING log rotation failed: {type(exc).__name__}: {exc}", err=True)
+        return False
+    lines = rotation.describe() or ["no log has reached the rotation size"]
+    for line in lines:
+        typer.echo(f"backup: logs: {line}")
+    return True
+
+
+# --------------------------------------------------------------------------
+# logs (SPEC §14) — size-based rotation of <data_root>/logs
+# --------------------------------------------------------------------------
+
+logs_app = typer.Typer(
+    name="logs",
+    help="The logs under <data_root>/logs: rotation at logging.rotate_bytes, "
+    "logging.retention_days of compressed generations. The nightly "
+    "`imsg backup` rotates them; this runs it by hand.",
+    no_args_is_help=True,
+)
+app.add_typer(logs_app, name="logs")
+
+
+@logs_app.command("rotate")
+def logs_rotate(config: ConfigOption = None, dry_run: DryRunOption = False) -> None:
+    """Rotate every `*.log` in `<data_root>/logs` that has reached
+    `logging.rotate_bytes` (copy into `<name>.1.gz`, truncate in place),
+    and delete generations beyond `logging.rotate_keep` or older than
+    `logging.retention_days`."""
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    try:
+        rotation = _run_log_rotation(cfg, dry_run=dry_run)
+    except (LogRotationError, OSError) as exc:
+        typer.echo(f"imsg: {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    for line in rotation.describe() or ["no log has reached the rotation size"]:
+        typer.echo(f"logs rotate: {line}")
+    if dry_run:
+        typer.echo(DRY_RUN_MARKER)
 
 
 # --------------------------------------------------------------------------
@@ -3880,43 +3970,100 @@ def install_agents(
         Path,
         typer.Option(
             help="Directory to write rendered plists into. Defaults to the real "
-            "~/Library/LaunchAgents; tests point this at a tmp_path instead."
+            "~/Library/LaunchAgents; render to a scratch directory first to review them."
         ),
     ] = Path("~/Library/LaunchAgents"),
+    only: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--only",
+            help=f"Render only this agent (repeatable): one of {', '.join(AGENT_NAMES)}. "
+            "Default: all of them, the tunnel only when cloudflared is on PATH.",
+        ),
+    ] = None,
+    interpreter: Annotated[
+        Path | None,
+        typer.Option(
+            help="The interpreter launchd starts (grant it Full Disk Access). Default: the one "
+            "running this command, symlinks resolved — a virtual environment's base interpreter.",
+        ),
+    ] = None,
+    mcp_public_config: Annotated[
+        Path | None,
+        typer.Option(
+            "--mcp-public-config",
+            help="Config file the public MCP server runs with, when it is not --config.",
+        ),
+    ] = None,
+    env_file: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--env-file",
+            help="NAME=RELPATH: read the env:NAME secret from this 0600 file under data_root "
+            "instead of private/env/NAME (repeatable).",
+        ),
+    ] = None,
 ) -> None:
     """Render and install the thin, content-free LaunchAgent plists
-    into `~/Library/LaunchAgents` — the only place launchd
-    discovers user agents. The rendered plists reference `--config
-    <path>` and fixed bootstrap paths only; every real value (hostname,
-    secrets) lives in that config file, never in the plist itself, and
-    the rendered plists are written only here, on a real machine at
-    install time — never committed to this repo.
-    """
+    into `~/Library/LaunchAgents` — the only place launchd discovers user
+    agents. Every agent runs the supervisor (`imsg.agents.supervise`),
+    which waits for the encrypted volume, passes the mount gate and reads
+    `env:` secrets from 0600 files; the plists name those files and
+    variables, never a value. Written here only, on a real machine at
+    install time — never committed. Loading them is a separate,
+    deliberate step (`launchctl bootstrap`)."""
     cfg = _load_config_or_die(config)
     resolved_config_path = (config if config is not None else default_config_path()).resolve()
+    public_cfg = _load_config_or_die(mcp_public_config) if mcp_public_config else None
 
+    overrides: dict[str, str] = {}
+    for item in env_file or []:
+        name, sep, relative = item.partition("=")
+        if not sep or not name or not relative:
+            typer.echo(f"imsg: --env-file must be NAME=RELPATH, got {item!r}", err=True)
+            raise typer.Exit(code=2)
+        overrides[name] = relative
+
+    selected = list(only) if only else None
     try:
         imsg_binary = _resolve_imsg_binary()
         postgres_binary = _resolve_binary_or_die("postgres")
-        cloudflared_binary = _resolve_binary_or_die("cloudflared")
-    except ImsgError as exc:
+        cloudflared_path = shutil.which("cloudflared")
+        cloudflared_binary = Path(cloudflared_path) if cloudflared_path else None
+        if selected is None and cloudflared_binary is None:
+            selected = [name for name in AGENT_NAMES if name != "tunnel"]
+            typer.echo("install-agents: cloudflared not on PATH; skipping the tunnel agent")
+        if selected is not None and "tunnel" in selected and cloudflared_binary is None:
+            cloudflared_binary = _resolve_binary_or_die("cloudflared")
+        plists = render_agent_plists(
+            cfg,
+            imsg_binary=imsg_binary,
+            postgres_binary=postgres_binary,
+            cloudflared_binary=cloudflared_binary,
+            config_path=resolved_config_path,
+            interpreter=interpreter.expanduser().resolve() if interpreter else None,
+            mcp_public_config=public_cfg,
+            mcp_public_config_path=mcp_public_config.resolve() if mcp_public_config else None,
+            env_files=overrides,
+            only=selected,
+        )
+    except (ImsgError, ValueError) as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-
-    plists = render_agent_plists(
-        cfg,
-        imsg_binary=imsg_binary,
-        postgres_binary=postgres_binary,
-        cloudflared_binary=cloudflared_binary,
-        config_path=resolved_config_path,
-    )
 
     dest_dir = dest.expanduser()
     dest_dir.mkdir(parents=True, exist_ok=True)
     for label, content in sorted(plists.items()):
         out_path = dest_dir / f"{label}.plist"
         out_path.write_bytes(content)
+        out_path.chmod(0o644)
         typer.echo(f"install-agents: wrote {out_path}")
+    typer.echo(f"install-agents: {LOGS_NOTE}")
+    typer.echo(
+        "install-agents: nothing was loaded. To start one: "
+        "launchctl bootstrap gui/$(id -u) <plist>; to replace a loaded one, "
+        "launchctl bootout gui/$(id -u)/<label> first"
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

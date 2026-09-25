@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1816,20 +1818,77 @@ def test_install_agents_missing_postgres_binary_exits_cleanly(
     assert "postgres" in result.output
 
 
-def test_install_agents_missing_cloudflared_binary_exits_cleanly(
+def test_install_agents_without_cloudflared_skips_only_the_tunnel(
     cli_config: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """The tunnel is optional (the public path can be another tunnel); a
+    missing cloudflared must not stop the other agents being installed.
+    Asking for the tunnel explicitly still fails cleanly."""
     import shutil
 
     monkeypatch.setattr(
         shutil, "which", lambda name: "/opt/homebrew/bin/postgres" if name == "postgres" else None
     )
+    dest = tmp_path / "LaunchAgents"
+    result = runner.invoke(
+        app, ["install-agents", "--config", str(cli_config), "--dest", str(dest)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "skipping the tunnel agent" in result.output
+    assert sorted(p.stem for p in dest.glob("*.plist")) == sorted(
+        f"com.imsgindex.{name}" for name in ("pg", "sync", "enrich", "mcp-public", "report", "backup")
+    )
+
+    explicit = runner.invoke(
+        app,
+        ["install-agents", "--config", str(cli_config), "--dest", str(dest), "--only", "tunnel"],
+    )
+    assert explicit.exit_code == 1
+    assert "cloudflared" in explicit.output
+
+
+def test_install_agents_only_and_env_file_and_public_config(
+    cli_config: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A typical index host: three supervised agents, the public server on its
+    own rendered config, one secret read from an existing 0600 file."""
+    import shutil
+
+    import yaml
+
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/opt/homebrew/bin/postgres" if name == "postgres" else None
+    )
+    public = tmp_path / "config.public.yaml"
+    raw = yaml.safe_load(cli_config.read_text(encoding="utf-8"))
+    raw.setdefault("mcp", {}).setdefault("public", {"scope": "full"})["oauth"] = {
+        "client_id": "env:IMSG_OAUTH_CLIENT_ID",
+        "owner_subject": "env:IMSG_OWNER_SUB",
+    }
+    public.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    dest = tmp_path / "LaunchAgents"
     result = runner.invoke(
         app,
-        ["install-agents", "--config", str(cli_config), "--dest", str(tmp_path / "LaunchAgents")],
+        [
+            "install-agents", "--config", str(cli_config), "--dest", str(dest),
+            "--only", "pg", "--only", "mcp-public", "--only", "backup",
+            "--mcp-public-config", str(public),
+            "--env-file", "IMSG_OWNER_SUB=private/owner-sub",
+            "--interpreter", sys.executable,
+        ],
     )
-    assert result.exit_code == 1
-    assert "cloudflared" in result.output
+    assert result.exit_code == 0, result.output
+    assert sorted(p.stem for p in dest.glob("*.plist")) == [
+        "com.imsgindex.backup", "com.imsgindex.mcp-public", "com.imsgindex.pg",
+    ]
+    arguments = plistlib.loads((dest / "com.imsgindex.mcp-public.plist").read_bytes())[
+        "ProgramArguments"
+    ]
+    assert arguments[0] == str(Path(sys.executable).resolve())
+    assert "IMSG_OWNER_SUB=private/owner-sub" in arguments
+    assert "IMSG_OAUTH_CLIENT_ID=private/env/IMSG_OAUTH_CLIENT_ID" in arguments
+    assert arguments[-1] == str(public.resolve())
+    assert "nothing was loaded" in result.output
 
 
 def test_mcp_local_disabled_in_config_exits_cleanly(

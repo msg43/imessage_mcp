@@ -77,6 +77,12 @@ class _FakeConn:
         self.shared_buffers = shared_buffers
         self.prewarmed: list[str] = []
         self.closed = False
+        self.oids: dict[str, int] = {}
+
+    def oid_for(self, name: str) -> int:
+        """A stable synthetic OID per relation name — `pg_prewarm` is now
+        given the OID, never the name."""
+        return self.oids.setdefault(name, 16384 + len(self.oids))
 
     def cursor(self) -> _FakeCursor:
         return _FakeCursor(self)
@@ -88,13 +94,15 @@ class _FakeConn:
         if "proname = 'pg_prewarm'" in sql:
             return [(self.has_prewarm,)]
         if "amname = 'hnsw'" in sql:
-            return [(name, size) for name, size in HNSW_ROWS]
+            return [(name, size, self.oid_for(name)) for name, size in HNSW_ROWS]
         if "block_size" in sql and "shared_buffers" in sql:
             return [(self.shared_buffers,)]
         if "block_size" in sql:
             return [(BLOCK,)]
         if "pg_prewarm(" in sql:
-            name = str((params or {})["name"])
+            assert "::oid::regclass" in sql, "prewarm must pass the OID: a name needs schema USAGE"
+            oid = (params or {})["oid"]
+            name = next(n for n, o in self.oids.items() if o == oid)
             if name in self.failing:
                 raise psycopg.errors.InsufficientPrivilege(f"permission denied for {name}")
             self.prewarmed.append(name)
@@ -105,15 +113,20 @@ class _FakeConn:
                 if name not in self.sizes:
                     continue
                 toast = self.toast.get(name)
+                toast_name = f"pg_toast.pg_toast_{name}" if toast else None
+                toast_index = f"pg_toast.pg_toast_{name}_index" if toast else None
                 rows.append(
                     (
                         name,
                         name,
                         self.sizes[name],
-                        f"pg_toast.pg_toast_{name}" if toast else None,
+                        toast_name,
                         toast[0] if toast else None,
-                        f"pg_toast.pg_toast_{name}_index" if toast else None,
+                        toast_index,
                         toast[1] if toast else None,
+                        self.oid_for(name),
+                        self.oid_for(toast_name) if toast_name else None,
+                        self.oid_for(toast_index) if toast_index else None,
                     )
                 )
             return rows
@@ -126,7 +139,8 @@ def _conn(**kwargs: Any) -> psycopg.Connection:
 
 def test_the_hnsw_indexes_come_from_the_catalog_not_a_list() -> None:
     conn = _conn()
-    assert hnsw_indexes(conn) == [PrewarmRelation(name, size) for name, size in HNSW_ROWS]
+    assert [(r.name, r.size_bytes) for r in hnsw_indexes(conn)] == HNSW_ROWS
+    assert all(isinstance(r, PrewarmRelation) and r.oid > 0 for r in hnsw_indexes(conn))
     assert hnsw_index_bytes(conn) == sum(size for _, size in HNSW_ROWS)
     assert shared_buffers_bytes(_conn(shared_buffers=99 * BLOCK)) == 99 * BLOCK
 

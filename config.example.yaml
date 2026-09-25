@@ -112,6 +112,11 @@ embedding:
     revision: 17aa0c25addfa14198fa2ff73d845a22d433432e   # immutable commit sha OF THIS REPO (manifest pin)
     dim: 1280                     # must match migration 0002's DDL
     batch_size: 16
+    # The text tower alone, cut from model@revision (manifest entry
+    # pe-core-g14-448-text-tower; produce it with that entry's command).
+    # Query embedding loads 2.0 GiB instead of the whole model; the vectors
+    # are identical. Missing directory: a warning, and the whole model loads.
+    text_tower_model: models/pe-core-bigG-14-448-text-17aa0c25   # relative to data_root; null to disable
 
 retrieval:
   k_fts: 100
@@ -240,6 +245,9 @@ eval:
 logging:
   level: INFO
   allow_content_debug: false
+  rotate_bytes: 50000000          # rotate a data_root/logs/*.log at this size (the nightly backup does it)
+  rotate_keep: 10                 # compressed generations kept per log
+  retention_days: 90              # generations older than this are deleted
 
 # The attachment fetcher (optional): where copies of attachments that are
 # not on this host can be read from. `imsg locate-attachments` records
