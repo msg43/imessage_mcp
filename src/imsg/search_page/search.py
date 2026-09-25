@@ -31,9 +31,16 @@ grouped by conversation with a count per conversation. Nothing reranks
 the full list; the optional `rerank` order sends only the best
 `search_page.rerank_top` hits to the reranker.
 
-Filters (people, dates, attachments) reuse the retrieval layer's own
-predicate (`imsg.retrieval.filters.compile_predicate`), under full scope:
-this page is the owner's own surface, like the local MCP surface.
+Filters (people, attachments) reuse the retrieval layer's own predicate
+(`imsg.retrieval.filters.compile_predicate`), under full scope: this page
+is the owner's own surface, like the local MCP surface. Dates are the
+page's own (`page_predicate`): a segment is kept when any part of it lies
+in the range, and the message that matched must itself be in the range.
+The MCP tools keep testing when a segment started.
+
+A segment found by the full-text index is kept only when the words occur
+in what people wrote (`imsg.search_page.content_match`), not only in the
+header lines and labels the index also holds.
 """
 
 from __future__ import annotations
@@ -44,7 +51,7 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -70,8 +77,13 @@ from imsg.retrieval.query import (
     like_pattern,
     trigram_match_expression,
 )
+from imsg.search_page.content_match import (
+    ContentMatch,
+    content_query,
+    segments_matching_content,
+    text_condition,
+)
 from imsg.search_page.errors import SearchInputError
-from imsg.search_page.highlight import normalized_terms
 
 if TYPE_CHECKING:
     import apsw
@@ -175,6 +187,9 @@ class SearchSettings:
     max_hits_per_channel: int
     ef_search: int
     max_scan_tuples: int
+    index_edit_history: bool = False
+    """`policy.index_edit_history`: earlier versions of edited messages are
+    in the index, so a match on one counts as a match on content."""
 
     @classmethod
     def from_config(cls, cfg: Config) -> SearchSettings:
@@ -192,12 +207,18 @@ class SearchSettings:
             max_hits_per_channel=page.semantic.max_hits_per_channel,
             ef_search=page.semantic.ef_search,
             max_scan_tuples=page.semantic.max_scan_tuples,
+            index_edit_history=cfg.policy.index_edit_history,
         )
 
 
 @dataclass(slots=True)
 class Hit:
-    """One viable hit: a segment, or a message not yet in any segment."""
+    """One viable hit: a segment, or a message not yet in any segment.
+
+    `at` dates the hit for sorting and for its conversation's "latest":
+    the latest matching message for a word match, otherwise the segment's
+    start, moved into the date range when the search has one. What the
+    page shows as the hit's time comes from the messages it shows."""
 
     key: str
     chat_id: int
@@ -288,6 +309,10 @@ class SearchResult:
     timings_ms: dict[str, float] = field(default_factory=dict)
     semantic: SemanticStatus = field(default_factory=lambda: SemanticStatus("pending"))
     reranked: bool = False
+    non_content_segments: frozenset[int] = frozenset()
+    """Segments the full-text index matched only in text nobody wrote (names
+    and times in the header lines, message labels): the text channel left
+    them out."""
     created_monotonic: float = field(default_factory=time.monotonic)
     lock: threading.RLock = field(default_factory=threading.RLock)
     """Held while the semantic merge or the optional rerank changes the
@@ -298,6 +323,11 @@ class SearchResult:
     @property
     def total_hits(self) -> int:
         return len(self.hits)
+
+    @property
+    def hidden_non_content(self) -> int:
+        """How many of `non_content_segments` no other channel found either."""
+        return sum(1 for sid in self.non_content_segments if segment_hit_key(sid) not in self.hits)
 
     def invalidate(self) -> None:
         self._orders.clear()
@@ -407,6 +437,42 @@ def resolve_request_filters(
         raise SearchInputError(str(exc)) from exc
 
 
+def page_predicate(filters: SearchFilters) -> CompiledPredicate:
+    """The page's filter over a `segment s`: people and attachments as the
+    retrieval layer compiles them; dates by overlap. A segment that began
+    on 30 Nov and ended on 2 Dec is in a search for 2 Dec. Which of its
+    messages count is decided per message (`message_time_clause`)."""
+    base = compile_predicate(replace(filters, after=None, before=None), FULL_SCOPE)
+    clauses = [base.sql]
+    params = dict(base.params)
+    if filters.after is not None:
+        clauses.append("s.ended_at >= %(pg_after)s")
+        params["pg_after"] = filters.after
+    if filters.before is not None:
+        clauses.append("s.started_at < %(pg_before)s")
+        params["pg_before"] = filters.before
+    return CompiledPredicate(sql=" AND ".join(clauses), params=params)
+
+
+def message_time_clause(filters: SearchFilters, *, alias: str = "m") -> CompiledPredicate:
+    """The date filter over one message's own time (`TRUE` without one)."""
+    clauses = ["TRUE"]
+    params: dict[str, object] = {}
+    if filters.after is not None:
+        clauses.append(f"{alias}.sent_at >= %(mt_after)s")
+        params["mt_after"] = filters.after
+    if filters.before is not None:
+        clauses.append(f"{alias}.sent_at < %(mt_before)s")
+        params["mt_before"] = filters.before
+    return CompiledPredicate(sql=" AND ".join(clauses), params=params)
+
+
+def _message_join(in_range: CompiledPredicate, *, on: str) -> str:
+    """Join `message m` only when the date filter needs it: measured at
+    52 ms on a 20,000-hit attachment search that has no date."""
+    return f"JOIN message m ON m.message_id = {on}" if in_range.params else ""
+
+
 def _message_predicate(filters: SearchFilters, *, alias: str = "m") -> CompiledPredicate:
     """The same filters, over a `message` row (for messages in no segment)."""
     clauses: list[str] = ["TRUE"]
@@ -475,6 +541,11 @@ def _add_segment(
     key = segment_hit_key(segment_id)
     hit = result.hits.get(key)
     if hit is None:
+        after, before = result.filters.after, result.filters.before
+        if after is not None and started_at < after:
+            started_at = after
+        if before is not None and ended_at >= before:
+            ended_at = max(started_at, before - timedelta(microseconds=1))
         hit = Hit(key=key, chat_id=chat_id, at=started_at, ended_at=ended_at, segment_id=segment_id)
         result.hits[key] = hit
     previous = hit.ranks.get(channel)
@@ -503,12 +574,31 @@ def _segment_fulltext(
         started = time.perf_counter()
         rows = _segment_rows(pg, ids, result.predicate)
         result.timings_ms["pg_segments"] = (time.perf_counter() - started) * 1000
+        wanted = content_query(analyzed)
+        matched: dict[int, ContentMatch] | None = None
+        if wanted is not None:
+            started = time.perf_counter()
+            found = segments_matching_content(
+                pg,
+                [segment_id for segment_id in ids if segment_id in rows],
+                wanted,
+                index_unsent=settings.index_unsent,
+                include_edit_history=settings.index_edit_history,
+                sent_after=result.filters.after,
+                sent_before=result.filters.before,
+            )
+            result.timings_ms["content_check"] = (time.perf_counter() - started) * 1000
+            matched = found
+            result.non_content_segments = frozenset(sid for sid in rows if sid not in found)
         rank = 0
         for segment_id in ids:
             row = rows.get(segment_id)
-            if row is None:
+            if row is None or (matched is not None and segment_id not in matched):
                 continue
-            _add_segment(result, segment_id, row[0], row[1], row[2], CHANNEL_TEXT, rank)
+            hit = _add_segment(result, segment_id, row[0], row[1], row[2], CHANNEL_TEXT, rank)
+            if matched is not None:
+                hit.add_matched(matched[segment_id].matched_attachments)
+                hit.at = matched[segment_id].last_match
             rank += 1
         result.counts[CHANNEL_TEXT] = rank
         return
@@ -516,6 +606,7 @@ def _segment_fulltext(
     # Emoji: unicode61 drops emoji as separators, so the index cannot
     # hold them; scan the message text itself (SPEC §7.3).
     started = time.perf_counter()
+    in_range = message_time_clause(result.filters)
     with pg.cursor() as cur:
         cur.execute(
             f"""
@@ -524,11 +615,18 @@ def _segment_fulltext(
             JOIN segment_message sm ON sm.message_id = m.message_id
             JOIN segment s ON s.segment_id = sm.segment_id
             WHERE m.text_original LIKE %(pattern)s ESCAPE '\\' AND ({result.predicate.sql})
+              AND ({in_range.sql}) AND (%(unsent)s OR NOT m.is_unsent)
             GROUP BY s.segment_id
             ORDER BY last_match DESC
             LIMIT %(limit)s
             """,
-            {"pattern": like_pattern(analyzed.phrase), "limit": cap + 1, **result.predicate.params},
+            {
+                "pattern": like_pattern(analyzed.phrase),
+                "limit": cap + 1,
+                "unsent": settings.index_unsent,
+                **result.predicate.params,
+                **in_range.params,
+            },
         )
         emoji_rows = cur.fetchall()
     result.timings_ms["pg_segments"] = (time.perf_counter() - started) * 1000
@@ -586,6 +684,7 @@ def _attachment_fulltext(
         )
         params = {"pattern": like_pattern(analyzed.phrase), "limit": cap + 1}
     started = time.perf_counter()
+    in_range = message_time_clause(result.filters)
     with pg.cursor() as cur:
         cur.execute(
             f"""
@@ -594,11 +693,12 @@ def _attachment_fulltext(
                    ma.message_id, ma.attachment_id
             FROM candidate c
             JOIN message_attachment ma ON ma.attachment_id = c.attachment_id
+            {_message_join(in_range, on="ma.message_id")}
             JOIN segment_message sm ON sm.message_id = ma.message_id
             JOIN segment s ON s.segment_id = sm.segment_id
-            WHERE {result.predicate.sql}
+            WHERE {result.predicate.sql} AND ({in_range.sql})
             """,
-            {**params, **result.predicate.params},
+            {**params, **result.predicate.params, **in_range.params},
         )
         rows = cur.fetchall()
     result.timings_ms["pg_attachments"] = (time.perf_counter() - started) * 1000
@@ -618,50 +718,19 @@ def _attachment_fulltext(
     result.counts[CHANNEL_ATTACHMENT_TEXT] = len(ordered)
 
 
-def _pg_regex_escape(text: str) -> str:
-    return "".join(ch if ch.isalnum() else "\\" + ch for ch in text)
-
-
 def _unindexed_text_clause(analyzed: AnalyzedQuery) -> tuple[str, dict[str, object]]:
-    """A text condition over `message m` that approximates the index's
-    matching for rows the index does not hold yet: whole words for a BM25
-    query (Postgres `\\m...\\M` word boundaries, case-insensitive), a
-    case-insensitive substring for a quoted phrase, a plain substring for
-    emoji."""
+    """A text condition over `message m` that reproduces the index's
+    matching for rows the index does not hold yet
+    (`imsg.search_page.content_match`): whole words with case and accents
+    folded for a plain search, a substring with case folded for a quoted
+    phrase, a plain substring for emoji."""
     if analyzed.mode == "emoji":
         return "m.text_original LIKE %(ux_emoji)s ESCAPE '\\'", {
             "ux_emoji": like_pattern(analyzed.phrase)
         }
-    if analyzed.mode == "trigram":
-        return "m.text_normalized ILIKE %(ux_phrase)s ESCAPE '\\'", {
-            "ux_phrase": like_pattern(analyzed.phrase)
-        }
-    clauses: list[str] = []
-    params: dict[str, object] = {}
-    for i, term in enumerate(normalized_terms(analyzed)):
-        parts = [p for p in _split_word(term) if p]
-        if not parts:
-            continue
-        pattern = r"\m" + r"\W+".join(_pg_regex_escape(p) for p in parts) + r"\M"
-        clauses.append(f"m.text_normalized ~* %(ux_t{i})s")
-        params[f"ux_t{i}"] = pattern
-    if not clauses:
-        return "FALSE", {}
-    return " AND ".join(clauses), params
-
-
-def _split_word(term: str) -> list[str]:
-    out: list[str] = []
-    current: list[str] = []
-    for ch in term:
-        if ch.isalnum():
-            current.append(ch)
-        elif current:
-            out.append("".join(current))
-            current = []
-    if current:
-        out.append("".join(current))
-    return out
+    wanted = content_query(analyzed)
+    assert wanted is not None
+    return text_condition(wanted, "coalesce(m.text_normalized, m.text_original)", prefix="ux_t")
 
 
 def _unindexed_messages(
@@ -725,7 +794,7 @@ def run_fulltext(
     request = request.validated()
     analyzed = analyze_query(request.query)
     filters = resolve_request_filters(pg, request, settings)
-    predicate = compile_predicate(filters, FULL_SCOPE)
+    predicate = page_predicate(filters)
     result = SearchResult(
         request=request,
         analyzed=analyzed,
@@ -862,6 +931,7 @@ def run_semantic(
     before_threads = {h.chat_id for h in result.hits.values()}
     cap = settings.max_hits_per_channel
     predicate = result.predicate
+    in_range = message_time_clause(result.filters)
     text_distance = 1.0 - settings.text_min_similarity
     started = time.perf_counter()
     notes: list[str] = []
@@ -899,13 +969,14 @@ def run_semantic(
             FROM attachment_chunk_embedding ace
             JOIN attachment_chunk ac ON ac.chunk_id = ace.chunk_id
             JOIN message_attachment ma ON ma.attachment_id = ac.attachment_id
+            {_message_join(in_range, on="ma.message_id")}
             JOIN segment_message sm ON sm.message_id = ma.message_id
             JOIN segment s ON s.segment_id = sm.segment_id
-            WHERE {predicate.sql}
+            WHERE {predicate.sql} AND ({in_range.sql})
             ORDER BY ace.vec <=> %(qv)s::halfvec
             LIMIT %(row_limit)s
             """,
-            {"qv": qv, **predicate.params},
+            {"qv": qv, **predicate.params, **in_range.params},
             max_distance=text_distance,
             row_limit=cap * ROWS_PER_SEGMENT_OVERFETCH,
             settings=settings,
@@ -929,13 +1000,14 @@ def run_semantic(
                    mm.vec <=> %(qv)s::halfvec AS distance
             FROM attachment_mm_embedding mm
             JOIN message_attachment ma ON ma.attachment_id = mm.attachment_id
+            {_message_join(in_range, on="ma.message_id")}
             JOIN segment_message sm ON sm.message_id = ma.message_id
             JOIN segment s ON s.segment_id = sm.segment_id
-            WHERE {predicate.sql}
+            WHERE {predicate.sql} AND ({in_range.sql})
             ORDER BY mm.vec <=> %(qv)s::halfvec
             LIMIT %(row_limit)s
             """,
-            {"qv": vector_literal(vectors.multimodal), **predicate.params},
+            {"qv": vector_literal(vectors.multimodal), **predicate.params, **in_range.params},
             max_distance=1.0 - settings.multimodal_min_similarity,
             row_limit=cap * ROWS_PER_SEGMENT_OVERFETCH,
             settings=settings,
@@ -1068,6 +1140,8 @@ __all__ = [
     "apply_rerank",
     "group_by_thread",
     "message_hit_key",
+    "message_time_clause",
+    "page_predicate",
     "rerank_candidates",
     "rescore",
     "run_fulltext",

@@ -364,6 +364,8 @@ class HitView:
     anchor_key: str | None
     snippets: list[tuple[str, str]] = field(default_factory=list)
     label: HitLabel | None = None
+    span: tuple[datetime, datetime] | None = None
+    """When the matching messages shown were sent: the hit's label."""
 
 
 @dataclass(slots=True)
@@ -422,14 +424,18 @@ def _label_controls(view: HitView) -> str:
     )
 
 
+def _span_label(start: datetime, end: datetime, tz: str) -> str:
+    if start == end:
+        return fmt_datetime(start, tz)
+    if fmt_date(start, tz) == fmt_date(end, tz):
+        return f"{fmt_datetime(start, tz)}\u2013{fmt_time(end, tz)}"
+    return f"{fmt_datetime(start, tz)} \u2013 {fmt_datetime(end, tz)}"
+
+
 def hit_html(view: HitView, *, chat: ChatView, tz: str, matcher: QueryMatcher, query: str) -> str:
     hit = view.hit
-    if hit.ended_at.date() == hit.at.date() or hit.ended_at == hit.at:
-        when = f"{fmt_datetime(hit.at, tz)}" + (
-            f"\u2013{fmt_time(hit.ended_at, tz)}" if hit.ended_at != hit.at else ""
-        )
-    else:
-        when = f"{fmt_datetime(hit.at, tz)} \u2013 {fmt_datetime(hit.ended_at, tz)}"
+    start, end = view.span if view.span is not None else (hit.at, hit.ended_at)
+    when = _span_label(start, end, tz)
     matched = frozenset(att_id for _msg, att_id in hit.matched_attachments)
     messages = "".join(
         message_html(
@@ -514,6 +520,7 @@ class StatusView:
     timings_ms: dict[str, float]
     label_counts: LabelCounts
     baseline_line: str
+    hidden_non_content: int = 0
 
 
 def status_html(status: StatusView) -> str:
@@ -533,6 +540,14 @@ def status_html(status: StatusView) -> str:
         "disabled": '<span class="semantic disabled">semantic search off</span>',
     }.get(status.semantic_state, "")
     note = f' <span class="muted">({esc(status.semantic_note)})</span>' if status.semantic_note else ""
+    hidden = ""
+    if status.hidden_non_content:
+        n = status.hidden_non_content
+        hidden = (
+            f'<p class="hidden-note muted">Not shown: {n:,} match{"es" if n != 1 else ""} '
+            f"where the words were only in names, dates, times or labels, not in anything "
+            f"anyone wrote.</p>"
+        )
     capped = ""
     if status.capped:
         capped = (
@@ -551,7 +566,7 @@ def status_html(status: StatusView) -> str:
     return (
         f'<div class="status" id="status">{" ".join(parts)} · {semantic}{note}{timing_html}'
         f'<div class="status-2">{label_html} · <span class="muted baseline">{esc(status.baseline_line)}</span></div>'
-        f"{capped}</div>"
+        f"{hidden}{capped}</div>"
     )
 
 

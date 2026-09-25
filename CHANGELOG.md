@@ -10,6 +10,57 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-25 — The search page matches only what people wrote, and dates each message by its own time
+
+**Why.** Every indexed segment's text begins with its participants' names,
+the group's name, the date range and the time zone, and labels each message
+with a time and a short name. On the index host all 124,703 segments match
+"york", "chat" and "time" (count queries, 2026-09-24), so a search for a
+contact's name, a year, an hour or "new york" returned every segment of every
+conversation involved. The date filter tested when a segment started, so a
+message sent on 2 Dec in a segment that began on 30 Nov was found only by a
+30 Nov filter.
+
+- **A segment hit is kept only when the words occur in its content**
+  (`imsg.search_page.content_match`): message text; the filename of a PDF or
+  other document (the renderer writes no filename for photos, video or
+  audio); extracted attachment text, when the search has several words (one
+  word in extracted text is already found by the attachment channel); and
+  earlier versions of edited messages when `policy.index_edit_history` puts
+  them in the index. The status line says how many matches it left out. The
+  shared full-text index and everything the MCP tools use are unchanged. The
+  lasting fix, an index column with message words only, needs
+  `imsg fts rebuild` and waits for the photo import.
+- **Matching follows the index's own rules.** Each query word is tokenized by
+  SQLite's tokenizer with the index's options, and each character becomes
+  the set of characters SQLite folds to it, read from SQLite itself (1,248
+  folds and 25 dropped combining marks; a scan of every code point gives the
+  same tables). Case and Latin accents fold both ways, and ß stays ß as in the
+  index. The expressions do not depend on the database's locale: Postgres's
+  own case-insensitive matching folds only ASCII in a C-locale database.
+  Messages not yet in any segment are matched the same way, so they now fold
+  accents too.
+- **Dates test each message's own time.** From and To keep every segment
+  that overlaps the range; a word counts only in messages sent inside it; only
+  those messages are shown; each hit is labelled with its matching message's
+  time, and a word hit is dated by its latest matching message. The MCP
+  tools' date filter (`imsg.retrieval.filters`) still tests segment starts.
+- **Cost, measured** on the synthetic full-size corpus (675,000 messages,
+  127,054 segments), p50 of 7 runs: the check takes 1 ms for 18 candidates,
+  24 ms for 1,183, 219 ms for a name found in 16,362 headers and no message,
+  and 228–258 ms at the 20,000 cap. Whole full-text search, before and after:
+  16 → 18 ms (rare word), 32 → 61 ms (1,886 hits), 93 → 285 ms (the name, now
+  0 hits instead of 16,362), 456 → 691 ms ("the", 34,837 hits). The check's
+  queries run unprepared: after five runs psycopg prepares a statement and
+  Postgres switched to a generic plan measured at 460 ms against 270 ms.
+- **Test fixture.** The search page tests now render segments with the
+  production renderer, header lines and message labels included, and store
+  `text_normalized` as extraction does.
+- **Tests:** 48 new. The 35 expression tests compare every expression with an
+  in-memory FTS5 table using the index's tokenizer; the 13 page tests run
+  against the previous code, where 11 fail and 2 pass (the index's own accent
+  folding, and the MCP date filter, which must not change).
+
 ## 2026-09-24 — `install-agents` names the running environment's `imsg`, and refuses a missing one
 
 **Why.** On a host whose `PATH` over SSH lacked the virtualenv, every

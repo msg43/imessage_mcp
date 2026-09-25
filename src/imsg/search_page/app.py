@@ -31,7 +31,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -498,6 +498,34 @@ def _result_for(deps: AppDeps, pg: psycopg.Connection, request: SearchRequest) -
     return result
 
 
+def _in_range(messages: list[MessageView], result: SearchResult) -> list[MessageView]:
+    """Only the messages inside the search's date range, when it has one:
+    a segment that overlaps the range may begin or end outside it."""
+    after, before = result.filters.after, result.filters.before
+    if after is None and before is None:
+        return messages
+    return [
+        m
+        for m in messages
+        if (after is None or m.sent_at >= after) and (before is None or m.sent_at < before)
+    ]
+
+
+def _matching_span(
+    messages: list[MessageView], hit: Hit, matcher: QueryMatcher
+) -> tuple[datetime, datetime] | None:
+    """When the shown messages that match were sent (all shown messages
+    when none matches the words, as for a hit found by meaning)."""
+    attachment_messages = {m for m, _a in hit.matched_attachments}
+    matching = [
+        m for m in messages if matcher.matched_terms(m.text) or m.message_id in attachment_messages
+    ]
+    chosen = matching or messages
+    if not chosen:
+        return None
+    return chosen[0].sent_at, chosen[-1].sent_at
+
+
 def _pick_messages(messages: list[MessageView], hit: Hit, matcher: QueryMatcher, limit: int = 3) -> list[MessageView]:
     if not messages:
         return []
@@ -543,7 +571,12 @@ def build_thread_views(
     hits = [h for _t, hs in shown for h in hs]
     segment_ids = [h.segment_id for h in hits if h.segment_id is not None]
     message_ids = [h.message_id for h in hits if h.message_id is not None]
-    by_segment = segment_messages(pg, segment_ids, index_unsent=deps.settings.index_unsent)
+    by_segment = {
+        segment_id: _in_range(messages, result)
+        for segment_id, messages in segment_messages(
+            pg, segment_ids, index_unsent=deps.settings.index_unsent
+        ).items()
+    }
     direct = messages_by_id(pg, message_ids)
     keys = _segment_keys(pg, segment_ids)
     picked: dict[str, list[MessageView]] = {}
@@ -596,6 +629,7 @@ def build_thread_views(
                     anchor_key=messages[0].message_key if messages else None,
                     snippets=snippets[:3],
                     label=label,
+                    span=_matching_span(messages, hit, matcher),
                 )
             )
         out.append(
@@ -634,6 +668,7 @@ def _status(
         timings_ms=dict(result.timings_ms),
         label_counts=label_store.label_counts(pg, query_id),
         baseline_line=_baseline_line(pg),
+        hidden_non_content=result.hidden_non_content,
     )
 
 

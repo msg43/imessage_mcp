@@ -4,18 +4,23 @@ Fictional people and made-up text only (the repo is public). Every row is
 written through plain SQL against a scratch database that has the real
 migrations applied, and every segment and attachment chunk is also
 written into a real FTS5 sidecar, so the page's queries run against the
-same schema they meet in production.
+same schema they meet in production. Segments are rendered by the
+production renderer (`imsg.segment.render.render_segment`), header lines
+and message labels included, because that is the text the index holds.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import re
+import secrets
 import uuid
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import apsw
 import psycopg
@@ -25,6 +30,9 @@ from imsg.embed.fts.schema import create_schema
 from imsg.embed.fts.sync import upsert_chunk_row, upsert_segment_row
 from imsg.embed.vector_codec import vector_literal
 from imsg.keys import attachment_key, message_key, thread_key
+from imsg.segment.models import MessageForSegmentation, SegmentDraft
+from imsg.segment.render import render_segment
+from imsg.textnorm import normalize_text
 
 TEST_PG_HOST = os.environ.get("IMSG_TEST_PG_HOST", "/tmp/imsgpg1")
 TEST_PG_PORT = os.environ.get("IMSG_TEST_PG_PORT", "55432")
@@ -84,17 +92,28 @@ def scratch_db(name: str) -> Iterator[psycopg.Connection]:
         drop_scratch_db(name)
 
 
+RENDER_TIMEZONE = "UTC"
+"""The zone segments are rendered in (their `Time:` line); a test may
+set `Corpus.render_timezone` to another."""
+
+
 @dataclass(frozen=True, slots=True)
 class Person:
     person_id: int
     short_name: str
     display_name: str
+    is_owner: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class Chat:
     chat_id: int
     thread_key: str
+    kind: str = "dm"
+    display_name: str | None = None
+    participant_names: tuple[str, ...] = ()
+    """Everyone but the owner, as the renderer's `Chat:` line lists them."""
+    unfiled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +142,7 @@ class Corpus:
     conn: psycopg.Connection
     fts: apsw.Connection
     data_root: Path
+    render_timezone: str = RENDER_TIMEZONE
 
     def person(self, display_name: str, *, owner: bool = False) -> Person:
         short = f"{display_name.lower().replace(' ', '-')}-{uuid.uuid4().hex[:6]}"
@@ -134,7 +154,7 @@ class Corpus:
             )
             row = cur.fetchone()
         assert row is not None
-        return Person(int(row[0]), short, display_name)
+        return Person(int(row[0]), short, display_name, owner)
 
     def chat(
         self,
@@ -160,7 +180,8 @@ class Corpus:
                     "INSERT INTO chat_participant (chat_id, person_id) VALUES (%s, %s)",
                     (chat_id, person.person_id),
                 )
-        return Chat(chat_id, tkey)
+        others = tuple(sorted(p.display_name for p in participants if not p.is_owner))
+        return Chat(chat_id, tkey, kind, display_name, others, unfiled_key is not None)
 
     def message(
         self,
@@ -193,7 +214,7 @@ class Corpus:
                     sender is None,
                     sent_at,
                     text,
-                    text,
+                    normalize_text(text.replace("\ufffc", "")) if text is not None else None,
                     unsent,
                     edited,
                     deleted_at,
@@ -213,7 +234,9 @@ class Corpus:
         extra_text: str = "",
     ) -> Seg:
         """A session with one segment holding `lines` (sender None = the
-        owner), rendered and indexed in the FTS sidecar."""
+        owner), rendered as production renders it and indexed in the FTS
+        sidecar. `extra_text` is appended to the rendered text (standing
+        in for attachment snippets)."""
         started, ended = lines[0][0], lines[-1][0]
         with self.conn.cursor() as cur:
             cur.execute(
@@ -224,10 +247,36 @@ class Corpus:
             row = cur.fetchone()
             assert row is not None
             session_id = int(row[0])
-        rendered = "\n".join(
-            f"[{at:%H:%M}] {(p.short_name if p else 'owner')}: {text}" for at, p, text in lines
+        messages = [self.message(chat, at, person, text) for at, person, text in lines]
+        draft = SegmentDraft(
+            session_started_at=started,
+            seq_in_session=0,
+            messages=tuple(
+                MessageForSegmentation(
+                    message_id=msg.message_id,
+                    source_guid=msg.source_guid,
+                    chat_id=chat.chat_id,
+                    sent_at=at,
+                    is_from_me=person is None,
+                    sender_short_name=person.short_name if person else "owner",
+                    text=text,
+                    is_unsent=False,
+                    is_edited=False,
+                    has_attachments=False,
+                )
+                for msg, (at, person, text) in zip(messages, lines, strict=True)
+            ),
         )
-        rendered = f"---\n{rendered}{(' ' + extra_text) if extra_text else ''}"
+        rendered = render_segment(
+            draft,
+            participants=chat.participant_names,
+            chat_kind=chat.kind,
+            chat_display_name=chat.display_name,
+            timezone=self.render_timezone,
+            attachment_snippet_chars=200,
+            unfiled=chat.unfiled,
+        )
+        rendered = f"{rendered}{(' ' + extra_text) if extra_text else ''}"
         stable = hashlib.sha256(f"seg:{uuid.uuid4()}".encode()).hexdigest()
         with self.conn.cursor() as cur:
             cur.execute(
@@ -242,8 +291,7 @@ class Corpus:
             row = cur.fetchone()
             assert row is not None
             seg = Seg(int(row[0]), stable)
-        for at, person, text in lines:
-            msg = self.message(chat, at, person, text)
+        for msg in messages:
             self.link(seg, msg)
         if index:
             upsert_segment_row(self.fts, seg.segment_id, stable, rendered)
@@ -404,6 +452,86 @@ def tiny_png(width: int = 8, height: int = 8, rgb: tuple[int, int, int] = (40, 1
     )
 
 
+def page_settings(**overrides: Any) -> Any:
+    """`SearchSettings` for tests: UTC, every channel on."""
+    from imsg.search_page.search import SearchSettings
+
+    values: dict[str, Any] = {
+        "timezone": "UTC",
+        "index_unsent": False,
+        "rrf_k": 60,
+        "fts_max_hits": 20000,
+        "unindexed_window_days": 60,
+        "semantic_enabled": True,
+        "multimodal_enabled": True,
+        "text_min_similarity": 0.5,
+        "multimodal_min_similarity": 0.2,
+        "max_hits_per_channel": 2000,
+        "ef_search": 200,
+        "max_scan_tuples": 50000,
+    }
+    values.update(overrides)
+    return SearchSettings(**values)
+
+
+def make_page_client(
+    corpus: Corpus,
+    dbname: str,
+    *,
+    settings: Any = None,
+    model_api: Any = None,
+    **page: Any,
+) -> Any:
+    """A Starlette test client for the page, already signed in: the owner
+    password is a random value nobody types, and the session is minted
+    server-side with the page's own `SessionStore` and set as a cookie
+    (no login form is filled in)."""
+    import psycopg as _psycopg
+    from starlette.testclient import TestClient
+
+    from imsg.search_page.app import AppDeps, ConnectionPool, FtsReaders, build_app
+    from imsg.search_page.auth import LoginGuard, PasswordFile, SessionStore, hash_password
+    from imsg.search_page.config import SearchPageConfig
+    from imsg.search_page.media import MediaConverter
+    from imsg.search_page.secret_files import write_private_file
+    from imsg.search_page.server import open_fts_reader
+
+    root = corpus.data_root
+    private = root / "private" / "search-page"
+    password_path = private / "owner-password"
+    write_private_file(
+        password_path, (hash_password(secrets.token_urlsafe(24), n=2**14) + "\n").encode("utf-8")
+    )
+    passwords = PasswordFile(password_path)
+    sessions = SessionStore(private / "sessions.json", lifetime_seconds=3600)
+    raw_token, _session = sessions.create(passwords.fingerprint())
+    deps = AppDeps(
+        page=SearchPageConfig(enabled=True, allowed_hosts=["testserver"], **page),
+        settings=settings if settings is not None else page_settings(),
+        data_root=root,
+        pool=ConnectionPool(lambda: _psycopg.connect(dsn(dbname), autocommit=True), 2),
+        fts=FtsReaders(
+            lambda: open_fts_reader(root / "fts" / "fts.db"), root / "fts" / "fts.db", 2
+        ),
+        passwords=passwords,
+        sessions=sessions,
+        login_guard=LoginGuard(
+            passwords, max_failures_per_client=5, max_failures_global=30, window_seconds=900
+        ),
+        media=MediaConverter(root / "search-page" / "thumbnails"),
+        model_api=model_api,
+    )
+    client = TestClient(build_app(deps))
+    client.cookies.set("imsg_session", raw_token)
+    return client
+
+
+def csrf_token_of(html: str) -> str:
+    match = re.search(r'<meta name="csrf-token" content="([^"]+)"', html)
+    assert match is not None
+    return match.group(1)
+
+
 __all__ = [
     "REACHABLE",
     "SKIP_REASON",
@@ -415,9 +543,12 @@ __all__ = [
     "Seg",
     "cosine",
     "create_scratch_db",
+    "csrf_token_of",
     "drop_scratch_db",
     "dsn",
+    "make_page_client",
     "open_fts",
+    "page_settings",
     "scratch_db",
     "tiny_png",
     "unit_vector",

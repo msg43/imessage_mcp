@@ -11,6 +11,13 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-09-25 search page changes for forensic review (built, not yet
+deployed):** a segment hit is kept only when the words occur in what people
+wrote, so a contact's name, a year, an hour or a time-zone word no longer
+matches every segment's header lines; the date filter tests each message's
+own time. Deploying needs a restart of the search page only. See
+`CHANGELOG.md`.
+
 **2026-09-24 public endpoint fixes from the QA review (not yet deployed):**
 requests refused before any token was judged are counted in memory and
 written as one `mcp_audit_rollup` row per code per minute instead of a

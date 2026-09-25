@@ -24,7 +24,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from imsg.retrieval.query import AnalyzedQuery
-from imsg.textnorm import normalize_text
 
 _TOKEN_RE = re.compile(r"[^\W_]+")
 _OBJECT_REPLACEMENT = "￼"
@@ -197,12 +196,4 @@ def display_text(text: str) -> str:
     return text.replace(_OBJECT_REPLACEMENT, "").strip()
 
 
-def normalized_terms(analyzed: AnalyzedQuery) -> list[str]:
-    """The query's terms in the index's normalized form (for `ILIKE`
-    fallbacks over rows the index does not cover)."""
-    if analyzed.mode == "bm25":
-        return [t for t in normalize_text(analyzed.phrase).split() if t][:MAX_TERMS]
-    return [analyzed.phrase]
-
-
-__all__ = ["QueryMatcher", "display_text", "normalized_terms"]
+__all__ = ["QueryMatcher", "display_text"]
