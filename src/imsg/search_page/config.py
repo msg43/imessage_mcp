@@ -120,6 +120,19 @@ class SemanticSearchConfig(_Strict):
     tuples one threshold search may visit before it stops."""
 
 
+class DetailsConfig(_Strict):
+    """What the per-message Details panel may show beyond the page's own
+    fields. Each widens what the page reveals, so each is off unless the
+    owner turns it on."""
+
+    show_edit_history: bool = False
+    """Show the text of earlier versions of an edited message
+    (`message_version`). The edit time always shows."""
+    show_raw_handles: bool = False
+    """Show the sender's raw number or email as the Messages database
+    recorded it (`source_handle.raw_value`)."""
+
+
 class ModelApiConfig(_Strict):
     """The internal model API: hosted by `imsg mcp public`, bound to
     127.0.0.1 only, authenticated by a shared secret in a 0600 file. The
@@ -182,6 +195,7 @@ class SearchPageConfig(_Strict):
     db_pool_size: int = Field(default=4, ge=1, le=16)
     semantic: SemanticSearchConfig = Field(default_factory=SemanticSearchConfig)
     model_api: ModelApiConfig = Field(default_factory=ModelApiConfig)
+    details: DetailsConfig = Field(default_factory=DetailsConfig)
 
     @field_validator("listen")
     @classmethod
@@ -244,6 +258,7 @@ class SearchPageConfig(_Strict):
 __all__ = [
     "DEFAULT_MODEL_API_PORT",
     "DEFAULT_PAGE_PORT",
+    "DetailsConfig",
     "ModelApiConfig",
     "SearchPageConfig",
     "SemanticSearchConfig",

@@ -169,6 +169,19 @@ button.link {
 .page-thread .msg .msg-actions { visibility: hidden; }
 .page-thread .msg:hover .msg-actions, .page-thread .msg:focus-within .msg-actions { visibility: visible; }
 @media (hover: none) { .page-thread .msg .msg-actions { visibility: visible; } }
+.details {
+  margin: 6px 0 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px;
+  background: var(--bg); color: var(--fg); font-size: 13px; text-align: left; max-width: 640px;
+}
+.msg.me .details { margin-left: auto; }
+.details-title { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+.details dl { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 4px 12px; margin: 0; }
+.details dt { color: var(--muted); }
+.details dd { margin: 0; overflow-wrap: anywhere; }
+.details ul, .details ol { margin: 2px 0; padding-left: 18px; }
+.details code { font-size: 12px; }
+@media (max-width: 600px) { .details dl { grid-template-columns: 1fr; } .details dt { margin-top: 4px; } }
+.page-thread .msg:has(.details) .msg-actions { visibility: visible; }
 .cite-box { width: 100%; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 4px; }
 .copy-buffer { position: fixed; top: 0; left: -9999px; opacity: 0; }
 .reactions { font-size: 12px; color: var(--muted); margin: 2px 6px; }

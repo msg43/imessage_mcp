@@ -313,6 +313,30 @@
     box.select();
   }
 
+  // ---------------------------------------------------------------- details panel
+
+  async function onDetailsClick(button) {
+    const row = button.closest(".msg-actions");
+    if (!row) return;
+    const open = row.nextElementSibling && row.nextElementSibling.classList.contains("details")
+      ? row.nextElementSibling : null;
+    if (open) {
+      open.remove();
+      button.setAttribute("aria-expanded", "false");
+      return;
+    }
+    button.disabled = true;
+    try {
+      const html = await fetchText(button.dataset.url);
+      row.after(fragment(html));
+      button.setAttribute("aria-expanded", "true");
+    } catch (error) {
+      button.title = "Could not load the details: " + error.message;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
   // ---------------------------------------------------------------- misc clicks
 
   document.addEventListener("click", (event) => {
@@ -322,6 +346,8 @@
     if (label) { event.preventDefault(); onLabelClick(label); return; }
     const cite = target.closest(".cite-btn");
     if (cite) { event.preventDefault(); onCiteClick(cite); return; }
+    const details = target.closest(".details-btn");
+    if (details) { event.preventDefault(); onDetailsClick(details); return; }
     const more = target.closest(".more-hits");
     if (more) {
       event.preventDefault();

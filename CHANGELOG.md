@@ -10,6 +10,35 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-25 — Search page: a Details panel shows where each message came from
+
+**Why.** A forensic citation needs more than the time to the minute and the
+Edited and Deleted badges the page showed. The database already holds the
+exact times, the sender's service and raw handle, earlier versions of edited
+messages, the delete date, how extraction filed each message, and which
+sources hold it (design review of 2026-09-24, change 3); the page read none
+of them.
+
+- **Details** under every message opens a panel (`GET
+  /message/{message_key}/details`, an HTML fragment loaded on click, so
+  searches cost nothing more): time to the second with the zone offset;
+  sender and service; whether and when it was edited, and how long after
+  sending; the delete date; whether it was unsent; the conversation and why
+  the message is filed there (its `chat_evidence` in plain words); every
+  source that holds it, live Messages database or older copy, with the row
+  and when the run that last read it finished; its attachments with size,
+  SHA-256 and sources; the message ID and the Messages GUID.
+- **Two new switches, both off by default**, because each widens what the
+  page shows: `search_page.details.show_edit_history` (the text of earlier
+  versions) and `search_page.details.show_raw_handles` (the sender's raw
+  number or email from `source_handle`, which nothing else downstream
+  reads). With a switch off, the panel says the field is hidden by that
+  setting and the value is not in the response. Only incoming messages
+  carry a handle; extraction records none on the owner's own. An unsent
+  message has no panel unless `policy.index_unsent` is on.
+- **Tests:** 8 new, covering each switch on and off and both on; all fail on
+  the previous code.
+
 ## 2026-09-25 — Search page: copy a citation, plain words, a Labels page, "show all" 50 at a time, and Back keeps the place
 
 **Why.** The design review of 2026-09-24 found that forensic review on the

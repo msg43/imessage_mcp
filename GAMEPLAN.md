@@ -17,8 +17,11 @@ wrote, so a contact's name, a year, an hour or a time-zone word no longer
 matches every segment's header lines; the date filter tests each message's
 own time; each message has "Copy citation"; decision codes gave way to plain
 words and the evaluation progress to a Labels page; "show all hits" loads 50
-at a time; Back from a conversation keeps the loaded results and the place.
-Deploying needs a restart of the search page only. See `CHANGELOG.md`.
+at a time; Back from a conversation keeps the loaded results and the place;
+a Details panel on every message shows its exact times, sender, edits,
+deletion, filing and sources (earlier text and raw handles each behind a
+`search_page.details` switch, off by default). Deploying needs a restart of
+the search page only. See `CHANGELOG.md`.
 
 **2026-09-24 public endpoint fixes from the QA review (not yet deployed):**
 requests refused before any token was judged are counted in memory and

@@ -83,6 +83,7 @@ from imsg.search_page.auth import (
     session_cookie_name,
     tokens_match,
 )
+from imsg.search_page.details import message_details
 from imsg.search_page.errors import ModelApiUnavailable, SearchInputError, SecretFileError
 from imsg.search_page.highlight import QueryMatcher
 from imsg.search_page.search import (
@@ -987,6 +988,26 @@ def labels_view(request: Request) -> Response:
     )
 
 
+def message_details_view(request: Request) -> Response:
+    """The Details panel for one message, as an HTML fragment."""
+    session = _session(request)
+    if session is None:
+        return _unauthorized()
+    deps = _deps(request)
+    key = str(request.path_params.get("message_key", ""))
+    with deps.pool.connection() as pg:
+        details = message_details(
+            pg,
+            key,
+            index_unsent=deps.settings.index_unsent,
+            show_edit_history=deps.page.details.show_edit_history,
+            show_raw_handles=deps.page.details.show_raw_handles,
+        )
+    if details is None:
+        return PlainTextResponse("not found", status_code=404)
+    return HTMLResponse(views.details_html(details, tz=deps.timezone))
+
+
 def people_api(request: Request) -> Response:
     session = _session(request)
     if session is None:
@@ -1292,6 +1313,7 @@ def build_app(deps: AppDeps) -> ASGIApp:
         Route("/api/label", label_api, methods=["POST"]),
         Route("/api/people", people_api, methods=["GET"]),
         Route("/labels", labels_view, methods=["GET"]),
+        Route("/message/{message_key}/details", message_details_view, methods=["GET"]),
         Route("/thread/{thread_key}", thread_view, methods=["GET"]),
         Route("/thread/{thread_key}/messages", thread_messages, methods=["GET"]),
         Route("/att/{key}", attachment_original, methods=["GET"]),

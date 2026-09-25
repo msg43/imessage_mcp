@@ -19,6 +19,7 @@ from datetime import datetime
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
+from imsg.search_page.details import FILED_BY, MessageDetails
 from imsg.search_page.highlight import QueryMatcher, display_text
 from imsg.search_page.labels import (
     NOT_RELEVANT_GRADE,
@@ -29,7 +30,7 @@ from imsg.search_page.labels import (
 from imsg.search_page.search import CHANNEL_LABELS, Hit
 from imsg.search_page.threads import AttachmentView, ChatView, MessageView
 
-STATIC_VERSION = "2"
+STATIC_VERSION = "3"
 _URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
@@ -300,12 +301,148 @@ def _attachment_html(att: AttachmentView, *, matched: bool) -> str:
 
 
 def message_actions(message: MessageView, *, conversation: str, tz: str) -> str:
-    """The row under a message: its citation, ready to copy."""
+    """The row under a message: its Details panel and its citation."""
     cite = citation_line(message, conversation=conversation, tz=tz)
+    key = esc(message.message_key)
     return (
         '<div class="msg-actions">'
+        f'<button type="button" class="link details-btn" data-url="/message/{key}/details" '
+        'aria-expanded="false">Details</button>'
         f'<button type="button" class="link cite-btn" data-cite="{esc(cite)}">Copy citation</button>'
         "</div>"
+    )
+
+
+_SERVICES = {"imessage": "iMessage", "sms": "SMS", "rcs": "RCS"}
+
+
+def service_name(service: str | None) -> str:
+    return _SERVICES.get((service or "").lower(), "service not recorded")
+
+
+def _duration(seconds: float) -> str:
+    whole = round(seconds)
+    if whole < 60:
+        return f"{whole} second{'s' if whole != 1 else ''}"
+    minutes, rest = divmod(whole, 60)
+    if minutes < 60:
+        text = f"{minutes} minute{'s' if minutes != 1 else ''}"
+        return text + (f" {rest} second{'s' if rest != 1 else ''}" if rest else "")
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours} hour{'s' if hours != 1 else ''}" + (
+            f" {minutes} minute{'s' if minutes != 1 else ''}" if minutes else ""
+        )
+    return f"{hours // 24} days"
+
+
+def exact_time(dt: datetime, tz: str) -> str:
+    """`Mon 24 Apr 2023, 14:28:07 EDT (UTC\u221204:00)`."""
+    return f"{fmt_seconds(dt, tz)} ({utc_offset(dt, tz)})"
+
+
+HIDDEN_BY_SETTING = "hidden by setting"
+
+
+def details_html(details: MessageDetails, *, tz: str) -> str:
+    """The Details panel for one message (an HTML fragment)."""
+    rows: list[tuple[str, str]] = []
+    rows.append(("Sent", esc(exact_time(details.sent_at, tz))))
+    sender = [esc(details.sender_name)]
+    if not details.is_from_me:
+        if details.raw_handle is not None:
+            handle = esc(details.raw_handle)
+            if details.raw_handle_service and details.raw_handle_service != details.service:
+                handle += f" ({esc(service_name(details.raw_handle_service))})"
+            sender.append(f'<span class="handle">{handle}</span>')
+        elif details.handles_hidden:
+            sender.append(
+                f'<span class="muted">number or email {HIDDEN_BY_SETTING} '
+                "(search_page.details.show_raw_handles)</span>"
+            )
+        else:
+            sender.append('<span class="muted">no number or email recorded</span>')
+    sender.append(esc(service_name(details.service)))
+    rows.append(("From", " \u00b7 ".join(sender)))
+    if details.is_edited:
+        if details.date_edited is not None:
+            after = _duration((details.date_edited - details.sent_at).total_seconds())
+            edited = (
+                f"Yes, last edited {esc(exact_time(details.date_edited, tz))}, "
+                f"{esc(after)} after sending"
+            )
+        else:
+            edited = "Yes; the edit time was not recorded"
+        if details.versions is None:
+            edited += (
+                f'<div class="muted">Earlier text {HIDDEN_BY_SETTING} '
+                "(search_page.details.show_edit_history)</div>"
+            )
+        elif details.versions:
+            items = "".join(
+                "<li>\u201c"
+                + esc(v.text)
+                + "\u201d"
+                + (f' <span class="muted">dated {esc(exact_time(v.edited_at, tz))}</span>' if v.edited_at else "")
+                + "</li>"
+                for v in details.versions
+            )
+            edited += f'<div>Earlier text, oldest first:</div><ol class="versions">{items}</ol>'
+        else:
+            edited += '<div class="muted">No earlier text was recorded.</div>'
+    else:
+        edited = "No"
+    rows.append(("Edited", edited))
+    if details.deleted_at is not None:
+        rows.append(
+            (
+                "Deleted",
+                f"Deleted in Messages on {esc(exact_time(details.deleted_at, tz))}; "
+                "kept from Recently Deleted",
+            )
+        )
+    else:
+        rows.append(("Deleted", "No"))
+    rows.append(("Unsent", "Yes" if details.is_unsent else "No"))
+    kind = "group" if details.chat_kind == "group" else "one-to-one"
+    if details.is_holding:
+        kind = "unfiled"
+    filed = FILED_BY.get(details.chat_evidence, details.chat_evidence)
+    rows.append(("Conversation", f"{esc(details.chat_title)} ({esc(kind)}) \u00b7 filed here because {esc(filed)}"))
+    if details.sources:
+        lines = []
+        for source in details.sources:
+            what = {
+                "live": "the live Messages database",
+                "seed": "an older or recovered copy, used only to fill gaps",
+            }.get(source.merge_mode or "", "a Messages database")
+            when = f", read {esc(exact_time(source.read_at, tz))}" if source.read_at else ""
+            lines.append(
+                f"<li>{esc(source.source_name)}: {esc(what)}, row {source.source_rowid}{when}</li>"
+            )
+        rows.append(("Found in", f'<ul class="sources">{"".join(lines)}</ul>'))
+    else:
+        rows.append(("Found in", '<span class="muted">no source recorded</span>'))
+    if details.attachments:
+        lines = []
+        for att in details.attachments:
+            parts = [esc(att.filename or "unnamed file")]
+            if att.byte_size is not None:
+                parts.append(esc(human_size(att.byte_size)))
+            if att.sha256:
+                parts.append(f'SHA-256 <code class="sha">{esc(att.sha256)}</code>')
+            if att.state != "materialized":
+                parts.append(f"file {esc(att.state)}")
+            if att.sources:
+                parts.append("from " + esc(", ".join(att.sources)))
+            lines.append("<li>" + " \u00b7 ".join(parts) + "</li>")
+        rows.append(("Attachments", f'<ul class="attachments">{"".join(lines)}</ul>'))
+    rows.append(("Message ID", f'<code class="key">{esc(details.message_key)}</code>'))
+    rows.append(("Messages GUID", f'<code class="key">{esc(details.source_guid)}</code>'))
+    body = "".join(f"<dt>{label}</dt><dd>{value}</dd>" for label, value in rows)
+    return (
+        '<div class="details" role="region" aria-label="Message details">'
+        f'<div class="details-title">Message details</div><dl>{body}</dl></div>'
     )
 
 
@@ -812,6 +949,8 @@ __all__ = [
     "PageContext",
     "StatusView",
     "ThreadResultView",
+    "citation_line",
+    "details_html",
     "error_page",
     "esc",
     "fmt_date",

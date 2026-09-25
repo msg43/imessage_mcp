@@ -301,3 +301,6 @@ logging:
 #     enabled: true                    # also read by `imsg mcp public`, which hosts it
 #     port: 8711                       # bound to 127.0.0.1 only
 #     secret_file: private/search-page/model-api.secret
+#   details:                           # the per-message Details panel
+#     show_edit_history: false         # true: also show the text of earlier versions of an edited message
+#     show_raw_handles: false          # true: also show the sender's raw number or email
