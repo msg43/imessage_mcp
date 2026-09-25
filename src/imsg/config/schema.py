@@ -38,6 +38,7 @@ from imsg import constants, mlx_runtime, shared_vlm_runtime
 from imsg.config.secrets import SecretRef
 from imsg.embed.batching import DEFAULT_MAX_BATCH_TOKENS
 from imsg.paths import is_contained_in, join_under_root, resolve_path
+from imsg.search_page.config import SearchPageConfig
 
 MESSAGES_DIR = Path("~/Library/Messages").expanduser()
 
@@ -1089,6 +1090,8 @@ class Config(StrictModel):
     attachments: AttachmentsConfig = Field(default_factory=AttachmentsConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     background: BackgroundConfig = Field(default_factory=BackgroundConfig)
+    search_page: SearchPageConfig = Field(default_factory=SearchPageConfig)
+    """The private local search page (D14); off unless `search_page.enabled`."""
 
     # ---- cross-field path-containment validation (hard requirements #1, #2) ----
 

@@ -264,3 +264,27 @@ logging:
 #       root: /volume1/share
 #   ssh_command: ssh -o BatchMode=yes
 #   rsync_command: rsync
+
+# The private local search page (optional, off by default): an always-on
+# web page on the local network with an owner login, returning every
+# viable hit grouped by conversation. It loads no model; semantic search
+# uses the public MCP server's loaded models through `model_api`.
+# Set up with `imsg search-page set-password` and (for semantic search)
+# `imsg search-page init-model-secret`; check with `imsg search-page check`.
+# search_page:
+#   enabled: true
+#   listen: ["127.0.0.1:8710", "192.0.2.10:8710"]   # loopback + this host's LAN address (IP literals only)
+#   allowed_hosts: ["127.0.0.1:8710", "localhost:8710", "192.0.2.10:8710"]  # exact Host header values
+#   # For the Tailscale-private alternative: listen on loopback only, run
+#   # `tailscale serve --bg --https=8443 http://127.0.0.1:8710` (never
+#   # `tailscale funnel`), and add the tailnet name to both lists:
+#   # https_hosts: ["host.tailnet.ts.net:8443"]
+#   password_file: private/search-page/owner-password   # relative to data_root, 0600
+#   session_days: 30
+#   semantic:
+#     text_min_similarity: 0.45        # starting values; tune with labelled queries
+#     multimodal_min_similarity: 0.2
+#   model_api:
+#     enabled: true                    # also read by `imsg mcp public`, which hosts it
+#     port: 8711                       # bound to 127.0.0.1 only
+#     secret_file: private/search-page/model-api.secret

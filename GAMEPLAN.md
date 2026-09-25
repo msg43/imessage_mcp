@@ -11,6 +11,20 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-09-24 private local search page (D14), built, not deployed:**
+`imsg search-page serve` returns every viable hit grouped by conversation,
+full text first and semantic above a similarity floor after, with threads
+that scroll both ways, attachments inline and relevance toggles that write
+eval labels. Local network only, one owner login; it loads no model and
+uses `imsg mcp public`'s models through a loopback-only internal API.
+Measured on a synthetic production-sized corpus on the Studio: 14-74 ms
+full-text search, 26-85 ms for the whole first page, ~70 ms of semantic
+database work; a near-stopword query takes ~0.4 s (`CHANGELOG.md`). Owner steps to deploy: add `search_page:`
+to config, set the password, create the model-API secret, restart `imsg mcp
+public`, then render and install the agent (`imsg install-agents --only
+search-page`). 2,734 tests pass against
+a scratch Postgres (2026-09-24).
+
 **2026-09-24 enrichment decoder limits and lock hand-over (not yet
 deployed):** every enrichment decoder runs sandboxed (no network, writes
 only in the task's work directory, now under `data_root`) inside one

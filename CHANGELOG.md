@@ -10,6 +10,115 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-24 — A private local search page (D14): every hit, grouped by conversation, local network only
+
+**Why.** Owner decision D14: an always-on search page for the owner alone,
+outside Gemini, that returns every viable hit with threads and attachments
+one click away, and is fast. Built, tested and measured; not deployed and
+not installed (heavy work on the index host is paused).
+
+- **`imsg search-page serve`** (new package `imsg.search_page`, config key
+  `search_page:`, off by default). Server-rendered HTML with one local
+  script and one stylesheet, no framework, light and dark, phone and desktop.
+- **Every viable hit, not a top-k.** Full text first: every segment the FTS
+  index matches (BM25 words, a quoted phrase through the trigram table, or
+  an emoji substring), every attachment text match (collapsed per
+  attachment), and messages from the last 60 days that are in no segment
+  yet (the index lags while heavy stages are paused). Then semantic: every
+  segment, attachment chunk and image above a similarity floor (0.45 text,
+  0.2 image: starting values to tune with labels), read from the HNSW index
+  in distance order until the first row past the floor. Deduplicated per
+  segment, fused with reciprocal rank fusion, grouped by conversation with
+  a count each; sort by relevance or date; filter by people, dates and
+  attachments. A safety cap of 20,000 per channel is reported when reached.
+  Nothing reranks the full list; an optional "reranked" order sends only the
+  best 20 to the reranker.
+- **Access control.** Listeners are IP literals on loopback or a
+  local-network range only (wildcards, Tailscale addresses and public
+  addresses are refused at config load; the public MCP port at startup).
+  An unknown or repeated `Host` header is refused before anything else.
+  One owner login: scrypt hash (N=2^16) in a 0600 file on the encrypted
+  volume, set by `imsg search-page set-password`; server-side sessions
+  stored as hashes in a 0600 file, cookies `HttpOnly`, `SameSite=Strict`,
+  `Secure` over HTTPS; a CSRF token and a same-site check on every `POST`;
+  failed logins throttled per address and overall before any hashing. A
+  Content Security Policy allows only the page's own script and style.
+  Access logging is off (search URLs carry the search text). Tailscale
+  Serve is the documented HTTPS alternative (`imsg.search_page.server`).
+- **One model set (D10.5).** The page loads no model. `imsg mcp public`
+  hosts an internal model API on 127.0.0.1 only, port 8711, behind a shared
+  secret in a 0600 file (`imsg search-page init-model-secret`); it refuses
+  browser and DNS-rebinding requests, runs every call on the public server's
+  model thread inside the query-in-flight marker, answers 503 at once while
+  the models are not loaded, and is never a reason for the public server to
+  fail. The public MCP app and its subject validation are untouched (a
+  12-line hook in `imsg mcp public`). When the API is down, full-text search
+  still answers and the page says why semantic search is missing.
+- **Threads and attachments.** A conversation opens around the hit and
+  scrolls both ways, with names, times, reactions, reply links, edited,
+  unsent and deleted markers (D13) and holding-chat labels. Attachments
+  come only from the content-addressed cache (path rebuilt from the sha256,
+  symlinks resolved, containment checked), with allowlisted content types:
+  images, video, audio and PDFs inline, anything a browser could run served
+  as a download. HEIC and TIFF previews, video posters and voice-note
+  conversion run in sandboxed child processes (`sandbox-exec`, no network,
+  writes only to a work directory on the encrypted volume).
+- **Eval labels.** Relevant and not-relevant toggles on each hit write
+  `relevance_label` rows through `imsg.eval.io` with `source =
+  'mark_relevant'`, anchored on the segment's first message GUID, under the
+  search text's eval query (`adhoc:<text>` unless a curated query has that
+  text). The page shows the query's label count and AT-4 progress.
+- **Launch agent, rendered only.** `imsg install-agents --only search-page
+  --dest <dir>` renders a KeepAlive agent under the shared supervisor
+  (`imsg.agents.supervise`, the ops fixes above): it waits for the volume
+  and for Postgres, passes the mount guard, reads the database secret from
+  the 0600 file the plist names (never a value), logs on the volume, and
+  runs as `ProcessType` Interactive. It is an optional agent, never in the
+  default set, since a KeepAlive agent for a disabled page would restart
+  forever. Nothing is installed.
+- **Measured on the Studio** (M2 Ultra) against a synthetic corpus shaped
+  like production (675,000 messages, 127,054 segments, 100,000
+  attachments, 60,000 chunks, 64,000 image vectors; FTS sidecar 337 MiB),
+  warm, 7 runs each, `scripts/bench_search_page.py`:
+  | Query | Hits | Full-text search p50 / p95 | Whole first page p50 |
+  |---|---|---|---|
+  | rare word | 35 | 14 / 15 ms | 30 ms |
+  | uncommon word | 225 | 18 / 19 ms | 33 ms |
+  | medium word | 1,886 | 28 / 30 ms | 49 ms |
+  | two words | 124 | 18 / 19 ms | 32 ms |
+  | quoted phrase | 449 | 32 / 33 ms | 41 ms |
+  | emoji | 678 | 74 / 75 ms | 85 ms |
+  | medium word, one person | 68 | 23 / 23 ms | 26 ms |
+  | medium word, one year | 197 | 18 / 20 ms | 49 ms |
+  | near-stopword (cap reached) | 34,837 | 423 / 437 ms | 484 ms |
+  A query's first run, before its pages are cached, took 19-116 ms
+  (448 ms for the near-stopword). Semantic database work for ~880 added
+  hits: 70-73 ms p50, 83-99 ms p95.
+  The internal API adds 0.7 ms per call over loopback; query embedding on
+  the mini was measured at 83 ms and the PE-Core text tower at 22 ms (warm
+  p50, 2026-09-16). The page process (the real `serve` path, Studio) held
+  about 180 MB at start and about 250 MB with its result cache holding a
+  35,000-hit query; the cache is bounded at 50,000 hits.
+- **Found by a real browser:** with `Referrer-Policy: no-referrer`,
+  browsers send `Origin: null` on the page's own form posts, so the
+  same-site check refused every login. The policy is `same-origin`.
+- **Found by measurement:** with a threshold scan's large safety `LIMIT`,
+  the planner sorted every chunk vector instead of walking the HNSW index
+  (520 ms); `enable_sort = off` keeps the index path (25 ms).
+- 133 new tests: unit, integration against a scratch Postgres, a real
+  sandboxed thumbnail, the rendered agent. Mutation checks confirm the Host
+  allowlist, session, CSRF, throttle, secret, containment, every-hit,
+  threshold and label-source tests each fail when their guard is removed.
+  Full suite: 2,734 passed against a scratch Postgres, none skipped. ruff
+  and mypy strict clean.
+- **Known limits.** On plain HTTP a session cookie crosses the local network
+  readable by anyone who can capture that traffic; use Tailscale Serve (or
+  listener TLS) for HTTPS. The similarity floors are untested against real
+  embeddings. A near-stopword query is over the 300 ms target. The FTS
+  sidecar's writers set no SQLite busy timeout (unchanged here), so a
+  reader holding a shared lock at a writer's commit can make that commit
+  fail and retry on the next sync.
+
 ## 2026-09-24 — Secrets can live in an owner-only file (`file:<absolute path>`)
 
 **Why.** On a headless Mac the login Keychain cannot be read over SSH or

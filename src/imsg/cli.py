@@ -60,7 +60,12 @@ import typer
 import uvicorn
 
 from imsg import host_memory
-from imsg.agents.plists import AGENT_NAMES, LOGS_NOTE, render_agent_plists
+from imsg.agents.plists import (
+    AGENT_NAMES,
+    LOGS_NOTE,
+    OPTIONAL_AGENT_NAMES,
+    render_agent_plists,
+)
 from imsg.backfill.fetch import LocationFetchReport, access_from_config, settings_from_config
 from imsg.backfill.locate import CoverageReport, LocatedFile, build_coverage, run_locate
 from imsg.backfill.pipeline import DEFAULT_RATE_PER_MINUTE, run_backfill
@@ -185,6 +190,8 @@ from imsg.retrieval.background_warm_up import BackgroundWarmUp
 from imsg.retrieval.idle_unload import IdleModelUnloader, PressureRelease, release_freed_memory
 from imsg.retrieval.model_thread import ModelThread
 from imsg.retrieval.service import RetrievalService
+from imsg.search_page.cli import search_page_app
+from imsg.search_page.model_api_server import start_model_api_if_enabled
 from imsg.segment.pipeline import REBUILD_ALL_SENTINEL, run_segment, run_segment_for_chat
 from imsg.stages.extract import ExtractResult, MergeMode, merge_mode_for_source, run_extract
 from imsg.stages.identity import (
@@ -232,6 +239,7 @@ models_app = typer.Typer(
 )
 app.add_typer(models_app, name="models")
 app.add_typer(eval_app, name="eval")
+app.add_typer(search_page_app, name="search-page")
 app.command("verify-seed")(verify_seed)
 app.command("reconcile-attachments")(reconcile_attachments)
 
@@ -3381,9 +3389,26 @@ def mcp_public(
     # returns, so uvicorn binds and serves while the weights load.
     warm_up.start()
     idle_unloader.start_watchdog()
+    # The search page's internal model API (D14): a separate loopback-only
+    # listener on its own port, sharing these warm models; off unless
+    # search_page.model_api.enabled, and never a reason for this server to
+    # fail (imsg.search_page.model_api_server).
+    model_api = start_model_api_if_enabled(
+        cfg,
+        text_provider=text_provider,
+        reranker=reranker,
+        multimodal_provider=multimodal_provider,
+        model_thread=model_thread,
+        query_marker=query_marker,
+        warm_up=warm_up,
+        idle_unloader=idle_unloader,
+        log=lambda line: typer.echo(f"mcp public: {line}", err=True),
+    )
     try:
         uvicorn.run(asgi_app, host=host, port=port, log_level="info")
     finally:
+        if model_api is not None:
+            model_api.stop()
         idle_unloader.stop()
         model_thread.close()
         admission.release()
@@ -4027,8 +4052,9 @@ def install_agents(
         list[str] | None,
         typer.Option(
             "--only",
-            help=f"Render only this agent (repeatable): one of {', '.join(AGENT_NAMES)}. "
-            "Default: all of them, the tunnel only when cloudflared is on PATH.",
+            help=f"Render only this agent (repeatable): one of "
+            f"{', '.join((*AGENT_NAMES, *OPTIONAL_AGENT_NAMES))}. "
+            "Default: all but the optional ones, the tunnel only when cloudflared is on PATH.",
         ),
     ] = None,
     interpreter: Annotated[

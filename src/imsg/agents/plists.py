@@ -109,6 +109,10 @@ LOGS_NOTE = (
 AGENT_NAMES: tuple[str, ...] = ("pg", "sync", "enrich", "mcp-public", "tunnel", "report", "backup")
 """SPEC §5.5's table, in its order."""
 
+OPTIONAL_AGENT_NAMES: tuple[str, ...] = ("search-page",)
+"""Agents outside SPEC §5.5's table, rendered only when named in `only`:
+the private local search page (D14), `imsg search-page serve`."""
+
 THROTTLE_SECONDS = 60
 """SPEC §5.4: agents "use ThrottleInterval 60 and simply retry until the
 mount appears" — also the least time between two starts of a KeepAlive
@@ -291,10 +295,11 @@ def render_agent_plists(
         postgres=postgres_binary,
         cloudflared=cloudflared_binary,
     )
-    selected = list(AGENT_NAMES) if only is None else [n for n in AGENT_NAMES if n in set(only)]
-    unknown = set(only or ()) - set(AGENT_NAMES)
+    known = (*AGENT_NAMES, *OPTIONAL_AGENT_NAMES)
+    selected = list(AGENT_NAMES) if only is None else [n for n in known if n in set(only)]
+    unknown = set(only or ()) - set(known)
     if unknown:
-        raise ValueError(f"unknown agent(s) {sorted(unknown)}; choose from {list(AGENT_NAMES)}")
+        raise ValueError(f"unknown agent(s) {sorted(unknown)}; choose from {list(known)}")
     public_config = mcp_public_config or config
     public_path = mcp_public_config_path or config_path
     db_env = env_secret_names(config, public=False)
@@ -379,6 +384,25 @@ def render_agent_plists(
             "StartCalendarInterval": {"Hour": 4, "Minute": 0},
             "ProcessType": "Background",
         },
+        # Only with `only=["search-page"]`: the page is off unless its
+        # config says otherwise, and a KeepAlive agent for a disabled page
+        # would restart forever.
+        "search-page": lambda: {
+            **_supervised(
+                "search-page",
+                binaries=binaries,
+                data_root=data_root,
+                guard_config=config_path,
+                command=[imsg, "search-page", "serve", "--config", cfg],
+                env_names=db_env,
+                env_files=env_files,
+                wait_for_postgres=True,
+            ),
+            "KeepAlive": True,
+            "RunAtLoad": True,
+            "ExitTimeOut": MCP_EXIT_TIMEOUT_SECONDS,
+            "ProcessType": "Interactive",
+        },
     }
     return {
         f"{LABEL_PREFIX}{name}": plistlib.dumps(builders[name](), fmt=plistlib.FMT_XML)
@@ -449,6 +473,7 @@ __all__ = [
     "DEFAULT_ENV_DIR",
     "LABEL_PREFIX",
     "LOGS_NOTE",
+    "OPTIONAL_AGENT_NAMES",
     "AgentBinaries",
     "calendar_intervals_for_window",
     "default_interpreter",
