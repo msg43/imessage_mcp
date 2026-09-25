@@ -218,6 +218,26 @@ figure.att { margin: 4px 0; }
 .day-break span { font-size: 12px; color: var(--muted); background: var(--card); padding: 2px 10px; border-radius: 999px; }
 .edge { text-align: center; color: var(--muted); font-size: 12px; padding: 12px; }
 
+/* grading mode */
+.grade-form { margin: -6px 0 10px; font-size: 13px; }
+.grade-form button.link { font-size: 13px; }
+.grading h1 { font-size: 20px; }
+.notice-plain { font-size: 13px; color: var(--muted); border-left: 3px solid var(--line); padding-left: 8px; }
+.candidate { border: 1px solid var(--line); border-radius: 14px; margin: 14px 0; overflow: hidden; }
+.candidate-head { padding: 8px 14px; background: var(--card); border-bottom: 1px solid var(--line); font-size: 14px; }
+.candidate-head .place { display: inline-block; min-width: 26px; font-weight: 600; color: var(--muted); }
+.candidate-body { padding: 6px 14px; }
+.candidate-text { white-space: pre-wrap; font-size: 13px; }
+.grade-controls { display: flex; gap: 8px; flex-wrap: wrap; padding: 8px 14px 12px; border-top: 1px solid var(--line); }
+.grade-btn {
+  border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+  border-radius: 999px; padding: 4px 12px; cursor: pointer; font-size: 13px;
+}
+.grade-btn.g2.on { background: var(--good); border-color: var(--good); color: #fff; }
+.grade-btn.g1.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.grade-btn.g0.on { background: var(--danger); border-color: var(--danger); color: #fff; }
+.grade-btn:disabled { opacity: .5; }
+
 /* labels */
 .labels h1 { font-size: 22px; }
 .labels h2 { font-size: 17px; margin-top: 24px; }

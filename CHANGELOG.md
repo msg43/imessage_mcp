@@ -10,6 +10,43 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-25 — Search page grading mode: grade every candidate of a search, and keep the list for scoring rerankers offline
+
+**Why.** Choosing between rerankers needs about 100 real queries with every
+candidate in the top 20 graded, shown in random order without scores, and
+the whole fused candidate list kept so any reranker can be scored later
+(reranker report of 2026-09-24, evaluation plan). The page's Relevant and
+Not relevant buttons label only what the owner happens to mark, in ranked
+order.
+
+- **"Grade the top 20"** on a results page (a form with the CSRF token and
+  the same-site check: it stores data) runs the search's meaning phase if it
+  has not run, then stores the list (**migration 0011**,
+  `eval_candidate_list` and `eval_candidate`): the query text, the filters
+  as set, how the list was ranked, and the segment hits in reciprocal-rank-
+  fusion order down to position 30, each with the GUID of the segment's
+  first message (the eval harness's anchor), its segment key and a copy of
+  its text, so a reranker scored later reads what was graded. Messages in no
+  segment yet are left out; no reranker or eval run can use them.
+- **The grading view** (`/grade/<id>`) shows the first 20 in a random order
+  fixed by a stored seed, with no scores, channel badges or positions, each
+  with 2 exactly what I wanted, 1 relevant, 0 not relevant; "grade 10 more"
+  adds places 21-30. A candidate found through an attachment shows the
+  attachment text that matched.
+- **Grades are ordinary eval labels**: `relevance_label` rows with source
+  `pool_judgment` (SPEC §13.2), anchored as `imsg eval run` resolves them,
+  under the page's eval query for that text, so they count toward AT-4. A
+  filtered search gets its own query (`adhoc:<text> [<filters>]`) with no
+  retrieval target, because `imsg eval run` cannot apply filters; its grades
+  stay with the list for offline scoring. The Labels page lists every graded
+  search with its progress.
+- **Offline scoring:** `imsg.search_page.grading.load_graded_lists` reads
+  every list with its current grades; `fused_order_metrics` and
+  `reordered_metrics` score the fused order, or any reranker's reordering,
+  with the harness's own metrics (`imsg.eval.metrics`).
+- **Tests:** 8 new; all fail on the previous code. The migrations test's
+  table count moves from 39 to 41.
+
 ## 2026-09-25 — Reranking takes 41 % less time with the same ranking quality: bf16 build, 8,192-token batches, shared prompt read once
 
 **Why.** Reranking 20 candidates is the largest step of a search: 1.005 s

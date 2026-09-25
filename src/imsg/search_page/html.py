@@ -20,6 +20,14 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from imsg.search_page.details import FILED_BY, MessageDetails
+from imsg.search_page.grading import (
+    GRADE_LABELS,
+    GRADED_POSITIONS,
+    MAX_POSITIONS,
+    GradedCandidate,
+    GradedList,
+    describe_filters,
+)
 from imsg.search_page.highlight import QueryMatcher, display_text
 from imsg.search_page.labels import (
     NOT_RELEVANT_GRADE,
@@ -30,7 +38,7 @@ from imsg.search_page.labels import (
 from imsg.search_page.search import CHANNEL_LABELS, Hit
 from imsg.search_page.threads import AttachmentView, ChatView, MessageView
 
-STATIC_VERSION = "3"
+STATIC_VERSION = "4"
 _URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
@@ -791,6 +799,22 @@ def status_html(status: StatusView) -> str:
     )
 
 
+def grade_form(form: FormState, *, csrf_token: str) -> str:
+    """"Grade the top 20": a form, because starting a graded list stores
+    the search (nothing is stored until the owner asks)."""
+    fields = "".join(
+        f'<input type="hidden" name="{esc(k)}" value="{esc(v)}">'
+        for k, v in form.params().items()
+        if k != "sort"
+    )
+    return (
+        '<form class="grade-form" method="post" action="/grade">'
+        f'<input type="hidden" name="csrf_token" value="{esc(csrf_token)}">{fields}'
+        '<button type="submit" class="link" title="Grade every one of the best 20 results, '
+        'for measuring search quality">Grade the top 20</button></form>'
+    )
+
+
 def search_page(
     ctx: PageContext,
     *,
@@ -818,8 +842,13 @@ def search_page(
             '<code>"quoted text"</code> matches exact text anywhere; emoji work too. Results are '
             "grouped by conversation; semantic matches arrive a moment after the text matches.</p></section>"
         )
+    grading = (
+        grade_form(form, csrf_token=ctx.csrf_token)
+        if status is not None and status.total_hits > 0
+        else ""
+    )
     body = (
-        f"{error_html}{intro}{status_html_text}"
+        f"{error_html}{intro}{status_html_text}{grading}"
         f'<div id="results" class="results"{data_attrs}>{results}</div>{empty}'
         '<div id="semantic-banner" class="banner" hidden></div>'
     )
@@ -884,6 +913,119 @@ def thread_page(
     return layout(ctx, body, body_class="page-thread", topbar=topbar)
 
 
+@dataclass(slots=True)
+class CandidateView:
+    candidate: GradedCandidate
+    chat: ChatView | None
+    messages: list[MessageView]
+    attachment_text: dict[int, str] = field(default_factory=dict)
+    """Extracted text of the candidate's attachments, by attachment id."""
+
+
+def _grade_controls(list_id: int, candidate: GradedCandidate) -> str:
+    buttons = []
+    for grade in (2, 1, 0):
+        on = candidate.grade == grade
+        buttons.append(
+            f'<button type="button" class="grade-btn g{grade}{" on" if on else ""}" '
+            f'data-grade="{grade}" aria-pressed="{"true" if on else "false"}">'
+            f"{grade} \u00b7 {esc(GRADE_LABELS[grade])}</button>"
+        )
+    return (
+        f'<div class="grade-controls" data-list="{list_id}" data-anchor="{esc(candidate.anchor_guid)}">'
+        + "".join(buttons)
+        + "</div>"
+    )
+
+
+def grading_page(
+    ctx: PageContext,
+    *,
+    graded: GradedList,
+    views: Sequence[CandidateView],
+    positions: int,
+    tz: str,
+    matcher: QueryMatcher,
+) -> str:
+    """Every candidate of one search, in random order and without scores,
+    each with the three grades."""
+    described = describe_filters(graded.filters)
+    shown_total = min(positions, len(graded.candidates))
+    graded_count = graded.graded(positions)
+    notes: list[str] = []
+    if described:
+        notes.append(
+            "This search has filters. Its grades stay with this list for comparing ways of "
+            "ranking; they do not count toward the first measured evaluation, which runs "
+            "searches without filters."
+        )
+    semantic = str(graded.ranking.get("semantic", ""))
+    if semantic and semantic != "done":
+        reason = str(graded.ranking.get("semantic_note") or semantic)
+        notes.append(
+            f"The meaning search did not run ({reason}), so this list holds word matches only."
+        )
+    cards: list[str] = []
+    for view in views:
+        candidate = view.candidate
+        if view.chat is not None and view.messages:
+            title = esc(view.chat.title)
+            start, end = view.messages[0].sent_at, view.messages[-1].sent_at
+            when = esc(_span_label(start, end, tz))
+            body = "".join(
+                message_html(m, tz=tz, matcher=matcher, group=True, thread_key=view.chat.thread_key)
+                for m in view.messages
+            )
+            names = {a.attachment_id: a.filename or "attachment" for m in view.messages for a in m.attachments}
+            body += "".join(
+                f'<div class="att-snippet"><span class="muted">{esc(names.get(att_id, "attachment"))}:</span> '
+                f"{matcher.snippet(text)}</div>"
+                for att_id, text in sorted(view.attachment_text.items())
+                if matcher.matched_terms(text)
+            )
+        else:
+            title = "Conversation"
+            when = ""
+            body = f'<pre class="candidate-text">{esc(candidate.segment_text)}</pre>'
+        cards.append(
+            f'<section class="candidate" data-anchor="{esc(candidate.anchor_guid)}">'
+            f'<div class="candidate-head"><span class="place">{candidate.shown_order}</span> '
+            f"<strong>{title}</strong> <span class=\"muted\">{when}</span></div>"
+            f'<div class="candidate-body">{body}</div>{_grade_controls(graded.list_id, candidate)}'
+            "</section>"
+        )
+    more = ""
+    if positions < MAX_POSITIONS and len(graded.candidates) > positions:
+        extra = min(len(graded.candidates), MAX_POSITIONS) - positions
+        more = (
+            f'<p><a href="/grade/{graded.list_id}?more=1">Grade {extra} more '
+            f"(places {positions + 1} to {positions + extra})</a></p>"
+        )
+    notes_html = "".join(f'<p class="notice-plain">{esc(n)}</p>' for n in notes)
+    body_html = (
+        f'<section class="grading" data-list="{graded.list_id}" data-positions="{positions}">'
+        f"<h1>Grade: \u201c{esc(graded.query_text)}\u201d</h1>"
+        f'<p class="muted">{esc("Filters: " + described) if described else "No filters."} '
+        f'<a href="{esc(FormState(query=graded.query_text).url())}">Back to the search</a></p>'
+        "<p>Grade each result for this search: <strong>2</strong> exactly what you wanted, "
+        "<strong>1</strong> relevant, <strong>0</strong> not relevant. The results are in random "
+        "order and show no scores, so a grade does not depend on where a result stood in the "
+        "list.</p>"
+        f"{notes_html}"
+        f'<p class="grade-progress"><span class="n-graded">{graded_count}</span> of '
+        f"{shown_total} graded.</p>"
+        + "".join(cards)
+        + more
+        + "</section>"
+    )
+    topbar = search_form(
+        FormState(query=graded.query_text),
+        semantic_available=ctx.semantic_available,
+        csrf_token=ctx.csrf_token,
+    )
+    return layout(ctx, body_html, body_class="page-grading", topbar=topbar)
+
+
 def _progress_row(label: str, have: int, need: int) -> str:
     met = have >= need
     return (
@@ -901,6 +1043,7 @@ def labels_page(
     passed: bool,
     minimums: tuple[int, int, int],
     queries: Sequence[LabelledQuery],
+    graded_lists: Sequence[GradedList] = (),
 ) -> str:
     """Progress toward the first measured evaluation of search quality,
     and every query that has labels."""
@@ -923,15 +1066,33 @@ def labels_page(
         if rows
         else '<p class="muted">No query has labels yet.</p>'
     )
+    list_rows = "".join(
+        "<tr>"
+        f'<td><a href="/grade/{g.list_id}">{esc(g.query_text)}</a>'
+        + (f' <span class="muted">({esc(describe_filters(g.filters))})</span>' if describe_filters(g.filters) else "")
+        + "</td>"
+        f"<td>{g.graded(GRADED_POSITIONS)} of {min(GRADED_POSITIONS, len(g.candidates))} graded</td>"
+        f'<td class="muted">{esc(fmt_date(g.created_at, ctx.timezone))}</td>'
+        "</tr>"
+        for g in graded_lists
+    )
+    lists_html = (
+        f'<table class="labels-table"><tbody>{list_rows}</tbody></table>'
+        if list_rows
+        else '<p class="muted">No search has been graded yet. Use "Grade the top 20" on a '
+        "results page.</p>"
+    )
     body = (
         '<section class="labels"><h1>Labels</h1>'
-        "<p>The Relevant and Not relevant buttons on each hit record whether a result answers "
-        "the search. Measuring search quality needs a minimum number of them:</p>"
+        "<p>The Relevant and Not relevant buttons on each hit, and the grades given in grading "
+        "mode, record whether a result answers the search. Measuring search quality needs a "
+        "minimum number of them:</p>"
         "<ul class=\"progress\">"
         + _progress_row("queries with labels", query_count, need_queries)
         + _progress_row("graded results", judgment_count, need_judgments)
         + _progress_row("queries with a relevant result", queries_with_relevant, need_relevant)
         + f"</ul><p><strong>{esc(verdict)}</strong></p>"
+        f"<h2>Graded searches</h2>{lists_html}"
         f"<h2>Labelled queries</h2>{table}</section>"
     )
     topbar = search_form(FormState(), semantic_available=ctx.semantic_available, csrf_token=ctx.csrf_token)
@@ -955,6 +1116,8 @@ __all__ = [
     "esc",
     "fmt_date",
     "fmt_datetime",
+    "grade_form",
+    "grading_page",
     "human_size",
     "labels_page",
     "linkify",

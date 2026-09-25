@@ -27,6 +27,7 @@ import contextlib
 import json
 import logging
 import queue
+import secrets
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -60,6 +61,7 @@ from imsg.eval.runner import (
 )
 from imsg.mcp.transport import find_duplicate_header, validate_host
 from imsg.retrieval.query import analyze_query
+from imsg.search_page import grading
 from imsg.search_page import html as views
 from imsg.search_page import labels as label_store
 from imsg.search_page.attachments import (
@@ -975,6 +977,7 @@ def labels_view(request: Request) -> Response:
     with deps.pool.connection() as pg:
         check = label_store.baseline_progress(pg)
         queries = label_store.labelled_queries(pg)
+        graded_lists = grading.load_graded_lists(pg)
     return HTMLResponse(
         views.labels_page(
             ctx,
@@ -984,7 +987,188 @@ def labels_view(request: Request) -> Response:
             passed=check.passed,
             minimums=(AT4_MIN_QUERIES, AT4_MIN_POOLED_JUDGMENTS, AT4_MIN_QUERIES_WITH_A_POSITIVE),
             queries=queries,
+            graded_lists=graded_lists,
         )
+    )
+
+
+# --------------------------------------------------------------------------
+# routes: grading mode
+# --------------------------------------------------------------------------
+
+
+def _form_fields(raw: bytes) -> dict[str, str]:
+    return {
+        k: v[0]
+        for k, v in parse_qs(raw.decode("utf-8", "replace"), max_num_fields=20).items()
+    }
+
+
+async def grade_start(request: Request) -> Response:
+    """Store the search's fused candidate list and open its grading view.
+    A POST with the CSRF token: it writes to the database."""
+    session = _session(request)
+    if session is None:
+        return _login_redirect(request)
+    raw = await _limited_body(request, MAX_FORM_BYTES)
+    if raw is None:
+        return PlainTextResponse("request too large", status_code=413)
+    fields = _form_fields(raw)
+    if not _csrf_ok(request, session, fields.get("csrf_token")):
+        return PlainTextResponse("CSRF check failed", status_code=403)
+    deps = _deps(request)
+    form = views.FormState(
+        query=fields.get("q", "")[:2000],
+        people=fields.get("people", "")[:500],
+        date_from=fields.get("from", "")[:10],
+        date_to=fields.get("to", "")[:10],
+        attachments=fields.get("att", "any") if fields.get("att") in ("with", "without") else "any",
+    )
+    filters: dict[str, object] = {}
+    people = [p.strip() for p in form.people.split(",") if p.strip()]
+    if people:
+        filters["people"] = people
+    if form.date_from:
+        filters["from"] = form.date_from
+    if form.date_to:
+        filters["to"] = form.date_to
+    if form.attachments != "any":
+        filters["attachments"] = form.attachments
+
+    def create() -> int:
+        search_request = _search_request(form)
+        with deps.pool.connection() as pg:
+            result = _result_for(deps, pg, search_request)
+            _ensure_semantic(deps, pg, result, "relevance")
+            with result.lock:
+                ranking = {
+                    "rrf_k": result.rrf_k,
+                    "semantic": result.semantic.state,
+                    "semantic_note": result.semantic.note,
+                    "text_min_similarity": deps.settings.text_min_similarity,
+                    "multimodal_min_similarity": deps.settings.multimodal_min_similarity,
+                    "counts": dict(result.counts),
+                    "capped": sorted(result.capped),
+                    "total_hits": result.total_hits,
+                    "segment_hits": sum(1 for h in result.hits.values() if h.segment_id is not None),
+                }
+                return grading.create_candidate_list(
+                    pg,
+                    result,
+                    query_text=result.request.query,
+                    filters=filters,
+                    ranking=ranking,
+                    seed=secrets.randbelow(2**31),
+                )
+
+    ctx = _page_ctx(request, session, title="Grade · Messages")
+    try:
+        list_id = await run_in_threadpool(create)
+    except SearchInputError as exc:
+        return HTMLResponse(
+            views.search_page(
+                ctx, form=form, status=None, results="", error=str(exc), semantic_url=None, search_key=None
+            ),
+            status_code=400,
+        )
+    return RedirectResponse(f"/grade/{list_id}", status_code=303)
+
+
+def grade_view(request: Request) -> Response:
+    session = _session(request)
+    if session is None:
+        return _login_redirect(request)
+    deps = _deps(request)
+    raw_id = str(request.path_params.get("list_id", ""))
+    if not raw_id.isdigit() or len(raw_id) > 18:
+        return PlainTextResponse("not found", status_code=404)
+    positions = (
+        grading.MAX_POSITIONS if request.query_params.get("more") == "1" else grading.GRADED_POSITIONS
+    )
+    ctx = _page_ctx(request, session, title="Grade · Messages")
+    with deps.pool.connection() as pg:
+        graded = grading.load_graded_list(pg, int(raw_id))
+        if graded is None:
+            return HTMLResponse(
+                views.error_page(ctx, status=404, message="No such graded search."), status_code=404
+            )
+        shown = graded.in_view(positions)
+        segment_ids = [c.current_segment_id for c in shown if c.current_segment_id is not None]
+        by_segment = segment_messages(pg, segment_ids, index_unsent=deps.settings.index_unsent)
+        decorate(pg, [m for ms in by_segment.values() for m in ms])
+        chats = chat_views(pg, {ms[0].chat_id for ms in by_segment.values() if ms})
+        texts = attachment_chunk_text(
+            pg, {a.attachment_id for ms in by_segment.values() for m in ms for a in m.attachments}
+        )
+    candidate_views = []
+    for candidate in shown:
+        messages = by_segment.get(candidate.current_segment_id or -1, [])
+        chat = chats.get(messages[0].chat_id) if messages else None
+        own = {a.attachment_id for m in messages for a in m.attachments}
+        candidate_views.append(
+            views.CandidateView(
+                candidate=candidate,
+                chat=chat,
+                messages=messages,
+                attachment_text={k: v for k, v in texts.items() if k in own},
+            )
+        )
+    matcher = QueryMatcher.for_query(analyze_query(graded.query_text))
+    return HTMLResponse(
+        views.grading_page(
+            ctx,
+            graded=graded,
+            views=candidate_views,
+            positions=positions,
+            tz=deps.timezone,
+            matcher=matcher,
+        )
+    )
+
+
+async def grade_api(request: Request) -> Response:
+    session = _session(request)
+    if session is None:
+        return _unauthorized()
+    if not _csrf_ok(request, session, request.headers.get("x-csrf-token")):
+        return JSONResponse({"error": "CSRF check failed"}, status_code=403)
+    raw = await _limited_body(request, MAX_FORM_BYTES)
+    if raw is None:
+        return JSONResponse({"error": "request too large"}, status_code=413)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    list_id = payload.get("list")
+    anchor = payload.get("anchor")
+    grade = payload.get("grade")
+    if (
+        not isinstance(list_id, int)
+        or isinstance(list_id, bool)
+        or not isinstance(anchor, str)
+        or not 0 < len(anchor) <= 200
+        or (grade is not None and (isinstance(grade, bool) or grade not in grading.GRADES))
+    ):
+        return JSONResponse({"error": "invalid grade"}, status_code=400)
+    deps = _deps(request)
+
+    def write() -> grading.GradeOutcome:
+        with deps.pool.connection() as pg:
+            return grading.write_grade(pg, list_id=list_id, anchor_guid=anchor, grade=grade)
+
+    try:
+        outcome = await run_in_threadpool(write)
+    except grading.UnknownCandidateError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return JSONResponse(
+        {
+            "grade": outcome.grade,
+            "graded": outcome.graded,
+            "graded_extra": outcome.graded_extra,
+            "total": outcome.total,
+        }
     )
 
 
@@ -1314,6 +1498,9 @@ def build_app(deps: AppDeps) -> ASGIApp:
         Route("/api/people", people_api, methods=["GET"]),
         Route("/labels", labels_view, methods=["GET"]),
         Route("/message/{message_key}/details", message_details_view, methods=["GET"]),
+        Route("/grade", grade_start, methods=["POST"]),
+        Route("/grade/{list_id}", grade_view, methods=["GET"]),
+        Route("/api/grade", grade_api, methods=["POST"]),
         Route("/thread/{thread_key}", thread_view, methods=["GET"]),
         Route("/thread/{thread_key}/messages", thread_messages, methods=["GET"]),
         Route("/att/{key}", attachment_original, methods=["GET"]),

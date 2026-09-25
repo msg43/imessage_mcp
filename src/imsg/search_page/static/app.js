@@ -313,6 +313,37 @@
     box.select();
   }
 
+  // ---------------------------------------------------------------- grading mode
+
+  async function onGradeClick(button) {
+    const controls = button.closest(".grade-controls");
+    if (!controls) return;
+    const grade = button.classList.contains("on") ? null : Number(button.dataset.grade);
+    const buttons = controls.querySelectorAll(".grade-btn");
+    buttons.forEach((b) => { b.disabled = true; });
+    try {
+      const answer = await fetchJSON("/api/grade", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf() },
+        body: JSON.stringify({ list: Number(controls.dataset.list), anchor: controls.dataset.anchor, grade: grade }),
+      });
+      buttons.forEach((b) => {
+        const on = answer.grade !== null && Number(b.dataset.grade) === answer.grade;
+        b.classList.toggle("on", on);
+        b.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+      const page = document.querySelector(".grading");
+      const counter = document.querySelector(".grade-progress .n-graded");
+      if (page && counter) {
+        counter.textContent = String(Number(page.dataset.positions) > 20 ? answer.graded_extra : answer.graded);
+      }
+    } catch (error) {
+      button.title = "Grade not saved: " + error.message;
+    } finally {
+      buttons.forEach((b) => { b.disabled = false; });
+    }
+  }
+
   // ---------------------------------------------------------------- details panel
 
   async function onDetailsClick(button) {
@@ -346,6 +377,8 @@
     if (label) { event.preventDefault(); onLabelClick(label); return; }
     const cite = target.closest(".cite-btn");
     if (cite) { event.preventDefault(); onCiteClick(cite); return; }
+    const grade = target.closest(".grade-btn");
+    if (grade) { event.preventDefault(); onGradeClick(grade); return; }
     const details = target.closest(".details-btn");
     if (details) { event.preventDefault(); onDetailsClick(details); return; }
     const more = target.closest(".more-hits");
