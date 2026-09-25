@@ -449,8 +449,10 @@ uv run imsg check-permissions && uv run imsg migrate
 ```
 
 Secrets are never stored in config — they resolve from the macOS
-Keychain (`keychain:<item>`) or the environment (`env:<VAR>`), and
-config validation rejects anything that looks like a literal secret.
+Keychain (`keychain:<item>`), the environment (`env:<VAR>`), or a file
+only you can read (`file:/absolute/path`, mode 0600; the usual choice on
+a headless host, where the Keychain is unreadable over SSH). Config
+validation rejects anything that looks like a literal secret.
 
 > **Two macOS gotchas that will each cost you an hour.**
 > PostgreSQL needs `export LC_ALL=C` or the postmaster dies at startup

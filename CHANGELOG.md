@@ -10,6 +10,29 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-24 — Secrets can live in an owner-only file (`file:<absolute path>`)
+
+**Why.** On a headless Mac the login Keychain cannot be read over SSH or
+by a launchd job, so the database password had to be an `env:` reference,
+and every caller (launchd agents, SSH wrappers, MCP client entries) had to
+set the variable itself. The secret ended up copied into every one of
+them. A file reference keeps it in one 0600 file that the config names
+once.
+
+- **`SecretRef` accepts `file:<absolute path>`** (`imsg.config.secrets`).
+  It resolves only when the path reaches a regular file owned by the
+  current user with no group or other permission bits, the rule `ssh`
+  applies to private keys. The checks run on the opened file, so the path
+  cannot be swapped between the check and the read. A FIFO is refused
+  without blocking. Trailing newlines are trimmed, as for Keychain items.
+  An empty, non-UTF-8 or over-64 KiB file is refused, and no error message
+  contains the value.
+- **`imsg install-agents`** passes no `--env …PASSWORD` pair when
+  `database.password` is a file reference, because the service reads the
+  file itself.
+- **Tests:** 28 new; all 28 fail on the previous code. The full suite with
+  Postgres passed (2,547 at `9847a86`).
+
 ## 2026-09-24 — Enrichment hands the heavy-model lock to a waiting sync between tasks
 
 **Why.** `imsg enrich` held the host-wide heavy-model lock for its whole

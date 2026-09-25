@@ -20,7 +20,8 @@ host that by design has a public tunnel attached to it.
 
 So this command accepts **references, not values**, in exactly the form
 the rest of the project already uses for secrets
-(`imsg.config.secrets.SecretRef`): ``keychain:<item>`` or ``env:<VAR>``.
+(`imsg.config.secrets.SecretRef`): ``keychain:<item>``, ``env:<VAR>`` or
+``file:<absolute path>``.
 A literal is rejected by `SecretRef.parse` itself, which is the point of
 reusing that type rather than inventing a parallel convention — the
 refusal is structural, not a rule an operator is trusted to follow. What
@@ -126,7 +127,8 @@ def _parse_ref(raw: str | None, *, flag: str, role: str) -> SecretRef:
     if raw is None or not raw.strip():
         raise ProbeConfigurationError(
             f"AT-1 needs a {role} bearer token and none was given: pass {flag} "
-            f"with a 'keychain:<item>' or 'env:<VAR>' reference.\n\n{TOKEN_SETUP_HINT}"
+            f"with a 'keychain:<item>', 'env:<VAR>' or 'file:<absolute path>' "
+            f"reference.\n\n{TOKEN_SETUP_HINT}"
         )
     try:
         return SecretRef.parse(raw)

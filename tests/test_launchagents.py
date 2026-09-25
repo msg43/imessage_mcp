@@ -332,3 +332,27 @@ def test_plists_are_config_driven_not_hardcoded(
         assert sentinel.encode() not in content, (
             f"{label} plist contains a value this config never supplied — it is hardcoded"
         )
+
+
+def test_a_file_referenced_database_password_is_not_passed_through_the_environment(
+    config_dict_factory: ConfigDictFactory,
+) -> None:
+    """With `database.password: file:<path>` the service reads the file
+    itself, so no agent gets an `--env IMSG_…PASSWORD=…` pair for it."""
+    config = load_config_dict(
+        config_dict_factory(
+            **{
+                "paths.data_root": _FIXED_DATA_ROOT,
+                "database.password": f"file:{_FIXED_DATA_ROOT}/private/env/IMSG_PG_PASSWORD",
+            }
+        )
+    )
+    rendered = _render(config)
+    for name, content in rendered.items():
+        parsed: dict[str, object] = plistlib.loads(content)
+        arguments = parsed["ProgramArguments"]
+        assert isinstance(arguments, list)
+        if "--" not in arguments:
+            continue
+        supervisor = arguments[: arguments.index("--")]
+        assert not any("PASSWORD" in value for value in _option_values(supervisor, "--env")), name

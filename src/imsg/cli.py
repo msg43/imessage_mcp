@@ -3217,8 +3217,8 @@ def mcp_public(
         str | None,
         typer.Option(
             "--owner-token-ref",
-            help="Secret REFERENCE to the owner's bearer token: 'keychain:<item>' "
-            "or 'env:<VAR>'. Never the token itself — that would land in your "
+            help="Secret REFERENCE to the owner's bearer token: 'keychain:<item>', "
+            "'env:<VAR>' or 'file:<absolute path>'. Never the token itself — that would land in your "
             "shell history and in 'ps' output. --probe only.",
         ),
     ] = None,
@@ -3476,7 +3476,7 @@ def _export_transport_or_die(cfg: Config) -> ExportTransport:
         raise ExportPushError(
             "export.gcp_credentials is not set — `imsg export push` has no credential "
             "to authenticate with and refuses rather than trying. Set it to a "
-            "'keychain:<item>' or 'env:<VAR>' reference naming a GCP service-account "
+            "'keychain:<item>', 'env:<VAR>' or 'file:<absolute path>' reference naming a GCP service-account "
             "key (SPEC §6; secrets never live in config.yaml itself). Nothing was "
             "uploaded, and no plan state changed."
         )
