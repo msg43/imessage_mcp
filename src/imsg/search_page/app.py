@@ -25,22 +25,26 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import json
 import logging
 import queue
 import secrets
 import threading
 import time
+import zipfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, quote, urlsplit
+from zoneinfo import ZoneInfo
 
 import psycopg
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
 from starlette.requests import Request
@@ -66,6 +70,7 @@ from imsg.retrieval.filters import MAX_PEOPLE_FILTER
 from imsg.retrieval.people import resolve_people
 from imsg.retrieval.query import analyze_query
 from imsg.search_page import browse, grading
+from imsg.search_page import cases as case_store
 from imsg.search_page import html as views
 from imsg.search_page import labels as label_store
 from imsg.search_page.attachments import (
@@ -110,6 +115,7 @@ from imsg.search_page.search import (
     run_semantic,
     segment_texts,
 )
+from imsg.search_page.secret_files import ensure_private_dir
 from imsg.search_page.threads import (
     MessageView,
     attachment_chunk_text,
@@ -696,6 +702,15 @@ def _page_number(request: Request) -> int:
     return max(1, min(int(raw), 100000)) if raw.isdigit() else 1
 
 
+def _thread_view_keys(thread_views: list[views.ThreadResultView]) -> set[str]:
+    return {m.message_key for t in thread_views for h in t.hits for m in h.messages}
+
+
+def _review_state(pg: psycopg.Connection, form: views.FormState) -> views.ReviewState | None:
+    saved = case_store.active_saved_search(pg, form.query, form.params())
+    return views.ReviewState(saved.search_id, saved.reviewed) if saved is not None else None
+
+
 def _render_results(
     deps: AppDeps,
     pg: psycopg.Connection,
@@ -703,10 +718,12 @@ def _render_results(
     form: views.FormState,
     page: int,
     query_id: str | None,
+    review: views.ReviewState | None = None,
 ) -> str:
     matcher = QueryMatcher.for_query(result.analyzed)
     slice_, more = _page_slice(deps, result, form.sort, page)
     thread_views = build_thread_views(deps, pg, result, slice_, matcher=matcher, query_id=query_id)
+    marks = case_store.marks(pg, _thread_view_keys(thread_views))
     extra = {"sem": "1"} if result.semantic.state == "done" else {}
     next_url = form.url("/search/page", page=page + 1, **extra) if more else None
     full_url = form.url("/search", page=page + 1) if more else None
@@ -717,6 +734,8 @@ def _render_results(
         form=form,
         next_page_url=next_url,
         next_full_url=full_url,
+        marks=marks,
+        review=review,
     )
 
 
@@ -808,11 +827,16 @@ def search_view(request: Request) -> Response:
         with deps.pool.connection() as pg:
             result = _result_for(deps, pg, search_request)
             query_id = label_store.find_query_id(pg, result.request.query)
+            review = _review_state(pg, form)
+            active = case_store.active_case(pg)
             with result.lock:
                 results_html = _render_results(
-                    deps, pg, result, form, _page_number(request), query_id
+                    deps, pg, result, form, _page_number(request), query_id, review
                 )
                 status = _status(result, form.sort)
+            box = views.case_box(
+                form, active=active, review=review, total_threads=status.total_threads
+            )
     except SearchInputError as exc:
         return HTMLResponse(
             views.search_page(
@@ -833,6 +857,7 @@ def search_view(request: Request) -> Response:
             error=None,
             semantic_url=semantic_url,
             search_key=result.request.cache_key(),
+            case_box=box,
         )
     )
     response.headers["server-timing"] = (
@@ -854,8 +879,11 @@ def search_page_fragment(request: Request) -> Response:
             if request.query_params.get("sem") == "1" or form.sort == "rerank":
                 _ensure_semantic(deps, pg, result, form.sort)
             query_id = label_store.find_query_id(pg, result.request.query)
+            review = _review_state(pg, form)
             with result.lock:
-                body = _render_results(deps, pg, result, form, _page_number(request), query_id)
+                body = _render_results(
+                    deps, pg, result, form, _page_number(request), query_id, review
+                )
     except SearchInputError as exc:
         return PlainTextResponse(str(exc), status_code=400)
     return HTMLResponse(body)
@@ -888,10 +916,16 @@ def search_thread_hits(request: Request) -> Response:
                 [view] = build_thread_views(
                     deps, pg, result, [group], matcher=matcher, query_id=query_id, hit_offset=offset
                 )
+            marks = case_store.marks(pg, _thread_view_keys([view]))
+            review = _review_state(pg, form)
     except SearchInputError as exc:
         return PlainTextResponse(str(exc), status_code=400)
     render = views.thread_result_html if offset == 0 else views.thread_hits_html
-    return HTMLResponse(render(view, tz=deps.timezone, matcher=matcher, form=form, query=form.query))
+    return HTMLResponse(
+        render(
+            view, tz=deps.timezone, matcher=matcher, form=form, query=form.query, marks=marks, review=review
+        )
+    )
 
 
 def semantic_api(request: Request) -> Response:
@@ -1306,6 +1340,7 @@ def timeline_view(request: Request) -> Response:
             counts = browse.day_counts(pg, filters, index_unsent=deps.settings.index_unsent, timezone=tz)
             page = browse.timeline_page(pg, filters, index_unsent=deps.settings.index_unsent, cursor=None)
             chats = chat_views(pg, {m.chat_id for m in page.messages})
+            marks = case_store.marks(pg, [m.message_key for m in page.messages])
             conversations = browse.conversation_count(
                 pg, filters, index_unsent=deps.settings.index_unsent
             )
@@ -1318,7 +1353,9 @@ def timeline_view(request: Request) -> Response:
         )
     total = sum(n for _d, n in counts)
     matcher = QueryMatcher.for_query(analyze_query(form.query)) if form.query.strip() else None
-    rows = views.timeline_rows_html(page.messages, chats=chats, tz=tz, matcher=matcher, previous_day=None)
+    rows = views.timeline_rows_html(
+        page.messages, chats=chats, tz=tz, matcher=matcher, previous_day=None, marks=marks
+    )
     day_links = [
         (
             d.strftime("%a %d %b %Y"),
@@ -1360,12 +1397,13 @@ def timeline_more(request: Request) -> Response:
                 return PlainTextResponse("a date range is required", status_code=400)
             page = browse.timeline_page(pg, filters, index_unsent=deps.settings.index_unsent, cursor=cursor)
             chats = chat_views(pg, {m.chat_id for m in page.messages})
+            marks = case_store.marks(pg, [m.message_key for m in page.messages])
     except SearchInputError as exc:
         return PlainTextResponse(str(exc), status_code=400)
     matcher = QueryMatcher.for_query(analyze_query(form.query)) if form.query.strip() else None
     previous_day = views.fmt_date(position[0], tz)
     body = views.timeline_rows_html(
-        page.messages, chats=chats, tz=tz, matcher=matcher, previous_day=previous_day
+        page.messages, chats=chats, tz=tz, matcher=matcher, previous_day=previous_day, marks=marks
     )
     if page.next_cursor:
         next_url = form.url("/timeline/page", cursor=page.next_cursor)
@@ -1400,6 +1438,7 @@ def media_view(request: Request) -> Response:
                 pg, filters, kind=kind, index_unsent=deps.settings.index_unsent, cursor=None
             )
             chats = chat_views(pg, {item.chat_id for item in page.items})
+            marks = case_store.marks(pg, [item.message_key for item in page.items])
     except SearchInputError as exc:
         return HTMLResponse(
             views.media_page(
@@ -1408,7 +1447,7 @@ def media_view(request: Request) -> Response:
             ),
             status_code=400,
         )
-    tiles = views.media_tiles_html(page.items, chats=chats, tz=deps.timezone)
+    tiles = views.media_tiles_html(page.items, chats=chats, tz=deps.timezone, marks=marks)
     next_url = form.url("/media/page", cursor=page.next_cursor) if page.next_cursor else None
     return HTMLResponse(
         views.media_page(
@@ -1435,9 +1474,10 @@ def media_more(request: Request) -> Response:
                 pg, filters, kind=kind, index_unsent=deps.settings.index_unsent, cursor=cursor
             )
             chats = chat_views(pg, {item.chat_id for item in page.items})
+            marks = case_store.marks(pg, [item.message_key for item in page.items])
     except SearchInputError as exc:
         return PlainTextResponse(str(exc), status_code=400)
-    body = views.media_tiles_html(page.items, chats=chats, tz=deps.timezone)
+    body = views.media_tiles_html(page.items, chats=chats, tz=deps.timezone, marks=marks)
     if page.next_cursor:
         next_url = form.url("/media/page", cursor=page.next_cursor)
         body += (
@@ -1445,6 +1485,464 @@ def media_more(request: Request) -> Response:
             'class="load-more">More</a></div>'
         )
     return HTMLResponse(body)
+
+
+# --------------------------------------------------------------------------
+# routes: evidence cases
+# --------------------------------------------------------------------------
+
+MAX_DOWNLOAD_FILE_BYTES = 2 * 1024 * 1024 * 1024
+"""The original files a case download may carry: 2 GiB. The zip is
+written on the encrypted volume, then streamed and deleted."""
+DOWNLOAD_STALE_SECONDS = 3600.0
+_SLUG_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
+
+
+class _ExactTimes:
+    def __init__(self, timezone: str) -> None:
+        self._tz = timezone
+
+    def exact(self, dt: datetime) -> str:
+        return views.exact_time(dt, self._tz)
+
+
+def _default_case_name(timezone: str) -> str:
+    return "Case started " + views.fmt_date(datetime.now(UTC), timezone)
+
+
+async def _form_post(request: Request) -> tuple[Session, dict[str, str]] | Response:
+    """A form POST from the page: signed in, same-site, CSRF token right."""
+    session = _session(request)
+    if session is None:
+        return _login_redirect(request)
+    raw = await _limited_body(request, 64 * 1024)
+    if raw is None:
+        return PlainTextResponse("request too large", status_code=413)
+    fields = _form_fields(raw)
+    if not _csrf_ok(request, session, fields.get("csrf_token")):
+        return PlainTextResponse("CSRF check failed", status_code=403)
+    return session, fields
+
+
+async def _json_post(request: Request) -> tuple[Session, dict[str, object]] | Response:
+    """A script POST from the page: signed in, same-site, CSRF header right."""
+    session = _session(request)
+    if session is None:
+        return _unauthorized()
+    if not _csrf_ok(request, session, request.headers.get("x-csrf-token")):
+        return JSONResponse({"error": "CSRF check failed"}, status_code=403)
+    raw = await _limited_body(request, MAX_FORM_BYTES)
+    if raw is None:
+        return JSONResponse({"error": "request too large"}, status_code=413)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    return session, payload
+
+
+def _id_param(request: Request, name: str) -> int | None:
+    raw = str(request.path_params.get(name, ""))
+    return int(raw) if raw.isdigit() and len(raw) <= 18 else None
+
+
+def cases_view(request: Request) -> Response:
+    session = _session(request)
+    if session is None:
+        return _login_redirect(request)
+    deps = _deps(request)
+    ctx = _page_ctx(request, session, title="Cases · Messages")
+    with deps.pool.connection() as pg:
+        found = case_store.list_cases(pg)
+    return HTMLResponse(views.cases_page(ctx, cases=found, error=None))
+
+
+async def case_create(request: Request) -> Response:
+    posted = await _form_post(request)
+    if isinstance(posted, Response):
+        return posted
+    session, fields = posted
+    deps = _deps(request)
+
+    def create() -> int:
+        with deps.pool.connection() as pg:
+            return case_store.create_case(pg, fields.get("name", ""))
+
+    try:
+        case_id = await run_in_threadpool(create)
+    except case_store.CaseError as exc:
+        def listing() -> list[case_store.CaseSummary]:
+            with deps.pool.connection() as pg:
+                return case_store.list_cases(pg)
+
+        ctx = _page_ctx(request, session, title="Cases · Messages")
+        found = await run_in_threadpool(listing)
+        return HTMLResponse(views.cases_page(ctx, cases=found, error=str(exc)), status_code=400)
+    return RedirectResponse(f"/case/{case_id}", status_code=303)
+
+
+def _coverage(
+    deps: AppDeps, pg: psycopg.Connection, case_id: int
+) -> list[case_store.SearchCoverage]:
+    """Each saved search with how many conversations it finds now."""
+    out: list[case_store.SearchCoverage] = []
+    for search in case_store.saved_searches(pg, case_id):
+        form = views.FormState(
+            query=search.query_text,
+            people=search.params.get("people", ""),
+            date_from=search.params.get("from", ""),
+            date_to=search.params.get("to", ""),
+            attachments=search.params.get("att", "any"),
+        )
+        try:
+            result = _result_for(deps, pg, _search_request(form))
+            with result.lock:
+                conversations: int | None = len(result.threads("relevance"))
+        except SearchInputError:
+            conversations = None
+        out.append(case_store.SearchCoverage(search=search, conversations=conversations))
+    return out
+
+
+def case_view(request: Request) -> Response:
+    session = _session(request)
+    if session is None:
+        return _login_redirect(request)
+    deps = _deps(request)
+    ctx = _page_ctx(request, session, title="Case · Messages")
+    case_id = _id_param(request, "case_id")
+    with deps.pool.connection() as pg:
+        case = case_store.get_case(pg, case_id) if case_id is not None else None
+        if case is None:
+            return HTMLResponse(views.error_page(ctx, status=404, message="No such case."), status_code=404)
+        items = case_store.case_items(
+            pg,
+            case.case_id,
+            index_unsent=deps.settings.index_unsent,
+            show_edit_history=deps.page.details.show_edit_history,
+            show_raw_handles=deps.page.details.show_raw_handles,
+        )
+        coverage = _coverage(deps, pg, case.case_id)
+    return HTMLResponse(
+        views.case_page(
+            ctx,
+            case=case,
+            items=items,
+            coverage=coverage,
+            tz=deps.timezone,
+            show_raw_handles=deps.page.details.show_raw_handles,
+            confirm_delete=request.query_params.get("delete") == "1",
+            error=None,
+        )
+    )
+
+
+def _case_action(
+    name: str, action: Callable[[psycopg.Connection, int, dict[str, str]], str]
+) -> Callable[[Request], Any]:
+    """A form POST on one case (or one of its items or searches) that ends
+    with a redirect to the page `action` returns."""
+
+    async def endpoint(request: Request) -> Response:
+        posted = await _form_post(request)
+        if isinstance(posted, Response):
+            return posted
+        _session_row, fields = posted
+        target_id = _id_param(request, name)
+        if target_id is None:
+            return PlainTextResponse("not found", status_code=404)
+        deps = _deps(request)
+
+        def run() -> str:
+            with deps.pool.connection() as pg:
+                return action(pg, target_id, fields)
+
+        try:
+            location = await run_in_threadpool(run)
+        except case_store.CaseError as exc:
+            return PlainTextResponse(str(exc), status_code=400)
+        return RedirectResponse(location, status_code=303)
+
+    return endpoint
+
+
+def _activate(pg: psycopg.Connection, case_id: int, _fields: dict[str, str]) -> str:
+    case_store.activate_case(pg, case_id)
+    return f"/case/{case_id}"
+
+
+def _rename(pg: psycopg.Connection, case_id: int, fields: dict[str, str]) -> str:
+    case_store.rename_case(pg, case_id, fields.get("name", ""))
+    return f"/case/{case_id}"
+
+
+def _notes(pg: psycopg.Connection, case_id: int, fields: dict[str, str]) -> str:
+    case_store.set_case_notes(pg, case_id, fields.get("notes", ""))
+    return f"/case/{case_id}"
+
+
+def _delete(pg: psycopg.Connection, case_id: int, fields: dict[str, str]) -> str:
+    if fields.get("confirm") != "1":
+        return f"/case/{case_id}?delete=1"
+    case_store.delete_case(pg, case_id)
+    return "/case"
+
+
+def _item_note(pg: psycopg.Connection, item_id: int, fields: dict[str, str]) -> str:
+    case_id = case_store.set_item_note(pg, item_id, fields.get("note", ""))
+    return f"/case/{case_id}#item-{item_id}"
+
+
+def _item_remove(pg: psycopg.Connection, item_id: int, _fields: dict[str, str]) -> str:
+    return f"/case/{case_store.remove_item(pg, item_id)}"
+
+
+def _search_remove(pg: psycopg.Connection, search_id: int, _fields: dict[str, str]) -> str:
+    return f"/case/{case_store.remove_search(pg, search_id)}"
+
+
+def _slug(name: str) -> str:
+    out: list[str] = []
+    for ch in name.lower():
+        if ch in _SLUG_CHARS:
+            out.append(ch)
+        elif out and out[-1] != "-":
+            out.append("-")
+    return "".join(out).strip("-")[:60] or "case"
+
+
+def _clear_stale_downloads(folder: Path) -> None:
+    now = time.time()
+    for old in folder.glob("*.zip"):
+        with contextlib.suppress(OSError):
+            if now - old.stat().st_mtime > DOWNLOAD_STALE_SECONDS:
+                old.unlink()
+
+
+def _write_zip(
+    deps: AppDeps,
+    path: Path,
+    *,
+    case_name: str,
+    text: str,
+    files: list[case_store.CaseFile],
+    stamp: tuple[int, int, int, int, int, int],
+) -> None:
+    """The case file, each original from the attachment cache, and a
+    `SHA256SUMS.txt` of the bytes as written (a file whose bytes no longer
+    match its recorded SHA-256 is flagged)."""
+    sums: list[str] = []
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
+        data = text.encode("utf-8")
+        zf.writestr(case_name, data)
+        sums.append(f"{hashlib.sha256(data).hexdigest()}  {case_name}")
+        for f in files:
+            arcname = case_store.file_path_in_zip(f)
+            source = cache_file(deps.data_root, f.sha256)
+            if source is None:
+                sums.append(f"# not in the attachment cache: {arcname}")
+                continue
+            digest = hashlib.sha256()
+            entry = zipfile.ZipInfo(arcname, date_time=stamp)
+            with source.open("rb") as handle, zf.open(entry, "w", force_zip64=True) as out:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    out.write(chunk)
+            line = f"{digest.hexdigest()}  {arcname}"
+            if digest.hexdigest() != f.sha256:
+                line += f"  # recorded SHA-256 {f.sha256} differs"
+            sums.append(line)
+        zf.writestr("SHA256SUMS.txt", "\n".join(sums) + "\n")
+
+
+_DOWNLOAD_TYPES = {
+    "md": "text/markdown; charset=utf-8",
+    "csv": "text/csv; charset=utf-8",
+    "json": "application/json",
+}
+
+
+def case_download(request: Request) -> Response:
+    """The case as Markdown, CSV or JSON; with `files=1`, a zip that adds
+    the original files and their SHA-256 list. Called "download" on the
+    page: "export" means the Gemini pipeline in this project."""
+    session = _session(request)
+    if session is None:
+        return _login_redirect(request)
+    deps = _deps(request)
+    ctx = _page_ctx(request, session, title="Case · Messages")
+    case_id = _id_param(request, "case_id")
+    fmt = request.query_params.get("fmt", "md")
+    if fmt not in case_store.DOWNLOAD_FORMATS:
+        return PlainTextResponse("unknown format", status_code=400)
+    with_files = request.query_params.get("files") == "1"
+    with deps.pool.connection() as pg:
+        case = case_store.get_case(pg, case_id) if case_id is not None else None
+        if case is None:
+            return HTMLResponse(views.error_page(ctx, status=404, message="No such case."), status_code=404)
+        items = case_store.case_items(
+            pg,
+            case.case_id,
+            index_unsent=deps.settings.index_unsent,
+            show_edit_history=deps.page.details.show_edit_history,
+            show_raw_handles=deps.page.details.show_raw_handles,
+        )
+        coverage = _coverage(deps, pg, case.case_id)
+    now = datetime.now(UTC)
+    text = case_store.render_download(
+        fmt,
+        case=case,
+        items=items,
+        coverage=coverage,
+        formatter=_ExactTimes(deps.timezone),
+        downloaded_at=now,
+        timezone=deps.timezone,
+        with_files=with_files,
+    )
+    slug = _slug(case.name)
+    slug = slug.removeprefix("case-") if slug != "case" else ""
+    local_now = now.astimezone(ZoneInfo(deps.timezone))
+    base = f"case-{slug + '-' if slug else ''}{local_now.date().isoformat()}"
+    if not with_files:
+        return Response(
+            text.encode("utf-8"),
+            media_type=_DOWNLOAD_TYPES[fmt],
+            headers={
+                "Content-Disposition": f'attachment; filename="{base}.{fmt}"',
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    files = case_store.case_files(items)
+    total = sum(f.byte_size or 0 for f in files)
+    if total > MAX_DOWNLOAD_FILE_BYTES:
+        return HTMLResponse(
+            views.error_page(
+                ctx,
+                status=413,
+                message=(
+                    f"The case's files total {views.human_size(total)}, more than a download may "
+                    f"carry ({views.human_size(MAX_DOWNLOAD_FILE_BYTES)}). Download without the "
+                    "files, or take the largest files out of the case."
+                ),
+            ),
+            status_code=413,
+        )
+    folder = deps.data_root / "search-page" / "downloads"
+    ensure_private_dir(folder)
+    _clear_stale_downloads(folder)
+    path = folder / f"{secrets.token_hex(12)}.zip"
+    try:
+        _write_zip(
+            deps,
+            path,
+            case_name=f"{base}.{fmt}",
+            text=text,
+            files=files,
+            stamp=local_now.timetuple()[:6],
+        )
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=f"{base}.zip",
+        headers={"X-Content-Type-Options": "nosniff"},
+        background=BackgroundTask(path.unlink, missing_ok=True),
+    )
+
+
+async def case_item_api(request: Request) -> Response:
+    posted = await _json_post(request)
+    if isinstance(posted, Response):
+        return posted
+    _session_row, payload = posted
+    message_key = payload.get("message_key")
+    attachment_key = payload.get("attachment_key")
+    add = payload.get("add")
+    if (
+        not isinstance(message_key, str)
+        or (attachment_key is not None and not isinstance(attachment_key, str))
+        or not isinstance(add, bool)
+    ):
+        return JSONResponse({"error": "invalid request"}, status_code=400)
+    deps = _deps(request)
+
+    def toggle() -> case_store.ToggleOutcome:
+        with deps.pool.connection() as pg:
+            return case_store.toggle_item(
+                pg,
+                message_key=message_key,
+                attachment_key=attachment_key,
+                add=add,
+                default_name=_default_case_name(deps.timezone),
+            )
+
+    try:
+        outcome = await run_in_threadpool(toggle)
+    except case_store.CaseError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return JSONResponse(
+        {
+            "in_case": outcome.in_case,
+            "case_id": outcome.case_id,
+            "case_name": outcome.case_name,
+            "count": outcome.item_count,
+        }
+    )
+
+
+async def case_search_api(request: Request) -> Response:
+    posted = await _json_post(request)
+    if isinstance(posted, Response):
+        return posted
+    _session_row, payload = posted
+    query = payload.get("q")
+    if not isinstance(query, str):
+        return JSONResponse({"error": "invalid request"}, status_code=400)
+    deps = _deps(request)
+
+    def save() -> tuple[int, str]:
+        with deps.pool.connection() as pg:
+            return case_store.save_search(
+                pg, query_text=query, params=payload, default_name=_default_case_name(deps.timezone)
+            )
+
+    try:
+        search_id, name = await run_in_threadpool(save)
+    except case_store.CaseError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse({"search_id": search_id, "case_name": name})
+
+
+async def case_review_api(request: Request) -> Response:
+    posted = await _json_post(request)
+    if isinstance(posted, Response):
+        return posted
+    _session_row, payload = posted
+    search_id = payload.get("search_id")
+    thread_key = payload.get("thread_key")
+    reviewed = payload.get("reviewed")
+    if (
+        not isinstance(search_id, int)
+        or isinstance(search_id, bool)
+        or not isinstance(thread_key, str)
+        or not isinstance(reviewed, bool)
+    ):
+        return JSONResponse({"error": "invalid request"}, status_code=400)
+    deps = _deps(request)
+
+    def mark() -> int:
+        with deps.pool.connection() as pg:
+            return case_store.set_reviewed(pg, search_id=search_id, thread_key=thread_key, reviewed=reviewed)
+
+    try:
+        count = await run_in_threadpool(mark)
+    except case_store.CaseError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return JSONResponse({"reviewed": count})
 
 
 def people_api(request: Request) -> Response:
@@ -1481,6 +1979,7 @@ def thread_view(request: Request) -> Response:
             after=THREAD_WINDOW_EACH_SIDE,
             index_unsent=deps.settings.index_unsent,
         )
+        marks = case_store.marks(pg, [m.message_key for m in window.messages])
     matcher = QueryMatcher.for_query(analyze_query(query)) if query.strip() else None
     messages_html = views.messages_with_day_breaks(
         window.messages,
@@ -1490,6 +1989,7 @@ def thread_view(request: Request) -> Response:
         anchor_key=window.anchor_key,
         thread_key=chat.thread_key,
         conversation=chat.title,
+        marks=marks,
     )
     back_url = views.FormState(query=query).url() if query.strip() else None
     return HTMLResponse(
@@ -1530,6 +2030,7 @@ def thread_messages(request: Request) -> Response:
             limit=THREAD_PAGE_SIZE,
             index_unsent=deps.settings.index_unsent,
         )
+        marks = case_store.marks(pg, [m.message_key for m in window.messages])
     matcher = QueryMatcher.for_query(analyze_query(query)) if query.strip() else None
     body = views.messages_with_day_breaks(
         window.messages,
@@ -1539,6 +2040,7 @@ def thread_messages(request: Request) -> Response:
         anchor_key=None,
         thread_key=chat.thread_key,
         conversation=chat.title,
+        marks=marks,
     )
     messages = window.messages
     next_cursor = (messages[0] if direction == "older" else messages[-1]).message_key if messages else None
@@ -1760,6 +2262,22 @@ def build_app(deps: AppDeps) -> ASGIApp:
         Route("/grade", grade_start, methods=["POST"]),
         Route("/grade/{list_id}", grade_view, methods=["GET"]),
         Route("/api/grade", grade_api, methods=["POST"]),
+        Route("/case", cases_view, methods=["GET"]),
+        Route("/case", case_create, methods=["POST"]),
+        Route("/case/{case_id}", case_view, methods=["GET"]),
+        Route("/case/{case_id}/download", case_download, methods=["GET"]),
+        Route("/case/{case_id}/activate", _case_action("case_id", _activate), methods=["POST"]),
+        Route("/case/{case_id}/rename", _case_action("case_id", _rename), methods=["POST"]),
+        Route("/case/{case_id}/notes", _case_action("case_id", _notes), methods=["POST"]),
+        Route("/case/{case_id}/delete", _case_action("case_id", _delete), methods=["POST"]),
+        Route("/case/item/{item_id}/note", _case_action("item_id", _item_note), methods=["POST"]),
+        Route("/case/item/{item_id}/remove", _case_action("item_id", _item_remove), methods=["POST"]),
+        Route(
+            "/case/search/{search_id}/remove", _case_action("search_id", _search_remove), methods=["POST"]
+        ),
+        Route("/api/case/item", case_item_api, methods=["POST"]),
+        Route("/api/case/search", case_search_api, methods=["POST"]),
+        Route("/api/case/review", case_review_api, methods=["POST"]),
         Route("/thread/{thread_key}", thread_view, methods=["GET"]),
         Route("/thread/{thread_key}/messages", thread_messages, methods=["GET"]),
         Route("/att/{key}", attachment_original, methods=["GET"]),

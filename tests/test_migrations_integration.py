@@ -118,7 +118,8 @@ def test_apply_pending_creates_every_table_and_hnsw_index(
     # 35 from 0001 + attachment_mm_embedding from 0002 + chat_group_id from 0007
     # + attachment_location from 0008 + mcp_audit_rollup from 0010
     # + eval_candidate_list and eval_candidate from 0011
-    assert row[0] == 41
+    # + search_case, search_case_item, search_case_search, search_case_review from 0012
+    assert row[0] == 45
 
 
 def test_apply_pending_is_idempotent(scratch_db: psycopg.Connection) -> None:

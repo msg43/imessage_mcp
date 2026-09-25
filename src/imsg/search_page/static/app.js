@@ -313,6 +313,69 @@
     box.select();
   }
 
+  // ---------------------------------------------------------------- evidence case
+
+  function postJSON(url, body) {
+    return fetchJSON(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf() },
+      body: JSON.stringify(body),
+    });
+  }
+
+  async function onCaseClick(button) {
+    const add = !button.classList.contains("on");
+    const message = button.dataset.message;
+    const attachment = button.dataset.attachment || null;
+    button.disabled = true;
+    try {
+      const answer = await postJSON("/api/case/item", { message_key: message, attachment_key: attachment, add: add });
+      // The same message can be on the page more than once.
+      document.querySelectorAll(".case-btn").forEach((b) => {
+        if (b.dataset.message !== message || (b.dataset.attachment || null) !== attachment) return;
+        b.classList.toggle("on", answer.in_case);
+        b.setAttribute("aria-pressed", answer.in_case ? "true" : "false");
+        b.textContent = answer.in_case ? "In case \u2713" : (b.dataset.addLabel || "Add to case");
+        b.title = answer.in_case ? "In \u201c" + answer.case_name + "\u201d" : "";
+      });
+    } catch (error) {
+      button.title = "Not saved: " + error.message;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function onSaveSearch(button) {
+    const d = button.dataset;
+    button.disabled = true;
+    try {
+      await postJSON("/api/case/search", { q: d.q || "", people: d.people || "", from: d.from || "", to: d.to || "", att: d.att || "any" });
+      // Reload so each conversation gets its Reviewed box; the place in the
+      // results is kept (see savePlace).
+      window.location.reload();
+    } catch (error) {
+      button.disabled = false;
+      button.title = "Not saved: " + error.message;
+    }
+  }
+
+  document.addEventListener("change", async (event) => {
+    const box = event.target instanceof HTMLInputElement && event.target.classList.contains("review-box") ? event.target : null;
+    if (!box) return;
+    box.disabled = true;
+    try {
+      const answer = await postJSON("/api/case/review", {
+        search_id: Number(box.dataset.search), thread_key: box.dataset.thread, reviewed: box.checked,
+      });
+      document.querySelectorAll(".n-reviewed").forEach((el) => { el.textContent = String(answer.reviewed); });
+    } catch (error) {
+      box.checked = !box.checked;
+      box.title = "Not saved: " + error.message;
+    } finally {
+      box.disabled = false;
+    }
+  });
+
   // ---------------------------------------------------------------- grading mode
 
   async function onGradeClick(button) {
@@ -377,6 +440,10 @@
     if (label) { event.preventDefault(); onLabelClick(label); return; }
     const cite = target.closest(".cite-btn");
     if (cite) { event.preventDefault(); onCiteClick(cite); return; }
+    const caseButton = target.closest(".case-btn");
+    if (caseButton) { event.preventDefault(); onCaseClick(caseButton); return; }
+    const saveSearch = target.closest(".save-search-btn");
+    if (saveSearch) { event.preventDefault(); onSaveSearch(saveSearch); return; }
     const grade = target.closest(".grade-btn");
     if (grade) { event.preventDefault(); onGradeClick(grade); return; }
     const details = target.closest(".details-btn");

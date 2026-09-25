@@ -24,8 +24,13 @@ deletion, filing and sources (earlier text and raw handles each behind a
 one of a search's top 20 in random order for the reranker evaluation and
 stores the whole fused list (migration 0011); a Timeline shows every
 message across conversations for a day or range, and a Media grid shows the
-files, both opening the conversation at the chosen message. Deploying needs
-`imsg migrate` and a restart of the search page only. See `CHANGELOG.md`.
+files, both opening the conversation at the chosen message; evidence cases
+collect messages and files with notes, track reviewed conversations of saved
+searches, and download as Markdown, CSV or JSON with exact citations,
+optionally with the original files and a SHA-256 list (migration 0012).
+Deploying needs `imsg migrate` (0011, 0012), the two `search_page.details`
+keys the owner chose, and a restart of the search page only. See
+`CHANGELOG.md`.
 
 **2026-09-24 public endpoint fixes from the QA review (not yet deployed):**
 requests refused before any token was judged are counted in memory and

@@ -33,6 +33,14 @@ from imsg.search_page.threads import chat_views, is_opaque_key
 if TYPE_CHECKING:
     import psycopg
 
+SERVICE_NAMES = {"imessage": "iMessage", "sms": "SMS", "rcs": "RCS"}
+
+
+def service_name(service: str | None) -> str:
+    """`message.service` as people write it."""
+    return SERVICE_NAMES.get((service or "").lower(), "service not recorded")
+
+
 FILED_BY: dict[str, str] = {
     "chat_message_join": "the Messages database links it to this conversation",
     "recoverable_join": "Recently Deleted in the Messages database names this conversation",
@@ -237,4 +245,5 @@ __all__ = [
     "SourceRecord",
     "VersionRecord",
     "message_details",
+    "service_name",
 ]

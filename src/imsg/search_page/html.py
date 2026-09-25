@@ -20,7 +20,14 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from imsg.search_page.browse import MediaItem
-from imsg.search_page.details import FILED_BY, MessageDetails
+from imsg.search_page.cases import (
+    DOWNLOAD_FORMATS,
+    CaseItem,
+    CaseMarks,
+    CaseSummary,
+    SearchCoverage,
+)
+from imsg.search_page.details import FILED_BY, MessageDetails, service_name
 from imsg.search_page.grading import (
     GRADE_LABELS,
     GRADED_POSITIONS,
@@ -39,7 +46,7 @@ from imsg.search_page.labels import (
 from imsg.search_page.search import CHANNEL_LABELS, Hit
 from imsg.search_page.threads import AttachmentView, ChatView, MessageView
 
-STATIC_VERSION = "5"
+STATIC_VERSION = "6"
 _URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
@@ -224,7 +231,8 @@ def search_form(form: FormState, *, semantic_available: bool, csrf_token: str) -
         + "</select></label>"
         "</div></details>"
         '<nav class="views" aria-label="Views"><a href="/timeline">Timeline</a>'
-        '<a href="/media">Media</a><a href="/labels">Labels</a></nav></div></form>'
+        '<a href="/media">Media</a><a href="/case">Case</a><a href="/labels">Labels</a></nav>'
+        "</div></form>"
         '<form class="logout" method="post" action="/logout">'
         f'<input type="hidden" name="csrf_token" value="{esc(csrf_token)}">'
         '<button type="submit" class="link">Sign out</button></form>'
@@ -256,15 +264,22 @@ def linkify(escaped_html: str) -> str:
     return _URL_RE.sub(repl, escaped_html)
 
 
-def _attachment_html(att: AttachmentView, *, matched: bool) -> str:
+def _attachment_html(
+    att: AttachmentView,
+    *,
+    matched: bool,
+    message_key: str | None = None,
+    marks: CaseMarks | None = None,
+) -> str:
     cls = "att matched" if matched else "att"
+    add = f" \u00b7 {case_button(message_key, att.attachment_key, marks)}" if message_key else ""
     name = att.filename or {"image": "Image", "video": "Video", "audio": "Audio", "pdf": "PDF"}.get(
         att.kind, "Attachment"
     )
     key = esc(att.attachment_key)
     download = (
         f'<a class="att-download" href="/att/{key}?download=1" title="Download">'
-        f"Download{(' · ' + esc(human_size(att.byte_size))) if att.byte_size else ''}</a>"
+        f"Download{(' · ' + esc(human_size(att.byte_size))) if att.byte_size else ''}</a>{add}"
     )
     if not att.available:
         return (
@@ -307,28 +322,38 @@ def _attachment_html(att: AttachmentView, *, matched: bool) -> str:
     return (
         f'<div class="{cls} att-file"><span class="att-icon">FILE</span> '
         f'<a href="/att/{key}?download=1">{esc(name)}</a>'
-        f" <span class=\"muted\">{esc(human_size(att.byte_size))}</span></div>"
+        f" <span class=\"muted\">{esc(human_size(att.byte_size))}</span>{add}</div>"
     )
 
 
-def message_actions(message: MessageView, *, conversation: str, tz: str) -> str:
-    """The row under a message: its Details panel and its citation."""
+def case_button(message_key: str, attachment_key: str | None, marks: CaseMarks | None) -> str:
+    """"Add to case" for a message, or for one of its files."""
+    on = marks is not None and (message_key, attachment_key) in marks
+    what = "file " if attachment_key else ""
+    label = "In case \u2713" if on else f"Add {what}to case"
+    data = f' data-attachment="{esc(attachment_key)}"' if attachment_key else ""
+    return (
+        f'<button type="button" class="link case-btn{" on" if on else ""}" '
+        f'data-message="{esc(message_key)}"{data} aria-pressed="{"true" if on else "false"}" '
+        f'data-add-label="Add {what}to case">{label}</button>'
+    )
+
+
+def message_actions(
+    message: MessageView, *, conversation: str, tz: str, marks: CaseMarks | None = None
+) -> str:
+    """The row under a message: add to the case, its Details panel, its
+    citation."""
     cite = citation_line(message, conversation=conversation, tz=tz)
     key = esc(message.message_key)
     return (
         '<div class="msg-actions">'
-        f'<button type="button" class="link details-btn" data-url="/message/{key}/details" '
+        + case_button(message.message_key, None, marks)
+        + f'<button type="button" class="link details-btn" data-url="/message/{key}/details" '
         'aria-expanded="false">Details</button>'
         f'<button type="button" class="link cite-btn" data-cite="{esc(cite)}">Copy citation</button>'
         "</div>"
     )
-
-
-_SERVICES = {"imessage": "iMessage", "sms": "SMS", "rcs": "RCS"}
-
-
-def service_name(service: str | None) -> str:
-    return _SERVICES.get((service or "").lower(), "service not recorded")
 
 
 def _duration(seconds: float) -> str:
@@ -468,6 +493,7 @@ def message_html(
     thread_key: str | None = None,
     show_date: bool = False,
     conversation: str | None = None,
+    marks: CaseMarks | None = None,
 ) -> str:
     classes = ["msg", "me" if message.is_from_me else "them"]
     if message.is_deleted:
@@ -495,7 +521,12 @@ def message_html(
             f'#m-{esc(message.reply_to_key)}">Reply to: {esc(display_text(message.reply_to_text or "")[:80])}</a>'
         )
     atts = "".join(
-        _attachment_html(att, matched=att.attachment_id in matched_attachment_ids)
+        _attachment_html(
+            att,
+            matched=att.attachment_id in matched_attachment_ids,
+            message_key=message.message_key if conversation is not None else None,
+            marks=marks,
+        )
         for att in message.attachments
     )
     previews = "".join(
@@ -518,7 +549,9 @@ def message_html(
     )
     text_html = f'<div class="text">{body}</div>' if body else ""
     actions = (
-        message_actions(message, conversation=conversation, tz=tz) if conversation is not None else ""
+        message_actions(message, conversation=conversation, tz=tz, marks=marks)
+        if conversation is not None
+        else ""
     )
     return (
         f'<article class="{" ".join(classes)}" id="m-{esc(message.message_key)}" '
@@ -537,6 +570,7 @@ def messages_with_day_breaks(
     thread_key: str,
     previous_day: str | None = None,
     conversation: str | None = None,
+    marks: CaseMarks | None = None,
 ) -> str:
     out: list[str] = []
     day = previous_day
@@ -554,6 +588,7 @@ def messages_with_day_breaks(
                 anchor=(message.message_key == anchor_key),
                 thread_key=thread_key,
                 conversation=conversation,
+                marks=marks,
             )
         )
     return "".join(out)
@@ -645,7 +680,24 @@ def _span_label(start: datetime, end: datetime, tz: str) -> str:
     return f"{fmt_datetime(start, tz)} \u2013 {fmt_datetime(end, tz)}"
 
 
-def hit_html(view: HitView, *, chat: ChatView, tz: str, matcher: QueryMatcher, query: str) -> str:
+@dataclass(frozen=True, slots=True)
+class ReviewState:
+    """The active case's saved search for the shown search, if the owner
+    saved it: which conversations are marked reviewed."""
+
+    search_id: int
+    reviewed: frozenset[str]
+
+
+def hit_html(
+    view: HitView,
+    *,
+    chat: ChatView,
+    tz: str,
+    matcher: QueryMatcher,
+    query: str,
+    marks: CaseMarks | None = None,
+) -> str:
     hit = view.hit
     start, end = view.span if view.span is not None else (hit.at, hit.ended_at)
     when = _span_label(start, end, tz)
@@ -659,6 +711,7 @@ def hit_html(view: HitView, *, chat: ChatView, tz: str, matcher: QueryMatcher, q
             matched_attachment_ids=matched,
             thread_key=chat.thread_key,
             conversation=chat.title,
+            marks=marks,
         )
         for m in view.messages
     )
@@ -698,17 +751,45 @@ def _next_hits_button(view: ThreadResultView, form: FormState) -> str:
 
 
 def thread_hits_html(
-    view: ThreadResultView, *, tz: str, matcher: QueryMatcher, form: FormState, query: str
+    view: ThreadResultView,
+    *,
+    tz: str,
+    matcher: QueryMatcher,
+    form: FormState,
+    query: str,
+    marks: CaseMarks | None = None,
+    review: ReviewState | None = None,
 ) -> str:
     """The next hits of one conversation, appended by the page script."""
-    hits = "".join(hit_html(h, chat=view.chat, tz=tz, matcher=matcher, query=query) for h in view.hits)
+    hits = "".join(
+        hit_html(h, chat=view.chat, tz=tz, matcher=matcher, query=query, marks=marks) for h in view.hits
+    )
     return hits + _next_hits_button(view, form)
 
 
+def _review_box(chat: ChatView, review: ReviewState | None) -> str:
+    if review is None:
+        return ""
+    checked = " checked" if chat.thread_key in review.reviewed else ""
+    return (
+        '<label class="review-label"><input type="checkbox" class="review-box" '
+        f'data-search="{review.search_id}" data-thread="{esc(chat.thread_key)}"{checked}> Reviewed</label>'
+    )
+
+
 def thread_result_html(
-    view: ThreadResultView, *, tz: str, matcher: QueryMatcher, form: FormState, query: str
+    view: ThreadResultView,
+    *,
+    tz: str,
+    matcher: QueryMatcher,
+    form: FormState,
+    query: str,
+    marks: CaseMarks | None = None,
+    review: ReviewState | None = None,
 ) -> str:
-    hits = "".join(hit_html(h, chat=view.chat, tz=tz, matcher=matcher, query=query) for h in view.hits)
+    hits = "".join(
+        hit_html(h, chat=view.chat, tz=tz, matcher=matcher, query=query, marks=marks) for h in view.hits
+    )
     more = ""
     remaining = view.count - len(view.hits)
     if view.shown_all:
@@ -721,7 +802,7 @@ def thread_result_html(
         )
     return (
         f'<section class="thread-result" data-thread="{esc(view.chat.thread_key)}">'
-        f'<div class="thread-head">{_chat_header(view.chat)}'
+        f'<div class="thread-head">{_review_box(view.chat, review)}{_chat_header(view.chat)}'
         f'<div class="thread-meta"><span class="count">{view.count} hit{"s" if view.count != 1 else ""}</span>'
         f' · latest {esc(fmt_date(view.latest_at, tz))} · '
         f'<a href="/thread/{esc(view.chat.thread_key)}">Open</a></div></div>'
@@ -737,9 +818,14 @@ def results_fragment(
     form: FormState,
     next_page_url: str | None,
     next_full_url: str | None = None,
+    marks: CaseMarks | None = None,
+    review: ReviewState | None = None,
 ) -> str:
     body = "".join(
-        thread_result_html(t, tz=tz, matcher=matcher, form=form, query=form.query) for t in threads
+        thread_result_html(
+            t, tz=tz, matcher=matcher, form=form, query=form.query, marks=marks, review=review
+        )
+        for t in threads
     )
     if next_page_url:
         body += (
@@ -827,6 +913,7 @@ def search_page(
     error: str | None,
     semantic_url: str | None,
     search_key: str | None,
+    case_box: str = "",
 ) -> str:
     error_html = f'<p class="error" role="alert">{esc(error)}</p>' if error else ""
     data_attrs = ""
@@ -851,7 +938,7 @@ def search_page(
         else ""
     )
     body = (
-        f"{error_html}{intro}{status_html_text}{grading}"
+        f'{error_html}{intro}{status_html_text}<div class="result-tools">{grading}{case_box}</div>'
         f'<div id="results" class="results"{data_attrs}>{results}</div>{empty}'
         '<div id="semantic-banner" class="banner" hidden></div>'
     )
@@ -1165,6 +1252,7 @@ def timeline_rows_html(
     tz: str,
     matcher: QueryMatcher | None,
     previous_day: str | None,
+    marks: CaseMarks | None = None,
 ) -> str:
     """Timeline rows with a break at each new day."""
     out: list[str] = []
@@ -1190,7 +1278,10 @@ def timeline_rows_html(
             badges += '<span class="badge">Unsent</span>'
         if message.is_edited:
             badges += '<span class="badge">Edited</span>'
-        atts = "".join(_attachment_html(att, matched=False) for att in message.attachments)
+        atts = "".join(
+            _attachment_html(att, matched=False, message_key=message.message_key, marks=marks)
+            for att in message.attachments
+        )
         out.append(
             f'<article class="tl-row{" me" if message.is_from_me else ""}" id="m-{key}" data-key="{key}">'
             f'<time class="tl-when" datetime="{esc(message.sent_at.isoformat())}">'
@@ -1199,7 +1290,7 @@ def timeline_rows_html(
             f' \u00b7 <span class="sender">{esc(message.sender_name)}</span>{badges}</div>'
             + (f'<div class="tl-text">{body}</div>' if body else "")
             + atts
-            + message_actions(message, conversation=title, tz=tz)
+            + message_actions(message, conversation=title, tz=tz, marks=marks)
             + "</div></article>"
         )
     return "".join(out)
@@ -1240,7 +1331,13 @@ def timeline_page(
 _TILE_LABELS = {"image": "Photo", "video": "Video", "audio": "Voice note", "pdf": "PDF", "other": "File"}
 
 
-def media_tiles_html(items: Sequence[MediaItem], *, chats: dict[int, ChatView], tz: str) -> str:
+def media_tiles_html(
+    items: Sequence[MediaItem],
+    *,
+    chats: dict[int, ChatView],
+    tz: str,
+    marks: CaseMarks | None = None,
+) -> str:
     out: list[str] = []
     for item in items:
         att = item.attachment
@@ -1265,7 +1362,8 @@ def media_tiles_html(items: Sequence[MediaItem], *, chats: dict[int, ChatView], 
             f"{player}"
             f'<figcaption><span class="tile-when">{esc(fmt_datetime(item.sent_at, tz))}</span>'
             f' \u00b7 {esc(item.sender_name)}<br><span class="tile-name">{esc(name)}</span>'
-            f"{missing}{download}</figcaption></figure>"
+            f"{missing}{download}<br>{case_button(item.message_key, att.attachment_key, marks)}"
+            "</figcaption></figure>"
         )
     return "".join(out)
 
@@ -1305,6 +1403,250 @@ def media_page(
     return layout(ctx, body, body_class="page-media", topbar=topbar)
 
 
+# --------------------------------------------------------------------------
+# evidence cases
+# --------------------------------------------------------------------------
+
+
+def case_box(
+    form: FormState,
+    *,
+    active: CaseSummary | None,
+    review: ReviewState | None,
+    total_threads: int,
+) -> str:
+    """Under the result count: save this search to the case, or, once it is
+    saved, how many of its conversations are marked reviewed."""
+    if review is not None and active is not None:
+        return (
+            f'<div class="case-box">Saved in \u201c<a href="/case/{active.case_id}">{esc(active.name)}</a>\u201d '
+            f'\u00b7 reviewed <span class="n-reviewed">{len(review.reviewed)}</span> of '
+            f"{total_threads:,} conversation{'s' if total_threads != 1 else ''}</div>"
+        )
+    target = f" to \u201c{esc(active.name)}\u201d" if active is not None else ""
+    fields = {k: v for k, v in form.params().items() if k in ("q", "people", "from", "to", "att")}
+    data = " ".join(f'data-{esc(k)}="{esc(v)}"' for k, v in fields.items())
+    return (
+        f'<div class="case-box"><button type="button" class="link save-search-btn" {data}>'
+        f"Save this search{target}</button></div>"
+    )
+
+
+def _post_form(action: str, csrf_token: str, body: str, *, cls: str = "inline-form") -> str:
+    return (
+        f'<form class="{esc(cls)}" method="post" action="{esc(action)}">'
+        f'<input type="hidden" name="csrf_token" value="{esc(csrf_token)}">{body}</form>'
+    )
+
+
+def cases_page(ctx: PageContext, *, cases: Sequence[CaseSummary], error: str | None) -> str:
+    error_html = f'<p class="error" role="alert">{esc(error)}</p>' if error else ""
+    rows = "".join(
+        "<tr>"
+        f'<td><a href="/case/{c.case_id}">{esc(c.name)}</a>'
+        + (' <span class="badge on">open</span>' if c.is_active else "")
+        + f"</td><td>{c.item_count:,} item{'s' if c.item_count != 1 else ''}</td>"
+        f"<td>{c.search_count:,} saved search{'es' if c.search_count != 1 else ''}</td>"
+        f'<td class="muted">{esc(fmt_date(c.updated_at, ctx.timezone))}</td></tr>'
+        for c in cases
+    )
+    table = (
+        f'<table class="labels-table"><tbody>{rows}</tbody></table>'
+        if rows
+        else '<p class="muted">No case yet. "Add to case" on any message starts one.</p>'
+    )
+    create = _post_form(
+        "/case",
+        ctx.csrf_token,
+        '<label>New case <input type="text" name="name" maxlength="200" required '
+        'placeholder="a name for what you are looking into"></label> <button type="submit">Create</button>',
+    )
+    body = (
+        f'<section class="cases"><h1>Cases</h1>{error_html}'
+        "<p>A case collects messages and files you want to keep together, with notes and the "
+        'searches that found them. "Add to case" adds to the open case.</p>'
+        f"{table}{create}</section>"
+    )
+    topbar = search_form(FormState(), semantic_available=ctx.semantic_available, csrf_token=ctx.csrf_token)
+    return layout(ctx, body, body_class="page-cases", topbar=topbar)
+
+
+def _case_item_html(item: CaseItem, n: int, *, ctx: PageContext, tz: str, show_raw_handles: bool) -> str:
+    if not item.present:
+        body = (
+            '<p class="muted">This message is no longer shown: it left the index, or it is unsent '
+            f'and unsent messages are hidden by setting. Message ID <code class="key">{esc(item.message_key)}</code></p>'
+        )
+    else:
+        assert item.sent_at is not None
+        who = esc(item.sender_name)
+        if item.raw_handle:
+            who += f' <span class="handle">({esc(item.raw_handle)})</span>'
+        kind = f" ({esc(item.conversation_kind)})" if item.conversation_kind else ""
+        head = (
+            f'<div class="case-item-head"><strong>{esc(exact_time(item.sent_at, tz))}</strong> \u00b7 {who} '
+            f"\u00b7 {esc(service_name(item.service))} \u00b7 in "
+            f'<a href="/thread/{esc(item.thread_key)}?anchor={esc(item.message_key)}#m-{esc(item.message_key)}">'
+            f"{esc(item.conversation)}</a>{kind}</div>"
+        )
+        text = ""
+        if item.text:
+            text = f'<div class="case-text">{linkify(esc(display_text(item.text))).replace(chr(10), "<br>")}</div>'
+        files = "".join(
+            f'<li><a href="/att/{esc(f.attachment_key)}?download=1">{esc(f.filename or "unnamed file")}</a>'
+            + (f" \u00b7 {esc(human_size(f.byte_size))}" if f.byte_size is not None else "")
+            + (f' \u00b7 SHA-256 <code class="sha">{esc(f.sha256)}</code>' if f.sha256 else "")
+            + ("" if f.available else f" \u00b7 file {esc(f.state)}")
+            + "</li>"
+            for f in item.files
+        )
+        files_html = f'<ul class="case-files">{files}</ul>' if files else ""
+        facts: list[str] = []
+        if item.is_edited:
+            facts.append(
+                "Edited" + (f" {esc(exact_time(item.date_edited, tz))}" if item.date_edited else "")
+            )
+            for v in item.versions or ():
+                facts.append(f"Earlier text: \u201c{esc(v.text)}\u201d")
+        if item.deleted_at is not None:
+            facts.append(f"Deleted in Messages {esc(exact_time(item.deleted_at, tz))}; kept from Recently Deleted")
+        if item.is_unsent:
+            facts.append("Unsent")
+        if item.sources:
+            facts.append(
+                "Found in " + "; ".join(f"{esc(s.source_name)} row {s.source_rowid}" for s in item.sources)
+            )
+        facts.append(f'Message ID <code class="key">{esc(item.message_key)}</code>')
+        body = head + text + files_html + "".join(f'<div class="case-fact muted">{f}</div>' for f in facts)
+    note = _post_form(
+        f"/case/item/{item.item_id}/note",
+        ctx.csrf_token,
+        f'<label class="note-label">Note <textarea name="note" rows="2" maxlength="5000">{esc(item.note)}</textarea></label>'
+        '<button type="submit" class="small">Save note</button>',
+        cls="note-form",
+    )
+    remove = _post_form(
+        f"/case/item/{item.item_id}/remove",
+        ctx.csrf_token,
+        '<button type="submit" class="link danger">Remove from case</button>',
+    )
+    return (
+        f'<li class="case-item" id="item-{item.item_id}"><div class="case-n">{n}.</div>'
+        f'<div class="case-body">{body}{note}{remove}</div></li>'
+    )
+
+
+def case_page(
+    ctx: PageContext,
+    *,
+    case: CaseSummary,
+    items: Sequence[CaseItem],
+    coverage: Sequence[SearchCoverage],
+    tz: str,
+    show_raw_handles: bool,
+    confirm_delete: bool,
+    error: str | None,
+) -> str:
+    error_html = f'<p class="error" role="alert">{esc(error)}</p>' if error else ""
+    header = (
+        f'<h1>{esc(case.name)}{" <span class=\"badge on\">open</span>" if case.is_active else ""}</h1>'
+        f'<p class="muted"><a href="/case">All cases</a> \u00b7 {len(items):,} item{"s" if len(items) != 1 else ""}</p>'
+    )
+    if not case.is_active:
+        header += _post_form(
+            f"/case/{case.case_id}/activate",
+            ctx.csrf_token,
+            '<button type="submit" class="link">Make this the open case</button> '
+            '<span class="muted">("Add to case" adds to the open case)</span>',
+        )
+    rename = _post_form(
+        f"/case/{case.case_id}/rename",
+        ctx.csrf_token,
+        f'<label>Name <input type="text" name="name" value="{esc(case.name)}" maxlength="200" required></label> '
+        '<button type="submit" class="small">Rename</button>',
+    )
+    notes = _post_form(
+        f"/case/{case.case_id}/notes",
+        ctx.csrf_token,
+        f'<textarea name="notes" rows="4" maxlength="20000" aria-label="Case notes">{esc(case.notes)}</textarea>'
+        '<button type="submit" class="small">Save notes</button>',
+        cls="notes-form",
+    )
+    item_list = "".join(
+        _case_item_html(item, n, ctx=ctx, tz=tz, show_raw_handles=show_raw_handles)
+        for n, item in enumerate(items, start=1)
+    )
+    items_html = (
+        f'<ol class="case-items">{item_list}</ol>'
+        if item_list
+        else '<p class="muted">No items yet. Use "Add to case" on a message or a file.</p>'
+    )
+    searches: list[str] = []
+    for c in coverage:
+        s = c.search
+        filters = "; ".join(f"{esc(k)} {esc(v)}" for k, v in s.params.items())
+        url = FormState(
+            query=s.query_text,
+            people=s.params.get("people", ""),
+            date_from=s.params.get("from", ""),
+            date_to=s.params.get("to", ""),
+            attachments=s.params.get("att", "any"),
+        ).url()
+        count = (
+            f"reviewed {len(s.reviewed):,} of {c.conversations:,} conversation{'s' if c.conversations != 1 else ''}"
+            if c.conversations is not None
+            else f"{len(s.reviewed):,} conversations reviewed; the search could not run now"
+        )
+        remove = _post_form(
+            f"/case/search/{s.search_id}/remove",
+            ctx.csrf_token,
+            '<button type="submit" class="link danger">Remove</button>',
+        )
+        searches.append(
+            f'<li><a href="{esc(url)}">\u201c{esc(s.query_text)}\u201d</a>'
+            + (f' <span class="muted">({filters})</span>' if filters else "")
+            + f" \u00b7 {count} {remove}</li>"
+        )
+    searches_html = (
+        f'<ul class="case-searches">{"".join(searches)}</ul>'
+        if searches
+        else '<p class="muted">No saved searches. "Save this search" on a results page adds one.</p>'
+    )
+    formats = "".join(
+        f'<label><input type="radio" name="fmt" value="{f}"{" checked" if f == "md" else ""}> {label}</label>'
+        for f, label in zip(DOWNLOAD_FORMATS, ("Markdown", "CSV", "JSON"), strict=True)
+    )
+    download = (
+        f'<form class="download-form" method="get" action="/case/{case.case_id}/download">'
+        f"<div>{formats}</div>"
+        '<label><input type="checkbox" name="files" value="1"> Add the original files and a '
+        "SHA-256 list (zip)</label>"
+        '<button type="submit">Download</button>'
+        '<p class="muted">A download is a copy outside the encrypted volume. It goes only to this '
+        "browser; keep it somewhere safe.</p></form>"
+    )
+    if confirm_delete:
+        delete = _post_form(
+            f"/case/{case.case_id}/delete",
+            ctx.csrf_token,
+            f'<p>Delete \u201c{esc(case.name)}\u201d with its {len(items):,} items, notes and saved '
+            'searches? The messages themselves stay in the index.</p><input type="hidden" name="confirm" value="1">'
+            f'<button type="submit" class="danger-btn">Delete this case</button> <a href="/case/{case.case_id}">Keep it</a>',
+            cls="delete-form",
+        )
+    else:
+        delete = f'<p><a class="danger" href="/case/{case.case_id}?delete=1">Delete this case\u2026</a></p>'
+    body = (
+        f'<section class="case">{header}{error_html}{rename}'
+        f"<h2>Notes</h2>{notes}"
+        f"<h2>Items, in the order they were sent</h2>{items_html}"
+        f"<h2>Saved searches</h2>{searches_html}"
+        f"<h2>Download</h2>{download}{delete}</section>"
+    )
+    topbar = search_form(FormState(), semantic_available=ctx.semantic_available, csrf_token=ctx.csrf_token)
+    return layout(ctx, body, body_class="page-case", topbar=topbar)
+
+
 def error_page(ctx: PageContext, *, status: int, message: str) -> str:
     body = f'<section class="error-page"><h1>{status}</h1><p>{esc(message)}</p><p><a href="/">Search</a></p></section>'
     return layout(ctx, body, body_class="page-error")
@@ -1315,8 +1657,13 @@ __all__ = [
     "FormState",
     "HitView",
     "PageContext",
+    "ReviewState",
     "StatusView",
     "ThreadResultView",
+    "case_box",
+    "case_button",
+    "case_page",
+    "cases_page",
     "citation_line",
     "details_html",
     "error_page",

@@ -220,6 +220,39 @@ figure.att { margin: 4px 0; }
 .day-break span { font-size: 12px; color: var(--muted); background: var(--card); padding: 2px 10px; border-radius: 999px; }
 .edge { text-align: center; color: var(--muted); font-size: 12px; padding: 12px; }
 
+/* evidence case */
+.msg-actions button.case-btn.on, .case-btn.on { color: var(--accent); font-weight: 600; }
+.att .case-btn, .tile .case-btn { font-size: 12px; }
+.result-tools { display: flex; gap: 16px; flex-wrap: wrap; align-items: baseline; margin: -6px 0 10px; font-size: 13px; }
+.result-tools .grade-form, .result-tools .case-box { margin: 0; }
+.review-label { float: right; font-size: 13px; color: var(--muted); display: flex; gap: 4px; align-items: center; }
+.badge.on { color: var(--accent); border-color: var(--accent); }
+.case h1, .cases h1 { font-size: 22px; }
+.case h2 { font-size: 17px; margin-top: 24px; }
+.inline-form { display: inline; }
+.inline-form label, .note-label { font-size: 13px; color: var(--muted); }
+.inline-form input[type=text], .notes-form textarea, .note-form textarea {
+  font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg);
+}
+.notes-form textarea { width: 100%; display: block; margin-bottom: 6px; }
+.note-form { display: flex; gap: 6px; align-items: flex-end; margin-top: 4px; }
+.note-form textarea { flex: 1; }
+button.small, .download-form button, .cases .inline-form button[type=submit]:not(.link) {
+  padding: 3px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; font-size: 13px;
+}
+.case-items { list-style: none; padding: 0; }
+.case-item { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 6px; padding: 10px 0; border-top: 1px solid var(--line); }
+.case-n { color: var(--muted); font-weight: 600; }
+.case-text { margin: 4px 0; overflow-wrap: anywhere; }
+.case-files { margin: 4px 0; padding-left: 18px; font-size: 13px; }
+.case-fact { font-size: 12px; }
+.danger { color: var(--danger); }
+button.link.danger { color: var(--danger); font-size: 12px; }
+.danger-btn { background: var(--danger); color: #fff; border: 0; border-radius: 8px; padding: 4px 12px; cursor: pointer; }
+.download-form { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+.download-form > div { display: flex; gap: 14px; }
+.download-form button { align-self: flex-start; background: var(--accent); color: #fff; border: 0; }
+
 /* timeline and media */
 .browse h1 { font-size: 20px; margin: 4px 0 8px; }
 .browse-form { margin-bottom: 8px; }

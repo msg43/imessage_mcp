@@ -10,6 +10,53 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-25 — Search page evidence cases: collect messages and files with notes, track reviewed conversations, download with exact citations
+
+**Why.** Reconstructing what happened takes several sessions: the owner
+needs to keep the messages and files that matter, note why, know which
+conversations of a search he has already read, and hand over a dated list
+with exact citations and file fingerprints (design review of 2026-09-24,
+change 4). The Relevant buttons are eval labels, not a place to keep
+evidence.
+
+- **"Add to case"** on every message, every file, every Timeline row and
+  every Media tile adds to the open case; the first add starts one. The
+  button shows "In case" wherever that message or file appears.
+- **Case pages** (`/case`, `/case/<id>`): cases listed with their counts; a
+  case lists its items in the order they were sent, with time to the second
+  and zone offset, sender (with the raw number or email only under
+  `search_page.details.show_raw_handles`), service, conversation, text,
+  files with size and SHA-256, edits (earlier text only under
+  `show_edit_history`), deletion, sources and message ID, a note on each
+  item, and the case's own notes. Rename, open, and delete (after a
+  confirming step; the messages stay in the index).
+- **Saved searches.** "Save this search" keeps the search text and filters
+  in the open case; its results then carry a Reviewed box on each
+  conversation and a "reviewed N of M conversations" count, which the case
+  page repeats for every saved search. Nothing is stored unless the owner
+  clicks.
+- **Downloads** as Markdown, CSV or JSON with exact citations (machine
+  times in UTC), or a zip that adds the original files from the attachment
+  cache and a `SHA256SUMS.txt` computed from the bytes written (a file whose
+  bytes differ from its recorded SHA-256 is flagged). The zip is built on
+  the encrypted volume, streamed, then deleted; downloads over 2 GiB of
+  files are refused with a message. The page calls this "download", never
+  "export", and says a download is a copy outside the encrypted volume.
+- **Storage (migration 0012):** `search_case`, `search_case_item`,
+  `search_case_search`, `search_case_review`. Items are keyed by
+  `message_key` / `attachment_key`, so they survive re-segmentation; there is
+  no foreign key to `message`, so a case never blocks work on the core
+  tables. At most one case is open (a partial unique index).
+- **Security:** every new POST (JSON or form) checks the session, a
+  same-site request and the CSRF token, as the label route does; downloads
+  are GETs behind the session and carry `no-store`.
+- **Tests:** 9 new; all fail on the previous code. The security tests now
+  also cover every route this series added (36 more cases, no database):
+  each refuses a request without a session, and each POST refuses a missing
+  or wrong CSRF token and a cross-site request; removing the CSRF check from
+  the shared JSON handler fails 3 of them. The migrations test's table count
+  moves from 41 to 45.
+
 ## 2026-09-25 — Search page: browse a day's messages on a Timeline, and files in a Media grid
 
 **Why.** The page could not answer "what happened on Fri 7 Apr" or "the

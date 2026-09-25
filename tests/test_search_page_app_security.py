@@ -131,6 +131,16 @@ def test_duplicate_host_header_is_refused(app_client: TestClient) -> None:
         "/att/" + "a" * 64 + "/audio",
         "/att/" + "a" * 64 + "/poster",
         "/",
+        "/labels",
+        "/message/" + "a" * 64 + "/details",
+        "/grade/1",
+        "/timeline",
+        "/timeline/page?cursor=1.1",
+        "/media",
+        "/media/page?cursor=1.1.1",
+        "/case",
+        "/case/1",
+        "/case/1/download?fmt=md",
     ],
 )
 def test_every_data_route_refuses_without_a_session(app_client: TestClient, path: str) -> None:
@@ -235,3 +245,59 @@ def test_static_files_are_only_the_two_assets(app_client: TestClient) -> None:
     assert app_client.get("/static/app.js").status_code == 200
     assert app_client.get("/static/..%2Fapp.py").status_code == 404
     assert app_client.get("/static/app.py").status_code == 404
+
+
+def _signed_in(client: TestClient) -> str:
+    """A session minted server-side with the page's own `SessionStore`
+    (no password is posted); returns its CSRF token."""
+    deps = client.app._app.state.deps  # type: ignore[attr-defined]
+    raw, session = deps.sessions.create(deps.passwords.fingerprint())
+    client.cookies.set("imsg_session", raw)
+    return str(session.csrf_token)
+
+
+STATE_CHANGING_FORMS = [
+    "/grade",
+    "/case",
+    "/case/1/activate",
+    "/case/1/rename",
+    "/case/1/notes",
+    "/case/1/delete",
+    "/case/item/1/note",
+    "/case/item/1/remove",
+    "/case/search/1/remove",
+]
+STATE_CHANGING_APIS = ["/api/grade", "/api/case/item", "/api/case/search", "/api/case/review"]
+
+
+@pytest.mark.parametrize("path", STATE_CHANGING_FORMS + STATE_CHANGING_APIS)
+def test_every_new_state_change_needs_a_session(app_client: TestClient, path: str) -> None:
+    response = app_client.post(path, data={"q": "x"}, follow_redirects=False)
+    assert response.status_code in (303, 401), path
+
+
+@pytest.mark.parametrize("path", STATE_CHANGING_FORMS)
+def test_every_new_form_needs_the_csrf_token_and_the_same_site(app_client: TestClient, path: str) -> None:
+    """Refused before the database is touched (the pool here fails the test
+    on any connection)."""
+    token = _signed_in(app_client)
+    assert app_client.post(path, data={"q": "x"}, follow_redirects=False).status_code == 403
+    assert app_client.post(path, data={"csrf_token": "wrong"}, follow_redirects=False).status_code == 403
+    cross = app_client.post(
+        path,
+        data={"csrf_token": token},
+        headers={"Origin": "http://evil.example"},
+        follow_redirects=False,
+    )
+    assert cross.status_code == 403
+
+
+@pytest.mark.parametrize("path", STATE_CHANGING_APIS)
+def test_every_new_api_needs_the_csrf_header_and_the_same_site(app_client: TestClient, path: str) -> None:
+    token = _signed_in(app_client)
+    assert app_client.post(path, json={}).status_code == 403
+    assert app_client.post(path, json={}, headers={"X-CSRF-Token": "wrong"}).status_code == 403
+    cross = app_client.post(
+        path, json={}, headers={"X-CSRF-Token": token, "Sec-Fetch-Site": "cross-site"}
+    )
+    assert cross.status_code == 403
