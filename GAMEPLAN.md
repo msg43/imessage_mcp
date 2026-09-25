@@ -11,6 +11,19 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-09-25 MCP servers load before background work (built, not yet
+deployed):** an MCP server whose model load is refused posts a notice
+(`<data_root>/run/live-servers-waiting/<pid>.json`); while it is up, no
+background model load starts and running background work stops after its
+current unit of work (exit 75). What background jobs were promised counts
+against the server only for the first 60 s of its wait
+(`memory.background_yield_seconds`). A refused load is retried every 15 s
+and logged when its cause changes and at least once a minute; `imsg status`
+shows which servers wait and on what. Deploying needs a restart of
+`imsg mcp public`; no migration and no required config key. Background
+commands and `imsg mcp local` pick up the change at their next start. See
+`CHANGELOG.md`.
+
 **2026-09-25 search page filters, saved searches and result downloads
 (built, not yet deployed):** "Sent by" a person or me, sent / received,
 one-to-one or group conversations, and one conversation; a search with no
