@@ -3197,3 +3197,72 @@ def test_status_reports_the_heavy_lock_holder(
         "heavy_models_lock_held": True,
         "heavy_models_lock_holder": "pid 4242 (imsg embed) since 2026-09-24T03:00:00+00:00",
     }
+
+
+# --------------------------------------------------------------------------
+# install-agents: which `imsg` the agents run
+# --------------------------------------------------------------------------
+
+
+def _fake_venv(tmp_path: Path, *, with_imsg: bool) -> Path:
+    """A base interpreter plus a venv whose `bin/python3` symlinks to it,
+    the shape uv and `python -m venv` both create. Returns the venv's
+    `bin/python3` as a process would see it in `sys.executable`."""
+    base_bin = tmp_path / "uv-python" / "bin"
+    base_bin.mkdir(parents=True)
+    base_python = base_bin / "python3.12"
+    base_python.write_text("")
+    venv_bin = tmp_path / "project" / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_python = venv_bin / "python3"
+    venv_python.symlink_to(base_python)
+    if with_imsg:
+        imsg = venv_bin / "imsg"
+        imsg.write_text("#!/bin/sh\n")
+        imsg.chmod(0o755)
+    return venv_python
+
+
+def test_resolve_imsg_binary_uses_the_venv_not_the_resolved_base_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+
+    from imsg.cli import _resolve_imsg_binary
+
+    venv_python = _fake_venv(tmp_path, with_imsg=True)
+    monkeypatch.setattr(sys, "executable", str(venv_python))
+    monkeypatch.setattr(shutil, "which", lambda name: "/elsewhere/bin/imsg" if name == "imsg" else None)
+    assert _resolve_imsg_binary() == venv_python.parent / "imsg"
+
+
+def test_resolve_imsg_binary_falls_back_to_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+
+    from imsg.cli import _resolve_imsg_binary
+
+    venv_python = _fake_venv(tmp_path, with_imsg=False)
+    monkeypatch.setattr(sys, "executable", str(venv_python))
+    monkeypatch.setattr(shutil, "which", lambda name: "/opt/imsg/bin/imsg" if name == "imsg" else None)
+    assert _resolve_imsg_binary() == Path("/opt/imsg/bin/imsg")
+
+
+def test_install_agents_refuses_when_no_imsg_exists_instead_of_naming_a_missing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli_config: Path
+) -> None:
+    import shutil
+
+    venv_python = _fake_venv(tmp_path, with_imsg=False)
+    monkeypatch.setattr(sys, "executable", str(venv_python))
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/opt/homebrew/bin/postgres" if name == "postgres" else None
+    )
+    dest = tmp_path / "LaunchAgents"
+    result = runner.invoke(
+        app, ["install-agents", "--config", str(cli_config), "--dest", str(dest), "--only", "pg"]
+    )
+    assert result.exit_code == 1
+    assert "no executable 'imsg'" in result.output
+    assert not dest.exists() or not list(dest.glob("*.plist"))

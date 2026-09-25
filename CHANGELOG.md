@@ -10,6 +10,22 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-24 — `install-agents` names the running environment's `imsg`, and refuses a missing one
+
+**Why.** On a host whose `PATH` over SSH lacked the virtualenv, every
+rendered agent named `…/uv/python/cpython-3.12…/bin/imsg`, a file that
+does not exist, so none of the agents would have started. The fallback
+resolved `sys.executable`, and a virtualenv's `bin/python` is a symlink
+into the base interpreter's directory, which holds no `imsg`.
+
+- `imsg install-agents` now takes the `imsg` next to the interpreter as
+  invoked (the environment the operator ran), then `imsg` on `PATH`. If
+  neither exists it refuses, rather than write agents naming a missing
+  file.
+- **Tests:** 3 new. Two of them fail on the previous code; the third pins
+  the `PATH` fallback, which is unchanged. Full suite with Postgres:
+  2,819 passed.
+
 ## 2026-09-24 — The public MCP endpoint counts refused requests instead of logging each one, throttles repeat offenders, and keeps all I/O off the event loop
 
 **Why.** The QA review of 2026-09-24 found that every request with no

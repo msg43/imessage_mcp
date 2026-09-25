@@ -44,6 +44,7 @@ traceback reach the terminal for an expected failure mode.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -4163,14 +4164,30 @@ def _resolve_binary_or_die(name: str) -> Path:
 
 
 def _resolve_imsg_binary() -> Path:
-    """The installed `imsg` console-script, if this environment has
-    one on `PATH`; otherwise the sibling `bin/imsg` next to the
-    running interpreter (`sys.executable`) — the shape a `uv`/venv
-    install normally takes. Never guesses a hardcoded absolute path."""
+    """The `imsg` console script of the environment running this command:
+    the sibling `bin/imsg` of `sys.executable` *as invoked*, else `imsg`
+    on `PATH`. Never guesses a hardcoded absolute path, and refuses
+    rather than render agents naming a file that does not exist.
+
+    `sys.executable` is deliberately not resolved: in a virtualenv
+    `bin/python` is a symlink into the base interpreter's directory,
+    which holds no `imsg`. Resolving it once rendered every agent on a
+    host with `…/uv/python/cpython-3.12…/bin/imsg`, a path that does
+    not exist, because that host's `PATH` over SSH lacked the venv
+    (2026-09-24). The running environment comes first because it is the
+    one the operator chose by running its `imsg`; `PATH` may name
+    another install."""
+    sibling = Path(sys.executable).parent / "imsg"
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return sibling
     found = shutil.which("imsg")
     if found is not None:
         return Path(found)
-    return Path(sys.executable).resolve().parent / "imsg"
+    raise AgentInstallError(
+        f"no executable 'imsg' next to the running interpreter ({sibling}) and "
+        f"none on $PATH; run 'imsg install-agents' with the imsg of the "
+        f"environment the agents should use"
+    )
 
 
 @app.command("install-agents")
