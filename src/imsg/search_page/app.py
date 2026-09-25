@@ -98,9 +98,15 @@ from imsg.search_page.details import message_details
 from imsg.search_page.errors import ModelApiUnavailable, SearchInputError, SecretFileError
 from imsg.search_page.highlight import QueryMatcher
 from imsg.search_page.search import (
+    CHANNEL_ATTACHMENT_SEMANTIC,
     CHANNEL_ATTACHMENT_TEXT,
+    CHANNEL_FILTERS,
+    CHANNEL_IMAGE,
+    CHANNEL_LABELS,
+    CHANNEL_SEMANTIC,
+    CHANNEL_TEXT,
+    CHANNEL_UNINDEXED,
     FULL_SCOPE,
-    SORT_ORDERS,
     Hit,
     QueryVectors,
     ResultCache,
@@ -468,17 +474,7 @@ def _page_ctx(request: Request, session: Session, title: str = "Messages") -> vi
 
 
 def _form_state(request: Request) -> views.FormState:
-    params = request.query_params
-    sort = params.get("sort", "relevance")
-    att = params.get("att", "any")
-    return views.FormState(
-        query=params.get("q", "")[:2000],
-        people=params.get("people", "")[:500],
-        date_from=params.get("from", "")[:10],
-        date_to=params.get("to", "")[:10],
-        attachments=att if att in ("any", "with", "without") else "any",
-        sort=sort if sort in SORT_ORDERS else "relevance",
-    )
+    return views.FormState.from_mapping(request.query_params)
 
 
 def _search_request(form: views.FormState) -> SearchRequest:
@@ -500,6 +496,10 @@ def _search_request(form: views.FormState) -> SearchRequest:
         after=form.date_from or None,
         before=before,
         attachments=form.attachments,  # type: ignore[arg-type]
+        sender=form.sender,
+        direction=form.direction,  # type: ignore[arg-type]
+        chat_kind=form.chat_kind,  # type: ignore[arg-type]
+        thread=form.thread,
     )
 
 
@@ -517,17 +517,25 @@ def _result_for(deps: AppDeps, pg: psycopg.Connection, request: SearchRequest) -
     return result
 
 
-def _in_range(messages: list[MessageView], result: SearchResult) -> list[MessageView]:
-    """Only the messages inside the search's date range, when it has one:
-    a segment that overlaps the range may begin or end outside it."""
-    after, before = result.filters.after, result.filters.before
-    if after is None and before is None:
+def _passing(messages: list[MessageView], result: SearchResult) -> list[MessageView]:
+    """Only the messages the per-message filters keep (dates, who sent it),
+    when the search has any: a segment that overlaps the range may begin
+    or end outside it, and holds other people's messages too."""
+    filters = result.filters
+    if filters.after is None and filters.before is None and not filters.by_sender:
         return messages
     return [
         m
         for m in messages
-        if (after is None or m.sent_at >= after) and (before is None or m.sent_at < before)
+        if filters.keeps(
+            sent_at=m.sent_at, is_from_me=m.is_from_me, sender_person_id=m.sender_person_id
+        )
     ]
+
+
+def matcher_for(result: SearchResult) -> QueryMatcher:
+    """The words' matcher; one that matches nothing for a search by filters alone."""
+    return QueryMatcher.for_query(result.analyzed) if result.analyzed is not None else QueryMatcher("bm25")
 
 
 def _matching_span(
@@ -599,7 +607,7 @@ def build_thread_views(
     segment_ids = [h.segment_id for h in hits if h.segment_id is not None]
     message_ids = [h.message_id for h in hits if h.message_id is not None]
     by_segment = {
-        segment_id: _in_range(messages, result)
+        segment_id: _passing(messages, result)
         for segment_id, messages in segment_messages(
             pg, segment_ids, index_unsent=deps.settings.index_unsent
         ).items()
@@ -707,8 +715,12 @@ def _thread_view_keys(thread_views: list[views.ThreadResultView]) -> set[str]:
 
 
 def _review_state(pg: psycopg.Connection, form: views.FormState) -> views.ReviewState | None:
-    saved = case_store.active_saved_search(pg, form.query, form.params())
-    return views.ReviewState(saved.search_id, saved.reviewed) if saved is not None else None
+    saved = case_store.saved_search_for(pg, form.query, form.params())
+    if saved is None:
+        return None
+    return views.ReviewState(
+        saved.search_id, saved.reviewed, case_id=saved.case_id, case_name=saved.case_name, name=saved.name
+    )
 
 
 def _render_results(
@@ -720,7 +732,7 @@ def _render_results(
     query_id: str | None,
     review: views.ReviewState | None = None,
 ) -> str:
-    matcher = QueryMatcher.for_query(result.analyzed)
+    matcher = matcher_for(result)
     slice_, more = _page_slice(deps, result, form.sort, page)
     thread_views = build_thread_views(deps, pg, result, slice_, matcher=matcher, query_id=query_id)
     marks = case_store.marks(pg, _thread_view_keys(thread_views))
@@ -751,6 +763,7 @@ def _ensure_semantic(deps: AppDeps, pg: psycopg.Connection, result: SearchResult
                 )
             else:
                 try:
+                    assert result.analyzed is not None  # a search with no words is never pending
                     embedded = deps.model_api.embed(
                         result.analyzed.phrase, multimodal=deps.settings.multimodal_enabled
                     )
@@ -764,7 +777,12 @@ def _ensure_semantic(deps: AppDeps, pg: psycopg.Connection, result: SearchResult
                         QueryVectors(text=embedded.text_vector, multimodal=embedded.multimodal_vector),
                         deps.settings,
                     )
-        if sort == "rerank" and not result.reranked and deps.model_api is not None:
+        if (
+            sort == "rerank"
+            and not result.reranked
+            and deps.model_api is not None
+            and result.analyzed is not None
+        ):
             candidates = rerank_candidates(result, deps.page.rerank_top)
             texts = segment_texts(
                 pg, [h.segment_id for h in candidates if h.segment_id is not None], max_chars=RERANK_DOC_CHARS
@@ -812,14 +830,7 @@ def search_view(request: Request) -> Response:
     deps = _deps(request)
     ctx = _page_ctx(request, session, title="Search · Messages")
     form = _form_state(request)
-    if not form.query.strip():
-        # A date or a person with no words: that is browsing, and the
-        # Timeline shows it.
-        if form.date_from or form.date_to or form.people:
-            target = views.BrowseForm(
-                date_from=form.date_from, date_to=form.date_to, people=form.people
-            ).url("/timeline")
-            return RedirectResponse(target, status_code=303)
+    if not form.query.strip() and not form.has_filters:
         return RedirectResponse("/", status_code=303)
     started = time.perf_counter()
     try:
@@ -837,6 +848,7 @@ def search_view(request: Request) -> Response:
             box = views.case_box(
                 form, active=active, review=review, total_threads=status.total_threads
             )
+            only_in = chat_by_thread_key(pg, form.thread) if form.thread else None
     except SearchInputError as exc:
         return HTMLResponse(
             views.search_page(
@@ -845,7 +857,9 @@ def search_view(request: Request) -> Response:
             status_code=400,
         )
     semantic_url = None
-    if result.semantic.state == "pending" or (form.sort == "rerank" and not result.reranked):
+    if result.semantic.state == "pending" or (
+        form.sort == "rerank" and not result.reranked and result.analyzed is not None
+    ):
         semantic_url = form.url("/api/semantic")
     page_ms = (time.perf_counter() - started) * 1000
     response = HTMLResponse(
@@ -858,6 +872,7 @@ def search_view(request: Request) -> Response:
             semantic_url=semantic_url,
             search_key=result.request.cache_key(),
             case_box=box,
+            thread_title=only_in.title if only_in is not None else None,
         )
     )
     response.headers["server-timing"] = (
@@ -907,7 +922,7 @@ def search_thread_hits(request: Request) -> Response:
         with deps.pool.connection() as pg:
             result = _result_for(deps, pg, search_request)
             chat = chat_by_thread_key(pg, thread_key)
-            matcher = QueryMatcher.for_query(result.analyzed)
+            matcher = matcher_for(result)
             query_id = label_store.find_query_id(pg, result.request.query)
             with result.lock:
                 group = result.thread(chat.chat_id, form.sort) if chat else None  # type: ignore[arg-type]
@@ -1063,13 +1078,7 @@ async def grade_start(request: Request) -> Response:
     if not _csrf_ok(request, session, fields.get("csrf_token")):
         return PlainTextResponse("CSRF check failed", status_code=403)
     deps = _deps(request)
-    form = views.FormState(
-        query=fields.get("q", "")[:2000],
-        people=fields.get("people", "")[:500],
-        date_from=fields.get("from", "")[:10],
-        date_to=fields.get("to", "")[:10],
-        attachments=fields.get("att", "any") if fields.get("att") in ("with", "without") else "any",
-    )
+    form = dataclasses.replace(views.FormState.from_mapping(fields), sort="relevance")
     filters: dict[str, object] = {}
     people = [p.strip() for p in form.people.split(",") if p.strip()]
     if people:
@@ -1080,8 +1089,18 @@ async def grade_start(request: Request) -> Response:
         filters["to"] = form.date_to
     if form.attachments != "any":
         filters["attachments"] = form.attachments
+    if form.sender.strip():
+        filters["sender"] = form.sender.strip()
+    if form.direction != "any":
+        filters["direction"] = form.direction
+    if form.chat_kind != "any":
+        filters["conversations"] = form.chat_kind
+    if form.thread:
+        filters["conversation"] = form.thread
 
     def create() -> int:
+        if not form.query.strip():
+            raise SearchInputError("Grading needs a search with words.")
         search_request = _search_request(form)
         with deps.pool.connection() as pg:
             result = _result_for(deps, pg, search_request)
@@ -1589,13 +1608,7 @@ def _coverage(
     """Each saved search with how many conversations it finds now."""
     out: list[case_store.SearchCoverage] = []
     for search in case_store.saved_searches(pg, case_id):
-        form = views.FormState(
-            query=search.query_text,
-            people=search.params.get("people", ""),
-            date_from=search.params.get("from", ""),
-            date_to=search.params.get("to", ""),
-            attachments=search.params.get("att", "any"),
-        )
+        form = views.FormState.from_mapping({**search.params, "q": search.query_text})
         try:
             result = _result_for(deps, pg, _search_request(form))
             with result.lock:
@@ -1700,7 +1713,212 @@ def _item_remove(pg: psycopg.Connection, item_id: int, _fields: dict[str, str]) 
 
 
 def _search_remove(pg: psycopg.Connection, search_id: int, _fields: dict[str, str]) -> str:
-    return f"/case/{case_store.remove_search(pg, search_id)}"
+    case_id = case_store.remove_search(pg, search_id)
+    return f"/case/{case_id}" if case_id is not None else "/saved"
+
+
+def _saved_remove(pg: psycopg.Connection, search_id: int, _fields: dict[str, str]) -> str:
+    case_store.remove_search(pg, search_id)
+    return "/saved"
+
+
+def _saved_rename(pg: psycopg.Connection, search_id: int, fields: dict[str, str]) -> str:
+    case_store.rename_search(pg, search_id, fields.get("name", ""))
+    return f"/saved#saved-{search_id}"
+
+
+# --------------------------------------------------------------------------
+# saved searches and "Download results"
+# --------------------------------------------------------------------------
+
+
+def saved_view(request: Request) -> Response:
+    """Every saved search, on its own or in a case."""
+    session = _session(request)
+    if session is None:
+        return _login_redirect(request)
+    deps = _deps(request)
+    ctx = _page_ctx(request, session, title="Saved searches · Messages")
+    with deps.pool.connection() as pg:
+        searches = case_store.all_saved_searches(pg)
+        conversations: dict[str, str] = {}
+        for key in {s.params["in"] for s in searches if s.params.get("in")}:
+            chat = chat_by_thread_key(pg, key)
+            if chat is not None:
+                conversations[key] = chat.title
+    return HTMLResponse(
+        views.saved_page(ctx, searches=searches, conversations=conversations, tz=deps.timezone, error=None)
+    )
+
+
+async def saved_api(request: Request) -> Response:
+    """Save the shown search on its own, outside any case."""
+    posted = await _json_post(request)
+    if isinstance(posted, Response):
+        return posted
+    _session_row, payload = posted
+    query = payload.get("q", "")
+    name = payload.get("name", "")
+    if not isinstance(query, str) or not isinstance(name, str):
+        return JSONResponse({"error": "invalid request"}, status_code=400)
+    deps = _deps(request)
+
+    def save() -> int:
+        with deps.pool.connection() as pg:
+            return case_store.save_search_alone(pg, query_text=query, params=payload, name=name)
+
+    try:
+        search_id = await run_in_threadpool(save)
+    except case_store.CaseError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse({"search_id": search_id})
+
+
+FOUND_BY = {
+    CHANNEL_TEXT: "the words",
+    CHANNEL_ATTACHMENT_TEXT: "a file's text",
+    CHANNEL_UNINDEXED: "the words (not yet indexed)",
+    CHANNEL_SEMANTIC: "meaning",
+    CHANNEL_ATTACHMENT_SEMANTIC: "a file's meaning",
+    CHANNEL_IMAGE: "an image",
+    CHANNEL_FILTERS: "the filters",
+}
+DOWNLOAD_THREAD_BATCH = 200
+
+
+def _download_selection(
+    deps: AppDeps, pg: psycopg.Connection, result: SearchResult, sort: str
+) -> tuple[list[str], dict[str, str], dict[str, int], bool, int]:
+    """Which messages "Download results" writes, in the results' order of
+    conversations and, within each, the order they were sent: for a hit on
+    one message, that message; for a passage, the messages in it that the
+    filters keep and that match the words or a matching file, or, when
+    none does (found by meaning or by the filters alone), every message
+    in it the filters keep. Returns the message keys, how each was found,
+    its conversation's place, whether the limit stopped it, and how many
+    conversations the results hold."""
+    matcher = matcher_for(result)
+    threads = result.threads(sort)  # type: ignore[arg-type]
+    keys: list[str] = []
+    found_by: dict[str, str] = {}
+    place: dict[str, int] = {}
+    seen: set[str] = set()
+    n = 0
+    for start in range(0, len(threads), DOWNLOAD_THREAD_BATCH):
+        batch = threads[start : start + DOWNLOAD_THREAD_BATCH]
+        known = chat_views(pg, [t.chat_id for t in batch])
+        batch = [t for t in batch if t.chat_id in known]
+        hits = [h for t in batch for h in t.hits]
+        by_segment = segment_messages(
+            pg, [h.segment_id for h in hits if h.segment_id is not None],
+            index_unsent=deps.settings.index_unsent,
+        )
+        direct = messages_by_id(pg, [h.message_id for h in hits if h.message_id is not None])
+        for thread in batch:
+            n += 1
+            chosen: dict[str, tuple[datetime, int, str]] = {}
+            for hit in thread.hits:
+                how = ", ".join(FOUND_BY.get(c, c) for c in hit.channels)
+                if hit.segment_id is not None:
+                    messages = _passing(by_segment.get(hit.segment_id, []), result)
+                    attached = {m for m, _a in hit.matched_attachments}
+                    matching = [
+                        m for m in messages if matcher.matched_terms(m.text) or m.message_id in attached
+                    ]
+                    picked = matching or messages
+                else:
+                    picked = [direct[hit.message_id]] if hit.message_id in direct else []
+                for m in picked:
+                    if m.message_key not in chosen:
+                        chosen[m.message_key] = (m.sent_at, m.message_id, how)
+            for key, (_at, _id, how) in sorted(chosen.items(), key=lambda kv: (kv[1][0], kv[1][1])):
+                if key in seen:
+                    continue
+                if len(keys) >= case_store.MAX_DOWNLOAD_MESSAGES:
+                    return keys, found_by, place, True, len(threads)
+                seen.add(key)
+                keys.append(key)
+                found_by[key] = how
+                place[key] = n
+    return keys, found_by, place, False, len(threads)
+
+
+def search_download(request: Request) -> Response:
+    """Every result of a search as Markdown, CSV or JSON, with the case
+    download's exact citations. Called "download" on the page: "export"
+    means the Gemini pipeline in this project."""
+    session = _session(request)
+    if session is None:
+        return _login_redirect(request)
+    deps = _deps(request)
+    ctx = _page_ctx(request, session, title="Download · Messages")
+    fmt = request.query_params.get("fmt", "md")
+    if fmt not in case_store.DOWNLOAD_FORMATS:
+        return PlainTextResponse("unknown format", status_code=400)
+    form = _form_state(request)
+    sort = form.sort if form.sort != "rerank" else "relevance"
+    try:
+        search_request = _search_request(form)
+        with deps.pool.connection() as pg:
+            result = _result_for(deps, pg, search_request)
+            if result.analyzed is not None:
+                _ensure_semantic(deps, pg, result, sort)
+            with result.lock:
+                keys, found_by, place, truncated, conversations = _download_selection(
+                    deps, pg, result, sort
+                )
+                total_hits = result.total_hits
+                capped = tuple(sorted(CHANNEL_LABELS.get(c, c) for c in result.capped))
+                semantic = {
+                    "done": "done",
+                    "disabled": "off",
+                    "unavailable": "unavailable",
+                    "pending": "not run",
+                }.get(result.semantic.state, result.semantic.state)
+                if result.semantic.note:
+                    semantic += f" ({result.semantic.note})"
+            items = case_store.message_items(
+                pg,
+                keys,
+                index_unsent=deps.settings.index_unsent,
+                show_edit_history=deps.page.details.show_edit_history,
+                show_raw_handles=deps.page.details.show_raw_handles,
+            )
+            only_in = chat_by_thread_key(pg, form.thread) if form.thread else None
+    except SearchInputError as exc:
+        return HTMLResponse(views.error_page(ctx, status=400, message=str(exc)), status_code=400)
+    now = datetime.now(UTC)
+    text = case_store.render_search_download(
+        fmt,
+        search=case_store.SearchDownload(
+            query_text=result.request.query,
+            filters=views.describe_search_filters(
+                form.filter_params(), conversation=only_in.title if only_in else None
+            ),
+            conversations=conversations,
+            hits=total_hits,
+            semantic=semantic,
+            capped=capped,
+            truncated=truncated,
+        ),
+        items=items,
+        found_by=found_by,
+        conversation_result=place,
+        formatter=_ExactTimes(deps.timezone),
+        downloaded_at=now,
+        timezone=deps.timezone,
+    )
+    slug = _slug(result.request.query) if result.request.query else "filters"
+    local_now = now.astimezone(ZoneInfo(deps.timezone))
+    base = f"search-{slug}-{local_now.date().isoformat()}"
+    return Response(
+        text.encode("utf-8"),
+        media_type=_DOWNLOAD_TYPES[fmt],
+        headers={
+            "Content-Disposition": f'attachment; filename="{base}.{fmt}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def _slug(name: str) -> str:
@@ -2278,6 +2496,11 @@ def build_app(deps: AppDeps) -> ASGIApp:
         Route("/api/case/item", case_item_api, methods=["POST"]),
         Route("/api/case/search", case_search_api, methods=["POST"]),
         Route("/api/case/review", case_review_api, methods=["POST"]),
+        Route("/saved", saved_view, methods=["GET"]),
+        Route("/api/saved", saved_api, methods=["POST"]),
+        Route("/saved/{search_id}/rename", _case_action("search_id", _saved_rename), methods=["POST"]),
+        Route("/saved/{search_id}/remove", _case_action("search_id", _saved_remove), methods=["POST"]),
+        Route("/search/download", search_download, methods=["GET"]),
         Route("/thread/{thread_key}", thread_view, methods=["GET"]),
         Route("/thread/{thread_key}/messages", thread_messages, methods=["GET"]),
         Route("/att/{key}", attachment_original, methods=["GET"]),

@@ -79,6 +79,20 @@ def describe_filters(filters: Mapping[str, Any]) -> str:
         parts.append("with attachments")
     elif attachments == "without":
         parts.append("without attachments")
+    if filters.get("sender"):
+        parts.append(f"sent by {filters['sender']}")
+    direction = filters.get("direction")
+    if direction == "sent":
+        parts.append("sent by me")
+    elif direction == "received":
+        parts.append("received")
+    kind = filters.get("conversations")
+    if kind == "dm":
+        parts.append("one-to-one conversations")
+    elif kind == "group":
+        parts.append("group conversations")
+    if filters.get("conversation"):
+        parts.append(f"conversation {filters['conversation']}")
     return "; ".join(parts)
 
 

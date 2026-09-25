@@ -114,6 +114,9 @@ class MessageView:
     reply_to_key: str | None = None
     reply_to_text: str | None = None
     link_previews: list[tuple[str, str | None, str | None]] = field(default_factory=list)
+    sender_person_id: int | None = None
+    """For the page's "Sent by" filter, which also tests the messages it
+    shows."""
 
 
 # --------------------------------------------------------------------------
@@ -185,7 +188,7 @@ def chat_by_thread_key(pg: psycopg.Connection, thread_key: str) -> ChatView | No
 MESSAGE_COLUMNS = """
     m.message_id, m.message_key, m.source_guid, m.chat_id, m.sent_at, m.is_from_me,
     m.text_original, m.is_unsent, m.is_edited, m.deleted_at, m.has_attachments,
-    m.reply_to_guid, p.display_name
+    m.reply_to_guid, p.display_name, m.sender_person_id
 """
 
 
@@ -204,6 +207,7 @@ def row_to_view(row: Sequence[Any]) -> MessageView:
         has_attachments,
         reply_to_guid,
         display_name,
+        sender_person_id,
     ) = row
     return MessageView(
         message_id=int(message_id),
@@ -220,6 +224,7 @@ def row_to_view(row: Sequence[Any]) -> MessageView:
         has_attachments=bool(has_attachments),
         reply_to_guid=reply_to_guid,
         deleted_at=deleted_at,
+        sender_person_id=int(sender_person_id) if sender_person_id is not None else None,
     )
 
 

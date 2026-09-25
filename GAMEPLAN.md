@@ -11,6 +11,14 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-09-25 search page filters, saved searches and result downloads
+(built, not yet deployed):** "Sent by" a person or me, sent / received,
+one-to-one or group conversations, and one conversation; a search with no
+words lists every message the filters keep; searches can be saved outside
+any case and are listed on `/saved`; "Download results" writes every result
+as Markdown, CSV or JSON with citations. Deploying needs `imsg migrate`
+(0013) and a restart of the search page only. See `CHANGELOG.md`.
+
 **2026-09-25 search page changes for forensic review (built, not yet
 deployed):** a segment hit is kept only when the words occur in what people
 wrote, so a contact's name, a year, an hour or a time-zone word no longer

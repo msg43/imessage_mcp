@@ -138,13 +138,14 @@ def test_the_timeline_defaults_to_the_latest_day_and_pages_by_cursor(corpus: Cor
     assert backwards.status_code == 400
 
 
-def test_a_search_without_words_opens_the_timeline(corpus: Corpus) -> None:
+def test_a_search_without_words_lists_the_messages_and_links_the_timeline(corpus: Corpus) -> None:
+    """A date with no words used to redirect to the Timeline; it is now a
+    search by filters alone, which links the same days on the Timeline."""
     _day(corpus)
     client = _client(corpus)
     dated = client.get("/search", params={"q": "", "from": "2023-04-07", "to": "2023-04-07"}, follow_redirects=False)  # type: ignore[attr-defined]
-    assert dated.status_code == 303
-    assert dated.headers["location"].startswith("/timeline?")
-    assert "from=2023-04-07" in dated.headers["location"]
+    assert dated.status_code == 200
+    assert "/timeline?from=2023-04-07&amp;to=2023-04-07" in dated.text
     bare = client.get("/search", params={"q": ""}, follow_redirects=False)  # type: ignore[attr-defined]
     assert bare.status_code == 303 and bare.headers["location"] == "/"
 

@@ -349,7 +349,7 @@
     const d = button.dataset;
     button.disabled = true;
     try {
-      await postJSON("/api/case/search", { q: d.q || "", people: d.people || "", from: d.from || "", to: d.to || "", att: d.att || "any" });
+      await postJSON(d.endpoint || "/api/case/search", JSON.parse(d.params || "{}"));
       // Reload so each conversation gets its Reviewed box; the place in the
       // results is kept (see savePlace).
       window.location.reload();

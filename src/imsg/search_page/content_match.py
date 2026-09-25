@@ -67,7 +67,7 @@ import apsw
 from imsg.embed.fts.schema import PRIMARY_TOKENIZER
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     import psycopg
 
@@ -387,10 +387,17 @@ class ContentMatch:
 
 
 def _visibility(
-    *, index_unsent: bool, sent_after: datetime | None, sent_before: datetime | None
+    *,
+    index_unsent: bool,
+    sent_after: datetime | None,
+    sent_before: datetime | None,
+    message_filter: tuple[str, Mapping[str, object]] | None = None,
 ) -> tuple[str, dict[str, object]]:
     clauses = ["(%(cm_unsent)s OR NOT m.is_unsent)"]
     params: dict[str, object] = {"cm_unsent": index_unsent}
+    if message_filter is not None:
+        clauses.append(f"({message_filter[0]})")
+        params.update(message_filter[1])
     if sent_after is not None:
         clauses.append("m.sent_at >= %(cm_after)s")
         params["cm_after"] = sent_after
@@ -467,10 +474,13 @@ def segments_matching_content(
     include_edit_history: bool,
     sent_after: datetime | None = None,
     sent_before: datetime | None = None,
+    message_filter: tuple[str, Mapping[str, object]] | None = None,
 ) -> dict[int, ContentMatch]:
     """The segments among `segment_ids` whose content matches every term
     of `query`. With `sent_after` / `sent_before`, only messages sent in
-    that range count (the page's date filter).
+    that range count (the page's date filter). `message_filter` is any
+    further condition over the `message m` row (the page's "Sent by"
+    filter), as SQL with its bound parameters.
 
     Two passes, because the first settles most segments cheaply:
 
@@ -490,7 +500,10 @@ def segments_matching_content(
     if not segment_ids or query.matches_nothing:
         return {}
     visible, params = _visibility(
-        index_unsent=index_unsent, sent_after=sent_after, sent_before=sent_before
+        index_unsent=index_unsent,
+        sent_after=sent_after,
+        sent_before=sent_before,
+        message_filter=message_filter,
     )
     n = len(query.patterns)
     terms: dict[int, list[bool]] = {}

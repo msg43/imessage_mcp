@@ -10,6 +10,66 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-25 — Search page: filter by who sent a message and by conversation, search by filters alone, save searches on their own, download every result
+
+**Why.** The owner asked to run a filtered search across the whole corpus,
+keep searches to run again, and take the results away. The People filter
+only said who was in a conversation, not who wrote a message; a search
+needed words; a search could be saved only inside an evidence case; and a
+download covered only the messages picked into a case.
+
+- **New filters** (`imsg.search_page.search.PageFilters`; the MCP tools'
+  `SearchFilters` is unchanged):
+  - **Sent by** a person, or `me` (the owner's own name means the same).
+    A word counts only in a message that person wrote, a hit shows only
+    their messages, and a passage found by meaning must hold at least one
+    of them.
+  - **Messages:** sent by me, or received.
+  - **Conversations:** one-to-one (the unfiled holding conversations are
+    neither) or groups.
+  - **One conversation:** "Search only here" on each result's conversation
+    and a "Search here" box on the conversation page; the search bar shows
+    "Only in …" with a way out.
+  - Contradictions are refused with a message ("sent by Bob" and "sent by
+    me").
+- **A search by filters alone.** No words and at least one filter lists
+  every message the filters keep, grouped by conversation and newest first
+  (a new `filters` channel), including messages in no segment yet. Semantic
+  search does not run: there are no words to embed. A dates-only search
+  used to redirect to the Timeline; it now lists the messages and links
+  the same days on the Timeline.
+- **Saved searches on their own (migration 0013).** "Save this search"
+  keeps a search outside any case; "Save to case" still saves to the open
+  case. `/saved` lists every saved search, those in cases too, with plain
+  words for the filters and how many conversations are marked reviewed;
+  each can be run, renamed, downloaded or removed. The Reviewed boxes work
+  for either kind. Migration 0013 lets `search_case_search.case_id` be
+  NULL, adds `name`, allows no words when there are filters, and keeps one
+  search on its own per text and filters (a partial unique index). No rows
+  change.
+- **Download results** (`/search/download`, Markdown, CSV or JSON): every
+  result of the search, not only the page shown, with the case download's
+  citations (time to the second with its zone, sender, service,
+  conversation, files with SHA-256, edits, deletion, sources, message ID,
+  Messages GUID), plus how each message was found and its conversation's
+  place in the results. A passage contributes the messages that match the
+  words or a matching file; one found by meaning or by the filters
+  contributes every message in it the filters keep. It runs the semantic
+  channels first when they have not run, says when a channel reached its
+  safety cap, and stops at 20,000 messages with a note. No zip of the
+  original files: that stays with case downloads, where the owner has
+  chosen them. The case download's text is unchanged (its Markdown and CSV
+  writers are now shared).
+- **Security:** the new POSTs check the session, a same-site request and
+  the CSRF token like the others; the security tests list the five new
+  routes.
+- **Tests:** `tests/test_search_page_filters.py` (9, against the scratch
+  Postgres). Removing the sender test from the word check fails 2 of them,
+  removing the "must hold a message from the sender" test for meaning
+  fails 1, and showing every message of a passage fails the download test.
+  The browse test for the old Timeline redirect now checks the new
+  behaviour.
+
 ## 2026-09-25 — Search page evidence cases: collect messages and files with notes, track reviewed conversations, download with exact citations
 
 **Why.** Reconstructing what happened takes several sessions: the owner

@@ -141,6 +141,9 @@ def test_duplicate_host_header_is_refused(app_client: TestClient) -> None:
         "/case",
         "/case/1",
         "/case/1/download?fmt=md",
+        "/saved",
+        "/search/download?q=anything&fmt=csv",
+        "/search?sender=me",
     ],
 )
 def test_every_data_route_refuses_without_a_session(app_client: TestClient, path: str) -> None:
@@ -266,8 +269,12 @@ STATE_CHANGING_FORMS = [
     "/case/item/1/note",
     "/case/item/1/remove",
     "/case/search/1/remove",
+    "/saved/1/rename",
+    "/saved/1/remove",
 ]
-STATE_CHANGING_APIS = ["/api/grade", "/api/case/item", "/api/case/search", "/api/case/review"]
+STATE_CHANGING_APIS = [
+    "/api/grade", "/api/case/item", "/api/case/search", "/api/case/review", "/api/saved",
+]
 
 
 @pytest.mark.parametrize("path", STATE_CHANGING_FORMS + STATE_CHANGING_APIS)

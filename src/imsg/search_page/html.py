@@ -12,8 +12,9 @@ anchors with `rel="noopener noreferrer"`.
 from __future__ import annotations
 
 import html
+import json
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import urlencode
@@ -22,9 +23,11 @@ from zoneinfo import ZoneInfo
 from imsg.search_page.browse import MediaItem
 from imsg.search_page.cases import (
     DOWNLOAD_FORMATS,
+    SEARCH_PARAMS,
     CaseItem,
     CaseMarks,
     CaseSummary,
+    SavedSearch,
     SearchCoverage,
 )
 from imsg.search_page.details import FILED_BY, MessageDetails, service_name
@@ -46,7 +49,7 @@ from imsg.search_page.labels import (
 from imsg.search_page.search import CHANNEL_LABELS, Hit
 from imsg.search_page.threads import AttachmentView, ChatView, MessageView
 
-STATIC_VERSION = "6"
+STATIC_VERSION = "7"
 _URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
@@ -168,6 +171,14 @@ def login_page(*, login_token: str, next_url: str, error: str | None) -> str:
 # --------------------------------------------------------------------------
 
 
+FILTER_KEYS = SEARCH_PARAMS
+"""The search's filters as URL parameters: what a saved search keeps."""
+
+
+def _choice(value: object, allowed: tuple[str, ...]) -> str:
+    return value if isinstance(value, str) and value in allowed else allowed[0]
+
+
 @dataclass(frozen=True, slots=True)
 class FormState:
     query: str = ""
@@ -176,6 +187,43 @@ class FormState:
     date_to: str = ""
     attachments: str = "any"
     sort: str = "relevance"
+    sender: str = ""
+    """"Sent by": a person's name, or `me`."""
+    direction: str = "any"
+    """`sent` (by the owner) or `received`."""
+    chat_kind: str = "any"
+    """`dm` (one-to-one) or `group`."""
+    thread: str = ""
+    """Only this conversation (its `thread_key`)."""
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, object]) -> FormState:
+        """From URL parameters, a posted form or a saved search's filters,
+        clipped and with unknown choices set back to their defaults."""
+
+        def text(key: str, limit: int) -> str:
+            value = values.get(key, "")
+            return value[:limit] if isinstance(value, str) else ""
+
+        return cls(
+            query=text("q", 2000),
+            people=text("people", 500),
+            date_from=text("from", 10),
+            date_to=text("to", 10),
+            attachments=_choice(values.get("att"), ("any", "with", "without")),
+            sort=_choice(values.get("sort"), ("relevance", "date", "rerank")),
+            sender=text("sender", 200),
+            direction=_choice(values.get("dir"), ("any", "sent", "received")),
+            chat_kind=_choice(values.get("kind"), ("any", "dm", "group")),
+            thread=text("in", 100),
+        )
+
+    @property
+    def has_filters(self) -> bool:
+        return any(k != "sort" for k in self.params() if k != "q")
+
+    def filter_params(self) -> dict[str, str]:
+        return {k: v for k, v in self.params().items() if k in FILTER_KEYS}
 
     def params(self, **overrides: str | int) -> dict[str, str]:
         values: dict[str, str] = {
@@ -184,6 +232,10 @@ class FormState:
             "from": self.date_from,
             "to": self.date_to,
             "att": self.attachments,
+            "sender": self.sender,
+            "dir": self.direction,
+            "kind": self.chat_kind,
+            "in": self.thread,
             "sort": self.sort,
         }
         values.update({k: str(v) for k, v in overrides.items()})
@@ -198,26 +250,58 @@ def _option(value: str, label: str, current: str) -> str:
     return f'<option value="{esc(value)}"{selected}>{esc(label)}</option>'
 
 
-def search_form(form: FormState, *, semantic_available: bool, csrf_token: str) -> str:
+def search_form(
+    form: FormState,
+    *,
+    semantic_available: bool,
+    csrf_token: str,
+    thread_title: str | None = None,
+) -> str:
+    """`thread_title`: the conversation's name when the search is limited
+    to one (`form.thread`)."""
     sorts = [("relevance", "Best match"), ("date", "Newest first")]
     if semantic_available:
         sorts.append(("rerank", "Best match, reranked"))
+    only_in = ""
+    if form.thread:
+        without = FormState.from_mapping({**form.params(), "in": ""}).url()
+        only_in = (
+            f'<input type="hidden" name="in" value="{esc(form.thread)}">'
+            f'<span class="only-in">Only in \u201c{esc(thread_title or "this conversation")}\u201d '
+            f'<a href="{esc(without)}" title="Search every conversation">\u00d7</a></span>'
+        )
     return (
         '<header class="topbar"><form class="search-form" method="get" action="/search" role="search">'
         '<div class="row main-row">'
         '<a class="home" href="/" title="New search">Messages</a>'
         f'<input class="q" type="search" name="q" value="{esc(form.query)}" '
         'placeholder="Search every message" aria-label="Search" autocomplete="off" '
-        f'{"autofocus" if not form.query else ""} required maxlength="1000">'
+        f'{"autofocus" if not form.query else ""} maxlength="1000">'
         '<button type="submit">Search</button>'
         "</div>"
+        f"{only_in}"
         '<div class="row second-row"><details class="filters"'
-        + (" open" if (form.people or form.date_from or form.date_to or form.attachments != "any") else "")
+        + (" open" if form.has_filters and not (form.thread and len(form.filter_params()) == 1) else "")
         + "><summary>Filters</summary>"
         '<div class="row filter-row">'
-        '<label>People <input type="text" name="people" list="people-list" '
+        '<label title="Conversations every listed person is in">People in the conversation '
+        '<input type="text" name="people" list="people-list" '
         f'value="{esc(form.people)}" placeholder="name, name" autocomplete="off" '
         'class="people-input"></label>'
+        '<label title="Who wrote the message: a name, or me">Sent by '
+        '<input type="text" name="sender" list="people-list" '
+        f'value="{esc(form.sender)}" placeholder="name or me" autocomplete="off" '
+        'class="people-input sender-input"></label>'
+        '<label>Messages <select name="dir">'
+        + _option("any", "Sent and received", form.direction)
+        + _option("sent", "Sent by me", form.direction)
+        + _option("received", "Received", form.direction)
+        + "</select></label>"
+        '<label>Conversations <select name="kind">'
+        + _option("any", "All", form.chat_kind)
+        + _option("dm", "One-to-one", form.chat_kind)
+        + _option("group", "Groups", form.chat_kind)
+        + "</select></label>"
         '<datalist id="people-list"></datalist>'
         f'<label>From <input type="date" name="from" value="{esc(form.date_from)}"></label>'
         f'<label>To <input type="date" name="to" value="{esc(form.date_to)}"></label>'
@@ -231,7 +315,8 @@ def search_form(form: FormState, *, semantic_available: bool, csrf_token: str) -
         + "</select></label>"
         "</div></details>"
         '<nav class="views" aria-label="Views"><a href="/timeline">Timeline</a>'
-        '<a href="/media">Media</a><a href="/case">Case</a><a href="/labels">Labels</a></nav>'
+        '<a href="/media">Media</a><a href="/saved">Saved</a><a href="/case">Case</a>'
+        '<a href="/labels">Labels</a></nav>'
         "</div></form>"
         '<form class="logout" method="post" action="/logout">'
         f'<input type="hidden" name="csrf_token" value="{esc(csrf_token)}">'
@@ -682,11 +767,15 @@ def _span_label(start: datetime, end: datetime, tz: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ReviewState:
-    """The active case's saved search for the shown search, if the owner
-    saved it: which conversations are marked reviewed."""
+    """The saved search for the shown search, if the owner saved it (to
+    the active case, or on its own): which conversations are marked
+    reviewed."""
 
     search_id: int
     reviewed: frozenset[str]
+    case_id: int | None = None
+    case_name: str | None = None
+    name: str = ""
 
 
 def hit_html(
@@ -805,7 +894,14 @@ def thread_result_html(
         f'<div class="thread-head">{_review_box(view.chat, review)}{_chat_header(view.chat)}'
         f'<div class="thread-meta"><span class="count">{view.count} hit{"s" if view.count != 1 else ""}</span>'
         f' · latest {esc(fmt_date(view.latest_at, tz))} · '
-        f'<a href="/thread/{esc(view.chat.thread_key)}">Open</a></div></div>'
+        f'<a href="/thread/{esc(view.chat.thread_key)}">Open</a>'
+        + (
+            ""
+            if form.thread
+            else f' · <a class="only-here" href="{esc(form.url(**{"in": view.chat.thread_key}))}">'
+            "Search only here</a>"
+        )
+        + "</div></div>"
         f'<div class="hits">{hits}</div>{more}</section>'
     )
 
@@ -914,6 +1010,7 @@ def search_page(
     semantic_url: str | None,
     search_key: str | None,
     case_box: str = "",
+    thread_title: str | None = None,
 ) -> str:
     error_html = f'<p class="error" role="alert">{esc(error)}</p>' if error else ""
     data_attrs = ""
@@ -926,15 +1023,26 @@ def search_page(
     if status is not None and status.total_hits == 0 and status.semantic_state != "pending":
         empty = '<p class="empty">No messages match.</p>'
     intro = ""
-    if not form.query and not error:
+    if not form.query and not form.has_filters and not error:
         intro = (
             '<section class="intro"><p>Every message, every attachment. Words match whole words; '
             '<code>"quoted text"</code> matches exact text anywhere; emoji work too. Results are '
-            "grouped by conversation; semantic matches arrive a moment after the text matches.</p></section>"
+            "grouped by conversation; semantic matches arrive a moment after the text matches. "
+            "Leave the words empty and set a filter to list every message it keeps.</p></section>"
         )
+    elif not form.query and status is not None and (form.date_from or form.date_to):
+        timeline = BrowseForm(
+            date_from=form.date_from, date_to=form.date_to, people=form.people, sender=form.sender
+        ).url("/timeline")
+        intro = (
+            '<p class="muted filters-only">Every message these filters keep, newest first. '
+            f'<a href="{esc(timeline)}">The same days on the Timeline</a></p>'
+        )
+    elif not form.query and status is not None:
+        intro = '<p class="muted filters-only">Every message these filters keep, newest first.</p>'
     grading = (
         grade_form(form, csrf_token=ctx.csrf_token)
-        if status is not None and status.total_hits > 0
+        if status is not None and status.total_hits > 0 and form.query.strip()
         else ""
     )
     body = (
@@ -947,7 +1055,10 @@ def search_page(
         body,
         body_class="page-search",
         topbar=search_form(
-            form, semantic_available=ctx.semantic_available, csrf_token=ctx.csrf_token
+            form,
+            semantic_available=ctx.semantic_available,
+            csrf_token=ctx.csrf_token,
+            thread_title=thread_title,
         ),
     )
 
@@ -992,7 +1103,12 @@ def thread_page(
     )
     body = (
         f'<header class="thread-header">{back}{_chat_header(chat, with_participants=False)}'
-        f'<div class="participants">With: {esc(participants)}</div>{holding}</header>'
+        f'<div class="participants">With: {esc(participants)}</div>{holding}'
+        '<form class="search-here" method="get" action="/search" role="search">'
+        f'<input type="hidden" name="in" value="{esc(chat.thread_key)}">'
+        f'<input type="search" name="q" value="{esc(query)}" placeholder="Search this conversation" '
+        'aria-label="Search this conversation" maxlength="1000">'
+        '<button type="submit" class="small">Search here</button></form></header>'
         f'<div class="thread" id="thread" data-thread="{esc(chat.thread_key)}" '
         f'data-group="{"1" if chat.kind == "group" else "0"}"{q_attr}>'
         f'{older}<div class="messages">{messages_html}</div>{newer}</div>'
@@ -1415,20 +1531,44 @@ def case_box(
     review: ReviewState | None,
     total_threads: int,
 ) -> str:
-    """Under the result count: save this search to the case, or, once it is
-    saved, how many of its conversations are marked reviewed."""
-    if review is not None and active is not None:
+    """Under the result count: save this search (on its own, or to the open
+    case), or, once it is saved, where and how many of its conversations
+    are marked reviewed; and download every result."""
+    download = download_links(form)
+    if review is not None:
+        if review.case_id is not None:
+            where = (
+                f'Saved in \u201c<a href="/case/{review.case_id}">{esc(review.case_name or "")}</a>\u201d'
+            )
+        else:
+            label = f" as \u201c{esc(review.name)}\u201d" if review.name else ""
+            where = f'<a href="/saved">Saved</a>{label}'
         return (
-            f'<div class="case-box">Saved in \u201c<a href="/case/{active.case_id}">{esc(active.name)}</a>\u201d '
+            f'<div class="case-box">{where} '
             f'\u00b7 reviewed <span class="n-reviewed">{len(review.reviewed)}</span> of '
-            f"{total_threads:,} conversation{'s' if total_threads != 1 else ''}</div>"
+            f"{total_threads:,} conversation{'s' if total_threads != 1 else ''}{download}</div>"
         )
-    target = f" to \u201c{esc(active.name)}\u201d" if active is not None else ""
-    fields = {k: v for k, v in form.params().items() if k in ("q", "people", "from", "to", "att")}
-    data = " ".join(f'data-{esc(k)}="{esc(v)}"' for k, v in fields.items())
+    params = esc(json.dumps({"q": form.query, **form.filter_params()}, ensure_ascii=False))
+    target = f" \u201c{esc(active.name)}\u201d" if active is not None else ""
     return (
-        f'<div class="case-box"><button type="button" class="link save-search-btn" {data}>'
-        f"Save this search{target}</button></div>"
+        '<div class="case-box">'
+        f'<button type="button" class="link save-search-btn" data-endpoint="/api/saved" data-params="{params}">'
+        "Save this search</button> \u00b7 "
+        f'<button type="button" class="link save-search-btn" data-endpoint="/api/case/search" data-params="{params}">'
+        f"Save to case{target}</button>{download}</div>"
+    )
+
+
+def download_links(form: FormState) -> str:
+    """"Download results" as Markdown, CSV or JSON: every result of the
+    search, not only the page shown."""
+    links = " ".join(
+        f'<a href="{esc(form.url("/search/download", fmt=fmt))}" download>{label}</a>'
+        for fmt, label in (("md", "Markdown"), ("csv", "CSV"), ("json", "JSON"))
+    )
+    return (
+        ' \u00b7 <span class="download-results" title="A download is a copy outside the encrypted '
+        f'volume">Download results: {links}</span>'
     )
 
 
@@ -1584,14 +1724,8 @@ def case_page(
     searches: list[str] = []
     for c in coverage:
         s = c.search
-        filters = "; ".join(f"{esc(k)} {esc(v)}" for k, v in s.params.items())
-        url = FormState(
-            query=s.query_text,
-            people=s.params.get("people", ""),
-            date_from=s.params.get("from", ""),
-            date_to=s.params.get("to", ""),
-            attachments=s.params.get("att", "any"),
-        ).url()
+        filters = esc(describe_search_filters(s.params))
+        url = FormState.from_mapping({**s.params, "q": s.query_text}).url()
         count = (
             f"reviewed {len(s.reviewed):,} of {c.conversations:,} conversation{'s' if c.conversations != 1 else ''}"
             if c.conversations is not None
@@ -1603,7 +1737,7 @@ def case_page(
             '<button type="submit" class="link danger">Remove</button>',
         )
         searches.append(
-            f'<li><a href="{esc(url)}">\u201c{esc(s.query_text)}\u201d</a>'
+            f'<li><a href="{esc(url)}">{esc(search_title(s))}</a>'
             + (f' <span class="muted">({filters})</span>' if filters else "")
             + f" \u00b7 {count} {remove}</li>"
         )
@@ -1645,6 +1779,113 @@ def case_page(
     )
     topbar = search_form(FormState(), semantic_available=ctx.semantic_available, csrf_token=ctx.csrf_token)
     return layout(ctx, body, body_class="page-case", topbar=topbar)
+
+
+# --------------------------------------------------------------------------
+# saved searches
+# --------------------------------------------------------------------------
+
+
+def describe_search_filters(params: Mapping[str, str], *, conversation: str | None = None) -> str:
+    """A saved search's filters in plain words: `people Alice; sent by
+    Bob; from 2023-04-01; to 2023-04-30; with attachments`."""
+    parts: list[str] = []
+    if params.get("people"):
+        parts.append(f"with {params['people']}")
+    if params.get("sender"):
+        parts.append(f"sent by {params['sender']}")
+    direction = params.get("dir")
+    if direction == "sent":
+        parts.append("sent by me")
+    elif direction == "received":
+        parts.append("received")
+    kind = params.get("kind")
+    if kind == "dm":
+        parts.append("one-to-one conversations")
+    elif kind == "group":
+        parts.append("group conversations")
+    if params.get("in"):
+        parts.append(f"only in \u201c{conversation}\u201d" if conversation else "in one conversation")
+    if params.get("from"):
+        parts.append(f"from {params['from']}")
+    if params.get("to"):
+        parts.append(f"to {params['to']}")
+    att = params.get("att")
+    if att == "with":
+        parts.append("with attachments")
+    elif att == "without":
+        parts.append("without attachments")
+    return "; ".join(parts)
+
+
+def search_title(search: SavedSearch) -> str:
+    """The saved search's name, else its words in quotes, else "(filters only)"."""
+    if search.name:
+        return search.name
+    return f"\u201c{search.query_text}\u201d" if search.query_text else "(filters only)"
+
+
+def saved_page(
+    ctx: PageContext,
+    *,
+    searches: Sequence[SavedSearch],
+    conversations: Mapping[str, str],
+    tz: str,
+    error: str | None,
+) -> str:
+    """Every saved search: run it, rename it, download its results, or
+    remove it. `conversations` names the conversation of each "only in"
+    filter, by thread key."""
+    error_html = f'<p class="error" role="alert">{esc(error)}</p>' if error else ""
+    rows: list[str] = []
+    for s in searches:
+        form = FormState.from_mapping({**s.params, "q": s.query_text})
+        filters = describe_search_filters(s.params, conversation=conversations.get(s.params.get("in", "")))
+        words = (
+            f"\u201c{esc(s.query_text)}\u201d" if s.query_text else '<span class="muted">no words</span>'
+        )
+        where = (
+            f'case <a href="/case/{s.case_id}">{esc(s.case_name or "")}</a>'
+            if s.case_id is not None
+            else "on its own"
+        )
+        rename = _post_form(
+            f"/saved/{s.search_id}/rename",
+            ctx.csrf_token,
+            f'<input type="text" name="name" value="{esc(s.name)}" maxlength="200" '
+            'placeholder="Name" aria-label="Name">'
+            '<button type="submit" class="small">Rename</button>',
+        )
+        remove = _post_form(
+            f"/saved/{s.search_id}/remove",
+            ctx.csrf_token,
+            '<button type="submit" class="link danger">Remove</button>',
+        )
+        rows.append(
+            f'<li class="saved-search" id="saved-{s.search_id}">'
+            f'<div><a class="run" href="{esc(form.url())}"><strong>{esc(search_title(s))}</strong></a>'
+            + (f" \u00b7 {words}" if s.name else "")
+            + (f' <span class="muted">({esc(filters)})</span>' if filters else "")
+            + "</div>"
+            f'<div class="muted">Saved {esc(fmt_date(s.created_at, tz))}, {where} \u00b7 '
+            f"{len(s.reviewed):,} conversation{'s' if len(s.reviewed) != 1 else ''} marked reviewed"
+            f"{download_links(form)}</div>"
+            f'<div class="saved-actions">{rename} {remove}</div></li>'
+        )
+    body = (
+        '<section class="saved"><h1>Saved searches</h1>'
+        f"{error_html}"
+        + (
+            f'<ul class="saved-searches">{"".join(rows)}</ul>'
+            if rows
+            else '<p class="muted">No saved searches yet. "Save this search" on a results page '
+            "keeps one here.</p>"
+        )
+        + '<p class="muted">A download is a copy outside the encrypted volume. It goes only to '
+        "this browser; keep it somewhere safe.</p></section>"
+    )
+    topbar = search_form(FormState(), semantic_available=ctx.semantic_available, csrf_token=ctx.csrf_token)
+    return layout(ctx, body, body_class="page-saved", topbar=topbar)
 
 
 def error_page(ctx: PageContext, *, status: int, message: str) -> str:

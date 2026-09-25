@@ -328,3 +328,23 @@ button.link.danger { color: var(--danger); font-size: 12px; }
   .thread-result { border-radius: 10px; }
   .hit, .thread-head { padding: 8px 10px; }
 }
+
+/* filters, saved searches, result downloads */
+.filter-row { flex-wrap: wrap; row-gap: 6px; }
+.only-in {
+  display: inline-flex; gap: 6px; align-items: center; margin-top: 6px; font-size: 13px;
+  padding: 2px 10px; border: 1px solid var(--accent); border-radius: 999px; color: var(--fg);
+}
+.only-in a { text-decoration: none; font-weight: 600; }
+.search-here { display: flex; gap: 6px; margin-top: 8px; max-width: 480px; }
+.search-here input[type=search] {
+  flex: 1; min-width: 0; font: inherit; padding: 4px 8px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--card); color: var(--fg);
+}
+.filters-only { margin: 0 0 8px; font-size: 13px; }
+.download-results a { margin-left: 4px; }
+.saved h1 { font-size: 22px; }
+.saved-searches { list-style: none; padding: 0; }
+.saved-search { padding: 10px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.saved-search .muted { font-size: 13px; }
+.saved-actions { margin-top: 4px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }

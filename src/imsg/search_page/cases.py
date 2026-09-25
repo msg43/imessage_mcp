@@ -314,20 +314,70 @@ def case_items(
 ) -> list[CaseItem]:
     """The case's items in the order their messages were sent (items whose
     message is gone come last)."""
+    return _load_items(
+        pg,
+        source="search_case_item",
+        where="WHERE i.case_id = %s",
+        order="m.sent_at NULLS LAST, m.message_id, i.attachment_key NULLS FIRST, i.item_id",
+        params=(case_id,),
+        index_unsent=index_unsent,
+        show_edit_history=show_edit_history,
+        show_raw_handles=show_raw_handles,
+    )
+
+
+def message_items(
+    pg: psycopg.Connection,
+    message_keys: Sequence[str],
+    *,
+    index_unsent: bool,
+    show_edit_history: bool,
+    show_raw_handles: bool,
+) -> list[CaseItem]:
+    """Messages as items with everything a citation needs, in the order of
+    `message_keys` (a search's results, for "Download results"). Each
+    carries every file of its message; `item_id` is its place in the list
+    and there is no note."""
+    return _load_items(
+        pg,
+        source=(
+            "(SELECT u.n AS item_id, u.k AS message_key, NULL::text AS attachment_key, "
+            "''::text AS note, now() AS added_at FROM unnest(%s::text[]) WITH ORDINALITY AS u(k, n))"
+        ),
+        where="",
+        order="i.item_id",
+        params=(list(message_keys),),
+        index_unsent=index_unsent,
+        show_edit_history=show_edit_history,
+        show_raw_handles=show_raw_handles,
+    )
+
+
+def _load_items(
+    pg: psycopg.Connection,
+    *,
+    source: str,
+    where: str,
+    order: str,
+    params: tuple[object, ...],
+    index_unsent: bool,
+    show_edit_history: bool,
+    show_raw_handles: bool,
+) -> list[CaseItem]:
     with pg.cursor() as cur:
         cur.execute(
-            """
+            f"""
             SELECT i.item_id, i.message_key, i.attachment_key, i.note, i.added_at,
                    m.message_id, m.source_guid, m.sent_at, m.is_from_me, p.display_name,
                    m.service::text, m.chat_id, m.chat_evidence, m.text_original, m.is_edited,
                    m.date_edited, m.deleted_at, m.is_unsent, m.sender_source_handle_id
-            FROM search_case_item i
+            FROM {source} i
             LEFT JOIN message m ON m.message_key = i.message_key
             LEFT JOIN person p ON p.person_id = m.sender_person_id
-            WHERE i.case_id = %s
-            ORDER BY m.sent_at NULLS LAST, m.message_id, i.attachment_key NULLS FIRST, i.item_id
+            {where}
+            ORDER BY {order}
             """,
-            (case_id,),
+            params,
         )
         rows = cur.fetchall()
         message_ids = [int(r[5]) for r in rows if r[5] is not None]
@@ -434,7 +484,10 @@ def case_items(
 # saved searches and reviewed conversations
 # --------------------------------------------------------------------------
 
-SEARCH_PARAMS = ("people", "from", "to", "att")
+SEARCH_PARAMS = ("people", "from", "to", "att", "sender", "dir", "kind", "in")
+"""The filters a saved search keeps, as the search page's URL parameters."""
+_DEFAULT_CHOICES = {"att": "any", "dir": "any", "kind": "any"}
+MAX_SEARCH_NAME_CHARS = 200
 
 
 def search_params(params: Mapping[str, object]) -> dict[str, str]:
@@ -442,7 +495,7 @@ def search_params(params: Mapping[str, object]) -> dict[str, str]:
     out: dict[str, str] = {}
     for key in SEARCH_PARAMS:
         value = params.get(key)
-        if isinstance(value, str) and value.strip() and not (key == "att" and value == "any"):
+        if isinstance(value, str) and value.strip() and value != _DEFAULT_CHOICES.get(key):
             out[key] = value.strip()[:500]
     return out
 
@@ -450,11 +503,31 @@ def search_params(params: Mapping[str, object]) -> dict[str, str]:
 @dataclass(frozen=True, slots=True)
 class SavedSearch:
     search_id: int
-    case_id: int
+    case_id: int | None
+    """`None`: saved on its own, outside any case."""
     query_text: str
     params: dict[str, str]
     reviewed: frozenset[str]
     created_at: datetime
+    name: str = ""
+    case_name: str | None = None
+
+
+def _clean_search(query_text: str, params: Mapping[str, object]) -> tuple[str, str]:
+    text = " ".join(query_text.split())
+    kept = search_params(params)
+    if len(text) > 1000:
+        raise CaseError("A saved search has at most 1,000 characters.")
+    if not text and not kept:
+        raise CaseError("Save a search that has words or a filter.")
+    return text, json.dumps(kept, sort_keys=True)
+
+
+def _clean_search_name(name: str) -> str:
+    cleaned = " ".join(name.split())
+    if len(cleaned) > MAX_SEARCH_NAME_CHARS:
+        raise CaseError(f"A saved search's name has at most {MAX_SEARCH_NAME_CHARS} characters.")
+    return cleaned
 
 
 def save_search(
@@ -463,10 +536,7 @@ def save_search(
     """Save a search to the active case (creating one if none is open);
     returns `(search_id, case name)`. Saving it again returns the same
     search."""
-    text = " ".join(query_text.split())
-    if not text or len(text) > 1000:
-        raise CaseError("Save a search that has words.")
-    kept = json.dumps(search_params(params), sort_keys=True)
+    text, kept = _clean_search(query_text, params)
     with pg.transaction(), pg.cursor() as cur:
         cur.execute("SELECT case_id, name FROM search_case WHERE is_active")
         row = cur.fetchone()
@@ -492,58 +562,120 @@ def save_search(
     return int(found[0]), name
 
 
+def save_search_alone(
+    pg: psycopg.Connection, *, query_text: str, params: Mapping[str, object], name: str = ""
+) -> int:
+    """Save a search on its own, outside any case (migration 0013); returns
+    its id. Saving the same text and filters again returns the same search,
+    renamed when a name is given."""
+    text, kept = _clean_search(query_text, params)
+    label = _clean_search_name(name)
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO search_case_search (case_id, query_text, params, name)
+            VALUES (NULL, %s, %s::jsonb, %s)
+            ON CONFLICT (query_text, params) WHERE case_id IS NULL
+            DO UPDATE SET name = CASE WHEN EXCLUDED.name <> '' THEN EXCLUDED.name
+                                      ELSE search_case_search.name END
+            RETURNING search_id
+            """,
+            (text, kept, label),
+        )
+        row = cur.fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def rename_search(pg: psycopg.Connection, search_id: int, name: str) -> None:
+    label = _clean_search_name(name)
+    with pg.cursor() as cur:
+        cur.execute("UPDATE search_case_search SET name = %s WHERE search_id = %s", (label, search_id))
+        if cur.rowcount == 0:
+            raise CaseError("No such saved search.")
+
+
 def _as_params(value: object) -> dict[str, str]:
     loaded = json.loads(value) if isinstance(value, str) else value
     return {str(k): str(v) for k, v in loaded.items()} if isinstance(loaded, dict) else {}
 
 
-def saved_searches(pg: psycopg.Connection, case_id: int) -> list[SavedSearch]:
+def _saved(pg: psycopg.Connection, where: str, params: Mapping[str, object], order: str) -> list[SavedSearch]:
     with pg.cursor() as cur:
         cur.execute(
-            """
+            f"""
             SELECT s.search_id, s.case_id, s.query_text, s.params, s.created_at,
-                   coalesce(array_agg(r.thread_key) FILTER (WHERE r.thread_key IS NOT NULL), '{}')
-            FROM search_case_search s LEFT JOIN search_case_review r ON r.search_id = s.search_id
-            WHERE s.case_id = %s
-            GROUP BY s.search_id ORDER BY s.created_at, s.search_id
+                   coalesce(array_agg(r.thread_key) FILTER (WHERE r.thread_key IS NOT NULL), '{{}}'),
+                   s.name, c.name
+            FROM search_case_search s
+            LEFT JOIN search_case_review r ON r.search_id = s.search_id
+            LEFT JOIN search_case c ON c.case_id = s.case_id
+            WHERE {where}
+            GROUP BY s.search_id, c.case_id ORDER BY {order}
             """,
-            (case_id,),
+            dict(params),
         )
         return [
-            SavedSearch(int(sid), int(cid), str(text), _as_params(params), frozenset(str(k) for k in keys), created)
-            for sid, cid, text, params, created, keys in cur.fetchall()
+            SavedSearch(
+                int(sid), int(cid) if cid is not None else None, str(text), _as_params(params_),
+                frozenset(str(k) for k in keys), created, str(label), str(case) if case is not None else None,
+            )
+            for sid, cid, text, params_, created, keys, label, case in cur.fetchall()
         ]
 
 
-def active_saved_search(
+def saved_searches(pg: psycopg.Connection, case_id: int) -> list[SavedSearch]:
+    return _saved(pg, "s.case_id = %(id)s", {"id": case_id}, "s.created_at, s.search_id")
+
+
+def all_saved_searches(pg: psycopg.Connection) -> list[SavedSearch]:
+    """Every saved search: those on their own first, newest first, then
+    each case's (the open case first)."""
+    return _saved(
+        pg,
+        "TRUE",
+        {},
+        "(s.case_id IS NOT NULL), c.is_active DESC NULLS FIRST, c.updated_at DESC NULLS FIRST, "
+        "s.created_at DESC, s.search_id DESC",
+    )
+
+
+def get_saved_search(pg: psycopg.Connection, search_id: int) -> SavedSearch | None:
+    found = _saved(pg, "s.search_id = %(id)s", {"id": search_id}, "s.search_id")
+    return found[0] if found else None
+
+
+def saved_search_for(
     pg: psycopg.Connection, query_text: str, params: Mapping[str, object]
 ) -> SavedSearch | None:
-    """The active case's saved search with exactly this text and these
-    filters, if the owner saved one."""
+    """The saved search with exactly this text and these filters: the
+    active case's if the owner saved it there, otherwise the one saved on
+    its own."""
     text = " ".join(query_text.split())
     kept = json.dumps(search_params(params), sort_keys=True)
     with pg.cursor() as cur:
         cur.execute(
-            "SELECT s.search_id, s.case_id FROM search_case_search s JOIN search_case c ON c.case_id = s.case_id "
-            "WHERE c.is_active AND s.query_text = %s AND s.params = %s::jsonb",
+            "SELECT s.search_id FROM search_case_search s LEFT JOIN search_case c ON c.case_id = s.case_id "
+            "WHERE (c.is_active OR s.case_id IS NULL) AND s.query_text = %s AND s.params = %s::jsonb "
+            "ORDER BY (s.case_id IS NULL) LIMIT 1",
             (text, kept),
         )
         row = cur.fetchone()
-    if row is None:
-        return None
-    for search in saved_searches(pg, int(row[1])):
-        if search.search_id == int(row[0]):
-            return search
-    return None
+    return get_saved_search(pg, int(row[0])) if row is not None else None
 
 
-def remove_search(pg: psycopg.Connection, search_id: int) -> int:
+active_saved_search = saved_search_for
+"""The earlier name, from when a search could be saved only to a case."""
+
+
+def remove_search(pg: psycopg.Connection, search_id: int) -> int | None:
+    """Delete a saved search; returns its case (`None` for one on its own)."""
     with pg.cursor() as cur:
         cur.execute("DELETE FROM search_case_search WHERE search_id = %s RETURNING case_id", (search_id,))
         row = cur.fetchone()
     if row is None:
         raise CaseError("No such saved search.")
-    return int(row[0])
+    return int(row[0]) if row[0] is not None else None
 
 
 def set_reviewed(pg: psycopg.Connection, *, search_id: int, thread_key: str, reviewed: bool) -> int:
@@ -677,28 +809,7 @@ def render_download(
             ensure_ascii=False,
         ) + "\n"
     if fmt == "csv":
-        buffer = io.StringIO()
-        columns = [
-            "item", "sent_at", "sent_local", "sender", "sender_handle", "service", "conversation",
-            "text", "files", "file_sha256", "edited_at", "earlier_text", "deleted_at", "unsent",
-            "found_in", "message_id", "attachment_id", "messages_guid", "note",
-        ]
-        writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore", lineterminator="\n")
-        writer.writeheader()
-        for record in records:
-            row = dict(record)
-            files = record.get("files") or []
-            row["files"] = "; ".join(str(f.get("path") or f.get("name") or "") for f in files)
-            row["file_sha256"] = "; ".join(str(f.get("sha256") or "") for f in files)
-            row["found_in"] = "; ".join(
-                f"{s['source']} row {s['row']}" for s in record.get("found_in") or []
-            )
-            earlier = record.get("earlier_text")
-            row["earlier_text"] = " | ".join(str(v["text"]) for v in earlier) if earlier else ""
-            if record.get("missing"):
-                row["text"] = "(no longer in the index)"
-            writer.writerow(row)
-        return buffer.getvalue()
+        return _csv(records, CSV_COLUMNS)
     lines = [
         f"# {case.name}",
         "",
@@ -711,44 +822,7 @@ def render_download(
         lines += ["## Notes", "", case.notes.strip(), ""]
     lines += ["## Items", ""]
     for record, item in zip(records, items, strict=True):
-        n = record["item"]
-        if record.get("missing"):
-            lines += [f"{n}. (no longer in the index) · Message ID {item.message_key}", ""]
-            continue
-        who = str(record["sender"]) + (f" ({record['sender_handle']})" if record.get("sender_handle") else "")
-        lines.append(
-            f"{n}. {record['sent_local']} · {who} · {record['service']} · in "
-            f"“{record['conversation']}”"
-        )
-        if record.get("text"):
-            text = " ".join(str(record["text"]).split())
-            lines.append(f"   “{text}”")
-        for f in record.get("files") or []:
-            parts = [str(f.get("path") or f.get("name") or "unnamed file")]
-            if f.get("sha256"):
-                parts.append(f"SHA-256 {f['sha256']}")
-            if f.get("bytes") is not None:
-                parts.append(f"{f['bytes']:,} bytes")
-            lines.append("   File: " + ", ".join(parts))
-        if item.is_edited:
-            lines.append(
-                "   Edited" + (f" {formatter.exact(item.date_edited)}" if item.date_edited else "")
-            )
-            for v in item.versions or ():
-                lines.append(f"   Earlier text: “{' '.join(v.text.split())}”")
-        if item.deleted_at:
-            lines.append(f"   Deleted in Messages {formatter.exact(item.deleted_at)}; kept from Recently Deleted")
-        if item.is_unsent:
-            lines.append("   Unsent")
-        if item.sources:
-            lines.append(
-                "   Found in: "
-                + "; ".join(f"{s.source_name} row {s.source_rowid}" for s in item.sources)
-            )
-        lines.append(f"   Message ID {item.message_key} · Messages GUID {item.source_guid}")
-        if item.note.strip():
-            lines.append(f"   Note: {' '.join(item.note.split())}")
-        lines.append("")
+        lines += _markdown_item(record, item, formatter)
     if coverage:
         lines += ["## Saved searches", ""]
         for c in coverage:
@@ -764,6 +838,185 @@ def render_download(
                 f"- \u201c{c.search.query_text}\u201d" + (f" ({filters})" if filters else "") + f": {coverage_text}"
             )
         lines.append("")
+    return "\n".join(lines)
+
+
+CSV_COLUMNS = [
+    "item", "sent_at", "sent_local", "sender", "sender_handle", "service", "conversation",
+    "text", "files", "file_sha256", "edited_at", "earlier_text", "deleted_at", "unsent",
+    "found_in", "message_id", "attachment_id", "messages_guid", "note",
+]
+
+
+def _csv(records: Sequence[Mapping[str, Any]], columns: Sequence[str]) -> str:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(columns), extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    for record in records:
+        row = dict(record)
+        files = record.get("files") or []
+        row["files"] = "; ".join(str(f.get("path") or f.get("name") or "") for f in files)
+        row["file_sha256"] = "; ".join(str(f.get("sha256") or "") for f in files)
+        row["found_in"] = "; ".join(
+            f"{s['source']} row {s['row']}" for s in record.get("found_in") or []
+        )
+        earlier = record.get("earlier_text")
+        row["earlier_text"] = " | ".join(str(v["text"]) for v in earlier) if earlier else ""
+        if record.get("missing"):
+            row["text"] = "(no longer in the index)"
+        writer.writerow(row)
+    return buffer.getvalue()
+
+
+def _markdown_item(record: Mapping[str, Any], item: CaseItem, formatter: Any) -> list[str]:
+    """One item of a Markdown download: its citation lines and a blank line."""
+    lines: list[str] = []
+    n = record["item"]
+    if record.get("missing"):
+        return [f"{n}. (no longer in the index) · Message ID {item.message_key}", ""]
+    who = str(record["sender"]) + (f" ({record['sender_handle']})" if record.get("sender_handle") else "")
+    lines.append(
+        f"{n}. {record['sent_local']} · {who} · {record['service']} · in "
+        f"“{record['conversation']}”"
+    )
+    if record.get("text"):
+        text = " ".join(str(record["text"]).split())
+        lines.append(f"   “{text}”")
+    for f in record.get("files") or []:
+        parts = [str(f.get("path") or f.get("name") or "unnamed file")]
+        if f.get("sha256"):
+            parts.append(f"SHA-256 {f['sha256']}")
+        if f.get("bytes") is not None:
+            parts.append(f"{f['bytes']:,} bytes")
+        lines.append("   File: " + ", ".join(parts))
+    if item.is_edited:
+        lines.append(
+            "   Edited" + (f" {formatter.exact(item.date_edited)}" if item.date_edited else "")
+        )
+        for v in item.versions or ():
+            lines.append(f"   Earlier text: “{' '.join(v.text.split())}”")
+    if item.deleted_at:
+        lines.append(f"   Deleted in Messages {formatter.exact(item.deleted_at)}; kept from Recently Deleted")
+    if item.is_unsent:
+        lines.append("   Unsent")
+    if item.sources:
+        lines.append(
+            "   Found in: "
+            + "; ".join(f"{s.source_name} row {s.source_rowid}" for s in item.sources)
+        )
+    lines.append(f"   Message ID {item.message_key} · Messages GUID {item.source_guid}")
+    if item.note.strip():
+        lines.append(f"   Note: {' '.join(item.note.split())}")
+    lines.append("")
+    return lines
+
+
+MAX_DOWNLOAD_MESSAGES = 20_000
+"""The most messages "Download results" writes; past it the download says
+it stopped, and a narrower search gets the rest."""
+SEARCH_CSV_COLUMNS = [
+    "item", "conversation_result", "found_by", *CSV_COLUMNS[1:7], "conversation_kind", *CSV_COLUMNS[7:-1],
+]
+
+
+@dataclass(frozen=True, slots=True)
+class SearchDownload:
+    """What a results download says about the search that made it."""
+
+    query_text: str
+    filters: str
+    """The filters in plain words (`imsg.search_page.html.describe_search_filters`)."""
+    conversations: int
+    hits: int
+    semantic: str
+    """The semantic channels' state: done, unavailable (with why), off."""
+    capped: tuple[str, ...]
+    """Channels that reached their safety cap: not every hit is included."""
+    truncated: bool
+    """The download stopped at `MAX_DOWNLOAD_MESSAGES`."""
+
+
+def render_search_download(
+    fmt: str,
+    *,
+    search: SearchDownload,
+    items: Sequence[CaseItem],
+    found_by: Mapping[str, str],
+    conversation_result: Mapping[str, int],
+    formatter: Any,
+    downloaded_at: datetime,
+    timezone: str,
+) -> str:
+    """A search's results as Markdown, CSV or JSON, with the same exact
+    citations as a case download. `found_by` says, by message key, how
+    each message was found (the words, a file's text, meaning, an image,
+    the filters); `conversation_result` gives its conversation's place in
+    the results."""
+    records = _items_as_records(items, formatter)
+    for record, item in zip(records, items, strict=True):
+        record["found_by"] = found_by.get(item.message_key, "")
+        record["conversation_result"] = conversation_result.get(item.message_key)
+    about = {
+        "search": search.query_text,
+        "filters": search.filters,
+        "conversations": search.conversations,
+        "hits": search.hits,
+        "messages": len(items),
+        "semantic_search": search.semantic,
+        "capped_channels": list(search.capped),
+        "stopped_at_limit": search.truncated,
+    }
+    if fmt == "json":
+        return json.dumps(
+            {
+                **about,
+                "downloaded_at": _utc(downloaded_at),
+                "time_zone": timezone,
+                "messages_found": records,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ) + "\n"
+    if fmt == "csv":
+        return _csv(records, SEARCH_CSV_COLUMNS)
+    title = f"\u201c{search.query_text}\u201d" if search.query_text else "Messages by filters"
+    lines = [
+        f"# Search: {title}",
+        "",
+        f"Downloaded {formatter.exact(downloaded_at)} from the private message search. "
+        f"Times are {timezone}. Message IDs are the search page's; Messages GUIDs are the "
+        "Messages database's own.",
+        "",
+    ]
+    if search.filters:
+        lines += [f"Filters: {search.filters}.", ""]
+    lines += [
+        f"{search.hits:,} hit{'s' if search.hits != 1 else ''} in {search.conversations:,} "
+        f"conversation{'s' if search.conversations != 1 else ''}; {len(items):,} "
+        f"message{'s' if len(items) != 1 else ''} below. Semantic search: {search.semantic}.",
+        "",
+    ]
+    if search.capped:
+        lines += [
+            f"Not complete: {', '.join(search.capped)} reached the page's safety cap. "
+            "Narrow the search or add a filter to get every hit.",
+            "",
+        ]
+    if search.truncated:
+        lines += [
+            f"Stopped at {MAX_DOWNLOAD_MESSAGES:,} messages. Narrow the search to get the rest.",
+            "",
+        ]
+    current: int | None = None
+    for record, item in zip(records, items, strict=True):
+        place = record.get("conversation_result")
+        if place != current and not record.get("missing"):
+            current = place
+            lines += [f"## {place}. {record['conversation']}", ""]
+        entry = _markdown_item(record, item, formatter)
+        if record.get("found_by") and len(entry) > 1:
+            entry.insert(1, f"   Found by: {record['found_by']}")
+        lines += entry
     return "\n".join(lines)
 
 
@@ -789,6 +1042,7 @@ def case_files(items: Sequence[CaseItem]) -> list[CaseFile]:
 
 __all__ = [
     "DOWNLOAD_FORMATS",
+    "MAX_DOWNLOAD_MESSAGES",
     "MAX_ITEM_NOTE_CHARS",
     "MAX_NAME_CHARS",
     "MAX_NOTES_CHARS",
@@ -799,23 +1053,31 @@ __all__ = [
     "CaseSummary",
     "SavedSearch",
     "SearchCoverage",
+    "SearchDownload",
     "ToggleOutcome",
     "activate_case",
     "active_case",
     "active_saved_search",
+    "all_saved_searches",
     "case_files",
     "case_items",
     "create_case",
     "delete_case",
     "file_path_in_zip",
     "get_case",
+    "get_saved_search",
     "list_cases",
     "marks",
+    "message_items",
     "remove_item",
     "remove_search",
     "rename_case",
+    "rename_search",
     "render_download",
+    "render_search_download",
     "save_search",
+    "save_search_alone",
+    "saved_search_for",
     "saved_searches",
     "search_params",
     "set_case_notes",
