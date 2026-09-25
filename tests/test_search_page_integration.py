@@ -509,7 +509,8 @@ def test_thread_view_scrolls_both_ways_with_markers(corpus: Corpus, tmp_path: Pa
     assert "message number 199" in newer["html"] and newer["more"] is False
 
     holding_page = client.get(f"/thread/{holding.thread_key}").text
-    assert "holding chat" in holding_page and "Unfiled" in holding_page
+    assert "No conversation could be named for these messages" in holding_page
+    assert "Unfiled" in holding_page
 
 
 def test_attachments_served_with_types_and_never_outside_the_cache(
@@ -605,8 +606,9 @@ def test_labels_are_written_in_the_eval_harness_format(corpus: Corpus, tmp_path:
     assert not_rel.status_code == 200
     assert not_rel.json()["counts"] == {"total": 2, "relevant": 1, "not_relevant": 1}
     rendered = client.get("/search", params={"q": "fence"}).text
-    assert "labelled for this query" in rendered and 'class="n-total">2<' in rendered
     assert 'label-btn rel on' in rendered and 'label-btn notrel on' in rendered
+    labels_page = client.get("/labels").text
+    assert "1 relevant" in labels_page and "1 not relevant" in labels_page
 
     cleared = client.post(
         "/api/label",

@@ -108,6 +108,7 @@ class MessageView:
     is_deleted: bool
     has_attachments: bool
     reply_to_guid: str | None = None
+    deleted_at: datetime | None = None
     attachments: list[AttachmentView] = field(default_factory=list)
     reactions: list[tuple[str, str]] = field(default_factory=list)
     reply_to_key: str | None = None
@@ -218,6 +219,7 @@ def _row_to_view(row: Sequence[Any]) -> MessageView:
         is_deleted=deleted_at is not None,
         has_attachments=bool(has_attachments),
         reply_to_guid=reply_to_guid,
+        deleted_at=deleted_at,
     )
 
 

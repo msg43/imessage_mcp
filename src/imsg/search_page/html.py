@@ -20,11 +20,16 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from imsg.search_page.highlight import QueryMatcher, display_text
-from imsg.search_page.labels import NOT_RELEVANT_GRADE, RELEVANT_GRADE, HitLabel, LabelCounts
+from imsg.search_page.labels import (
+    NOT_RELEVANT_GRADE,
+    RELEVANT_GRADE,
+    HitLabel,
+    LabelledQuery,
+)
 from imsg.search_page.search import CHANNEL_LABELS, Hit
 from imsg.search_page.threads import AttachmentView, ChatView, MessageView
 
-STATIC_VERSION = "1"
+STATIC_VERSION = "2"
 _URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
@@ -65,6 +70,41 @@ def fmt_date(dt: datetime, tz: str) -> str:
 
 def fmt_time(dt: datetime, tz: str) -> str:
     return _fmt(dt, tz, "%H:%M")
+
+
+def fmt_seconds(dt: datetime, tz: str) -> str:
+    """To the second, with the zone's abbreviation: `Mon 24 Apr 2023,
+    14:28:07 EDT`."""
+    return _fmt(dt, tz, "%a %d %b %Y, %H:%M:%S %Z")
+
+
+def utc_offset(dt: datetime, tz: str) -> str:
+    """`UTC\u221204:00` for a time four hours behind UTC."""
+    offset = dt.astimezone(ZoneInfo(tz)).utcoffset()
+    minutes = int(offset.total_seconds() // 60) if offset is not None else 0
+    sign = "+" if minutes >= 0 else "\u2212"
+    minutes = abs(minutes)
+    return f"UTC{sign}{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def citation_line(message: MessageView, *, conversation: str, tz: str) -> str:
+    """One line that cites a message exactly: time to the second, sender,
+    conversation, text, message ID. What "Copy citation" copies."""
+    parts = [fmt_seconds(message.sent_at, tz), message.sender_name, conversation]
+    text = " ".join(display_text(message.text).split()) if message.text else ""
+    if text:
+        parts.append(f"\u201c{text}\u201d")
+    names = [a.filename or a.kind for a in message.attachments]
+    if names:
+        parts.append(("attachment: " if len(names) == 1 else "attachments: ") + ", ".join(names))
+    if message.is_edited:
+        parts.append("edited")
+    if message.is_unsent:
+        parts.append("unsent")
+    if message.is_deleted:
+        parts.append("deleted in Messages")
+    parts.append(f"ID {message.message_key}")
+    return " \u00b7 ".join(parts)
 
 
 def layout(ctx: PageContext, body: str, *, body_class: str = "", topbar: str = "") -> str:
@@ -259,6 +299,16 @@ def _attachment_html(att: AttachmentView, *, matched: bool) -> str:
     )
 
 
+def message_actions(message: MessageView, *, conversation: str, tz: str) -> str:
+    """The row under a message: its citation, ready to copy."""
+    cite = citation_line(message, conversation=conversation, tz=tz)
+    return (
+        '<div class="msg-actions">'
+        f'<button type="button" class="link cite-btn" data-cite="{esc(cite)}">Copy citation</button>'
+        "</div>"
+    )
+
+
 def message_html(
     message: MessageView,
     *,
@@ -269,6 +319,7 @@ def message_html(
     anchor: bool = False,
     thread_key: str | None = None,
     show_date: bool = False,
+    conversation: str | None = None,
 ) -> str:
     classes = ["msg", "me" if message.is_from_me else "them"]
     if message.is_deleted:
@@ -280,7 +331,11 @@ def message_html(
     body = linkify(body).replace("\n", "<br>")
     badges: list[str] = []
     if message.is_deleted:
-        badges.append('<span class="badge deleted" title="In Recently Deleted (D13)">Deleted</span>')
+        deleted_title = "Deleted in Messages"
+        if message.deleted_at is not None:
+            deleted_title += f" on {fmt_datetime(message.deleted_at, tz)}"
+        deleted_title += "; kept from Recently Deleted"
+        badges.append(f'<span class="badge deleted" title="{esc(deleted_title)}">Deleted</span>')
     if message.is_unsent:
         badges.append('<span class="badge">Unsent</span>')
     if message.is_edited:
@@ -314,9 +369,13 @@ def message_html(
         f'title="{esc(fmt_datetime(message.sent_at, tz))}">{esc(when)}</time>{"".join(badges)}</div>'
     )
     text_html = f'<div class="text">{body}</div>' if body else ""
+    actions = (
+        message_actions(message, conversation=conversation, tz=tz) if conversation is not None else ""
+    )
     return (
         f'<article class="{" ".join(classes)}" id="m-{esc(message.message_key)}" '
-        f'data-key="{esc(message.message_key)}">{meta}{reply}{text_html}{atts}{previews}{reactions}</article>'
+        f'data-key="{esc(message.message_key)}">{meta}{reply}{text_html}{atts}{previews}{reactions}'
+        f"{actions}</article>"
     )
 
 
@@ -329,6 +388,7 @@ def messages_with_day_breaks(
     anchor_key: str | None,
     thread_key: str,
     previous_day: str | None = None,
+    conversation: str | None = None,
 ) -> str:
     out: list[str] = []
     day = previous_day
@@ -345,6 +405,7 @@ def messages_with_day_breaks(
                 group=group,
                 anchor=(message.message_key == anchor_key),
                 thread_key=thread_key,
+                conversation=conversation,
             )
         )
     return "".join(out)
@@ -375,13 +436,17 @@ class ThreadResultView:
     hits: list[HitView]
     latest_at: datetime
     shown_all: bool
+    next_offset: int | None = None
+    """Where the next 50 of this conversation's hits start, when the owner
+    asked for all of them and more remain."""
+    shown_from: int = 0
 
 
 def _chat_header(chat: ChatView, *, with_participants: bool = True) -> str:
     kind = "Group" if chat.kind == "group" else "Conversation"
     holding = (
-        '<span class="badge holding" title="A holding chat: messages that no real conversation '
-        'could be named for (D13)">Unfiled</span>'
+        '<span class="badge holding" title="No conversation could be named for these '
+        'messages">Unfiled</span>'
         if chat.is_holding
         else ""
     )
@@ -445,6 +510,7 @@ def hit_html(view: HitView, *, chat: ChatView, tz: str, matcher: QueryMatcher, q
             group=True,
             matched_attachment_ids=matched,
             thread_key=chat.thread_key,
+            conversation=chat.title,
         )
         for m in view.messages
     )
@@ -467,17 +533,43 @@ def hit_html(view: HitView, *, chat: ChatView, tz: str, matcher: QueryMatcher, q
     )
 
 
+HITS_PAGE = 50
+"""Hits per request when the owner asks for all of a conversation's hits."""
+
+
+def _next_hits_button(view: ThreadResultView, form: FormState) -> str:
+    if view.next_offset is None:
+        return ""
+    shown = view.next_offset
+    step = min(HITS_PAGE, view.count - shown)
+    more_url = form.url("/search/thread", thread=view.chat.thread_key, offset=shown)
+    return (
+        f'<button type="button" class="more-hits link" data-url="{esc(more_url)}" data-append="1">'
+        f"Show {step} more ({shown:,} of {view.count:,} shown)</button>"
+    )
+
+
+def thread_hits_html(
+    view: ThreadResultView, *, tz: str, matcher: QueryMatcher, form: FormState, query: str
+) -> str:
+    """The next hits of one conversation, appended by the page script."""
+    hits = "".join(hit_html(h, chat=view.chat, tz=tz, matcher=matcher, query=query) for h in view.hits)
+    return hits + _next_hits_button(view, form)
+
+
 def thread_result_html(
     view: ThreadResultView, *, tz: str, matcher: QueryMatcher, form: FormState, query: str
 ) -> str:
     hits = "".join(hit_html(h, chat=view.chat, tz=tz, matcher=matcher, query=query) for h in view.hits)
     more = ""
     remaining = view.count - len(view.hits)
-    if remaining > 0 and not view.shown_all:
-        more_url = form.url("/search/thread", thread=view.chat.thread_key)
+    if view.shown_all:
+        more = _next_hits_button(view, form)
+    elif remaining > 0:
+        more_url = form.url("/search/thread", thread=view.chat.thread_key, offset=0)
         more = (
             f'<button type="button" class="more-hits link" data-url="{esc(more_url)}">'
-            f"Show all {view.count} hits in this conversation</button>"
+            f"Show all {view.count:,} hits in this conversation</button>"
         )
     return (
         f'<section class="thread-result" data-thread="{esc(view.chat.thread_key)}">'
@@ -518,8 +610,6 @@ class StatusView:
     semantic_state: str
     semantic_note: str | None
     timings_ms: dict[str, float]
-    label_counts: LabelCounts
-    baseline_line: str
     hidden_non_content: int = 0
 
 
@@ -557,16 +647,10 @@ def status_html(status: StatusView) -> str:
         )
     timing = status.timings_ms.get("fulltext_total")
     timing_html = f' · <span class="muted timing">text search {timing:.0f} ms</span>' if timing else ""
-    labels = status.label_counts
-    label_html = (
-        f'<span class="label-count" data-total="{labels.total}">labelled for this query: '
-        f'<span class="n-total">{labels.total}</span> (<span class="n-rel">{labels.relevant}</span> relevant, '
-        f'<span class="n-notrel">{labels.not_relevant}</span> not)</span>'
-    )
+    labels_link = ' · <a class="labels-link" href="/labels">Labels</a>'
     return (
         f'<div class="status" id="status">{" ".join(parts)} · {semantic}{note}{timing_html}'
-        f'<div class="status-2">{label_html} · <span class="muted baseline">{esc(status.baseline_line)}</span></div>'
-        f"{hidden}{capped}</div>"
+        f"{labels_link}{hidden}{capped}</div>"
     )
 
 
@@ -631,8 +715,8 @@ def thread_page(
 ) -> str:
     participants = ", ".join(chat.participants) if chat.participants else "only you"
     holding = (
-        '<p class="notice">This is a holding chat: messages whose real conversation could not be '
-        "identified, filed here so they stay searchable (D13).</p>"
+        '<p class="notice">No conversation could be named for these messages. They are kept '
+        "together here so they stay searchable.</p>"
         if chat.is_holding
         else ""
     )
@@ -663,6 +747,60 @@ def thread_page(
     return layout(ctx, body, body_class="page-thread", topbar=topbar)
 
 
+def _progress_row(label: str, have: int, need: int) -> str:
+    met = have >= need
+    return (
+        f'<li class="{"met" if met else "short"}">{have:,} of the {need:,} {esc(label)}'
+        f'{" (met)" if met else ""}</li>'
+    )
+
+
+def labels_page(
+    ctx: PageContext,
+    *,
+    query_count: int,
+    judgment_count: int,
+    queries_with_relevant: int,
+    passed: bool,
+    minimums: tuple[int, int, int],
+    queries: Sequence[LabelledQuery],
+) -> str:
+    """Progress toward the first measured evaluation of search quality,
+    and every query that has labels."""
+    need_queries, need_judgments, need_relevant = minimums
+    verdict = (
+        "Enough labels for the first measured evaluation."
+        if passed
+        else "Not enough labels yet for the first measured evaluation."
+    )
+    rows = "".join(
+        "<tr>"
+        f'<td><a href="{esc(FormState(query=q.query_text).url())}">{esc(q.query_text)}</a></td>'
+        f"<td>{q.relevant:,} relevant</td><td>{q.not_relevant:,} not relevant</td>"
+        f"<td class=\"muted\">{esc(q.query_id if not q.query_id.startswith('adhoc:') else '')}</td>"
+        "</tr>"
+        for q in queries
+    )
+    table = (
+        f'<table class="labels-table"><tbody>{rows}</tbody></table>'
+        if rows
+        else '<p class="muted">No query has labels yet.</p>'
+    )
+    body = (
+        '<section class="labels"><h1>Labels</h1>'
+        "<p>The Relevant and Not relevant buttons on each hit record whether a result answers "
+        "the search. Measuring search quality needs a minimum number of them:</p>"
+        "<ul class=\"progress\">"
+        + _progress_row("queries with labels", query_count, need_queries)
+        + _progress_row("graded results", judgment_count, need_judgments)
+        + _progress_row("queries with a relevant result", queries_with_relevant, need_relevant)
+        + f"</ul><p><strong>{esc(verdict)}</strong></p>"
+        f"<h2>Labelled queries</h2>{table}</section>"
+    )
+    topbar = search_form(FormState(), semantic_available=ctx.semantic_available, csrf_token=ctx.csrf_token)
+    return layout(ctx, body, body_class="page-labels", topbar=topbar)
+
+
 def error_page(ctx: PageContext, *, status: int, message: str) -> str:
     body = f'<section class="error-page"><h1>{status}</h1><p>{esc(message)}</p><p><a href="/">Search</a></p></section>'
     return layout(ctx, body, body_class="page-error")
@@ -679,6 +817,7 @@ __all__ = [
     "fmt_date",
     "fmt_datetime",
     "human_size",
+    "labels_page",
     "linkify",
     "login_page",
     "message_html",

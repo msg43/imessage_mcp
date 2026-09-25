@@ -10,6 +10,47 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-25 — Search page: copy a citation, plain words, a Labels page, "show all" 50 at a time, and Back keeps the place
+
+**Why.** The design review of 2026-09-24 found that forensic review on the
+page lacked an exact way to cite a message, that tooltips named decision
+records ("D13") instead of saying what happened, that the evaluation
+progress line took two of five status lines on a phone, that "show all hits"
+sent a whole conversation's hits at once, and that Back from a conversation
+lost the loaded results and the scroll position.
+
+- **Copy citation** under every message, in results and conversations: one
+  line with the time to the second and the zone, sender, conversation, text
+  (attachment names; edited, unsent or deleted when so) and the message ID.
+  It works over plain HTTP on the local network, where browsers offer no
+  Clipboard API: a selected text area and the copy command; if nothing can
+  copy, the line is shown selected. In a conversation the row appears on
+  hover or focus, and always on touch screens.
+- **Plain words.** "In Recently Deleted (D13)" is now "Deleted in Messages on
+  <date>; kept from Recently Deleted"; the Unfiled badge and notice say that
+  no conversation could be named for the messages. The evaluation progress
+  moved off the results to a Labels page (`/labels`) that also lists every
+  labelled query; each result page links to it. The status block no longer
+  runs the label count and AT-4 queries on every search.
+- **"Show all N hits in this conversation" loads 50 at a time.** Measured on
+  the synthetic corpus with curl, 3 runs: "the" in its largest conversation
+  (1,976 hits) sent 6.07 MB in 1.07 s; the first 50 now send 208 KB in 35 ms.
+- **Back keeps the place.** The results page records in its own history
+  entry how many pages were loaded, which conversations were expanded, and
+  the hit at the top of the screen. Returning from a conversation (Back, or
+  the page's "Results" link) loads the same pages again and puts that hit
+  where it was. Measured in headless Chrome on the synthetic corpus: after
+  75 conversations were loaded and the 56th opened, Back used to return 50
+  conversations at 10,039 px instead of 23,457 px; it now returns all 75 at
+  the same place, in a desktop window and at phone width. Nothing is
+  written to browser storage, and responses stay `no-store`.
+- The stylesheet and script links carry a new version, so browsers fetch
+  the new files instead of their cached copies.
+- **Tests:** 5 new, all failing on the previous code; two existing tests
+  follow the new wording and the Labels page. The page-script behaviours
+  (copying, keeping the place) have no Python test; they were checked in
+  headless Chrome against the previous and the new code, as above.
+
 ## 2026-09-25 — The search page matches only what people wrote, and dates each message by its own time
 
 **Why.** Every indexed segment's text begins with its participants' names,

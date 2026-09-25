@@ -15,8 +15,10 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 deployed):** a segment hit is kept only when the words occur in what people
 wrote, so a contact's name, a year, an hour or a time-zone word no longer
 matches every segment's header lines; the date filter tests each message's
-own time. Deploying needs a restart of the search page only. See
-`CHANGELOG.md`.
+own time; each message has "Copy citation"; decision codes gave way to plain
+words and the evaluation progress to a Labels page; "show all hits" loads 50
+at a time; Back from a conversation keeps the loaded results and the place.
+Deploying needs a restart of the search page only. See `CHANGELOG.md`.
 
 **2026-09-24 public endpoint fixes from the QA review (not yet deployed):**
 requests refused before any token was judged are counted in memory and

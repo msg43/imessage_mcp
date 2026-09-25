@@ -31,6 +31,66 @@
     return template.content;
   }
 
+  // ---------------------------------------------------------------- place in the results
+  // The results page keeps its place in its own history entry
+  // (history.replaceState): how many pages of conversations were loaded,
+  // which conversations were expanded, and the scroll position. Back from
+  // a conversation reloads the page (every response is no-store), and this
+  // state lets it load the same pages again and return to the same spot.
+  // Nothing is written to browser storage.
+
+  const PLACE = "imsgResults";
+
+  function savedPlace() {
+    const state = history.state;
+    return state && typeof state === "object" && state[PLACE] ? state[PLACE] : null;
+  }
+
+  function savePlace(patch) {
+    try {
+      const state = Object.assign({}, history.state || {});
+      state[PLACE] = Object.assign({ pages: 1, y: 0, expanded: {} }, state[PLACE] || {}, patch);
+      history.replaceState(state, "");
+    } catch (_error) { /* keeping the place is a convenience */ }
+  }
+
+  function topOfScreen() {
+    // The first hit (or conversation heading) still visible under the
+    // sticky search bar, and how far its top sits from the top of the
+    // window. Restoring to it keeps the place when something above it
+    // changes height after the restore, such as photos finishing loading.
+    const bar = document.querySelector(".topbar");
+    const below = bar ? bar.getBoundingClientRect().bottom : 0;
+    for (const el of document.querySelectorAll(".thread-result .thread-head, .thread-result .hit")) {
+      const box = el.getBoundingClientRect();
+      if (box.bottom > below) {
+        const section = el.closest(".thread-result");
+        return {
+          anchor: el.classList.contains("hit") ? "hit:" + el.dataset.hit : "thread:" + (section ? section.dataset.thread : ""),
+          offset: Math.round(box.top),
+        };
+      }
+    }
+    return { anchor: null, offset: 0 };
+  }
+
+  function findAnchor(results, anchor) {
+    if (!anchor) return null;
+    const [kind, key] = [anchor.slice(0, anchor.indexOf(":")), anchor.slice(anchor.indexOf(":") + 1)];
+    if (kind === "hit") {
+      return Array.from(results.querySelectorAll(".hit")).find((h) => h.dataset.hit === key) || null;
+    }
+    const section = Array.from(results.querySelectorAll(".thread-result")).find((s) => s.dataset.thread === key);
+    return section ? section.querySelector(".thread-head") : null;
+  }
+
+  function rememberExpanded(threadKey, shown) {
+    if (!threadKey) return;
+    const expanded = Object.assign({}, (savedPlace() || {}).expanded || {});
+    expanded[threadKey] = shown;
+    savePlace({ expanded: expanded });
+  }
+
   // ---------------------------------------------------------------- results
 
   let pagesLoaded = 1;
@@ -60,6 +120,7 @@
       const parent = sentinel.parentNode;
       parent.replaceChild(content, sentinel);
       pagesLoaded += 1;
+      savePlace({ pages: pagesLoaded });
       watchSentinels(parent);
     } catch (error) {
       delete sentinel.dataset.loading;
@@ -73,7 +134,67 @@
     const html = await fetchText(url);
     results.replaceChildren(fragment(html));
     pagesLoaded = 1;
+    savePlace({ pages: 1, expanded: {} });
     watchSentinels(results);
+  }
+
+  function liveSection(key) {
+    return Array.from(document.querySelectorAll(".thread-result")).find((s) => s.dataset.thread === key) || null;
+  }
+
+  async function expandThread(key, until) {
+    // Load a conversation's hits 50 at a time until `until` are shown. The
+    // first step replaces the conversation's section, so look it up again
+    // each time.
+    let section = liveSection(key);
+    let button = section ? section.querySelector(".more-hits") : null;
+    while (button && section && section.querySelectorAll(".hit").length < until) {
+      button = await loadMoreHits(button);
+      section = liveSection(key);
+    }
+  }
+
+  async function loadMoreHits(button) {
+    // One step of "show all hits": returns the next step's button, if any.
+    button.disabled = true;
+    const section = button.closest(".thread-result");
+    const html = await fetchText(button.dataset.url);
+    const content = fragment(html);
+    let next = null;
+    if (button.dataset.append && section) {
+      next = content.querySelector(".more-hits");
+      if (next) next.remove();
+      section.querySelector(".hits").appendChild(content);
+      if (next) button.replaceWith(next); else button.remove();
+    } else if (section) {
+      const replacement = content.querySelector(".thread-result");
+      section.replaceWith(content);
+      next = replacement ? replacement.querySelector(".more-hits") : null;
+    }
+    const key = section ? section.dataset.thread : null;
+    const holder = key ? liveSection(key) : null;
+    if (holder) rememberExpanded(key, holder.querySelectorAll(".hit").length);
+    return next;
+  }
+
+  async function restorePlace(results) {
+    const place = savedPlace();
+    if (!place) return;
+    userMoved = true; // never swap the list under a restored position
+    for (let page = 1; page < (place.pages || 1); page++) {
+      const sentinel = results.querySelector(".sentinel[data-next]");
+      if (!sentinel) break;
+      await loadNextPage(sentinel);
+    }
+    for (const [key, shown] of Object.entries(place.expanded || {})) {
+      try { await expandThread(key, shown); } catch (_error) { /* shown as loaded */ }
+    }
+    const anchor = findAnchor(results, place.anchor);
+    if (anchor) {
+      window.scrollTo(0, anchor.getBoundingClientRect().top + window.scrollY - (place.offset || 0));
+    } else {
+      window.scrollTo(0, place.y || 0);
+    }
   }
 
   async function runSemantic() {
@@ -148,6 +269,50 @@
     }
   }
 
+  // ---------------------------------------------------------------- copy citation
+
+  async function copyText(text) {
+    // The page is usually plain HTTP on the local network, where the
+    // Clipboard API does not exist; a selected text area and the copy
+    // command work there.
+    if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+      try { await navigator.clipboard.writeText(text); return true; } catch (_error) { /* try the other way */ }
+    }
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.className = "copy-buffer";
+    document.body.appendChild(area);
+    area.select();
+    let copied = false;
+    try { copied = document.execCommand("copy"); } catch (_error) { copied = false; }
+    area.remove();
+    return copied;
+  }
+
+  async function onCiteClick(button) {
+    const text = button.dataset.cite || "";
+    if (await copyText(text)) {
+      const label = button.textContent;
+      button.textContent = "Copied";
+      setTimeout(() => { button.textContent = label; }, 1500);
+      return;
+    }
+    // Nothing could copy: show the citation selected, to copy by hand.
+    let box = button.parentNode.querySelector(".cite-box");
+    if (!box) {
+      box = document.createElement("input");
+      box.type = "text";
+      box.readOnly = true;
+      box.className = "cite-box";
+      box.setAttribute("aria-label", "Citation");
+      button.after(box);
+    }
+    box.value = text;
+    box.focus();
+    box.select();
+  }
+
   // ---------------------------------------------------------------- misc clicks
 
   document.addEventListener("click", (event) => {
@@ -155,15 +320,26 @@
     if (!target) return;
     const label = target.closest(".label-btn");
     if (label) { event.preventDefault(); onLabelClick(label); return; }
+    const cite = target.closest(".cite-btn");
+    if (cite) { event.preventDefault(); onCiteClick(cite); return; }
     const more = target.closest(".more-hits");
     if (more) {
       event.preventDefault();
-      more.disabled = true;
-      fetchText(more.dataset.url).then((html) => {
-        const section = more.closest(".thread-result");
-        if (section) section.replaceWith(fragment(html));
-      }).catch((error) => { more.textContent = "Could not load: " + error.message; });
+      loadMoreHits(more).catch((error) => { more.disabled = false; more.textContent = "Could not load: " + error.message; });
       return;
+    }
+    const back = target.closest("a.back");
+    if (back && document.referrer) {
+      // "Results" returns to the results page the owner came from, with its
+      // place kept, rather than opening a fresh copy of it.
+      try {
+        const came = new URL(document.referrer);
+        if (came.origin === window.location.origin && came.pathname === "/search" && history.length > 1) {
+          event.preventDefault();
+          history.back();
+          return;
+        }
+      } catch (_error) { /* follow the link */ }
     }
     const pdf = target.closest(".pdf-toggle");
     if (pdf) {
@@ -290,9 +466,22 @@
     if (box) { event.preventDefault(); box.focus(); box.select(); }
   });
 
-  document.addEventListener("DOMContentLoaded", () => {
+  document.addEventListener("DOMContentLoaded", async () => {
     const results = document.getElementById("results");
-    if (results) { watchSentinels(results); runSemantic(); }
+    if (results) {
+      if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+      await restorePlace(results);
+      let pending = null;
+      window.addEventListener("scroll", () => {
+        if (pending) return;
+        pending = setTimeout(() => {
+          pending = null;
+          savePlace(Object.assign({ y: window.scrollY }, topOfScreen()));
+        }, 200);
+      }, { passive: true });
+      watchSentinels(results);
+      runSemantic();
+    }
     setupPeople();
     setupThread();
   });

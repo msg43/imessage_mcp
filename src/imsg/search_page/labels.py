@@ -106,6 +106,33 @@ def baseline_progress(pg: psycopg.Connection) -> AT4Check:
 
 
 @dataclass(frozen=True, slots=True)
+class LabelledQuery:
+    query_id: str
+    query_text: str
+    relevant: int
+    not_relevant: int
+
+
+def labelled_queries(pg: psycopg.Connection) -> list[LabelledQuery]:
+    """Every eval query with at least one label, most recently labelled
+    first."""
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT q.query_id, q.query_text,
+                   count(*) FILTER (WHERE rl.grade >= 1), count(*) FILTER (WHERE rl.grade = 0)
+            FROM eval_query q JOIN relevance_label rl ON rl.query_id = q.query_id
+            GROUP BY q.query_id, q.query_text
+            ORDER BY max(rl.added_at) DESC, q.query_id
+            """
+        )
+        return [
+            LabelledQuery(str(qid), str(text), int(rel), int(notrel))
+            for qid, text, rel, notrel in cur.fetchall()
+        ]
+
+
+@dataclass(frozen=True, slots=True)
 class HitLabel:
     grade: int
     source: str
@@ -251,12 +278,14 @@ __all__ = [
     "HitLabel",
     "LabelCounts",
     "LabelOutcome",
+    "LabelledQuery",
     "UnknownHitError",
     "adhoc_query_id",
     "baseline_progress",
     "ensure_query_id",
     "find_query_id",
     "label_counts",
+    "labelled_queries",
     "labels_for_hits",
     "write_label",
 ]

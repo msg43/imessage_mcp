@@ -53,6 +53,11 @@ from starlette.responses import (
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from imsg.eval.runner import (
+    AT4_MIN_POOLED_JUDGMENTS,
+    AT4_MIN_QUERIES,
+    AT4_MIN_QUERIES_WITH_A_POSITIVE,
+)
 from imsg.mcp.transport import find_duplicate_header, validate_host
 from imsg.retrieval.query import analyze_query
 from imsg.search_page import html as views
@@ -561,12 +566,20 @@ def build_thread_views(
     *,
     matcher: QueryMatcher,
     query_id: str | None,
-    all_hits: bool = False,
+    hit_offset: int | None = None,
 ) -> list[views.ThreadResultView]:
+    """`hit_offset` set: the owner asked for all of each conversation's
+    hits, and gets the 50 from that offset."""
     per_thread = deps.page.hits_per_thread
     chats = chat_views(pg, [t.chat_id for t in threads])
+
+    def window(t: ThreadHits) -> list[Hit]:
+        if hit_offset is None:
+            return t.hits[:per_thread]
+        return t.hits[hit_offset : hit_offset + views.HITS_PAGE]
+
     shown: list[tuple[ThreadHits, list[Hit]]] = [
-        (t, t.hits if all_hits else t.hits[:per_thread]) for t in threads if t.chat_id in chats
+        (t, window(t)) for t in threads if t.chat_id in chats
     ]
     hits = [h for _t, hs in shown for h in hs]
     segment_ids = [h.segment_id for h in hits if h.segment_id is not None]
@@ -632,31 +645,24 @@ def build_thread_views(
                     span=_matching_span(messages, hit, matcher),
                 )
             )
+        next_offset: int | None = None
+        if hit_offset is not None and hit_offset + len(thread_hits) < thread.count:
+            next_offset = hit_offset + len(thread_hits)
         out.append(
             views.ThreadResultView(
                 chat=chats[thread.chat_id],
                 count=thread.count,
                 hits=hit_views,
                 latest_at=thread.latest_at,
-                shown_all=all_hits,
+                shown_all=hit_offset is not None,
+                next_offset=next_offset,
+                shown_from=hit_offset or 0,
             )
         )
     return out
 
 
-def _baseline_line(pg: psycopg.Connection) -> str:
-    check = label_store.baseline_progress(pg)
-    state = "met" if check.passed else "not met yet"
-    return (
-        f"eval baseline (AT-4): {check.query_count}/30 queries, "
-        f"{check.pooled_judgment_count}/100 judgments, {check.queries_with_a_positive}/25 "
-        f"queries with a relevant hit — {state}"
-    )
-
-
-def _status(
-    pg: psycopg.Connection, result: SearchResult, sort: str, query_id: str | None
-) -> views.StatusView:
+def _status(result: SearchResult, sort: str) -> views.StatusView:
     threads = result.threads(sort)  # type: ignore[arg-type]
     return views.StatusView(
         total_hits=result.total_hits,
@@ -666,8 +672,6 @@ def _status(
         semantic_state=result.semantic.state,
         semantic_note=result.semantic.note,
         timings_ms=dict(result.timings_ms),
-        label_counts=label_store.label_counts(pg, query_id),
-        baseline_line=_baseline_line(pg),
         hidden_non_content=result.hidden_non_content,
     )
 
@@ -793,7 +797,7 @@ def search_view(request: Request) -> Response:
                 results_html = _render_results(
                     deps, pg, result, form, _page_number(request), query_id
                 )
-                status = _status(pg, result, form.sort, query_id)
+                status = _status(result, form.sort)
     except SearchInputError as exc:
         return HTMLResponse(
             views.search_page(
@@ -851,6 +855,10 @@ def search_thread_hits(request: Request) -> Response:
     thread_key = request.query_params.get("thread", "")
     if not is_opaque_key(thread_key):
         return PlainTextResponse("not found", status_code=404)
+    raw_offset = request.query_params.get("offset", "0")
+    if not raw_offset.isdigit() or int(raw_offset) > 10_000_000:
+        return PlainTextResponse("bad offset", status_code=400)
+    offset = int(raw_offset)
     try:
         search_request = _search_request(form)
         with deps.pool.connection() as pg:
@@ -863,13 +871,12 @@ def search_thread_hits(request: Request) -> Response:
                 if chat is None or group is None:
                     return PlainTextResponse("not found", status_code=404)
                 [view] = build_thread_views(
-                    deps, pg, result, [group], matcher=matcher, query_id=query_id, all_hits=True
+                    deps, pg, result, [group], matcher=matcher, query_id=query_id, hit_offset=offset
                 )
     except SearchInputError as exc:
         return PlainTextResponse(str(exc), status_code=400)
-    return HTMLResponse(
-        views.thread_result_html(view, tz=deps.timezone, matcher=matcher, form=form, query=form.query)
-    )
+    render = views.thread_result_html if offset == 0 else views.thread_hits_html
+    return HTMLResponse(render(view, tz=deps.timezone, matcher=matcher, form=form, query=form.query))
 
 
 def semantic_api(request: Request) -> Response:
@@ -884,9 +891,8 @@ def semantic_api(request: Request) -> Response:
         with deps.pool.connection() as pg:
             result = _result_for(deps, pg, search_request)
             _ensure_semantic(deps, pg, result, form.sort)
-            query_id = label_store.find_query_id(pg, result.request.query)
             with result.lock:
-                status = _status(pg, result, form.sort, query_id)
+                status = _status(result, form.sort)
     except SearchInputError as exc:
         return JSONResponse({"state": "error", "note": str(exc)}, status_code=400)
     return JSONResponse(
@@ -959,6 +965,28 @@ async def label_api(request: Request) -> Response:
     )
 
 
+def labels_view(request: Request) -> Response:
+    session = _session(request)
+    if session is None:
+        return _login_redirect(request)
+    deps = _deps(request)
+    ctx = _page_ctx(request, session, title="Labels · Messages")
+    with deps.pool.connection() as pg:
+        check = label_store.baseline_progress(pg)
+        queries = label_store.labelled_queries(pg)
+    return HTMLResponse(
+        views.labels_page(
+            ctx,
+            query_count=check.query_count,
+            judgment_count=check.pooled_judgment_count,
+            queries_with_relevant=check.queries_with_a_positive,
+            passed=check.passed,
+            minimums=(AT4_MIN_QUERIES, AT4_MIN_POOLED_JUDGMENTS, AT4_MIN_QUERIES_WITH_A_POSITIVE),
+            queries=queries,
+        )
+    )
+
+
 def people_api(request: Request) -> Response:
     session = _session(request)
     if session is None:
@@ -1001,6 +1029,7 @@ def thread_view(request: Request) -> Response:
         group=chat.kind == "group" or chat.is_holding,
         anchor_key=window.anchor_key,
         thread_key=chat.thread_key,
+        conversation=chat.title,
     )
     back_url = views.FormState(query=query).url() if query.strip() else None
     return HTMLResponse(
@@ -1049,6 +1078,7 @@ def thread_messages(request: Request) -> Response:
         group=chat.kind == "group" or chat.is_holding,
         anchor_key=None,
         thread_key=chat.thread_key,
+        conversation=chat.title,
     )
     messages = window.messages
     next_cursor = (messages[0] if direction == "older" else messages[-1]).message_key if messages else None
@@ -1261,6 +1291,7 @@ def build_app(deps: AppDeps) -> ASGIApp:
         Route("/api/semantic", semantic_api, methods=["GET"]),
         Route("/api/label", label_api, methods=["POST"]),
         Route("/api/people", people_api, methods=["GET"]),
+        Route("/labels", labels_view, methods=["GET"]),
         Route("/thread/{thread_key}", thread_view, methods=["GET"]),
         Route("/thread/{thread_key}/messages", thread_messages, methods=["GET"]),
         Route("/att/{key}", attachment_original, methods=["GET"]),

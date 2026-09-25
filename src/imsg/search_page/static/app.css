@@ -94,7 +94,8 @@ button.link {
 /* status */
 .status { margin: 8px 0 12px; font-size: 14px; }
 .status .channels { color: var(--muted); }
-.status-2 { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.status .labels-link { font-size: 13px; }
+.hidden-note { font-size: 13px; margin: 4px 0 0; }
 .semantic.pending { color: var(--muted); }
 .semantic.done { color: var(--good); }
 .semantic.unavailable { color: var(--danger); }
@@ -131,7 +132,7 @@ button.link {
 .label-controls { display: flex; gap: 6px; }
 .label-btn {
   border: 1px solid var(--line); background: var(--bg); color: var(--muted);
-  border-radius: 999px; padding: 2px 10px; cursor: pointer; font-size: 12px;
+  border-radius: 999px; padding: 1px 8px; cursor: pointer; font-size: 11px;
 }
 .label-btn.rel.on { background: var(--good); border-color: var(--good); color: #fff; }
 .label-btn.notrel.on { background: var(--danger); border-color: var(--danger); color: #fff; }
@@ -161,6 +162,15 @@ button.link {
 .msg.deleted .text { opacity: .65; border: 1px dashed var(--danger); }
 .msg.anchor .text { box-shadow: 0 0 0 3px var(--mark); }
 .reply-to { display: block; font-size: 12px; color: var(--muted); margin: 0 4px 2px; }
+.msg-actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 2px 6px 0; font-size: 12px; }
+.msg.me .msg-actions { justify-content: flex-end; }
+.msg-actions button.link { color: var(--muted); font-size: 12px; }
+.msg-actions button.link:hover, .msg-actions button.link:focus-visible { color: var(--accent); }
+.page-thread .msg .msg-actions { visibility: hidden; }
+.page-thread .msg:hover .msg-actions, .page-thread .msg:focus-within .msg-actions { visibility: visible; }
+@media (hover: none) { .page-thread .msg .msg-actions { visibility: visible; } }
+.cite-box { width: 100%; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 4px; }
+.copy-buffer { position: fixed; top: 0; left: -9999px; opacity: 0; }
 .reactions { font-size: 12px; color: var(--muted); margin: 2px 6px; }
 .reaction { margin-right: 6px; }
 .link-preview { font-size: 13px; margin: 3px 4px; }
@@ -194,6 +204,13 @@ figure.att { margin: 4px 0; }
 .day-break { text-align: center; margin: 14px 0 6px; }
 .day-break span { font-size: 12px; color: var(--muted); background: var(--card); padding: 2px 10px; border-radius: 999px; }
 .edge { text-align: center; color: var(--muted); font-size: 12px; padding: 12px; }
+
+/* labels */
+.labels h1 { font-size: 22px; }
+.labels h2 { font-size: 17px; margin-top: 24px; }
+.labels .progress li.met { color: var(--good); }
+.labels-table { border-collapse: collapse; width: 100%; font-size: 14px; }
+.labels-table td { border-top: 1px solid var(--line); padding: 6px 8px 6px 0; }
 
 /* login */
 .login { max-width: 360px; margin: 12vh auto 0; }
