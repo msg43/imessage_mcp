@@ -10,6 +10,106 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-26 — `imsg sync`'s segmentation and embedding wait while a search is running
+
+**Why.** The owner asked to "make the sync wait while a search is running
+now." The 2026-09-25 reranking investigation measured on the M2 Ultra
+development host that one process embedding in the sync's batch shape
+beside the public server made its reranking 2.3x slower with the bf16
+reranker (3.6x with the mxfp8 one before it), and two such processes
+6.4x (10.4x). The enrichment worker has waited between tasks while a
+search is in flight since 2026-09-17; the sync's heavy steps never did.
+
+- **Where they wait** (new `imsg.search_yield`): segmentation before each
+  call to the boundary model (sync's S4, `imsg segment`, `imsg segment
+  --rebuild`); embedding before each text batch and each image or video
+  (sync's S6, `imsg embed`), where the pause switch and memory pressure are
+  already checked. A unit that has started always finishes.
+- **Same mechanism as enrichment.** The gate is enrichment's
+  (`imsg.db.enrichment_yield_locks`, now named `QueryYieldGate`;
+  `EnrichmentYieldGate` is the same class), probing the same
+  query-in-flight advisory lock. A public or local MCP search holds it for
+  its whole length, the servers' warm-up holds it, and the search page's
+  model API holds it while it computes each embedding or rerank. The model
+  API already did; nothing changed there, and a new integration test pins
+  it.
+- **Bounded, with enrichment's settings.** One wait lasts at most
+  `enrichment.yield_max_pause_seconds` (300 s), then the unit runs anyway;
+  a waiting step re-checks every `enrichment.yield_poll_interval_seconds`
+  (0.25 s); `enrichment.yield_to_queries: false` turns it off for every
+  step. No new config key.
+- **The pause switch and a waiting live server still win.** While a step
+  waits, each poll also asks `BackgroundGate.stop_at_once` (background
+  work paused, or a live MCP server waiting for memory) and stops waiting
+  at once if either is true; the step's usual stop check then decides.
+  Without this, a stream of searches could hold a paused host's sync for
+  up to 300 s. Enrichment's wait is unchanged.
+- **It never slows a search.** A search's marker is a try-lock that never
+  waits, and a step's probe holds the conflicting lock for one round trip.
+  With nobody searching, each unit costs one probe (two statements) and
+  no sleep.
+- **Visible.** Log events `segment.yielding`, `segment.resumed`,
+  `segment.yield_timed_out`, `segment.yield_interrupted`, and the same for
+  `embed`; closing lines such as `sync: embedding yielded to in-flight
+  searches 2 time(s), 3.0s total` (`segment:` and `embed:` when run on
+  their own), printed only when a step waited. `imsg status` adds
+  `segment_yielding_now` and `embed_yielding_now`, read from `pg_locks`:
+  a waiting step holds advisory key 3 (segmentation) or 4 (embedding) in
+  the `imsg` namespace, as enrichment holds key 2.
+- **Measured on the M2 Ultra development host** with the investigation's
+  harness: the public server's model set and model API, now holding the
+  real marker on a scratch Postgres; its timing script (3 warm-up calls,
+  then 20 timed reranks of 20 documents); and a second process embedding
+  in the sync's batch shape (at most 32 rows and 2,048 padded tokens per
+  batch, the embed role's 14 GiB MLX limit), asking the production
+  embedding stop check before each batch. Times are the model API's own
+  `timings_ms.rerank`, two rounds per condition:
+
+  | Beside the server | Back-to-back p50 / p95 (ms) | 3 s apart p50 / p95 (ms) |
+  |---|---|---|
+  | Nothing | 392.5 / 393.6; 393.3 / 394.0 | 419.8 / 436.3; 429.7 / 434.7 |
+  | Embedding load, not waiting (the sync until now) | 1,013.2 / 1,079.2; 1,014.8 / 1,141.4 | 1,046.1 / 1,157.7; 1,035.0 / 1,071.3 |
+  | Embedding load, waiting | 393.2 / 397.9; 392.6 / 393.7 | 1,036.0 / 1,096.0; 999.3 / 1,146.0 |
+
+  - A burst of searches is no longer slowed: 2.6x before, 1.0x now. The
+    slowest waiting-load call was 573 and 708 ms, the first calls of each
+    run, which met the batch already running.
+  - A lone search is still slowed: 2.4-2.5x at p50 either way. Of 20
+    searches 3 s apart, 15 and 16 took over 1.5x their time alone, against
+    20 of 20 without waiting: most arrived while a batch (median 2.6-2.9 s)
+    was running, and a batch that has started runs to the end.
+  - The Qwen3-Embedding-8B weights were not on the host. The server's text
+    embedder and the load both used the production embedding class on a
+    Qwen3-8B mxfp8 checkpoint of the same architecture (36 layers, hidden
+    size 4,096). The load that did not wait slowed reranking 2.6x, against
+    2.3x with the real embedder on 2026-09-25.
+- **What it does not do.**
+  - It does not preempt (above). On the production host the sync's
+    embedding batches took 44-104 s each on 2026-09-25, so there a lone
+    search will usually meet a batch in progress.
+  - A lone search is only protected if the gate keeps waiting between
+    searches. In a harness-only experiment, holding the marker 5 s after
+    each rerank made the 3 s-apart searches 431.6 / 459.6 ms (alone: 419.6
+    / 428.9; load not waiting: 1,069.2 / 1,105.8), and the load started no
+    batch for the 70 s they lasted.
+    Background work would then wait as long as someone keeps searching, up
+    to the 300 s bound per unit. Not built; the owner's call.
+  - The search page's embedding and rerank are two model-API calls with the
+    page's database work between them, and the marker is not held in that
+    gap.
+- **Tests:** 33 new. Against the previous build 30 fail. 5 fail on what
+  they check: the sync's boundary model and an embedding batch each ran
+  while a search held the marker; a search that never ends added no
+  bounded wait; the sync never checked for searches (0 probes where each
+  unit now makes one); a pause during a wait did not stop `imsg embed`.
+  25 fail because the new module, names or status fields do not exist.
+  3 pass on both builds by design: nothing changes with no search in
+  flight, the switch set off asks nothing, and the model API holds the
+  marker while it computes. One existing test now looks through the
+  wrapper for the factory's boundary provider. Full suite against a real
+  Postgres 17 with pgvector: 3,051 passed, 2 skipped (the real-reranker
+  tests, which need a model directory); ruff and strict mypy clean.
+
 ## 2026-09-25 — MCP servers load before background work; a refused load is retried every 15 s and says what it waits on
 
 **Why.** On the production host the public MCP server was restarted with

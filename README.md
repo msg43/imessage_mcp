@@ -383,6 +383,22 @@ each role's measured MLX peak so it changes neither results nor latency.
 state and its reason, and every running model process with its footprint
 (read without root) and what it was admitted for.
 
+**Heavy work waits while a search is running.** The enrich worker waits
+between tasks, segmentation before each boundary-model call and embedding
+before each batch (in `sync` and on their own) while any search is in
+flight: a public or local MCP search, or the search page's embedding or
+rerank. The servers hold a Postgres advisory lock while they answer, and a
+background step checks it, which costs two short statements when nobody
+is searching. A wait lasts at most `enrichment.yield_max_pause_seconds`
+(300 s), then the unit runs anyway; for segmentation and embedding, a
+pause or a live server waiting for memory ends it at once.
+`enrichment.yield_to_queries: false` turns it off everywhere.
+`imsg status` shows `query_in_flight` and which step is waiting
+(`enrichment_yielding_now`, `segment_yielding_now`, `embed_yielding_now`),
+and each command's last lines say how often and how long it waited. It
+does not preempt: a search that starts during a batch shares the GPU with
+that batch until the batch ends.
+
 **Before exposing the public surface**, AT-1 must pass:
 
 ```bash
@@ -767,7 +783,8 @@ Learned the expensive way; written down so you don't have to.
   above are what closed the gap; this is kept because it costs one round
   trip when nobody is searching and it will matter wherever the batch is
   finer-grained than the traffic — not because it earned its place on
-  this workload.
+  this workload. Segmentation and embedding use the same gate since
+  2026-09-26 (`imsg.search_yield`).
 - **The planner can abandon an HNSW index at some `ef_search` values, and
   that is not a monotonic effect.** pgvector's own cost estimate bounds
   layer-0 tuples by `ef_search` while its selectivity term carries

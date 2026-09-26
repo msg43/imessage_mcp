@@ -11,6 +11,18 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-09-26 the sync waits while a search is running (built, not yet
+deployed):** `imsg sync`'s segmentation waits before each boundary-model
+call and its embedding before each batch while any search is in flight
+(a public or local MCP search, or the search page's model API computing an
+embedding or rerank), at most 300 s per wait, as the enrich worker already
+did; `imsg segment` and `imsg embed` too. On the M2 Ultra development host
+a burst of reranks beside a sync-shaped embedding load went from 2.6x
+slower to 1.0x; a lone search that starts during a batch is still 2.4-2.5x
+slower. No migration and no config change; background commands pick it up
+at their next start, and nothing needs a restart for it. `imsg status` adds
+`segment_yielding_now` and `embed_yielding_now`. See `CHANGELOG.md`.
+
 **2026-09-25 MCP servers load before background work (built, not yet
 deployed):** an MCP server whose model load is refused posts a notice
 (`<data_root>/run/live-servers-waiting/<pid>.json`); while it is up, no

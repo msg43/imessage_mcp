@@ -1,5 +1,6 @@
 """Enrichment yields to in-flight queries, never the reverse (D10.3's
-ratified remedy, preference 3).
+ratified remedy, preference 3). Segmentation and embedding yield the
+same way (2026-09-26, `imsg.search_yield`).
 
 Why this exists
 ---------------
@@ -18,6 +19,14 @@ enrichment, not even for the length of a lock acquisition (see
 :class:`QueryInFlightMarker`). Enrichment waits, bounded, and only
 between units of work.
 
+The same contention comes from `imsg sync`'s segmentation and embedding
+(and the standalone `imsg segment` and `imsg embed`). Measured on an M2
+Ultra (2026-09-25): one sync-shaped embedding process beside the public
+server made its reranking 2.3x slower with the deployed bf16 reranker,
+and 3.6x with the mxfp8 one it replaced. So those steps wait on the
+same gate (:class:`QueryYieldGate`), each publishing its own
+"yielding" key.
+
 The signal, and why Postgres advisory locks
 -------------------------------------------
 
@@ -31,20 +40,22 @@ server cannot leave enrichment paused, because its lock dies with its
 connection, with no timeout to tune and no stale-marker file to reap.
 That is the failure mode a lock file or a status row would get wrong.
 
-Two keys, each held *shared* by whoever is publishing a state, and probed
+The keys, each held *shared* by whoever is publishing a state, and probed
 *exclusively* by whoever is asking:
 
 ``QUERY_IN_FLIGHT_LOCK_KEY``
     Held by an MCP server for the span of a query (and of its warm-up,
-    which is the same GPU work). Any number of concurrent queries can
-    hold it at once, which is why it is a shared lock.
+    which is the same GPU work), and by the search page's model API for
+    each embedding or rerank it computes. Any number of concurrent
+    queries can hold it at once, which is why it is a shared lock.
 
-``ENRICHMENT_PAUSED_LOCK_KEY``
-    Held by an enrichment worker while it is parked waiting. Purely
-    observability: it is what lets `imsg status` say enrichment is
-    *currently yielding* rather than merely that it would.
+``ENRICHMENT_PAUSED_LOCK_KEY``, ``SEGMENT_YIELDING_LOCK_KEY``, ``EMBED_YIELDING_LOCK_KEY``
+    Held by an enrichment worker, a segmentation step or an embedding
+    step while it is parked waiting. Purely observability: it is what
+    lets `imsg status` say that step is *currently yielding* rather than
+    merely that it would.
 
-`imsg status` reads both from ``pg_locks`` and takes no lock itself, so
+`imsg status` reads them from ``pg_locks`` and takes no lock itself, so
 looking at the system cannot perturb it.
 
 What this does not do
@@ -86,6 +97,17 @@ is identifiable at a glance."""
 
 QUERY_IN_FLIGHT_LOCK_KEY = (_LOCK_NAMESPACE << 32) | 1
 ENRICHMENT_PAUSED_LOCK_KEY = (_LOCK_NAMESPACE << 32) | 2
+SEGMENT_YIELDING_LOCK_KEY = (_LOCK_NAMESPACE << 32) | 3
+EMBED_YIELDING_LOCK_KEY = (_LOCK_NAMESPACE << 32) | 4
+
+YIELDING_LOCK_KEYS: dict[str, int] = {
+    "enrich": ENRICHMENT_PAUSED_LOCK_KEY,
+    "segment": SEGMENT_YIELDING_LOCK_KEY,
+    "embed": EMBED_YIELDING_LOCK_KEY,
+}
+"""The "currently yielding" key each step holds while it waits, by the
+step name its log events carry (``enrich.yielding``, ``embed.yielding``
+and so on)."""
 
 _PG_LOCKS_CLASSID = _LOCK_NAMESPACE
 """How Postgres splits a single-``bigint`` advisory key across
@@ -242,22 +264,34 @@ class QueryInFlightMarker:
 @dataclass(frozen=True, slots=True)
 class YieldReport:
     """What one gate check did — logged per unit of work, and summed into
-    `imsg enrich`'s closing line."""
+    the command's closing line (`imsg enrich`; `imsg sync`, `imsg segment`
+    and `imsg embed` through `imsg.search_yield`)."""
 
     paused: bool
     waited_seconds: float
     gave_up: bool = False
     """True when `max_pause_seconds` elapsed with a query still in flight
     and the worker proceeded anyway."""
+    interrupted: bool = False
+    """True when the caller's `interrupt` said to stop waiting (background
+    work paused, or a live MCP server waiting for memory), so its own stop
+    check decides what happens next."""
 
 
-class EnrichmentYieldGate:
-    """Blocks an enrichment worker between units of work while a query is
-    in flight.
+class QueryYieldGate:
+    """Blocks a heavy background step between units of work while a query
+    is in flight: the enrichment worker between tasks, segmentation before
+    each boundary-model call, embedding before each batch
+    (`imsg.search_yield`).
 
-    Takes the worker's own connection: a session-level lock has to live on
-    a session that lasts as long as the worker, this is that session, and
-    a worker that dies takes its "I am paused" marker with it.
+    Takes the step's own connection: a session-level lock has to live on
+    a session that lasts as long as the step, this is that session, and a
+    process that dies takes its "I am yielding" marker with it.
+
+    `step` names the log events (``<step>.yielding``, ``<step>.resumed``,
+    ``<step>.yield_timed_out``) and picks the key published while waiting
+    (:data:`YIELDING_LOCK_KEYS`), so `imsg status` can say which step is
+    yielding.
 
     Disabled (`enabled=False`), every check returns immediately — the
     escape hatch for an operator who would rather have throughput.
@@ -267,11 +301,12 @@ class EnrichmentYieldGate:
         self,
         conn: psycopg.Connection,
         *,
+        step: str = "enrich",
         enabled: bool = True,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         max_pause_seconds: float = DEFAULT_MAX_PAUSE_SECONDS,
         query_lock_key: int = QUERY_IN_FLIGHT_LOCK_KEY,
-        paused_lock_key: int = ENRICHMENT_PAUSED_LOCK_KEY,
+        paused_lock_key: int | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -279,7 +314,15 @@ class EnrichmentYieldGate:
             raise ValueError(f"poll_interval_seconds must be > 0, got {poll_interval_seconds}")
         if max_pause_seconds < 0:
             raise ValueError(f"max_pause_seconds must be >= 0, got {max_pause_seconds}")
+        if paused_lock_key is None:
+            if step not in YIELDING_LOCK_KEYS:
+                raise ValueError(
+                    f"step must be one of {sorted(YIELDING_LOCK_KEYS)} unless paused_lock_key "
+                    f"is given, got {step!r}"
+                )
+            paused_lock_key = YIELDING_LOCK_KEYS[step]
         self._conn = conn
+        self._step = step
         self._enabled = enabled
         self._poll_interval = poll_interval_seconds
         self._max_pause = max_pause_seconds
@@ -292,9 +335,18 @@ class EnrichmentYieldGate:
     def enabled(self) -> bool:
         return self._enabled
 
-    def wait_until_clear(self) -> YieldReport:
+    @property
+    def step(self) -> str:
+        return self._step
+
+    @property
+    def max_pause_seconds(self) -> float:
+        return self._max_pause
+
+    def wait_until_clear(self, *, interrupt: Callable[[], bool] | None = None) -> YieldReport:
         """Return once no query is in flight, or once `max_pause_seconds`
-        has elapsed.
+        has elapsed, or once `interrupt` (asked before each re-check while
+        waiting, never on the fast path) returns true.
 
         The fast path — the overwhelmingly common one, because nobody is
         searching at 03:00 — is a single round trip to a local Postgres
@@ -316,22 +368,32 @@ class EnrichmentYieldGate:
             return YieldReport(paused=False, waited_seconds=0.0)
 
         started = self._monotonic()
-        logger.info("enrich.yielding", note="a query is in flight; pausing between tasks")
+        logger.info(
+            f"{self._step}.yielding",
+            note="a query is in flight; pausing before the next unit of work",
+        )
         with self._published_as_paused():
             while True:
                 waited = self._monotonic() - started
                 if waited >= self._max_pause:
                     logger.warning(
-                        "enrich.yield_timed_out",
+                        f"{self._step}.yield_timed_out",
                         waited_seconds=round(waited, 2),
                         max_pause_seconds=self._max_pause,
-                        note="proceeding anyway so the queue still makes progress",
+                        note="proceeding anyway so the work still makes progress",
                     )
                     return YieldReport(paused=True, waited_seconds=waited, gave_up=True)
+                if interrupt is not None and interrupt():
+                    logger.info(
+                        f"{self._step}.yield_interrupted",
+                        waited_seconds=round(waited, 2),
+                        note="stopped waiting: the step's own stop check decides what is next",
+                    )
+                    return YieldReport(paused=True, waited_seconds=waited, interrupted=True)
                 self._sleep(self._poll_interval)
                 if self._query_side_is_idle():
                     waited = self._monotonic() - started
-                    logger.info("enrich.resumed", waited_seconds=round(waited, 2))
+                    logger.info(f"{self._step}.resumed", waited_seconds=round(waited, 2))
                     return YieldReport(paused=True, waited_seconds=waited)
 
     def _query_side_is_idle(self) -> bool:
@@ -353,17 +415,22 @@ class EnrichmentYieldGate:
         return acquired
 
     def _published_as_paused(self) -> _PausedMarker:
-        return _PausedMarker(self._conn, self._paused_lock_key)
+        return _PausedMarker(self._conn, self._paused_lock_key, step=self._step)
+
+
+EnrichmentYieldGate = QueryYieldGate
+"""The name the enrichment worker's gate has always had; the same class."""
 
 
 class _PausedMarker:
-    """Holds the "an enrichment worker is currently yielding" lock for the
-    length of a pause, so `imsg status` can report it. Shared, so two
-    workers pausing at once both show."""
+    """Holds a step's "currently yielding" lock for the length of a pause,
+    so `imsg status` can report it. Shared, so two processes pausing at
+    once both show."""
 
-    def __init__(self, conn: psycopg.Connection, lock_key: int) -> None:
+    def __init__(self, conn: psycopg.Connection, lock_key: int, *, step: str = "enrich") -> None:
         self._conn = conn
         self._lock_key = lock_key
+        self._step = step
         self._held = False
 
     def __enter__(self) -> Self:
@@ -373,7 +440,7 @@ class _PausedMarker:
                 row = cur.fetchone()
             self._held = bool(row and row[0])
         except Exception as exc:  # observability must not break the worker
-            logger.warning("enrich.paused_marker_failed", error=f"{type(exc).__name__}: {exc}")
+            logger.warning(f"{self._step}.paused_marker_failed", error=f"{type(exc).__name__}: {exc}")
         return self
 
     def __exit__(
@@ -389,7 +456,9 @@ class _PausedMarker:
             with self._conn.cursor() as cur:
                 cur.execute("SELECT pg_advisory_unlock_shared(%s)", (self._lock_key,))
         except Exception as exc_:
-            logger.warning("enrich.paused_unmark_failed", error=f"{type(exc_).__name__}: {exc_}")
+            logger.warning(
+                f"{self._step}.paused_unmark_failed", error=f"{type(exc_).__name__}: {exc_}"
+            )
 
 
 # --------------------------------------------------------------------------
@@ -405,6 +474,12 @@ class YieldState:
     enrichment_paused: bool
     reason: str | None = None
     """Set instead of the flags when the locks could not be read."""
+    segment_yielding: bool = False
+    """A segmentation step (`imsg segment`, sync's S4) is waiting for a
+    query to finish."""
+    embed_yielding: bool = False
+    """An embedding step (`imsg embed`, sync's S6) is waiting for a query
+    to finish."""
 
 
 _PG_LOCKS_QUERY = """
@@ -420,14 +495,17 @@ _PG_LOCKS_QUERY = """
 
 
 def read_yield_state(conn: psycopg.Connection) -> YieldState:
-    """Read both markers without taking a lock — a status command must be
+    """Read every marker without taking a lock — a status command must be
     able to observe the system without joining the contention it is
     reporting on."""
     query_objid = QUERY_IN_FLIGHT_LOCK_KEY & 0xFFFFFFFF
     paused_objid = ENRICHMENT_PAUSED_LOCK_KEY & 0xFFFFFFFF
+    segment_objid = SEGMENT_YIELDING_LOCK_KEY & 0xFFFFFFFF
+    embed_objid = EMBED_YIELDING_LOCK_KEY & 0xFFFFFFFF
+    objids = [query_objid, paused_objid, segment_objid, embed_objid]
     try:
         with conn.cursor() as cur:
-            cur.execute(_PG_LOCKS_QUERY, (_PG_LOCKS_CLASSID, [query_objid, paused_objid]))
+            cur.execute(_PG_LOCKS_QUERY, (_PG_LOCKS_CLASSID, objids))
             held = {int(objid) for objid, _count in cur.fetchall()}
     except Exception as exc:
         return YieldState(
@@ -438,16 +516,22 @@ def read_yield_state(conn: psycopg.Connection) -> YieldState:
     return YieldState(
         query_in_flight=query_objid in held,
         enrichment_paused=paused_objid in held,
+        segment_yielding=segment_objid in held,
+        embed_yielding=embed_objid in held,
     )
 
 
 __all__ = [
     "DEFAULT_MAX_PAUSE_SECONDS",
     "DEFAULT_POLL_INTERVAL_SECONDS",
+    "EMBED_YIELDING_LOCK_KEY",
     "ENRICHMENT_PAUSED_LOCK_KEY",
     "QUERY_IN_FLIGHT_LOCK_KEY",
+    "SEGMENT_YIELDING_LOCK_KEY",
+    "YIELDING_LOCK_KEYS",
     "EnrichmentYieldGate",
     "QueryInFlightMarker",
+    "QueryYieldGate",
     "YieldReport",
     "YieldState",
     "read_yield_state",

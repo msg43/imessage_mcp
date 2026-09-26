@@ -299,7 +299,14 @@ class EnrichmentConfig(StrictModel):
     asymmetry is deliberate: enrichment is restartable batch work with a
     queue, the MCP server is the externally visible surface with a 2.0 s
     budget. Set false to keep enrichment throughput at the query side's
-    expense."""
+    expense.
+
+    The same switch covers `imsg sync`'s segmentation and embedding and
+    the standalone `imsg segment` and `imsg embed` (`imsg.search_yield`,
+    2026-09-26): each waits before its next boundary-model call or
+    embedding batch while a search is in flight, including the search
+    page's embeddings and reranks. False also stops the MCP servers
+    publishing the marker, so nothing yields."""
 
     yield_poll_interval_seconds: float = Field(
         default=constants.ENRICHMENT_YIELD_POLL_INTERVAL_SECONDS, gt=0
@@ -314,7 +321,10 @@ class EnrichmentConfig(StrictModel):
     regardless. This is NOT the crash backstop — a killed MCP server's
     advisory lock dies with its database session, so nothing can wedge
     enrichment paused — it is the "someone is searching continuously and
-    the queue still has to drain overnight" backstop."""
+    the queue still has to drain overnight" backstop. Segmentation and
+    embedding use the same bound for each model call or batch, so a
+    stream of searches delays new messages becoming searchable by at most
+    this long per unit, never indefinitely."""
 
     @field_validator("window", mode="after")
     @classmethod

@@ -208,6 +208,7 @@ from imsg.retrieval.model_thread import ModelThread
 from imsg.retrieval.service import RetrievalService
 from imsg.search_page.cli import search_page_app
 from imsg.search_page.model_api_server import start_model_api_if_enabled
+from imsg.search_yield import SearchYield, YieldingBoundaryProvider, YieldStep, YieldTally
 from imsg.segment.pipeline import REBUILD_ALL_SENTINEL, run_segment, run_segment_for_chat
 from imsg.stages.extract import ExtractResult, MergeMode, merge_mode_for_source, run_extract
 from imsg.stages.identity import (
@@ -553,7 +554,9 @@ def _unload_enrichment_models(providers: EnrichmentProviders) -> None:
 def _query_marker(cfg: Config) -> QueryInFlightMarker:
     """The "a query is in flight" publisher an MCP server holds while it
     answers (`imsg.db.enrichment_yield_locks`), so the nightly enrichment
-    worker pauses between its units of work.
+    worker pauses between its units of work, and segmentation and
+    embedding pause before their next model call or batch
+    (`imsg.search_yield`).
 
     On its own connection, opened lazily on the first query: a
     session-level advisory lock has to live on a session that lasts as
@@ -564,6 +567,34 @@ def _query_marker(cfg: Config) -> QueryInFlightMarker:
         lambda: connect(cfg.database, autocommit=True),
         enabled=cfg.enrichment.yield_to_queries,
     )
+
+
+def _search_yield(
+    cfg: Config,
+    conn: psycopg.Connection,
+    gate: BackgroundGate,
+    step: YieldStep,
+    *,
+    tally: YieldTally | None = None,
+) -> SearchYield:
+    """`step` waiting, bounded, while a search is in flight
+    (`imsg.search_yield`), on the command's own connection, with the
+    settings the enrichment worker uses. While it waits it also asks the
+    gate's checks that stop at once (paused, a live server waiting), so
+    neither waits behind a search."""
+    return SearchYield.from_config(
+        cfg, conn, step, tally=tally, interrupt=lambda: gate.stop_at_once() is not None
+    )
+
+
+def _echo_search_yield(command: str, cfg: Config, tally: YieldTally, step: str = "") -> None:
+    """The closing line for a step that waited for searches, as `imsg
+    enrich` reports its own yielding: `<command>: [<step> ]yielded to
+    in-flight searches N time(s), X.Xs total`. Nothing when it never
+    waited."""
+    line = tally.describe(cfg.enrichment.yield_max_pause_seconds)
+    if line is not None:
+        typer.echo(f"{command}: {step} {line}" if step else f"{command}: {line}")
 
 
 def _decode_prompt(prompt_bytes: bytes) -> str:
@@ -895,10 +926,14 @@ def status(
         "at_rest_posture_caveat": posture.caveat,
         "disk_free_bytes": free_bytes,
         # D10.3: is enrichment standing aside for the query side right now?
+        # The same switch covers segmentation and embedding
+        # (imsg.search_yield), each with its own "yielding now".
         "enrichment_yield_enabled": cfg.enrichment.yield_to_queries,
         "enrichment_yielding_now": yield_state.enrichment_paused if yield_state else None,
         "query_in_flight": yield_state.query_in_flight if yield_state else None,
         "enrichment_yield_reason": yield_state.reason if yield_state else None,
+        "segment_yielding_now": yield_state.segment_yielding if yield_state else None,
+        "embed_yielding_now": yield_state.embed_yielding if yield_state else None,
         "mcp_public_warm_up": public_warm_up.state,
         "mcp_public_warm_up_detail": public_warm_up.detail,
         "mcp_public_pid": public_warm_up.pid,
@@ -2052,7 +2087,10 @@ def segment(
     Heavy background work (`imsg.background_gate`): exits 76 without
     loading anything while background work is paused, waits for memory
     and exits 75 if the host never has room, and between chats stops
-    (exit 75/76) when paused or when the host's memory pressure rises."""
+    (exit 75/76) when paused or when the host's memory pressure rises.
+
+    Before each call to the boundary model it waits, bounded, while a
+    search is in flight (`imsg.search_yield`)."""
     cfg = _load_config_or_die(config)
     if rebuild and chat is None:
         typer.echo("imsg: --rebuild requires --chat <id>", err=True)
@@ -2070,6 +2108,8 @@ def segment(
     )
 
     conn = _connect_and_verify_or_die(cfg)
+    search_yield = _search_yield(cfg, conn, gate, YieldStep.SEGMENT)
+    yielding_provider = YieldingBoundaryProvider(provider, search_yield)
     try:
         _acquire_heavy_lock_or_die(heavy_lock)
         _admit_or_exit(gate, admission, heavy_lock, "segment")
@@ -2080,7 +2120,7 @@ def segment(
                 conn,
                 chat,
                 cfg,
-                provider,
+                yielding_provider,
                 prompt_bytes,
                 earliest_changed_at=REBUILD_ALL_SENTINEL,
                 dry_run=dry_run,
@@ -2090,6 +2130,7 @@ def segment(
                 f"segments_deleted={report.segments_deleted} "
                 f"segments_unchanged={report.skipped_unchanged}"
             )
+            _echo_search_yield("segment", cfg, search_yield.tally)
         else:
             chat_ids = {chat} if chat is not None else None
             stopped: StopReason | None = None
@@ -2097,7 +2138,7 @@ def segment(
                 reports = run_segment(
                     conn,
                     cfg,
-                    provider,
+                    yielding_provider,
                     prompt_bytes,
                     chat_ids=chat_ids,
                     dry_run=dry_run,
@@ -2114,6 +2155,7 @@ def segment(
                 f"written, {total_unchanged} left unchanged, "
                 f"{total_fallback} fallback session(s)"
             )
+            _echo_search_yield("segment", cfg, search_yield.tally)
             if stopped is not None:
                 if dry_run:
                     typer.echo(DRY_RUN_MARKER)
@@ -2141,7 +2183,10 @@ def embed(
     Heavy background work (`imsg.background_gate`): exits 76 while
     background work is paused, exits 75 if the host never has memory for
     the models, and between batches stops (committing what is done) when
-    paused or when the host's memory pressure rises."""
+    paused or when the host's memory pressure rises.
+
+    Before each batch, and each image or video, it waits, bounded, while
+    a search is in flight (`imsg.search_yield`)."""
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
     gate = _background_gate(cfg, "embed")
@@ -2154,6 +2199,7 @@ def embed(
     multimodal_provider = _build_or_die(lambda: build_multimodal_provider(cfg))
 
     conn = _connect_and_verify_or_die(cfg)
+    search_yield = _search_yield(cfg, conn, gate, YieldStep.EMBED)
     # `_open_fts_conn` creates `fts/` and the sqlite sidecar file on disk
     # (a real filesystem write) — skip it entirely in dry-run mode, since
     # `run_embed(dry_run=True)` never needs it and a dry run must not
@@ -2175,7 +2221,7 @@ def embed(
                 batch_size=cfg.embedding.batch_size,
                 max_batch_tokens=cfg.embedding.max_batch_tokens,
                 dry_run=dry_run,
-                stop_check=None if dry_run else gate.between_units,
+                stop_check=None if dry_run else search_yield.stop_check(gate.between_units),
             )
         except BackgroundWorkDeferred as exc:
             if not isinstance(exc.partial, EmbedRunReport):  # pragma: no cover - run_embed always sets it
@@ -2209,6 +2255,7 @@ def embed(
             f"embed: fts events_applied={sync_report.events_applied} "
             f"(upserts={sync_report.upserts} deletes={sync_report.deletes})"
         )
+        _echo_search_yield("embed", cfg, search_yield.tally)
     if stopped is not None:
         _exit_deferred("embed", stopped)
 
@@ -2220,7 +2267,11 @@ class _SyncHeavySteps:
     `run_sync` records while S1-S3's work stands. A deferral sticks for
     the rest of the command, so later sources skip their heavy steps at
     once instead of waiting again, and it releases the heavy lock at once
-    so other heavy commands are not held up by the light work left."""
+    so other heavy commands are not held up by the light work left.
+
+    Within each step, the next boundary-model call or embedding batch
+    waits while a search is in flight (`imsg.search_yield`); the waits of
+    every source add up in `segment_yields` and `embed_yields`."""
 
     def __init__(self, cfg: Config, heavy_lock: HeavyModelLock, gate: BackgroundGate) -> None:
         self._cfg = cfg
@@ -2228,6 +2279,12 @@ class _SyncHeavySteps:
         self._gate = gate
         self._admission: MemoryAdmission | None = None
         self.deferred: StopReason | None = None
+        self.segment_yields = YieldTally()
+        self.embed_yields = YieldTally()
+
+    def search_yield(self, conn: psycopg.Connection, step: YieldStep) -> SearchYield:
+        tally = self.segment_yields if step is YieldStep.SEGMENT else self.embed_yields
+        return _search_yield(self._cfg, conn, self._gate, step, tally=tally)
 
     def begin(self, role: ModelRole) -> None:
         if self.deferred is not None:
@@ -2269,11 +2326,12 @@ def _make_segment_fn(cfg: Config, steps: _SyncHeavySteps) -> SegmentFn:
 
     def _segment_fn(conn: psycopg.Connection, config: Config, *, dry_run: bool = False) -> object:
         # A dry run asks the boundary model too, so it takes the lock and
-        # passes the gate too.
+        # passes the gate too, and waits for searches too.
         steps.begin(ModelRole.SEGMENT)
+        yielding = YieldingBoundaryProvider(provider, steps.search_yield(conn, YieldStep.SEGMENT))
         try:
             return run_segment(
-                conn, config, provider, prompt_bytes, dry_run=dry_run, stop_check=steps.stop_check
+                conn, config, yielding, prompt_bytes, dry_run=dry_run, stop_check=steps.stop_check
             )
         except BackgroundWorkDeferred as exc:
             steps.note_stopped(exc.reason)
@@ -2308,6 +2366,7 @@ def _make_embed_fn(cfg: Config, steps: _SyncHeavySteps) -> EmbedFn:
                 dry_run=True,
             )
         steps.begin(ModelRole.EMBED)
+        search_yield = steps.search_yield(conn, YieldStep.EMBED)
         stopped: BackgroundWorkDeferred | None = None
         try:
             try:
@@ -2317,7 +2376,7 @@ def _make_embed_fn(cfg: Config, steps: _SyncHeavySteps) -> EmbedFn:
                     multimodal_provider=multimodal_provider,
                     batch_size=config.embedding.batch_size,
                     max_batch_tokens=config.embedding.max_batch_tokens,
-                    stop_check=steps.stop_check,
+                    stop_check=search_yield.stop_check(steps.stop_check),
                 )
             except BackgroundWorkDeferred as exc:
                 stopped, report = exc, exc.partial
@@ -2373,6 +2432,10 @@ def sync(
     so no message is lost — skips segmentation and embedding, says so,
     and exits 76 (paused) or 75 (memory). Between S4 and S6 the boundary
     model is dropped, so the two model sets are never resident together.
+
+    Within S4 and S6, each boundary-model call and each embedding batch
+    first waits, bounded, while a search is in flight
+    (`imsg.search_yield`); the closing lines say how often and how long.
     """
     cfg = _load_config_or_die(config)
     _validate_seed_or_die(cfg, snapshot, source)
@@ -2435,6 +2498,8 @@ def sync(
                 f"{skipped} skipped — {r.deferred.line()}"
             )
             deferred = deferred or r.deferred
+    _echo_search_yield("sync", cfg, steps.segment_yields, YieldStep.SEGMENT.label)
+    _echo_search_yield("sync", cfg, steps.embed_yields, YieldStep.EMBED.label)
     if dry_run:
         typer.echo(DRY_RUN_MARKER)
     if deferred is not None:

@@ -94,6 +94,8 @@ enrichment:
   # Enrichment stands aside for in-flight searches (never the reverse): the MCP server holds a
   # Postgres session advisory lock while it answers, and this worker pauses BETWEEN tasks while
   # it is held. A killed server releases the lock with its session, so nothing can wedge paused.
+  # The same three settings govern segmentation (before each boundary-model call) and embedding
+  # (before each batch), in `imsg sync` and in `imsg segment` / `imsg embed`.
   yield_to_queries: true
   yield_poll_interval_seconds: 0.25   # only reached while a query is actually running
   yield_max_pause_seconds: 300        # then proceed anyway, so the queue still drains overnight

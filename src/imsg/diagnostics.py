@@ -248,9 +248,10 @@ def check_buffer_pool(config: Config) -> BufferPoolCheck:
 
 
 def check_enrichment_yield(config: Config) -> YieldState:
-    """Whether a query is in flight and whether an enrichment worker is
-    currently standing aside for it (D10.3's ratified remedy;
-    `imsg.db.enrichment_yield_locks`).
+    """Whether a query is in flight and whether an enrichment worker, a
+    segmentation step or an embedding step is currently standing aside
+    for it (D10.3's ratified remedy; `imsg.db.enrichment_yield_locks`,
+    `imsg.search_yield`).
 
     Read from `pg_locks` on a connection of its own, taking no lock — a
     status command must be able to observe the contention it reports on

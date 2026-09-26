@@ -32,6 +32,15 @@ steps. Each asks this gate three things:
    overlap run). The next scheduled run carries on from the queue and
    the dirty flags, so a stop loses no work.
 
+Separately from these checks, the model-heavy steps wait while a search
+is in flight: the enrichment worker between tasks
+(`imsg.enrich.worker`), segmentation before each boundary-model call and
+embedding before each batch (`imsg.search_yield`). A wait is not a stop:
+the command carries on once the search ends. While segmentation or
+embedding waits, it still asks the checks that stop at once
+(`stop_at_once`: paused, a live server waiting), so neither is held up
+behind a search.
+
 The MCP servers never ask the pause question: they keep answering, and
 their own memory checks are in `imsg.retrieval.background_warm_up` and
 `imsg.retrieval.idle_unload`.
@@ -226,15 +235,23 @@ class BackgroundGate:
             f"gives way, stopping after this unit of work",
         )
 
-    def between_units(self) -> StopReason | None:
-        """Check 3."""
+    def stop_at_once(self) -> StopReason | None:
+        """The part of check 3 that needs no confirmation: paused, or, for
+        a command that has loaded models, a live MCP server waiting to load
+        its own. Also asked while a step waits for a search to finish
+        (`imsg.search_yield`), so neither waits behind a search."""
         paused = self.paused()
         if paused is not None:
             return paused
         if self._models_admitted:
-            waiting = self.live_server_waiting()
-            if waiting is not None:
-                return waiting
+            return self.live_server_waiting()
+        return None
+
+    def between_units(self) -> StopReason | None:
+        """Check 3."""
+        at_once = self.stop_at_once()
+        if at_once is not None:
+            return at_once
         stop_at = PressureLevel(self._memory.background_stop_at)
         level, error = self._pressure()
         if level is None:
