@@ -36,12 +36,12 @@ from imsg.enrich.limits import check_path_containment
 from imsg.enrich.mime import (
     DEFAULT_SNIFF_BATCH_SIZE,
     MimeSnifferFn,
-    real_sniff_mime,
     sniff_mime_batch,
+    sniff_mime_in_scratch,
 )
 from imsg.enrich.queue import enqueue_pairs_by_kind
 from imsg.enrich.router import ENRICHMENT_KINDS, route_for_mime
-from imsg.errors import UntrustedAttachmentError
+from imsg.errors import EnrichmentError, UntrustedAttachmentError
 from imsg.paths import resolve_path
 
 if TYPE_CHECKING:
@@ -145,7 +145,9 @@ def plan_enrichment(
 
     # The cache is content-addressed: identical attachments share a file,
     # which is sniffed once.
-    sniffed = sniff_mime_batch(sorted(set(readable.values())), batch_size=batch_size)
+    sniffed = sniff_mime_batch(
+        sorted(set(readable.values())), data_root=root, batch_size=batch_size
+    )
 
     pairs: list[tuple[int, str]] = []
     for attachment_id, _, existing in rows:
@@ -182,7 +184,7 @@ def enqueue_for_materialized(
     cache_path: Path,
     *,
     data_root: Path,
-    sniffer: MimeSnifferFn = real_sniff_mime,
+    sniffer: MimeSnifferFn | None = None,
 ) -> MaterializedEnqueue:
     """Queue the router's kinds for one attachment that has just become
     `materialized`, and commit. Called by S5a after it marks the row.
@@ -190,11 +192,20 @@ def enqueue_for_materialized(
     A path that is refused or cannot be sniffed plans nothing and says
     why in `error`; it never fails the materialization, which has
     already succeeded, and `imsg enrich --plan` picks the attachment up
-    later."""
+    later. `file` runs sandboxed in a scratch work directory under
+    `data_root` (`imsg.enrich.mime.sniff_mime_in_scratch`); `sniffer`
+    replaces it in tests only."""
     try:
-        path = check_path_containment(Path(cache_path), resolve_path(data_root))
-        mime_type = sniffer(path)
-    except UntrustedAttachmentError as exc:
+        root = resolve_path(data_root)
+        path = check_path_containment(Path(cache_path), root)
+        if sniffer is None:
+            mime_type = sniff_mime_in_scratch(path, data_root=root)
+        else:
+            mime_type = sniffer(path)
+    except (EnrichmentError, OSError) as exc:
+        # `UntrustedAttachmentError` (refused, or `file` could not sniff
+        # it) and the scratch work directory failing alike: the
+        # materialization has already succeeded and must not fail now.
         return MaterializedEnqueue(mime_type=None, error=str(exc))
     route = route_for_mime(mime_type)
     if not route:

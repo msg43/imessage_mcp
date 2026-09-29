@@ -10,6 +10,52 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-09-29 — The MIME sniffer and the caption scaler run in the enrichment sandbox
+
+**Why.** The QA review (2026-09-24) found, and the owner approved fixing,
+that two enrichment steps still parsed attachment bytes outside the
+sandbox every other decoder got on 2026-09-24: the `file` MIME sniffer and
+the caption provider's downscaled copy (PIL, in the worker process, into
+the system temp directory on the boot volume). Anyone who can send the
+owner an iMessage chooses those bytes.
+
+- **`file` runs sandboxed.** In a task it runs under `sandbox-exec` with
+  the no-network, writes-only-in-the-work-directory profile, inside the
+  task's budget (wall clock, temp bytes, memory, output size), and within
+  its own time bound: 10 s for one path, 120 s for a batch, as before. The
+  task's work directory is now made before sniffing. The planner
+  (`imsg enrich --plan`) and S5a's enqueue hook run outside any task, so
+  they sniff in a scratch work directory under
+  `data_root/artifacts/enrich-work` (name starts with the process id, so
+  the worker's stale-directory sweep removes one left by a killed
+  process). The unsandboxed `real_sniff_mime` is gone.
+- **The scaled caption image is made by a sandboxed child process**
+  (`python -m imsg.enrich.caption_image_scaler`) inside the task's budget,
+  writing only in a directory inside the task's work directory, removed
+  after the caption. The same PIL steps run as before, so the scaled
+  image is the same. `CaptionProvider.caption` takes the task's budget as
+  a keyword; the pipeline always passes it (images and video frames).
+  Called without one (the model smoke test), the provider makes a
+  private budget in a fresh temp directory.
+- **Failures are recorded, not swallowed.** A sniff or scale past a
+  ceiling or its time bound is `UntrustedAttachmentError`, and the task is
+  recorded `failed` at once. A sandbox refusal of `file` is the sniff
+  failure it always was. A scaler that exits non-zero fails the caption
+  (`EnrichmentError`, retried) instead of showing the model the original.
+- **Tests.** New unit tests launch the real `sandbox-exec`: the sniffer's
+  and the scaler's commands are sandboxed in the right work directory, a
+  hung `file` is stopped at its bound and at the task's deadline, a write
+  outside the work directory is refused (the same command unsandboxed
+  does write), the scaler over the memory ceiling or past the deadline
+  fails the caption, and a scaled copy lands only in the work directory.
+  Two integration tests: `file` is in the every-decoder-is-sandboxed
+  check, and a hung sniffer fails its task permanently. All fail on the
+  previous code.
+
+No migration and no config change. Deploying needs only a restart of the
+enrichment workers; the planner and S5a's enqueue hook pick it up at
+their next start.
+
 ## 2026-09-26 — `imsg sync`'s segmentation and embedding wait while a search is running
 
 **Why.** The owner asked to "make the sync wait while a search is running

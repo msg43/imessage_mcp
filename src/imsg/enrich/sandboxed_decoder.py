@@ -2,8 +2,9 @@
 S5b, D6).
 
 Every decoder the enrichment pipeline shells out to (`pdfinfo`,
-`pdftotext`, `pdftoppm`, `ffprobe`, `ffmpeg`) reads bytes a stranger can
-choose: anyone who can send the owner an iMessage can send an attachment.
+`pdftotext`, `pdftoppm`, `ffprobe`, `ffmpeg`, and since 2026-09-29 the
+`file` MIME sniffer and the caption provider's image scaler) reads bytes
+a stranger can choose: anyone who can send the owner an iMessage can send an attachment.
 Each one runs:
 
 - **Under `sandbox-exec`**, with `TASK_SANDBOX_PROFILE`: no network at
@@ -24,8 +25,10 @@ Each one runs:
   than for each call), the bytes in the work directory
   (`temp_bytes_per_task`), the decoder's physical memory footprint
   (`max_decoder_memory_bytes`), and, where the caller keeps the decoder's
-  output, the size of that output. The first ceiling passed stops the
-  decoder with SIGKILL, which it cannot catch or ignore.
+  output, the size of that output. A caller may also give one call a
+  tighter time bound of its own (`max_seconds`; the MIME sniffer's 10 s).
+  The first ceiling passed stops the decoder with SIGKILL, which it
+  cannot catch or ignore.
 
 A ceiling hit is a typed permanent failure (`UntrustedAttachmentError`):
 the same file passes the same ceiling on every try, so it is recorded
@@ -55,7 +58,7 @@ from typing import IO, TYPE_CHECKING
 from imsg import constants
 from imsg.errors import EnrichmentError, UntrustedAttachmentError
 from imsg.host_memory import process_footprint_bytes
-from imsg.paths import is_contained_in, resolve_path
+from imsg.paths import is_contained_in, join_under_root, resolve_path
 
 if TYPE_CHECKING:
     from imsg.config.schema import EnrichmentLimits
@@ -90,6 +93,20 @@ DEFAULT_MAX_DECODER_MEMORY_BYTES = constants.DEFAULT_MAX_DECODER_MEMORY_BYTES
 module docstring for the measurements behind it)."""
 
 POLL_SECONDS = 0.05
+
+ENRICH_WORK_SUBDIR = Path("artifacts") / "enrich-work"
+
+
+def enrich_work_root(data_root: Path) -> Path:
+    """`<data_root>/artifacts/enrich-work`, where each task's work
+    directory is made; refused if it resolves outside `data_root` (an
+    `artifacts` symlink pointing elsewhere)."""
+    root = join_under_root(data_root, ENRICH_WORK_SUBDIR)
+    if not is_contained_in(root, data_root):
+        raise EnrichmentError(
+            f"the enrichment work directory '{root}' resolves outside data_root '{data_root}'"
+        )
+    return resolve_path(root)
 
 
 def directory_bytes(root: Path) -> int:
@@ -204,6 +221,31 @@ class DecoderBudget:
         return is_contained_in(path, self.work_dir)
 
 
+@contextlib.contextmanager
+def scratch_budget(
+    data_root: Path,
+    label: str,
+    *,
+    timeout_seconds: float,
+    max_temp_bytes: int,
+    max_memory_bytes: int = DEFAULT_MAX_DECODER_MEMORY_BYTES,
+) -> Iterator[DecoderBudget]:
+    """A budget for decoder work that belongs to no enrichment task (the
+    planner's MIME sniffing), with its own work directory under
+    `enrich_work_root(data_root)`, removed on exit. The directory name
+    starts with this process's id, so one left by a killed process is
+    removed by the next worker (`imsg.enrich.pipeline.sweep_stale_work_dirs`)."""
+    root = enrich_work_root(data_root)
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f"{os.getpid()}-{label}-", dir=root) as tmp:
+        yield DecoderBudget.start(
+            Path(tmp),
+            timeout_seconds=timeout_seconds,
+            max_temp_bytes=max_temp_bytes,
+            max_memory_bytes=max_memory_bytes,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class DecoderRun:
     """A decoder that ran to its own exit inside its budget."""
@@ -277,17 +319,20 @@ def run_decoder(
     subject: Path,
     stdout_name: str | None = None,
     max_stdout_bytes: int | None = None,
+    max_seconds: float | None = None,
 ) -> DecoderRun:
     """Run `argv` sandboxed, inside `budget` (module docstring), and
     return once it exits on its own.
 
     `stdout_name` is a file name in the work directory that receives the
     decoder's stdout; `None` discards it. `max_stdout_bytes` stops the
-    decoder once that file passes it. `name` and `subject` (the
-    attachment) only word the errors. Every ceiling is checked once more
+    decoder once that file passes it. `max_seconds` bounds this one call
+    below the task's deadline (a hit is the same typed failure). `name`
+    and `subject` (the attachment) only word the errors. Every ceiling is checked once more
     after the decoder exits, since the last burst of writing can land
     between two checks."""
     budget.check_deadline(f"{name} on '{subject}'")
+    call_deadline = None if max_seconds is None else budget.clock() + max_seconds
     work_dir = budget.work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     command = decoder_command(argv, work_dir)
@@ -323,6 +368,8 @@ def run_decoder(
                 subject=subject,
                 stdout_path=stdout_path,
                 max_stdout_bytes=max_stdout_bytes,
+                call_deadline=call_deadline,
+                max_seconds=max_seconds,
             )
         except BaseException:
             _stop(proc)
@@ -350,6 +397,8 @@ def _watch(
     subject: Path,
     stdout_path: Path | None,
     max_stdout_bytes: int | None,
+    call_deadline: float | None = None,
+    max_seconds: float | None = None,
 ) -> int:
     """Wait for `proc`, checking every ceiling each `POLL_SECONDS`; raise
     the first one passed (the caller stops the process). A footprint that
@@ -371,10 +420,13 @@ def _watch(
                 f"enrichment.limits.max_decoder_memory_bytes ({budget.max_memory_bytes})"
             )
         budget.check_deadline(doing)
+        if call_deadline is not None and budget.clock() > call_deadline:
+            raise UntrustedAttachmentError(f"{doing}: ran past its {max_seconds:g}s bound")
 
 
 __all__ = [
     "DEFAULT_MAX_DECODER_MEMORY_BYTES",
+    "ENRICH_WORK_SUBDIR",
     "MAX_DECODER_OUTPUT_BYTES",
     "POLL_SECONDS",
     "SANDBOX_EXEC",
@@ -384,6 +436,8 @@ __all__ = [
     "DecoderRun",
     "decoder_command",
     "directory_bytes",
+    "enrich_work_root",
     "resolve_executable",
     "run_decoder",
+    "scratch_budget",
 ]

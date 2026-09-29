@@ -11,6 +11,16 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-09-29 the MIME sniffer and the caption scaler run sandboxed
+(built, not yet deployed):** closes the QA review's last enrichment
+finding. `file` and the caption provider's downscaled copy now run under
+the same sandbox and per-task budget as every other decoder: no network,
+writes only in the task's work directory under `data_root`, and the
+task's time, temp-space and memory ceilings (`file` keeps its 10 s / 120 s
+bound). A hit fails that attachment's task. No migration and no config
+change; deploying needs only a restart of the enrichment workers. See
+`CHANGELOG.md`.
+
 **2026-09-26 the sync waits while a search is running (built, not yet
 deployed):** `imsg sync`'s segmentation waits before each boundary-model
 call and its embedding before each batch while any search is in flight

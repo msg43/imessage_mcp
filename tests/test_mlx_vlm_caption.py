@@ -5,7 +5,10 @@ network — plus the shipped `prompts/caption.txt`."""
 from __future__ import annotations
 
 import hashlib
+import os
+import subprocess
 import sys
+import time
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,12 +21,14 @@ from _model_runtime_stubs import block_module, install_hub_stub
 from imsg.enrich.mlx_vlm_caption import (
     CAPTION_TEMPERATURE,
     DEFAULT_CAPTION_PROMPT_PATH,
+    SCALER_MODULE,
     MlxVlmCaptionProvider,
     normalize_caption,
 )
 from imsg.enrich.model_runtime import ModelRuntimeUnavailableError
 from imsg.enrich.provider import CaptionProvider
-from imsg.errors import ConfigError, EnrichmentError
+from imsg.enrich.sandboxed_decoder import DecoderBudget
+from imsg.errors import ConfigError, EnrichmentError, UntrustedAttachmentError
 from imsg.hashing import sha256_text
 
 REPO = "example-org/vision-language-model-4bit"
@@ -464,3 +469,151 @@ def test_an_unreadable_image_goes_to_the_model_unchanged(vlm: VlmStub, image: Pa
 def test_a_non_positive_bound_is_rejected_at_construction() -> None:
     with pytest.raises(ConfigError):
         MlxVlmCaptionProvider(REPO, None, PROMPT, max_image_side=0)
+
+
+# --------------------------------------------------------------------------
+# The scaled copy is made by a separate process under the enrichment
+# sandbox, inside the task's budget, writing only in the task's work
+# directory (QA review 2026-09-24, fixed 2026-09-29).
+# --------------------------------------------------------------------------
+
+needs_sandbox = pytest.mark.skipif(
+    not Path("/usr/bin/sandbox-exec").exists(), reason="needs macOS sandbox-exec"
+)
+
+
+def _task_budget(tmp_path: Path, **overrides: Any) -> DecoderBudget:
+    settings: dict[str, Any] = {"timeout_seconds": 60, "max_temp_bytes": 2**30}
+    settings.update(overrides)
+    return DecoderBudget.start(tmp_path / "work", **settings)
+
+
+@pytest.fixture
+def launched(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    seen: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    class RecordingPopen(real_popen):  # type: ignore[valid-type,misc]
+        def __init__(self, args: Any, *rest: Any, **kwargs: Any) -> None:
+            seen.append([os.fspath(a) for a in args] if not isinstance(args, str) else [args])
+            super().__init__(args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", RecordingPopen)
+    return seen
+
+
+def _recording_paths(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Path, tuple[int, int]]]:
+    """A fake `mlx_vlm.generate` that records the path it is shown and
+    that image's size, while the image still exists."""
+    pil_image = pytest.importorskip("PIL.Image")
+    seen: list[tuple[Path, tuple[int, int]]] = []
+
+    def generate(*args: Any, **kwargs: Any) -> Any:
+        path = Path(kwargs["image"][0])
+        with pil_image.open(path) as img:
+            seen.append((path, img.size))
+        return SimpleNamespace(text="A blue rectangle.")
+
+    monkeypatch.setattr(sys.modules["mlx_vlm"], "generate", generate)
+    return seen
+
+
+@needs_sandbox
+def test_the_scaled_copy_is_made_sandboxed_inside_the_tasks_work_dir(
+    vlm: VlmStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launched: list[list[str]]
+) -> None:
+    seen = _recording_paths(monkeypatch)
+    photo = _photo(tmp_path / "photo", (4032, 3024))
+    budget = _task_budget(tmp_path)
+
+    MlxVlmCaptionProvider(REPO, None, PROMPT).caption(photo, budget=budget)
+
+    ((shown, size),) = seen
+    assert size == (1920, 1440)
+    assert budget.contains(shown), f"the scaled copy was written outside the work dir: {shown}"
+    (argv,) = [a for a in launched if SCALER_MODULE in a]
+    assert Path(argv[0]).name == "sandbox-exec", f"ran unsandboxed: {argv}"
+    assert argv[1:3] == ["-D", f"WORK_DIR={budget.work_dir}"]
+    assert argv[3] == "-p" and "(deny network*)" in argv[4] and "(deny file-write*)" in argv[4]
+    assert argv[5] == sys.executable
+    # Nothing is left behind in the work directory, and nothing was
+    # written anywhere else under the test's directory.
+    assert list(budget.work_dir.iterdir()) == []
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["photo", "work"]
+
+
+@needs_sandbox
+def test_the_scaler_cannot_write_outside_the_work_dir(
+    vlm: VlmStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scaler pointed at a path outside the work directory is refused by
+    the sandbox, and the caption fails rather than falling back to the
+    original. The same command unsandboxed does write there."""
+    import imsg.enrich.mlx_vlm_caption as caption_module
+
+    photo = _photo(tmp_path / "photo", (4032, 3024))
+    outside = tmp_path / "escaped.png"
+    real_command = caption_module.scaler_command
+    subprocess.run(real_command(photo, outside, 1920), check=True, capture_output=True)
+    assert outside.is_file(), "the probe cannot write even unsandboxed"
+    outside.unlink()
+    monkeypatch.setattr(
+        caption_module, "scaler_command", lambda image, _scaled, side: real_command(image, outside, side)
+    )
+
+    with pytest.raises(EnrichmentError, match="caption image scaler exited"):
+        MlxVlmCaptionProvider(REPO, None, PROMPT).caption(photo, budget=_task_budget(tmp_path))
+    assert not outside.exists()
+    assert vlm.generate_calls == []
+
+
+@needs_sandbox
+def test_a_scaler_over_the_memory_ceiling_fails_the_caption(
+    vlm: VlmStub, tmp_path: Path
+) -> None:
+    photo = _photo(tmp_path / "photo", (4032, 3024))
+    budget = _task_budget(tmp_path, max_memory_bytes=1024 * 1024)
+
+    with pytest.raises(UntrustedAttachmentError, match="max_decoder_memory_bytes"):
+        MlxVlmCaptionProvider(REPO, None, PROMPT).caption(photo, budget=budget)
+    assert vlm.generate_calls == []
+
+
+@needs_sandbox
+def test_a_scaler_past_the_tasks_deadline_is_stopped_and_fails_the_caption(
+    vlm: VlmStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import imsg.enrich.mlx_vlm_caption as caption_module
+
+    photo = _photo(tmp_path / "photo", (4032, 3024))
+    monkeypatch.setattr(caption_module, "scaler_command", lambda *_: ["/bin/sleep", "30"])
+    budget = _task_budget(tmp_path, timeout_seconds=0.5)
+
+    started = time.monotonic()
+    with pytest.raises(UntrustedAttachmentError, match="task_timeout_seconds"):
+        MlxVlmCaptionProvider(REPO, None, PROMPT).caption(photo, budget=budget)
+    assert time.monotonic() - started < 10
+    assert vlm.generate_calls == []
+
+
+@needs_sandbox
+def test_a_failed_scaler_fails_the_caption_instead_of_showing_the_original(
+    vlm: VlmStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import imsg.enrich.mlx_vlm_caption as caption_module
+
+    photo = _photo(tmp_path / "photo", (4032, 3024))
+    monkeypatch.setattr(caption_module, "scaler_command", lambda *_: ["/usr/bin/false"])
+
+    with pytest.raises(EnrichmentError, match="caption image scaler exited 1"):
+        MlxVlmCaptionProvider(REPO, None, PROMPT).caption(photo, budget=_task_budget(tmp_path))
+    assert vlm.generate_calls == []
+
+
+def test_a_scaled_copy_directory_outside_the_work_dir_is_refused(tmp_path: Path) -> None:
+    pytest.importorskip("PIL.Image")
+    from imsg.enrich.mlx_vlm_caption import bounded_image
+
+    photo = _photo(tmp_path / "photo", (4032, 3024))
+    with pytest.raises(EnrichmentError, match="outside the task's work directory"):
+        bounded_image(photo, 1920, budget=_task_budget(tmp_path), out_dir=tmp_path)

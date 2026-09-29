@@ -33,8 +33,10 @@ the provider makes its own private one and behaves exactly as before.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import re
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -42,8 +44,10 @@ from typing import Any
 import structlog
 
 from imsg.enrich.model_runtime import import_runtime_module
+from imsg.enrich.sandboxed_decoder import DecoderBudget, run_decoder
 from imsg.errors import ConfigError, EnrichmentError
 from imsg.hashing import sha256_text
+from imsg.paths import resolve_path
 from imsg.shared_vlm_runtime import (
     DEFAULT_ENRICHMENT_CACHE_LIMIT_BYTES,
     MLX_VLM_INSTALL_HINT,
@@ -121,29 +125,70 @@ def register_heif_opener() -> bool:
     return True
 
 
-def bounded_image(image_path: Path, max_side: int | None, work_dir: Path) -> Path:
+SCALER_MODULE = "imsg.enrich.caption_image_scaler"
+
+STANDALONE_TIMEOUT_SECONDS = 600
+STANDALONE_MAX_TEMP_BYTES = 1024**3
+"""The budget `caption` makes for itself when a caller outside the
+enrichment pipeline (the model smoke test) passes none."""
+
+
+def scaler_command(image_path: Path, scaled_path: Path, max_side: int) -> list[str]:
+    """The scaler's argv, before `run_decoder` wraps it in `sandbox-exec`.
+    `-P` keeps the work directory (its current directory) off the
+    child's module search path."""
+    return [
+        sys.executable,
+        "-P",
+        "-m",
+        SCALER_MODULE,
+        str(image_path),
+        str(scaled_path),
+        str(max_side),
+    ]
+
+
+def bounded_image(
+    image_path: Path, max_side: int | None, *, budget: DecoderBudget, out_dir: Path
+) -> Path:
     """The image the model should be shown: `image_path` itself when it
     already fits within `max_side` pixels (or there is no bound), else a
-    scaled copy in `work_dir` — aspect ratio kept, EXIF orientation
+    scaled copy in `out_dir` — aspect ratio kept, EXIF orientation
     applied first (the model's loader applies it to whatever it opens, so
     a copy must carry it already applied). An image PIL cannot open is
     passed through unchanged; the model's own loader then reports it as
-    that task's failure, exactly as before."""
+    that task's failure, exactly as before.
+
+    The attachment is opened and scaled in a separate process
+    (`imsg.enrich.caption_image_scaler`) run sandboxed inside `budget`
+    (`imsg.enrich.sandboxed_decoder`): no network, writes only inside the
+    task's work directory, which must contain `out_dir`, and the task's
+    ceilings. A ceiling hit raises `UntrustedAttachmentError`; a scaler
+    that fails or is refused by the sandbox raises `EnrichmentError`."""
     if max_side is None:
         return image_path
-    pil_image = import_runtime_module("PIL.Image", install_hint=_INSTALL_HINT)
-    pil_ops = import_runtime_module("PIL.ImageOps", install_hint=_INSTALL_HINT)
-    try:
-        with pil_image.open(image_path) as img:
-            if max(img.size) <= max_side:
-                return image_path
-            upright = pil_ops.exif_transpose(img).convert("RGB")
-    except (OSError, ValueError, SyntaxError, pil_image.DecompressionBombError):
-        return image_path
-    upright.thumbnail((max_side, max_side), pil_image.Resampling.LANCZOS)
-    scaled = work_dir / "caption-input.png"
-    upright.save(scaled, "PNG")
-    return scaled
+    # PIL is needed in the scaler; a missing one is an environment problem.
+    import_runtime_module("PIL.Image", install_hint=_INSTALL_HINT)
+    if not budget.contains(out_dir):
+        raise EnrichmentError(
+            f"the scaled caption image's directory '{out_dir}' is outside the task's "
+            f"work directory '{budget.work_dir}'"
+        )
+    scaled = resolve_path(out_dir) / "caption-input.png"
+    run = run_decoder(
+        scaler_command(image_path, scaled, max_side),
+        budget=budget,
+        name="caption-scaler",
+        subject=image_path,
+    )
+    if run.returncode != 0:
+        raise EnrichmentError(
+            f"the caption image scaler exited {run.returncode} on '{image_path}': "
+            f"{run.stderr_tail()}"
+        )
+    with contextlib.suppress(OSError):
+        run.stderr_path.unlink()
+    return scaled if scaled.is_file() else image_path
 
 
 class MlxVlmCaptionProvider:
@@ -209,7 +254,13 @@ class MlxVlmCaptionProvider:
         `ModelRuntimeUnavailableError`, not a per-task failure."""
         return self._runtime.acquire(self.model_repo, self.revision)
 
-    def caption(self, image_path: Path) -> str:
+    def caption(self, image_path: Path, *, budget: DecoderBudget | None = None) -> str:
+        """Caption `image_path`. An image over `max_image_side` is scaled
+        first by a sandboxed process inside `budget`, the task's
+        (`bounded_image`); the scaled copy lives in a directory inside
+        the budget's work directory, removed before this returns. Passed
+        no budget (a caller outside the pipeline), the provider makes a
+        private one in a fresh temporary directory."""
         if not image_path.is_file():
             raise EnrichmentError(f"caption input is not a file: '{image_path}'")
         mlx_vlm = import_runtime_module("mlx_vlm", install_hint=_INSTALL_HINT)
@@ -218,8 +269,18 @@ class MlxVlmCaptionProvider:
             register_heif_opener()
             self._heif_checked = True
         loaded = self._load()
-        with tempfile.TemporaryDirectory(prefix="imsg-caption-") as tmp:
-            shown = bounded_image(image_path, self.max_image_side, Path(tmp))
+        with contextlib.ExitStack() as stack:
+            if budget is None:
+                standalone = stack.enter_context(tempfile.TemporaryDirectory(prefix="imsg-caption-"))
+                budget = DecoderBudget.start(
+                    Path(standalone),
+                    timeout_seconds=STANDALONE_TIMEOUT_SECONDS,
+                    max_temp_bytes=STANDALONE_MAX_TEMP_BYTES,
+                )
+            out_dir = Path(
+                stack.enter_context(tempfile.TemporaryDirectory(prefix="caption-", dir=budget.work_dir))
+            )
+            shown = bounded_image(image_path, self.max_image_side, budget=budget, out_dir=out_dir)
             try:
                 # `enable_thinking=False`: rendered against the pinned Qwen3.5
                 # repo's chat_template.jinja (2026-09-14) it closes an empty
@@ -257,8 +318,10 @@ __all__ = [
     "CAPTION_TEMPERATURE",
     "DEFAULT_CAPTION_MAX_IMAGE_SIDE",
     "DEFAULT_CAPTION_PROMPT_PATH",
+    "SCALER_MODULE",
     "MlxVlmCaptionProvider",
     "bounded_image",
     "normalize_caption",
     "register_heif_opener",
+    "scaler_command",
 ]

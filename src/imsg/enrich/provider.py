@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from imsg.enrich.sandboxed_decoder import DecoderBudget
 
 
 class OcrProvider(Protocol):
@@ -33,9 +36,12 @@ class OcrProvider(Protocol):
 class CaptionProvider(Protocol):
     model_id: str
 
-    def caption(self, image_path: Path) -> str:
+    def caption(self, image_path: Path, *, budget: DecoderBudget | None = None) -> str:
         """Describe an image's content (SPEC §4.1: local VLM, fixed
-        prompt `prompts/caption.txt`, temperature 0)."""
+        prompt `prompts/caption.txt`, temperature 0). `budget` is the
+        enrichment task's: any decoding of the image before the model
+        sees it runs sandboxed inside it (`imsg.enrich.sandboxed_decoder`).
+        The pipeline always passes it."""
         ...
 
 
@@ -63,7 +69,7 @@ class FakeOcrProvider:
 class FakeCaptionProvider:
     model_id = "fake/caption@test"
 
-    def caption(self, image_path: Path) -> str:
+    def caption(self, image_path: Path, *, budget: DecoderBudget | None = None) -> str:
         return _deterministic_text("caption", image_path)
 
 
