@@ -96,6 +96,15 @@ suite (2,359 passed, 707 skipped). Its optional type check reports 215 errors in
 56 files; the green workflow does not establish a clean type check. These source
 checks close the CI repair, not the outstanding host/runtime gates.
 
+**Type-check triage:** review of that actual CI output assigns 176 errors to
+tests, 29 to scripts and ten to two unrelated optional Google integration modules.
+No error names a changed production module or `scripts/doctor.py`. The 34 errors
+in changed test files concern fixture/annotation inference and typing interfaces;
+they must not all be labelled preexisting. Inspection of the plausible runtime
+cases found the expected attributes and populated values. No reproducible product
+defect was established, so this remains nonblocking typing debt rather than a
+diagnosis of the live sync failure.
+
 Grounded bug/security fixes found along this path are authorized. Larger features
 belong in the existing roadmap as ownership questions with supporting evidence,
 scope and dependencies. Evaluation and external-exposure gates remain in force.

@@ -4,6 +4,9 @@
 
 - Actual Python 3.12 CI passes 2,359 tests with 707 skipped, plus Ruff and the
   public-data check. The optional type check still reports 215 errors in 56 files.
+- Independent triage finds no error in the changed production code or doctor
+  script and no confirmed runtime defect. Changed test files retain typing debt;
+  no claim is made that every reported error predates this work.
 - Read-only desktop inspection confirms Remote Login and remote-user full disk
   access are already enabled. SSH still fails before authentication; HTTP
   responses establish liveness only. Current sync evidence and caption queue
