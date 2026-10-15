@@ -1,8 +1,7 @@
 """MCP tool-call handlers (SPEC §10.2): each function takes
 already-JSON-Schema-validated arguments and returns a JSON-serializable
 dict, or raises an `imsg.retrieval.RetrievalError` — mapped to the
-SPEC §10.1 error model by `imsg.mcp.tools.dispatch`, not here. Four of
-the five are thin adapters over `imsg.retrieval.RetrievalService`;
+SPEC §10.1 error model by `imsg.mcp.tools.dispatch`, not here. The retrieval tools are thin adapters over `imsg.retrieval.RetrievalService`;
 `check_permissions` is diagnostics, not retrieval, so it is
 implemented directly against `imsg.diagnostics` plus the sync/watermark
 state those pipeline stages now write (SPEC §10.2's `check_permissions`
@@ -34,6 +33,7 @@ def search_messages(
 ) -> dict[str, Any]:
     result = service.search_messages(
         context,
+        **({"mode": params["mode"]} if params.get("mode") in {"keyword", "hybrid"} else {}),
         query=params["query"],
         people=params.get("people"),
         after=params.get("after"),
@@ -58,6 +58,19 @@ def get_conversation(
         thread_id=params["thread_id"],
         anchor=params.get("anchor"),
         window=int(params.get("window", 20)),
+    )
+
+
+def get_recent_messages(
+    service: RetrievalService, context: AccessContext, params: dict[str, Any]
+) -> dict[str, Any]:
+    return service.get_recent_messages(
+        context,
+        people=params.get("people"),
+        thread_id=params.get("thread_id"),
+        after=params.get("after"),
+        before=params.get("before"),
+        limit=int(params.get("limit", 20)),
     )
 
 

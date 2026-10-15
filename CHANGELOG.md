@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## 2026-10-15 — Reconcile availability with current retrieval and secret handling
+
+- Selectively integrate the published availability/doctor deltas after checking
+  current implementation. Keep pooled parallel channels, caller authorization,
+  search priority, admission and sandbox behavior. Explicit keyword fallback and
+  basic/recent reads can run without models; default hybrid search remains explicit
+  about unavailable models. The separate segmentation experiment is not included.
+- Doctor resolves configured secrets with bounded connection and Keychain stages.
+  Astra reproduced an unbounded Keychain subprocess, added its timeout, and checked
+  that timeout errors cannot reveal partial secret output. Ordinary secret callers
+  retain their prior defaults.
+- Independent Astra ultra QA passes 359 focused tests and 57 real synthetic
+  PostgreSQL/SQLite tests. Ruff, diff and public-data checks pass with zero hard
+  findings. Host SSH resets before authentication; sync exit 1 and caption-impact
+  measurements remain tracked open. No deployment, scheduling or corpus change ran.
+
 ## 2026-10-15 — Pending source is published before independent reconciliation
 
 - Availability changes `85ed3dd` and doctor fix `c8f57a5` are pushed on their

@@ -294,7 +294,7 @@ def test_tools_list_is_answered_while_the_models_are_still_loading(
         with anyio.fail_after(1.0):
             return await harness.server.on_list_tools(cast(Any, None), None)
 
-    assert len(anyio.run(main).tools) == 4
+    assert len(anyio.run(main).tools) == 5
     assert harness.warm_up.status().phase is WarmUpPhase.WARMING
     harness.release.set()
 
@@ -332,7 +332,7 @@ def test_the_event_loop_keeps_answering_while_a_tool_call_waits(
     finished: list[str] = []
 
     async def waiting_call() -> None:
-        await harness.call("search_messages", {"query": "kite festival"})
+        await harness.call("search_messages", {"mode": "hybrid", "query": "kite festival"})
         finished.append("search_messages")
 
     async def main() -> None:
@@ -362,7 +362,7 @@ def test_a_tool_call_during_warm_up_waits_for_it_then_succeeds(
     timer.start()
 
     began = time.monotonic()
-    result = anyio.run(harness.call, "search_messages", {"query": "kite festival"})
+    result = anyio.run(harness.call, "search_messages", {"mode": "hybrid", "query": "kite festival"})
     waited = time.monotonic() - began
     timer.join()
 
@@ -380,7 +380,7 @@ def test_a_tool_call_that_outwaits_the_bound_gets_a_retryable_warming_up_error(
     harness.warm_up.start()
 
     began = time.monotonic()
-    result = anyio.run(harness.call, "search_messages", {"query": "kite festival"})
+    result = anyio.run(harness.call, "search_messages", {"mode": "hybrid", "query": "kite festival"})
     waited = time.monotonic() - began
 
     assert result.is_error
@@ -401,7 +401,7 @@ def test_a_tool_call_that_outwaits_the_bound_gets_a_retryable_warming_up_error(
 
     harness.release.set()
     assert harness.warm_up.wait(timeout=5).phase is WarmUpPhase.READY
-    retried = anyio.run(harness.call, "search_messages", {"query": "kite festival"})
+    retried = anyio.run(harness.call, "search_messages", {"mode": "hybrid", "query": "kite festival"})
     assert not retried.is_error, text_of(retried)
 
 
@@ -449,9 +449,8 @@ def test_a_failed_warm_up_is_reported_on_every_subsequent_request(
     assert harness.warm_up.wait(timeout=5).phase is WarmUpPhase.FAILED
 
     for name, arguments in [
-        ("search_messages", {"query": "kite festival"}),
-        ("list_people", {}),
-        ("search_messages", {"query": "deck rebuild"}),
+        ("search_messages", {"mode": "hybrid", "query": "kite festival"}),
+        ("search_messages", {"mode": "hybrid", "query": "deck rebuild"}),
     ]:
         began = time.monotonic()
         result = anyio.run(harness.call, name, arguments)
@@ -463,7 +462,7 @@ def test_a_failed_warm_up_is_reported_on_every_subsequent_request(
         assert "restart the MCP server" in message
 
     assert harness.service.calls == []  # nothing served on half-loaded models
-    assert [row.error for row in harness.audit.snapshot()] == ["WARM_UP_FAILED"] * 3
+    assert [row.error for row in harness.audit.snapshot()] == ["WARM_UP_FAILED"] * 2
     assert sum("FAILED" in line for line in harness.log) == 1  # logged once, not per call
 
 
@@ -548,7 +547,7 @@ def test_a_foreign_subject_is_rejected_at_the_dispatcher_during_warm_up_too(
     for authorization in [bearer(OTHER_TOKEN), "Bearer nonsense", ""]:
         result = anyio.run(
             lambda auth=authorization: harness.call(  # type: ignore[misc]
-                "search_messages", {"query": "kite festival"}, authorization=auth
+                "search_messages", {"mode": "hybrid", "query": "kite festival"}, authorization=auth
             )
         )
         assert result.is_error
@@ -737,3 +736,33 @@ def test_an_aged_estimate_never_goes_negative(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert "about 1 s remaining" in read_warm_up_readiness(tmp_path).detail
+
+
+def test_public_explicit_keyword_search_offline_is_labeled_and_still_authorized(model_thread):
+    harness=Harness(model_thread,wait_seconds=0)
+    result=anyio.run(harness.call,'search_messages',{'query':'kite', 'mode':'keyword'})
+    assert not result.is_error
+    assert text_of(result).startswith('MODELS OFFLINE — KEYWORD-ONLY RESULTS.')
+    assert result.structured_content['degraded'] is True
+    assert result.structured_content['search_mode']=='keyword'
+    assert len(harness.audit.snapshot())==1
+
+
+def test_offline_search_never_discloses_results_or_status_to_another_subject(model_thread):
+    harness = Harness(model_thread, wait_seconds=0)
+    async def call():
+        return await harness.call('search_messages', {'query':'kite','mode':'keyword'}, authorization=bearer(OTHER_TOKEN))
+    result = anyio.run(call)
+    assert result.is_error
+    assert result.structured_content is None
+    assert 'MODELS OFFLINE' not in text_of(result)
+    assert harness.service.calls == []
+
+
+def test_public_default_search_has_no_automatic_keyword_fallback(model_thread):
+    harness = Harness(model_thread, wait_seconds=0)
+    result = anyio.run(harness.call, 'search_messages', {'query':'kite'})
+    assert result.is_error
+    assert text_of(result).startswith('WARMING_UP')
+    assert result.structured_content is None
+    assert harness.service.calls == []

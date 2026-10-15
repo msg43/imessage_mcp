@@ -269,6 +269,8 @@ def _assert_denied_everywhere(
     assert _served_by_conversation(service, control)
     assert not _served_by_conversation(service, denied)
     assert _served_by_search(service) == {control.thread_key}
+    assert {m["thread_key"] for m in service.get_recent_messages(PUBLIC)["messages"]} == {control.thread_key}
+    assert {r["thread_key"] for r in service.search_messages(PUBLIC, query=NEEDLE, mode="keyword").results} == {control.thread_key}
     assert eligible_chat_ids(db) == {control.chat_id}
 
 
@@ -572,6 +574,11 @@ def test_conversation_withholds_attachment_content_the_gate_denies(
     assert "beach.jpg" not in public
     assert WITHHELD in public
     assert "site survey sketch" in public
+    recent = str(service.get_recent_messages(PUBLIC, thread_id=group.thread_key))
+    assert "weekend beach photo" not in recent
+    assert "beach.jpg" not in recent
+    assert WITHHELD in recent
+    assert "site survey sketch" in recent
 
     local = _conversation_text(service, LOCAL_FULL_ACCESS, group)
     assert "weekend beach photo" in local
@@ -664,6 +671,12 @@ def test_allowlist_never_serves_unsent_messages_or_edit_history(
     assert "retracted wording" not in str(hit["text"])
     assert "first draft wording" not in str(hit["text"])
 
+    recent = str(service.get_recent_messages(PUBLIC, thread_id=dm.thread_key))
+    assert "retracted wording" not in recent
+    assert "first draft wording" not in recent
+    keyword = str(service.search_messages(PUBLIC, query=NEEDLE, mode="keyword").results)
+    assert "retracted wording" not in keyword
+    assert "first draft wording" not in keyword
     local_conversation = _conversation_text(service, LOCAL_FULL_ACCESS, dm)
     assert "retracted wording" in local_conversation
     assert "first draft wording" in local_conversation

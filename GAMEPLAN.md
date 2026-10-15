@@ -23,6 +23,29 @@ source is present. The timer's last exit was `1`; its cause remains undiagnosed.
 Historical local-schema and undeployed-status paragraphs below retain their
 original dates and must not override the newer component-specific evidence.
 
+**October 15 follow-up:** the implementation agent inspected current code and
+selectively reconciled the availability and doctor changes with current main.
+Explicit keyword fallback and basic/recent reads preserve existing authorization,
+pooled parallel retrieval, model admission and search priority. Default hybrid
+search still reports model unavailability rather than silently changing meaning.
+The doctor uses the configured secret resolver and bounds connection/Keychain
+waits without displaying partial secret output. Publication is not deployment.
+
+### Open bugs and deferred scheduling decisions
+
+- [ ] **Unattended sync exit 1:** diagnosis remains open. October 15 SSH attempts
+  reset before authentication, so current deployed logs, configuration, watermarks
+  and persisted results could not be inspected. This is an access failure, not a
+  diagnosed sync cause. Keep intentional pause and resource reservations intact.
+  Close only after isolating the cause and checking a later run's real output.
+- [ ] **Caption scheduling and image scope:** retain the owner's deferred choices.
+  Current queue composition, throughput, search latency and combined memory must
+  be measured before recommending a schedule or completion estimate. Existing
+  routing includes raster previews/favicons; historical measurements are not a
+  current queue forecast. No schedule or bulk-enrichment change has run.
+
+### Authorized work status
+
 - [ ] **Diagnose unattended sync:** inspect the actual deployed configuration,
   stage logs, watermarks and persisted results. Distinguish failure, memory
   deferral and intentional pause. Reuse existing stage diagnostics, isolate any
@@ -34,19 +57,26 @@ original dates and must not override the newer component-specific evidence.
   throughput, search latency and memory separately from completion estimates
   for scheduling/scope alternatives. Do not change the schedule or start bulk
   enrichment; preserve any intentional shared-host pause.
-- [ ] **Reconcile pending source:** port only verified deltas from the published
+- [x] **Reconcile pending source:** port only verified deltas from the published
   availability and doctor branches onto current main. Preserve authorization,
   privacy, sandboxing, model admission and search-priority behavior. Run focused
   tests and the public-data check before publishing integrated code.
-- [ ] **Independent QA:** `gpt-6.1-sol` performs this work; `gpt-6-astra` at ultra
-  reasoning reviews the diagnosis, actual diff, deployed assumptions and results.
-  Root owns shared docs and final landing. Initial sync-investigation estimate:
-  30–60 minutes, excluding host/model waits; caption runtime is measured before
-  giving a completion estimate.
+- [x] **Independent QA:** `gpt-6.1-sol` implementation and `gpt-6-astra` ultra
+  review are complete. Astra passes 359 focused tests and 57 real synthetic
+  PostgreSQL/SQLite retrieval, allowlist and concurrency tests. The public-data
+  scan has zero hard findings and 34 reviewed warnings for changed source; Ruff
+  and diff checks pass. QA added the bounded Keychain probe after reproducing its
+  missing timeout. Keychain and connection waits are separately bounded; this
+  does not promise a total timeout for all diagnostic queries. Runtime sync and
+  scheduling checks remain access-blocked above; no deployment has run.
 
 Grounded bug/security fixes found along this path are authorized. Larger features
 belong in the existing roadmap as ownership questions with supporting evidence,
 scope and dependencies. Evaluation and external-exposure gates remain in force.
+The preserved alternative segmentation experiment is an ownership question:
+should it receive a separate quality/throughput evaluation before any algorithm
+change? It is excluded from this availability integration; no benchmark result
+has established that it improves the production corpus.
 
 **2026-09-29 the MIME sniffer and the caption scaler run sandboxed
 (built, not yet deployed):** closes the QA review's last enrichment

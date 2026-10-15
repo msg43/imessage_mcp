@@ -44,30 +44,12 @@ unauthenticated or malformed request reaches a tool handler.
 **Serving before the models are warm.** The models load in the
 background (`imsg.retrieval.background_warm_up`), started by
 `imsg mcp public` at process start; the transport binds and answers
-without waiting for them. Only the four retrieval tools are gated on the
-warm-up: such a call waits for it — with `anyio.sleep`, so the event
-loop keeps answering everything else — for at most
-`TOOL_CALL_WARM_UP_WAIT_SECONDS`, then gets a retryable `WARMING_UP`
-tool error carrying an estimate; a warm-up that failed turns every
-retrieval call into `WARM_UP_FAILED` naming the cause, so a process that
-came back up with half its models loaded says so instead of serving.
-Both are ordinary tool errors (`isError: true` with the machine code on
-the first line), and both keep their own code in `mcp_audit` rather than
-collapsing to `INTERNAL` — `imsg.mcp.audit.ALLOWED_ERROR_CODES` lists
-them. Restarts are the normal case here, not the exception: the launchd
-agent is `KeepAlive`, so every crash is followed by another cold load.
-
-A load the host has no memory for is not started (`imsg.memory_admission`):
-the warm-up waits in `memory_busy`, retrieval calls get `WARMING_UP` with a
-"host memory busy" message in numbers only, and the server tries the load
-again by itself every `memory.admission_retry_seconds`
-(`imsg.retrieval.idle_unload.PressureRelease`, `rewarm`). Background work
-gives way to it meanwhile: it starts no model load and stops after its
-current unit of work, and what background jobs were promised stops
-counting against this server after `memory.background_yield_seconds`
-(`imsg.memory_admission.LiveServerAdmission`). That answer comes from the
-same place as every other tool error, inside `gate.dispatch`, so an
-unauthenticated request never learns the host's state.
+without waiting for them. Only model-using search calls wait for readiness,
+within `TOOL_CALL_WARM_UP_WAIT_SECONDS`. Explicit hybrid mode reports
+`WARMING_UP` or `WARM_UP_FAILED` when unavailable. Hybrid is the default;
+keyword-only results require an explicit user request. Conversation, recent-message, people and stored attachment
+reads need no models. Every outcome still passes through `gate.dispatch`, so
+neither content nor model status is disclosed without authorization.
 
 That the warm-up wait sits *outside* `gate.dispatch` — the one thing in
 this module that is ordered differently from the security layers above —
@@ -148,6 +130,7 @@ from imsg.mcp.tools.schemas import (
     PUBLIC_TOOL_DEFINITIONS_BY_NAME,
     ToolDefinition,
 )
+from imsg.mcp.tools.search_status import annotate_search, needs_models, search_arguments
 from imsg.mcp.transport import RawHeaders, find_duplicate_header, validate_host, validate_origin
 from imsg.retrieval.access import AccessContext
 from imsg.retrieval.access import Scope as AccessScope
@@ -232,6 +215,7 @@ _RETRIEVAL_HANDLERS: dict[
     str, Callable[[RetrievalService, AccessContext, dict[str, Any]], dict[str, Any]]
 ] = {
     "search_messages": handlers.search_messages,
+    "get_recent_messages": handlers.get_recent_messages,
     "get_conversation": handlers.get_conversation,
     "list_people": handlers.list_people,
     "get_attachment_text": handlers.get_attachment_text,
@@ -416,7 +400,7 @@ class PublicMcpServer:
         context = AccessContext(surface="public", scope=self.scope, subject=authorized.subject)
         tool_fn = _RETRIEVAL_HANDLERS[name]
         try:
-            if warm_up is not None:
+            if warm_up is not None and needs_models(name, arguments, warm_up):
                 # `WARMING_UP` / `WARM_UP_FAILED` are `RetrievalError`s, so
                 # they take the same route out as any other SPEC §10.1
                 # outcome: their own machine code in the tool error and in
@@ -426,7 +410,10 @@ class PublicMcpServer:
                 warm_up.raise_unless_ready(
                     wait_bound_seconds=self.warm_up_wait_seconds, public=True
                 )
-            payload = tool_fn(self.service, context, arguments)
+            effective = search_arguments(arguments, warm_up) if name == "search_messages" else arguments
+            payload = tool_fn(self.service, context, effective)
+            if name == "search_messages":
+                payload = annotate_search(payload, effective, warm_up)
         except RetrievalError as exc:
             return _ToolCallOutcome(payload=None, error_code=exc.code, error_message=str(exc))
         return _ToolCallOutcome(payload=payload, error_code=None, error_message=None)
@@ -443,13 +430,13 @@ class PublicMcpServer:
         # schema — is answered without waiting: no amount of warming makes
         # it valid. Everything else needs the models, so it waits for them
         # here, off the event loop, before the (synchronous) dispatch.
-        warm_up: WarmUpStatus | None = None
+        warm_up = self.warm_up.status() if self.warm_up is not None else None
         valid = _invalid_argument(name, arguments) is None
         # A valid call is registered with the idle unloader from before it
         # waits until the dispatch returns — or it is cancelled — so the
         # models are never dropped mid-call.
-        with self._retrieval_call() if valid else contextlib.nullcontext():
-            if valid:
+        with self._retrieval_call() if valid and needs_models(name, arguments, warm_up) else contextlib.nullcontext():
+            if valid and needs_models(name, arguments, warm_up):
                 warm_up = await self._settled_warm_up()
 
             def handler(authorized: AuthorizedRequest) -> ToolOutcome[_ToolCallOutcome]:
@@ -519,7 +506,7 @@ class PublicMcpServer:
 
         payload = outcome.payload or {}
         return types.CallToolResult(
-            content=[types.TextContent(type="text", text=json.dumps(payload, default=str))],
+            content=[types.TextContent(type="text", text=(str(payload["warning"]) + "\n\n" if payload.get("warning") else "") + json.dumps(payload, default=str))],
             structured_content=payload,
             is_error=False,
         )

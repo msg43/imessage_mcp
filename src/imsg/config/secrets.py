@@ -82,11 +82,14 @@ class SecretRef:
             return cls(kind="file", name=m.group("name"), raw=value)
         raise ValueError(_FORMAT_ERROR)
 
-    def resolve(self) -> str:
+    def resolve(self, *, timeout: float | None = None) -> str:
         """Resolve to the actual secret value.
 
         Callers must never log, print, or include the return value in an
         error message or exception.
+
+        `timeout`, when supplied by a diagnostic, bounds the Keychain
+        subprocess. Ordinary callers retain the existing unbounded wait.
         """
         if self.kind == "env":
             value = os.environ.get(self.name)
@@ -98,7 +101,7 @@ class SecretRef:
             return value
         if self.kind == "file":
             return self._resolve_file()
-        return self._resolve_keychain()
+        return self._resolve_keychain(timeout=timeout)
 
     def _resolve_file(self) -> str:
         # Open first, then check the opened file: checking the path and
@@ -173,7 +176,7 @@ class SecretRef:
             )
         return value
 
-    def _resolve_keychain(self) -> str:
+    def _resolve_keychain(self, *, timeout: float | None = None) -> str:
         try:
             proc = subprocess.run(
                 [
@@ -188,7 +191,14 @@ class SecretRef:
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=timeout,
             )
+        except subprocess.TimeoutExpired:
+            # TimeoutExpired may carry partial stdout containing the secret.
+            # Never expose it through a diagnostic or an exception chain.
+            raise SecretResolutionError(
+                f"Keychain item '{self.name}' resolution timed out"
+            ) from None
         except FileNotFoundError as exc:
             raise SecretResolutionError(
                 "the 'security' CLI is not available — Keychain secrets can only "

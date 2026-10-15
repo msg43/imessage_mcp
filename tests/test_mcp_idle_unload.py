@@ -144,7 +144,7 @@ class Harness:
         self.model_thread.run(lambda: None)
 
     async def search(self) -> types.CallToolResult:
-        params = types.CallToolRequestParams(name="search_messages", arguments={"query": "kites"})
+        params = types.CallToolRequestParams(name="search_messages", arguments={"mode": "hybrid", "query": "kites"})
         return await self.server.on_call_tool(cast(Any, None), params)
 
 
@@ -606,7 +606,7 @@ def test_stdin_eof_while_a_call_waits_for_the_models_exits_the_server(
     wait."""
     proc = _start_child(tmp_path, *idle_args)
     _initialize(proc)
-    call = {"name": "search_messages", "arguments": {"query": "kite festival"}}
+    call = {"name": "search_messages", "arguments": {"mode": "hybrid", "query": "kite festival"}}
     _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": call})
     time.sleep(0.5)  # the call is now waiting on the held warm-up
     assert proc.poll() is None
