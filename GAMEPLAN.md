@@ -13,9 +13,10 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 **Authorized work, October 15:** pending availability changes are committed and
 pushed as `85ed3dd` on `codex/october-availability`; the configured-credential
-doctor fix is `c8f57a5` on `codex/doctor-config-credentials`. Both require selective
-integration with current main, including its existing sandbox, search-priority
-and secret-file support. Neither branch publication establishes deployment.
+doctor fix is `c8f57a5` on `codex/doctor-config-credentials`. Their reviewed deltas
+are now integrated on main in `c056cb5`, preserving its sandbox, search-priority
+and secret-file support. The original branches remain preserved. This source
+publication does not establish deployment.
 
 **October 14 deployment evidence:** the deployed schema contains
 `message.deleted_at`, migrations match deployed source, and memory-protection
