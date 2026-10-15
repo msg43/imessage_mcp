@@ -180,7 +180,7 @@ def message_details(
                    coalesce(er.finished_at, er.started_at)
             FROM message_source ms JOIN extraction_run er ON er.run_id = ms.extraction_run_id
             WHERE ms.message_id = %s
-            ORDER BY (er.merge_mode = 'live') DESC NULLS LAST, ms.source_name
+            ORDER BY (er.merge_mode = 'live') DESC NULLS LAST, ms.source_name, ms.source_rowid
             """,
             (message_id,),
         )
@@ -191,7 +191,7 @@ def message_details(
         cur.execute(
             """
             SELECT a.filename, a.mime_type, a.byte_size, a.sha256, a.state::text,
-                   coalesce(array_agg(s.source_name ORDER BY s.source_name)
+                   coalesce(array_agg(DISTINCT s.source_name ORDER BY s.source_name)
                             FILTER (WHERE s.source_name IS NOT NULL), '{}')
             FROM message_attachment ma
             JOIN attachment a ON a.attachment_id = ma.attachment_id

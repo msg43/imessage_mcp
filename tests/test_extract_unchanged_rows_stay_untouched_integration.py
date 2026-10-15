@@ -343,13 +343,13 @@ _TRACKED_TABLES: dict[str, tuple[str, ...]] = {
     "source_handle": ("raw_value", "service"),
     "chat_participant_source": ("chat_id", "source_handle_id"),
     "message": ("source_guid",),
-    "message_source": ("source_name", "source_rowid"),
+    "message_source": ("message_id", "source_name", "source_rowid"),
     "message_version": ("message_id", "version_idx"),
     "message_attachment": ("message_id", "attachment_id"),
     "tapback": ("source_guid",),
     "link_preview": ("message_id", "url"),
     "attachment": ("source_guid",),
-    "attachment_source": ("source_name", "source_rowid"),
+    "attachment_source": ("attachment_id", "source_name", "source_rowid"),
 }
 
 

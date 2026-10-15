@@ -30,8 +30,11 @@ from chatdb_fixture import (
 )
 from imsg.backfill.classify import NO_SOURCE_PATH_ERROR
 from imsg.db.migrations import PostgresMigrationRunner
+from imsg.search_page.cases import message_items
+from imsg.search_page.details import message_details
 from imsg.stages.extract import (
     ExtractResult,
+    MergeMode,
     parse_link_preview,
     run_extract,
 )
@@ -83,7 +86,7 @@ def pg_conn() -> Iterator[psycopg.Connection]:
     finally:
         admin.close()
 
-    conn = psycopg.connect(_dsn(TEST_DB_NAME))
+    conn = psycopg.connect(_dsn(TEST_DB_NAME), autocommit=True)
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     conn.commit()
     runner = PostgresMigrationRunner(conn, REAL_MIGRATIONS_DIR)
@@ -282,6 +285,197 @@ def test_run_extract_is_idempotent(pg_conn: psycopg.Connection, tmp_path: Path) 
         assert cur.fetchone() == (1,)
         cur.execute("SELECT count(*) FROM chat")
         assert cur.fetchone() == (1,)
+
+
+def _extract_provenance_rows(
+    conn: psycopg.Connection,
+    tmp_path: Path,
+    label: str,
+    rows: list[tuple[str, int]],
+    *,
+    mode: MergeMode = MergeMode.SEED,
+    source_name: str = "mini",
+    attachment_rows: list[tuple[str, int]] | None = None,
+) -> ExtractResult:
+    builder = ChatDbBuilder()
+    chat = builder.add_chat(FixtureChat(guid="chat-provenance"))
+    # Rescan even a reused rowid below the watermark. This exercises the
+    # actual reader, canonical-message upsert and provenance writer.
+    edited_at = datetime.now(UTC) + timedelta(days=1)
+    for guid, rowid in rows:
+        builder.add_message(
+            FixtureMessage(guid=guid, rowid=rowid, chat_guid=chat.guid, date_edited=edited_at)
+        )
+    for guid, rowid in attachment_rows or []:
+        builder.add_attachment(FixtureAttachment(guid=guid, rowid=rowid))
+        builder.link_attachment(rows[0][0], guid)
+    snapshot = builder.build(tmp_path / f"{label}.db")
+
+    def fake_dump(binary: Path, path: Path, since_rowid: int) -> ImsgDumpRun:
+        return ImsgDumpRun(
+            messages=tuple(_dump_message(guid=guid, rowid=rowid) for guid, rowid in rows),
+            stderr_lines=(),
+        )
+
+    return run_extract(
+        conn=conn,
+        source_name=source_name,
+        snapshot_path=snapshot,
+        imsg_dump_binary=_fake_binary(tmp_path),
+        run_imsg_dump_fn=fake_dump,
+        merge_mode=mode,
+    )
+
+
+@pytest.mark.parametrize("mode", [MergeMode.SEED, MergeMode.LIVE])
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ([("msg-a", 1)], [("msg-a", 2)]),
+        ([("msg-a", 1)], [("msg-b", 1)]),
+        ([("msg-a", 1), ("msg-b", 2)], [("msg-a", 2), ("msg-b", 1)]),
+    ],
+    ids=["same-guid-new-rowid", "reused-rowid", "swapped-rowids"],
+)
+def test_extract_preserves_distinct_source_observations(
+    pg_conn: psycopg.Connection,
+    tmp_path: Path,
+    mode: MergeMode,
+    before: list[tuple[str, int]],
+    after: list[tuple[str, int]],
+) -> None:
+    first = _extract_provenance_rows(pg_conn, tmp_path, "before", before, mode=mode)
+    second = _extract_provenance_rows(pg_conn, tmp_path, "after", after, mode=mode)
+
+    def observations() -> list[tuple[str, str, int, int]]:
+        return pg_conn.execute(
+            "SELECT m.source_guid, ms.source_name, ms.source_rowid, ms.extraction_run_id "
+            "FROM message_source ms JOIN message m USING (message_id) "
+            "ORDER BY m.source_guid, ms.source_name, ms.source_rowid"
+        ).fetchall()
+
+    expected = {
+        (guid, "mini", rowid): first.run_id for guid, rowid in before
+    } | {(guid, "mini", rowid): second.run_id for guid, rowid in after}
+    assert observations() == sorted((*key, run_id) for key, run_id in expected.items())
+    assert second.message_source_rows.inserted == len(set(after) - set(before))
+    assert second.message_upserts.inserted == len(
+        {g for g, _ in after} - {g for g, _ in before}
+    )
+
+    # Re-observing an exact tuple changes only that tuple's last-seen run.
+    third = _extract_provenance_rows(pg_conn, tmp_path, "repeat", after, mode=mode)
+    assert third.message_source_rows.inserted == 0
+    assert third.message_source_rows.unchanged == len(after)
+    expected.update({(guid, "mini", rowid): third.run_id for guid, rowid in after})
+    assert observations() == sorted((*key, run_id) for key, run_id in expected.items())
+    assert pg_conn.execute("SELECT count(*) FROM message").fetchone() == (
+        len({guid for guid, _ in before + after}),
+    )
+    assert pg_conn.execute("SELECT DISTINCT status FROM extraction_run").fetchall() == [("ok",)]
+
+    # Details and citation exports expose every observation without
+    # multiplying their canonical messages. Rowids break same-source ties.
+    keys = pg_conn.execute(
+        "SELECT source_guid, message_key FROM message ORDER BY source_guid"
+    ).fetchall()
+    visibility = {"index_unsent": False, "show_edit_history": False, "show_raw_handles": False}
+    items = message_items(pg_conn, [key for _, key in keys], **visibility)
+    assert len(items) == len(keys)
+    for (guid, key), item in zip(keys, items, strict=True):
+        details = message_details(pg_conn, key, **visibility)
+        assert details is not None
+        expected_rows = sorted(rowid for g, _, rowid in expected if g == guid)
+        assert [source.source_rowid for source in details.sources] == expected_rows
+        assert [source.source_rowid for source in item.sources] == expected_rows
+
+    with psycopg.connect(_dsn(TEST_DB_NAME)) as observer:
+        assert observer.execute("SELECT count(*) FROM message_source").fetchone() == (len(expected),)
+
+
+@pytest.mark.parametrize("mode", [MergeMode.SEED, MergeMode.LIVE])
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ([("att-a", 1)], [("att-a", 2)]),
+        ([("att-a", 1)], [("att-b", 1)]),
+        ([("att-a", 1), ("att-b", 2)], [("att-a", 2), ("att-b", 1)]),
+    ],
+    ids=["same-guid-new-rowid", "reused-rowid", "swapped-rowids"],
+)
+def test_extract_preserves_distinct_attachment_observations(
+    pg_conn: psycopg.Connection,
+    tmp_path: Path,
+    mode: MergeMode,
+    before: list[tuple[str, int]],
+    after: list[tuple[str, int]],
+) -> None:
+    for label, attachments in [("before", before), ("after", after), ("repeat", after)]:
+        result = _extract_provenance_rows(
+            pg_conn, tmp_path, label, [("msg-carrier", 1)],
+            mode=mode, attachment_rows=attachments,
+        )
+    assert result.attachment_source_rows.inserted == 0
+    assert result.attachment_source_rows.unchanged == len(after)
+    expected = sorted(set(before + after))
+    with psycopg.connect(_dsn(TEST_DB_NAME)) as observer:
+        assert observer.execute(
+            "SELECT a.source_guid, s.source_rowid FROM attachment_source s "
+            "JOIN attachment a USING (attachment_id) ORDER BY a.source_guid, s.source_rowid"
+        ).fetchall() == expected
+    key = pg_conn.execute("SELECT message_key FROM message").fetchone()[0]
+    details = message_details(
+        pg_conn, key, index_unsent=False, show_edit_history=False, show_raw_handles=False
+    )
+    assert details is not None
+    assert len(details.attachments) == len({guid for guid, _ in expected})
+    assert all(attachment.sources == ("mini",) for attachment in details.attachments)
+
+
+def test_message_provenance_migration_preserves_rows_and_cascades(
+    pg_conn: psycopg.Connection, tmp_path: Path
+) -> None:
+    # Recreate the old constraints in this scratch table, then upgrade
+    # populated state with the real runner. Applied migration files stay immutable.
+    first = _extract_provenance_rows(
+        pg_conn, tmp_path, "old", [("msg-a", 1)], attachment_rows=[("att-a", 1)]
+    )
+    pg_conn.execute(
+        "ALTER TABLE message_source DROP CONSTRAINT message_source_pkey, "
+        "ADD PRIMARY KEY (source_name, source_rowid), "
+        "ADD UNIQUE (message_id, source_name)"
+    )
+    pg_conn.execute("DROP INDEX message_source_source_rowid_idx")
+    pg_conn.execute(
+        "ALTER TABLE attachment_source DROP CONSTRAINT attachment_source_pkey, "
+        "ADD PRIMARY KEY (source_name, source_rowid), "
+        "ADD UNIQUE (attachment_id, source_name)"
+    )
+    pg_conn.execute("DROP INDEX attachment_source_source_rowid_idx")
+    pg_conn.execute("DELETE FROM schema_migrations WHERE version = 14")
+    old = pg_conn.execute("SELECT * FROM message_source").fetchall()
+    old_attachments = pg_conn.execute("SELECT * FROM attachment_source").fetchall()
+    assert len(old) == 1
+    runner = PostgresMigrationRunner(pg_conn, REAL_MIGRATIONS_DIR)
+    assert [migration.version for migration in runner.apply_pending()] == [14]
+    assert pg_conn.execute("SELECT * FROM message_source").fetchall() == old
+    assert pg_conn.execute("SELECT * FROM attachment_source").fetchall() == old_attachments
+    assert runner.apply_pending() == []
+    assert runner.verify().is_clean
+    second = _extract_provenance_rows(pg_conn, tmp_path, "shifted", [("msg-a", 2)])
+    other = _extract_provenance_rows(
+        pg_conn, tmp_path, "other-source", [("msg-a", 1)], source_name="other-device"
+    )
+    assert pg_conn.execute(
+        "SELECT source_name, source_rowid, extraction_run_id FROM message_source "
+        "ORDER BY source_name, source_rowid"
+    ).fetchall() == [("mini", 1, first.run_id), ("mini", 2, second.run_id),
+                     ("other-device", 1, other.run_id)]
+    pg_conn.execute("DELETE FROM message WHERE source_guid = 'msg-a'")
+    assert pg_conn.execute("SELECT * FROM message_source").fetchall() == []
+    pg_conn.execute("DELETE FROM attachment WHERE source_guid = 'att-a'")
+    assert pg_conn.execute("SELECT * FROM attachment_source").fetchall() == []
+    assert pg_conn.execute("SELECT count(*) FROM extraction_run").fetchone() == (3,)
 
 
 def test_run_extract_incremental_only_processes_new_rows(

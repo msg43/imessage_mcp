@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## 2026-10-15 — Extraction preserves distinct source-row observations
+
+- Current scheduled-sync logs show S2 failing on message provenance uniqueness.
+  Real SQLite/PostgreSQL extraction reproduces the same error when a canonical
+  GUID appears at another rowid under the same source name. Reused rowids also
+  falsely refresh an older message's provenance and erase attachment provenance.
+  The host's actual rowid history remains unverified.
+- Migration 0014 keys provenance by entity, source name and source rowid, preserving
+  existing rows and foreign keys. Writers keep every observed association and
+  refresh only the exact message observation's last-read run. Canonical entities
+  still deduplicate by GUID. Details and citation exports sort same-source
+  observations by rowid; attachment source names appear once.
+- Regressions cover shifted, reused and swapped rowids in live and seed extraction,
+  repeated observations, persisted rows from another connection, populated-schema
+  upgrade, migration reruns, deletion cascades and reader cardinality. All 178
+  affected tests pass against synthetic PostgreSQL/SQLite. Independent review
+  passes 90 extraction, migration and reader tests and a committed-output
+  before/after probe. Ruff, DDL lint, diff and public-data checks pass.
+- Deployment requires stopped extraction and matching migration and writers;
+  old writers cannot use the new keys. Index rebuild duration and disk headroom
+  need host verification. Incremental selection remains unchanged. No production
+  database or schedule changed, and a successful live sync remains unverified.
+
 ## 2026-10-15 — Verify remote CI and narrow the runtime access gate
 
 - Actual Python 3.12 CI passes 2,359 tests with 707 skipped, plus Ruff and the

@@ -39,17 +39,31 @@ Tailscale paths still closes before authentication. Remote desktop inspection
 confirmed Remote Login and full disk access for remote users are already enabled;
 enabling them again is not the next step. Public metadata and the local sign-in
 page respond, but these checks do not establish authenticated search or freshness.
-Remote Console exposed the historical beginning of the sync log, not the current
-failure. The later desktop-control attempt failed to find its window. Diagnosis,
-deployment and current queue measurements require restored command access or a
-usable current log export; no cause has been established and no host setting,
-pause or schedule was changed. The private repository retains access evidence.
+Later read-only Console inspection reached current scheduled-sync output:
+extraction repeatedly fails on `message_source_message_id_source_name_key`.
+Deployed rowid history, watermarks and persisted results remain uninspected.
+No host setting, pause or schedule was changed. The private repository retains
+the access and runtime evidence.
 
-- [ ] **Unattended sync exit 1:** diagnosis remains open. October 15 SSH attempts
-  reset before authentication, so current deployed logs, configuration, watermarks
-  and persisted results could not be inspected. This is an access failure, not a
-  diagnosed sync cause. Keep intentional pause and resource reservations intact.
-  Close only after isolating the cause and checking a later run's real output.
+- [ ] **Unattended sync exit 1:** the current log isolates failure to S2's
+  provenance uniqueness constraint. A real SQLite/PostgreSQL extraction reproduces
+  that error when the same GUID appears at a new rowid for the same source;
+  reused rowids also misattribute message provenance and erase attachment
+  provenance. These are reproduced mechanisms, not established host history.
+  Migration 0014 and matching writers preserve every distinct entity/source/rowid
+  association, keeping canonical messages and attachments deduplicated by GUID.
+  The implementation run passes 178 affected tests against synthetic
+  PostgreSQL/SQLite. Independent review passes 90 extraction, migration and
+  reader tests, plus a committed-output probe that reproduces the old constraint
+  failure and verifies both observations after the fix. Ruff, DDL lint and diff
+  checks pass; the changed-file public-data scan has zero hard findings and 47
+  reviewed warnings. Deployment and a later real sync with persisted output
+  remain required. Keep intentional pause and resource reservations intact.
+  Deploy the matching migration and writers together while extraction is stopped:
+  old writers are incompatible with the new keys, and migration rebuilds indexes
+  under table locks. Host lock duration and disk headroom remain unmeasured.
+  Incremental selection is unchanged; this fix does not force a rescan of rows
+  below the source watermark.
 - [ ] **Caption scheduling and image scope:** retain the owner's deferred choices.
   Current queue composition, throughput, search latency and combined memory must
   be measured before recommending a schedule or completion estimate. Existing
@@ -59,10 +73,11 @@ pause or schedule was changed. The private repository retains access evidence.
 ### Authorized work status
 
 - [ ] **Diagnose unattended sync:** inspect the actual deployed configuration,
-  stage logs, watermarks and persisted results. Distinguish failure, memory
-  deferral and intentional pause. Reuse existing stage diagnostics, isolate any
-  confirmed defect, and add a regression before repair. Successful sync requires
-  subsequent execution evidence and persisted output, not just a zero exit.
+  watermarks and persisted results. Current stage logs establish a provenance
+  constraint failure; synthetic regressions reproduce and cover the source fix.
+  Independent source QA is complete. Deployment requires usable command access
+  and stopped extraction. Successful sync requires subsequent execution evidence
+  and persisted output, not just a zero exit.
 - [ ] **Measure caption scheduling impact:** inspect current queue kinds,
   link-preview/favicon coverage and prior measurements, then use the existing
   planner and bounded synthetic benchmark where appropriate. Report measured

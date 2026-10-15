@@ -408,7 +408,8 @@ def _load_items(
                        coalesce(er.finished_at, er.started_at)
                 FROM message_source ms JOIN extraction_run er ON er.run_id = ms.extraction_run_id
                 WHERE ms.message_id = ANY(%s::bigint[])
-                ORDER BY ms.message_id, (er.merge_mode = 'live') DESC NULLS LAST, ms.source_name
+                ORDER BY ms.message_id, (er.merge_mode = 'live') DESC NULLS LAST,
+                         ms.source_name, ms.source_rowid
                 """,
                 (message_ids,),
             )
