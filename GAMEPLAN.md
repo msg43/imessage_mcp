@@ -11,6 +11,43 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**Authorized work, October 15:** pending availability changes are committed and
+pushed as `85ed3dd` on `codex/october-availability`; the configured-credential
+doctor fix is `c8f57a5` on `codex/doctor-config-credentials`. Both require selective
+integration with current main, including its existing sandbox, search-priority
+and secret-file support. Neither branch publication establishes deployment.
+
+**October 14 deployment evidence:** the deployed schema contains
+`message.deleted_at`, migrations match deployed source, and memory-protection
+source is present. The timer's last exit was `1`; its cause remains undiagnosed.
+Historical local-schema and undeployed-status paragraphs below retain their
+original dates and must not override the newer component-specific evidence.
+
+- [ ] **Diagnose unattended sync:** inspect the actual deployed configuration,
+  stage logs, watermarks and persisted results. Distinguish failure, memory
+  deferral and intentional pause. Reuse existing stage diagnostics, isolate any
+  confirmed defect, and add a regression before repair. Successful sync requires
+  subsequent execution evidence and persisted output, not just a zero exit.
+- [ ] **Measure caption scheduling impact:** inspect current queue kinds,
+  link-preview/favicon coverage and prior measurements, then use the existing
+  planner and bounded synthetic benchmark where appropriate. Report measured
+  throughput, search latency and memory separately from completion estimates
+  for scheduling/scope alternatives. Do not change the schedule or start bulk
+  enrichment; preserve any intentional shared-host pause.
+- [ ] **Reconcile pending source:** port only verified deltas from the published
+  availability and doctor branches onto current main. Preserve authorization,
+  privacy, sandboxing, model admission and search-priority behavior. Run focused
+  tests and the public-data check before publishing integrated code.
+- [ ] **Independent QA:** `gpt-6.1-sol` performs this work; `gpt-6-astra` at ultra
+  reasoning reviews the diagnosis, actual diff, deployed assumptions and results.
+  Root owns shared docs and final landing. Initial sync-investigation estimate:
+  30–60 minutes, excluding host/model waits; caption runtime is measured before
+  giving a completion estimate.
+
+Grounded bug/security fixes found along this path are authorized. Larger features
+belong in the existing roadmap as ownership questions with supporting evidence,
+scope and dependencies. Evaluation and external-exposure gates remain in force.
+
 **2026-09-29 the MIME sniffer and the caption scaler run sandboxed
 (built, not yet deployed):** closes the QA review's last enrichment
 finding. `file` and the caption provider's downscaled copy now run under

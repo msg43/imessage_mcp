@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 2026-10-15 — Pending source is published before independent reconciliation
+
+- Availability changes `85ed3dd` and doctor fix `c8f57a5` are pushed on their
+  feature branches, with exact remote hashes verified. Initial validation passed
+  1,969 public tests, 48 retrieval/parity tests against synthetic PostgreSQL and
+  94 doctor tests. Public-data checks had no hard findings.
+- GAMEPLAN assigns sync diagnosis, caption-impact measurement and selective
+  integration to an implementation agent, followed by Astra ultra QA. Current
+  main's sandbox, admission and search-priority protections must be preserved.
+  No deployment, schedule change or corpus operation followed the branch pushes.
+
 Dated milestone history, newest-first. Terse bullets explaining the
 **why**, not just the what — link commit hashes where useful. Add the
 entry **in the same commit(s) as the work** whenever something notable
