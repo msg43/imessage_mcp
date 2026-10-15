@@ -423,7 +423,9 @@ def test_extract_preserves_distinct_attachment_observations(
             "SELECT a.source_guid, s.source_rowid FROM attachment_source s "
             "JOIN attachment a USING (attachment_id) ORDER BY a.source_guid, s.source_rowid"
         ).fetchall() == expected
-    key = pg_conn.execute("SELECT message_key FROM message").fetchone()[0]
+    message_row = pg_conn.execute("SELECT message_key FROM message").fetchone()
+    assert message_row is not None
+    key = message_row[0]
     details = message_details(
         pg_conn, key, index_unsent=False, show_edit_history=False, show_raw_handles=False
     )
