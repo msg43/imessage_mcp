@@ -34,6 +34,17 @@ waits without displaying partial secret output. Publication is not deployment.
 
 ### Open bugs and deferred scheduling decisions
 
+**Access follow-up, October 15:** direct SSH over the configured local and
+Tailscale paths still closes before authentication. Remote desktop inspection
+confirmed Remote Login and full disk access for remote users are already enabled;
+enabling them again is not the next step. Public metadata and the local sign-in
+page respond, but these checks do not establish authenticated search or freshness.
+Remote Console exposed the historical beginning of the sync log, not the current
+failure. The later desktop-control attempt failed to find its window. Diagnosis,
+deployment and current queue measurements require restored command access or a
+usable current log export; no cause has been established and no host setting,
+pause or schedule was changed. The private repository retains access evidence.
+
 - [ ] **Unattended sync exit 1:** diagnosis remains open. October 15 SSH attempts
   reset before authentication, so current deployed logs, configuration, watermarks
   and persisted results could not be inspected. This is an access failure, not a
@@ -78,6 +89,12 @@ existing recent-message tool. The local no-PostgreSQL suite passes 2,428 tests w
 659 skipped under Python 3.14; the CI runner uses Python 3.12. These environment
 counts are distinct from the 57 real database tests above. No product behavior or
 test coverage was removed to accommodate the runner.
+
+**Remote acceptance:** [CI run 38780783017](https://github.com/msg43/imessage_mcp/actions/runs/38780783017)
+passed on `9e1d77f`, including Ruff, the public-data check and the Python 3.12
+suite (2,359 passed, 707 skipped). Its optional type check reports 215 errors in
+56 files; the green workflow does not establish a clean type check. These source
+checks close the CI repair, not the outstanding host/runtime gates.
 
 Grounded bug/security fixes found along this path are authorized. Larger features
 belong in the existing roadmap as ownership questions with supporting evidence,

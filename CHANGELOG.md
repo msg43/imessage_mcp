@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-10-15 — Verify remote CI and narrow the runtime access gate
+
+- Actual Python 3.12 CI passes 2,359 tests with 707 skipped, plus Ruff and the
+  public-data check. The optional type check still reports 215 errors in 56 files.
+- Read-only desktop inspection confirms Remote Login and remote-user full disk
+  access are already enabled. SSH still fails before authentication; HTTP
+  responses establish liveness only. Current sync evidence and caption queue
+  measurements remain unavailable, with no host settings or scheduling changed.
+
 ## 2026-10-15 — Repair full CI after availability integration
 
 - The complete remote suite caught a stale four-tool assertion after recent-message
