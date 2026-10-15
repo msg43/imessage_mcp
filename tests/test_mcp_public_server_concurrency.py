@@ -200,7 +200,7 @@ def test_a_query_in_flight_does_not_stop_the_server_answering(
             assert harness.service.entered_search.is_set(), "the held query never started"
 
             listed = await harness.server.on_list_tools(cast("Any", None), None)
-            assert len(listed.tools) == 4
+            assert len(listed.tools) == 5
             finished.append("tools/list")
 
             second = await harness.call("list_people", {"limit": 5})

@@ -71,6 +71,14 @@ waits without displaying partial secret output. Publication is not deployment.
   does not promise a total timeout for all diagnostic queries. Runtime sync and
   scheduling checks remain access-blocked above; no deployment has run.
 
+**Full-suite follow-up:** the first remote CI run exposed an outdated tool count,
+colored-help assertions and missing media executables. CI now installs ffmpeg and
+Poppler, help tests compare visible text, and the concurrency check includes the
+existing recent-message tool. The local no-PostgreSQL suite passes 2,428 tests with
+659 skipped under Python 3.14; the CI runner uses Python 3.12. These environment
+counts are distinct from the 57 real database tests above. No product behavior or
+test coverage was removed to accommodate the runner.
+
 Grounded bug/security fixes found along this path are authorized. Larger features
 belong in the existing roadmap as ownership questions with supporting evidence,
 scope and dependencies. Evaluation and external-exposure gates remain in force.

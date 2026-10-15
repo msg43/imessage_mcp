@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from click.utils import strip_ansi
 from typer.testing import CliRunner
 
 from imsg.cli import app
@@ -163,7 +164,7 @@ runner = CliRunner()
 def test_cli_exposes_reference_db() -> None:
     result = runner.invoke(app, ["verify-seed", "--help"])
     assert result.exit_code == 0
-    assert "--reference-db" in result.output
+    assert "--reference-db" in strip_ansi(result.output)
 
 
 def test_cli_rejects_reference_and_reference_db_together() -> None:

@@ -5,6 +5,7 @@ unit-suite spirit as `tests/test_cli.py`)."""
 
 from __future__ import annotations
 
+from click.utils import strip_ansi
 from typer.testing import CliRunner
 
 from imsg.cli import app
@@ -24,14 +25,15 @@ def test_eval_command_group_is_registered() -> None:
 def test_verify_seed_is_registered() -> None:
     result = runner.invoke(app, ["verify-seed", "--help"])
     assert result.exit_code == 0
-    assert "--export" in result.output
-    assert "--reference" in result.output
+    help_text = strip_ansi(result.output)
+    assert "--export" in help_text
+    assert "--reference" in help_text
 
 
 def test_reconcile_attachments_is_registered() -> None:
     result = runner.invoke(app, ["reconcile-attachments", "--help"])
     assert result.exit_code == 0
-    assert "--csv-out" in result.output
+    assert "--csv-out" in strip_ansi(result.output)
 
 
 def test_verify_seed_requires_exactly_one_of_export_or_reference() -> None:

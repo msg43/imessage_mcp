@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 2026-10-15 — Repair full CI after availability integration
+
+- The complete remote suite caught a stale four-tool assertion after recent-message
+  reads were added, ANSI styling splitting help flags, and missing ffmpeg/Poppler
+  executables. Update the asserted surface, compare visible help text and install
+  the required media tools. Keep real parser tests enabled.
+- The 24 affected tests, Ruff and diff checks pass. The full local no-PostgreSQL
+  suite passes 2,428 tests with 659 skipped on Python 3.14; remote CI uses 3.12.
+  Product source and deployment configuration are unchanged by this repair.
+
 ## 2026-10-15 — Reconcile availability with current retrieval and secret handling
 
 - Selectively integrate the published availability/doctor deltas after checking
