@@ -19,12 +19,13 @@ from imsg.mcp.tools.schemas import (
 )
 
 
-def test_exactly_five_tools_are_registered() -> None:
+def test_exactly_six_tools_are_registered() -> None:
     # SPEC §10.2 closed surface — this build's scope is exactly these
     # five; find_similar_attachments/mark_relevant are out of scope,
     # run_sql/any escape hatch is never added.
     assert {t.name for t in TOOL_DEFINITIONS} == {
         "search_messages",
+        "get_recent_messages",
         "get_conversation",
         "list_people",
         "get_attachment_text",
@@ -63,7 +64,7 @@ def test_search_messages_schema_matches_spec_exactly() -> None:
         "maximum": 50,
         "default": 10,
     }
-    assert set(props) == {"query", "people", "after", "before", "has_attachment", "limit"}
+    assert set(props) == {"query", "people", "after", "before", "has_attachment", "limit", "mode"}
 
 
 def test_get_conversation_schema_matches_spec_exactly() -> None:
@@ -124,11 +125,12 @@ def test_check_permissions_schema_is_an_empty_object() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_public_surface_is_exactly_four_tools() -> None:
+def test_public_surface_is_exactly_five_tools() -> None:
     # check_permissions ("local surface only"), find_similar_attachments,
     # and mark_relevant are never registered on the public transport.
     assert {t.name for t in PUBLIC_TOOL_DEFINITIONS} == {
         "search_messages",
+        "get_recent_messages",
         "get_conversation",
         "list_people",
         "get_attachment_text",

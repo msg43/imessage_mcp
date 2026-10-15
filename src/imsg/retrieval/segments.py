@@ -36,6 +36,7 @@ from zoneinfo import ZoneInfo
 from imsg.export.eligibility import exportable_message_sql
 from imsg.retrieval.access import AttachmentGate, RequestScope, attachment_gate
 from imsg.retrieval.errors import InvalidArgumentError, NotFoundError
+from imsg.retrieval.filters import SearchFilters
 from imsg.segment.models import (
     AttachmentSnippet,
     EditVersion,
@@ -410,12 +411,12 @@ def _fetch_attachments(
 
 _TAPBACK_SYMBOLS = {
     "loved": "♥",
-    "liked": "\U0001F44D",
-    "disliked": "\U0001F44E",
-    "laughed": "\U0001F602",
+    "liked": "\U0001f44d",
+    "disliked": "\U0001f44e",
+    "laughed": "\U0001f602",
     "emphasized": "‼",
     "questioned": "❓",
-    "sticker": "\U0001F3F7",
+    "sticker": "\U0001f3f7",
 }
 
 
@@ -445,7 +446,9 @@ def _fetch_tapback_suffixes(cur: psycopg.Cursor, message_ids: list[int]) -> dict
     return result
 
 
-def _fetch_edit_history(cur: psycopg.Cursor, message_ids: list[int]) -> dict[int, list[EditVersion]]:
+def _fetch_edit_history(
+    cur: psycopg.Cursor, message_ids: list[int]
+) -> dict[int, list[EditVersion]]:
     if not message_ids:
         return {}
     cur.execute(
@@ -674,7 +677,7 @@ def render_segment_texts(
             JOIN message m ON m.message_id = sm.message_id
             LEFT JOIN person p ON p.person_id = m.sender_person_id
             WHERE sm.segment_id = ANY(%(ids)s::bigint[])
-              AND {exportable_message_sql('m')}
+              AND {exportable_message_sql("m")}
             ORDER BY sm.segment_id, m.sent_at, m.message_id
             """,
             {"ids": admitted},
@@ -728,3 +731,90 @@ __all__ = [
     "resolve_anchor",
     "resolve_thread",
 ]
+
+
+def fetch_recent_messages(
+    conn: psycopg.Connection,
+    *,
+    scope: RequestScope,
+    filters: SearchFilters,
+    chat_id: int | None,
+    limit: int,
+    index_unsent: bool,
+    include_edit_history: bool,
+    timezone: str,
+    attachment_snippet_chars: int,
+) -> list[dict[str, object]]:
+    """Newest messages, independent of segmentation and model availability.
+
+    People select conversations (including groups), so the owner's replies
+    are included. Authorization and attachment gating match conversation reads.
+    """
+    index_unsent = scope.shows_unsent(index_unsent)
+    include_edit_history = scope.shows_edit_history(include_edit_history)
+    predicate = scope.chat_predicate("m.chat_id")
+    clauses = [
+        predicate.sql,
+        "(%(unsent)s OR NOT m.is_unsent)",
+        "(%(deleted)s OR m.deleted_at IS NULL)",
+    ]
+    params = {
+        **predicate.params,
+        "unsent": index_unsent,
+        "deleted": scope.shows_deleted,
+        "limit": limit,
+    }
+    if chat_id is not None:
+        clauses.append("m.chat_id = %(chat)s")
+        params["chat"] = chat_id
+    for field, op in (("after", ">="), ("before", "<")):
+        value = getattr(filters, field)
+        if value is not None:
+            clauses.append(f"m.sent_at {op} %({field})s")
+            params[field] = value
+    for i, person in enumerate(filters.people):
+        clauses.append(
+            f"EXISTS (SELECT 1 FROM chat_participant cp WHERE cp.chat_id=m.chat_id AND cp.person_id=%(person_{i})s)"
+        )
+        params[f"person_{i}"] = person
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {_MESSAGE_COLUMNS}, m.chat_id, c.thread_key FROM message m "
+            "JOIN chat c ON c.chat_id=m.chat_id "
+            "LEFT JOIN person p ON p.person_id=m.sender_person_id "
+            f"WHERE {' AND '.join(clauses)} ORDER BY m.sent_at DESC, m.message_id DESC LIMIT %(limit)s",
+            params,
+        )
+        rows = cur.fetchall()
+        ids = [int(row[0]) for row in rows]
+        segment_map = _segment_by_message(cur, ids) if not scope.is_full else {}
+        gate = attachment_gate(conn, scope, segment_map.values())
+        rendered = {}
+        for selected_chat in {row[-2] for row in rows}:
+            chat_rows = [row for row in rows if row[-2] == selected_chat]
+            messages = _rows_to_messages(
+                cur,
+                selected_chat,
+                chat_rows,
+                include_edit_history=include_edit_history,
+                gate=gate,
+                segment_by_message=segment_map,
+            )
+            for row, message in zip(chat_rows, messages, strict=True):
+                rendered[row[0]] = {
+                    "message_key": row[1],
+                    "thread_key": row[-1],
+                    "sent_at": message.sent_at.astimezone(ZoneInfo(timezone)).isoformat(),
+                    "sender_short_name": message.sender_short_name,
+                    "is_from_me": message.is_from_me,
+                    "is_unsent": message.is_unsent,
+                    "is_edited": message.is_edited,
+                    "is_deleted": message.is_deleted,
+                    "text": render_message_line(
+                        message,
+                        timezone=timezone,
+                        attachment_snippet_chars=attachment_snippet_chars,
+                    ),
+                    "untrusted_content": True,
+                }
+    return [rendered[row[0]] for row in rows]

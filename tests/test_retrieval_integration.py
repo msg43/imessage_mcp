@@ -184,7 +184,11 @@ def _insert_person(
 
 
 def _insert_chat(
-    conn: psycopg.Connection, *, participants: list[int], kind: str = "dm", display_name: str | None = None
+    conn: psycopg.Connection,
+    *,
+    participants: list[int],
+    kind: str = "dm",
+    display_name: str | None = None,
 ) -> tuple[int, str]:
     guid = f"chat-{uuid.uuid4()}"
     tkey = derive_thread_key(guid)
@@ -535,8 +539,13 @@ def test_scan_cap_reached_is_reported_when_the_pool_is_exhausted(
 
     query = analyze_query("deck")
     people_filter = resolve_filters(
-        scratch_db, FULL, people=[bob_short], after=None, before=None,
-        has_attachment=None, timezone="UTC",
+        scratch_db,
+        FULL,
+        people=[bob_short],
+        after=None,
+        before=None,
+        has_attachment=None,
+        timezone="UTC",
     )
     predicate = compile_predicate(people_filter, FULL)
 
@@ -667,9 +676,7 @@ def test_resolve_person_exact_short_name(scratch_db: psycopg.Connection) -> None
 
 def test_resolve_person_exact_display_name(scratch_db: psycopg.Connection) -> None:
     person_id, _ = _insert_person(scratch_db, "Unique Display Name")
-    assert (
-        resolve_person(scratch_db, FULL, "Unique Display Name") == person_id
-    )
+    assert resolve_person(scratch_db, FULL, "Unique Display Name") == person_id
 
 
 def test_resolve_person_not_found(scratch_db: psycopg.Connection) -> None:
@@ -684,7 +691,9 @@ def test_resolve_person_fuzzy_never_silently_picks(scratch_db: psycopg.Connectio
     assert len(exc_info.value.candidates) >= 1
 
 
-def test_resolve_person_ambiguous_on_duplicate_display_names(scratch_db: psycopg.Connection) -> None:
+def test_resolve_person_ambiguous_on_duplicate_display_names(
+    scratch_db: psycopg.Connection,
+) -> None:
     _insert_person(scratch_db, "Duplicate Name")
     _insert_person(scratch_db, "Duplicate Name")
     with pytest.raises(PersonAmbiguousError):
@@ -774,11 +783,17 @@ def test_search_messages_reranks_at_least_limit_candidates_when_rerank_top_is_sm
         reranker=_CountingReranker(),
         multimodal_provider=FakeMultimodalEmbeddingProvider(dim=constants.MULTIMODAL_EMBEDDING_DIM),
     )
-    assert len(small_pool.search_messages(LOCAL_FULL_ACCESS, query="kite festival", limit=5).results) == 5
+    assert (
+        len(small_pool.search_messages(LOCAL_FULL_ACCESS, query="kite festival", limit=5).results)
+        == 5
+    )
     assert scored == [5]
     # at or below rerank_top, the pool is rerank_top
     scored.clear()
-    assert len(small_pool.search_messages(LOCAL_FULL_ACCESS, query="kite festival", limit=1).results) == 1
+    assert (
+        len(small_pool.search_messages(LOCAL_FULL_ACCESS, query="kite festival", limit=1).results)
+        == 1
+    )
     assert scored == [2]
 
 
@@ -835,21 +850,36 @@ def test_get_conversation_by_segment_key_defaults_anchor_to_segment_start(
     alice_id, _ = _insert_person(scratch_db, "Alice")
     chat_id, _ = _insert_chat(scratch_db, participants=[owner_id, alice_id])
     session_id = _insert_session(
-        scratch_db, chat_id, started_at=datetime(2024, 1, 1, 12, 0, tzinfo=UTC),
+        scratch_db,
+        chat_id,
+        started_at=datetime(2024, 1, 1, 12, 0, tzinfo=UTC),
         ended_at=datetime(2024, 1, 1, 12, 10, tzinfo=UTC),
     )
     segment_id, stable_key = _insert_segment(
-        scratch_db, chat_id=chat_id, session_id=session_id,
-        rendered_text="...", started_at=datetime(2024, 1, 1, 12, 0, tzinfo=UTC),
+        scratch_db,
+        chat_id=chat_id,
+        session_id=session_id,
+        rendered_text="...",
+        started_at=datetime(2024, 1, 1, 12, 0, tzinfo=UTC),
         ended_at=datetime(2024, 1, 1, 12, 10, tzinfo=UTC),
     )
     _, mkey1 = _insert_message(
-        scratch_db, chat_id=chat_id, segment_id=segment_id, sender_person_id=alice_id,
-        is_from_me=False, sent_at=datetime(2024, 1, 1, 12, 0, tzinfo=UTC), text="hello",
+        scratch_db,
+        chat_id=chat_id,
+        segment_id=segment_id,
+        sender_person_id=alice_id,
+        is_from_me=False,
+        sent_at=datetime(2024, 1, 1, 12, 0, tzinfo=UTC),
+        text="hello",
     )
     _, mkey2 = _insert_message(
-        scratch_db, chat_id=chat_id, segment_id=segment_id, sender_person_id=owner_id,
-        is_from_me=True, sent_at=datetime(2024, 1, 1, 12, 5, tzinfo=UTC), text="hi back",
+        scratch_db,
+        chat_id=chat_id,
+        segment_id=segment_id,
+        sender_person_id=owner_id,
+        is_from_me=True,
+        sent_at=datetime(2024, 1, 1, 12, 5, tzinfo=UTC),
+        text="hi back",
     )
 
     out = service.get_conversation(LOCAL_FULL_ACCESS, thread_id=stable_key)
@@ -865,20 +895,31 @@ def test_get_conversation_anchor_by_message_key_and_window(
     alice_id, _ = _insert_person(scratch_db, "Alice")
     chat_id, _ = _insert_chat(scratch_db, participants=[owner_id, alice_id])
     session_id = _insert_session(
-        scratch_db, chat_id, started_at=datetime(2024, 1, 1, tzinfo=UTC),
+        scratch_db,
+        chat_id,
+        started_at=datetime(2024, 1, 1, tzinfo=UTC),
         ended_at=datetime(2024, 1, 1, tzinfo=UTC),
     )
     segment_id, stable_key = _insert_segment(
-        scratch_db, chat_id=chat_id, session_id=session_id, rendered_text="...",
-        started_at=datetime(2024, 1, 1, tzinfo=UTC), ended_at=datetime(2024, 1, 1, tzinfo=UTC),
+        scratch_db,
+        chat_id=chat_id,
+        session_id=session_id,
+        rendered_text="...",
+        started_at=datetime(2024, 1, 1, tzinfo=UTC),
+        ended_at=datetime(2024, 1, 1, tzinfo=UTC),
     )
 
     keys = []
     base = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
     for i in range(7):
         _, mkey = _insert_message(
-            scratch_db, chat_id=chat_id, segment_id=segment_id, sender_person_id=alice_id,
-            is_from_me=False, sent_at=base + timedelta(minutes=i), text=f"message {i}",
+            scratch_db,
+            chat_id=chat_id,
+            segment_id=segment_id,
+            sender_person_id=alice_id,
+            is_from_me=False,
+            sent_at=base + timedelta(minutes=i),
+            text=f"message {i}",
         )
         keys.append(mkey)
 
@@ -902,8 +943,12 @@ def test_get_conversation_allowlist_scope_hides_ineligible_thread(
     alice_id, _ = _insert_person(scratch_db, "Alice")
     chat_id, thread_key = _insert_chat(scratch_db, participants=[owner_id, alice_id])
     _make_segment(
-        scratch_db, fts_conn, chat_id=chat_id, rendered_text="secret",
-        started_at=datetime(2024, 1, 1, tzinfo=UTC), person_id=alice_id,
+        scratch_db,
+        fts_conn,
+        chat_id=chat_id,
+        rendered_text="secret",
+        started_at=datetime(2024, 1, 1, tzinfo=UTC),
+        person_id=alice_id,
     )
     allowlist_ctx = AccessContext(surface="public", scope="allowlist", subject="12345")
     with pytest.raises(NotFoundError):
@@ -923,8 +968,12 @@ def test_list_people_query_filter_and_message_counts(
     _insert_person(scratch_db, "Bob Builder")
     chat_id, _ = _insert_chat(scratch_db, participants=[owner_id, alice_id])
     _make_segment(
-        scratch_db, fts_conn, chat_id=chat_id, rendered_text="hi",
-        started_at=datetime(2024, 1, 1, tzinfo=UTC), person_id=alice_id,
+        scratch_db,
+        fts_conn,
+        chat_id=chat_id,
+        rendered_text="hi",
+        started_at=datetime(2024, 1, 1, tzinfo=UTC),
+        person_id=alice_id,
     )
 
     out = service.list_people(LOCAL_FULL_ACCESS, query="Alice")
@@ -976,7 +1025,9 @@ def _insert_attachment(conn: psycopg.Connection) -> tuple[int, str]:
         return int(row[0]), key
 
 
-def _link_attachment_to_message(conn: psycopg.Connection, *, message_id: int, attachment_id: int) -> None:
+def _link_attachment_to_message(
+    conn: psycopg.Connection, *, message_id: int, attachment_id: int
+) -> None:
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO message_attachment (message_id, attachment_id, ordinal) VALUES (%s, %s, 0)",
@@ -991,8 +1042,12 @@ def test_get_attachment_text_returns_done_enrichment(
     alice_id, _ = _insert_person(scratch_db, "Alice")
     chat_id, _ = _insert_chat(scratch_db, participants=[owner_id, alice_id])
     segment_id, _ = _make_segment(
-        scratch_db, fts_conn, chat_id=chat_id, rendered_text="see attached",
-        started_at=datetime(2024, 1, 1, tzinfo=UTC), person_id=alice_id,
+        scratch_db,
+        fts_conn,
+        chat_id=chat_id,
+        rendered_text="see attached",
+        started_at=datetime(2024, 1, 1, tzinfo=UTC),
+        person_id=alice_id,
     )
     with scratch_db.cursor() as cur:
         cur.execute("SELECT message_id FROM segment_message WHERE segment_id = %s", (segment_id,))
@@ -1009,7 +1064,9 @@ def test_get_attachment_text_returns_done_enrichment(
 
     out = service.get_attachment_text(LOCAL_FULL_ACCESS, attachment_key=attachment_key)
     assert out["attachment_key"] == attachment_key
-    assert out["texts"] == [{"kind": "pdf_text", "model": "pdftotext", "text": "Deck rebuild, materials $14,200"}]
+    assert out["texts"] == [
+        {"kind": "pdf_text", "model": "pdftotext", "text": "Deck rebuild, materials $14,200"}
+    ]
     assert out["untrusted_content"] is True
 
 
@@ -1020,8 +1077,12 @@ def test_get_attachment_text_not_enriched_yet(
     alice_id, _ = _insert_person(scratch_db, "Alice")
     chat_id, _ = _insert_chat(scratch_db, participants=[owner_id, alice_id])
     segment_id, _ = _make_segment(
-        scratch_db, fts_conn, chat_id=chat_id, rendered_text="see attached",
-        started_at=datetime(2024, 1, 1, tzinfo=UTC), person_id=alice_id,
+        scratch_db,
+        fts_conn,
+        chat_id=chat_id,
+        rendered_text="see attached",
+        started_at=datetime(2024, 1, 1, tzinfo=UTC),
+        person_id=alice_id,
     )
     with scratch_db.cursor() as cur:
         cur.execute("SELECT message_id FROM segment_message WHERE segment_id = %s", (segment_id,))
@@ -1035,7 +1096,9 @@ def test_get_attachment_text_not_enriched_yet(
 
 def test_get_attachment_text_unknown_key_not_found(service: RetrievalService) -> None:
     with pytest.raises(NotFoundError):
-        service.get_attachment_text(LOCAL_FULL_ACCESS, attachment_key="no-such-attachment-key-at-all")
+        service.get_attachment_text(
+            LOCAL_FULL_ACCESS, attachment_key="no-such-attachment-key-at-all"
+        )
 
 
 def test_get_attachment_text_allowlist_scope_unauthorized_is_not_found(
@@ -1047,8 +1110,12 @@ def test_get_attachment_text_allowlist_scope_unauthorized_is_not_found(
     alice_id, _ = _insert_person(scratch_db, "Alice")
     chat_id, _ = _insert_chat(scratch_db, participants=[owner_id, alice_id])
     segment_id, _ = _make_segment(
-        scratch_db, fts_conn, chat_id=chat_id, rendered_text="see attached",
-        started_at=datetime(2024, 1, 1, tzinfo=UTC), person_id=alice_id,
+        scratch_db,
+        fts_conn,
+        chat_id=chat_id,
+        rendered_text="see attached",
+        started_at=datetime(2024, 1, 1, tzinfo=UTC),
+        person_id=alice_id,
     )
     with scratch_db.cursor() as cur:
         cur.execute("SELECT message_id FROM segment_message WHERE segment_id = %s", (segment_id,))
@@ -1065,3 +1132,82 @@ def test_get_attachment_text_allowlist_scope_unauthorized_is_not_found(
     allowlist_ctx = AccessContext(surface="public", scope="allowlist", subject="12345")
     with pytest.raises(NotFoundError):
         service.get_attachment_text(allowlist_ctx, attachment_key=attachment_key)
+
+
+def test_keyword_search_never_calls_models_and_preserves_scope(
+    scratch_db, fts_conn, service, monkeypatch
+):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("keyword search touched a model")
+
+    monkeypatch.setattr(service, "_run_model", forbidden)
+    owner, _ = _insert_person(scratch_db, "Owner", is_owner=True)
+    alice, name = _insert_person(scratch_db, "Alice Example")
+    chat, _ = _insert_chat(scratch_db, participants=[owner, alice])
+    _make_segment(
+        scratch_db,
+        fts_conn,
+        chat_id=chat,
+        rendered_text="deck repair agreed",
+        started_at=datetime(2024, 4, 12, 13, tzinfo=UTC),
+        person_id=alice,
+    )
+    result = service.search_messages(LOCAL_FULL_ACCESS, query="deck", mode="keyword", people=[name])
+    assert len(result.results) == 1
+    assert result.results[0]["untrusted_content"] is True
+    assert result.candidate_lists["segment_vector"] == 0
+    denied = service.search_messages(
+        AccessContext(surface="public", scope="allowlist", subject="owner"),
+        query="deck",
+        mode="keyword",
+    )
+    assert denied.results == []
+
+
+def test_recent_messages_use_message_time_and_include_owners_replies(
+    scratch_db, fts_conn, service, monkeypatch
+):
+    monkeypatch.setattr(
+        service, "_run_model", lambda *_: pytest.fail("recent messages touched models")
+    )
+    owner, _ = _insert_person(scratch_db, "Owner", is_owner=True)
+    alice, name = _insert_person(scratch_db, "Alice Example")
+    bob, _ = _insert_person(scratch_db, "Bob Example")
+    chat, thread = _insert_chat(scratch_db, participants=[owner, alice])
+    other, _ = _insert_chat(scratch_db, participants=[owner, bob])
+    for day, cid, pid, from_me in [
+        (1, chat, alice, False),
+        (2, chat, owner, True),
+        (3, other, bob, False),
+    ]:
+        _make_segment(
+            scratch_db,
+            fts_conn,
+            chat_id=cid,
+            rendered_text=f"update {day}",
+            started_at=datetime(2024, 4, day, 12, tzinfo=UTC),
+            person_id=pid,
+            is_from_me=from_me,
+        )
+    # Newest message is not segmented yet: chronological access must still see it.
+    scratch_db.execute(
+        "INSERT INTO message(source_guid,message_key,chat_id,sender_person_id,is_from_me,sent_at,service,text_original,text_normalized) VALUES ('new','new-key',%s,%s,false,'2024-04-04T12:00Z','imessage','latest','latest')",
+        (chat, alice),
+    )
+    result = service.get_recent_messages(LOCAL_FULL_ACCESS, people=[name], limit=3)
+    assert [m["is_from_me"] for m in result["messages"]] == [False, True, False]
+    assert result["messages"][0]["message_key"] == "new-key"
+    assert all(m["thread_key"] == thread for m in result["messages"])
+    assert result["models_used"] is False
+    assert (
+        len(
+            service.get_recent_messages(LOCAL_FULL_ACCESS, thread_id=thread, before="2024-04-03")[
+                "messages"
+            ]
+        )
+        == 2
+    )
+    public = AccessContext(surface="public", scope="allowlist", subject="owner")
+    assert service.get_recent_messages(public)["messages"] == []
+    with pytest.raises(NotFoundError):
+        service.get_recent_messages(public, thread_id=thread)

@@ -10,6 +10,43 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-10-15 — Track sync investigation and caption-impact measurement
+
+- Added open GAMEPLAN tasks for diagnosing the observed sync failure and
+  measuring caption scheduling/scope impact before requesting owner choices.
+  Both begin with existing-code and deployment checks; no investigation,
+  schedule change or production processing is claimed complete.
+
+## 2026-10-04 — Explicit offline search, recent messages, and chunking comparison
+
+- Added MCP search modes: hybrid (default) requires models and returns a clear
+  error with no results when unavailable; keyword never loads models and requires
+  an explicit user request. Removed automatic fallback after owner clarification:
+  model outages must remain visible, not masked by partial search results.
+  Keyword warnings appear in readable and structured responses, even when empty.
+  Existing public authorization remains mandatory.
+- Conversation, people and stored attachment reads no longer wait for models.
+  Added `get_recent_messages` on both surfaces: newest-first indexed messages,
+  people/thread/date filters, owner replies, and unsegmented messages, with the
+  same unsent/edit/deletion and attachment gates as conversation reads.
+- Audited refresh coverage and ran extraction, resegmentation and FTS tests:
+  edits/retractions, tapback-driven dirtying, content replacement and stale-index
+  deletion already have coverage. Read receipts are not indexed; archive retention
+  is not a live-message deletion mirror. No extraction-policy changes made.
+- Ran baseline eval before editing: zero queries and judgments, so no AT-4 quality
+  baseline. Added a non-mutating paired experiment using real boundary and text
+  embedding providers. Twelve sampled sessions / 325 messages: 25 topical versus
+  14 simple chunks. Both retrieved all supporting messages for 12 analyst-authored
+  paraphrased questions within their top three results, but simple chunks returned
+  1,071 versus 672 words on average (about 60% more). Cached-model rerun segmentation:
+  21.66 s topical including first load, 0.00024 s simple; the remaining 11 topical
+  sessions took 13.39 s. No reranking or attachments in this pilot; not a general
+  quality-equivalence claim. Production segmentation unchanged. Private inputs and
+  aggregate evidence remain under `data_root/eval`.
+- Validation: full suite 2,449 passed against scratch Postgres; new chunk invariants
+  and follow-up scope/transport checks passed. Changed service/transport files pass
+  mypy; lint and diff checks pass. No production migration or deployment performed.
+
 ## 2026-09-24 — Public repo made usable and safe for a non-expert
 
 **Why.** A non-expert could not get from a clone to "Claude searches my

@@ -620,11 +620,11 @@ def test_every_public_call_is_audited_with_the_tool_name() -> None:
     assert any(r.tool == "list_people" and r.subject_ok is True for r in rows)
 
 
-def test_on_list_tools_returns_exactly_the_public_four() -> None:
+def test_on_list_tools_returns_exactly_the_public_five() -> None:
     server, _, _ = make_server()
     result = run(server.on_list_tools(fake_context(None), None))
     names = {t.name for t in result.tools}
-    assert names == {"search_messages", "get_conversation", "list_people", "get_attachment_text"}
+    assert names == {"search_messages", "get_conversation", "list_people", "get_attachment_text", "get_recent_messages"}
 
 
 # ---------------------------------------------------------------------------

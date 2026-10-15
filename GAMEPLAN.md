@@ -11,6 +11,42 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-10-14 read-only deployment verification:** the deployed schema contains
+`message.deleted_at`; its migration history matches deployed source with no pending
+migrations. The October 4 schema observation below concerned an older local index.
+Deployed source contains the September memory protections, but does not contain
+the October availability changes (`search_status.py` and recent-message handlers).
+This verifies source presence, not new runtime stress or retrieval acceptance.
+
+The deployed lineage already supports guarded file secret references; preserve that
+existing capability when reconciling it with canonical main. The setup doctor's
+extension check omitted configured credentials even though both extensions were
+installed. A tested correction to the existing doctor is uncommitted in branch
+`codex/doctor-config-credentials`, based on deployed source; it is not deployed.
+No new secret resolver, migration or installation prerequisite was needed. Evaluation
+and external-exposure acceptance gates remain open.
+
+**2026-10-04 availability improvements implemented, not deployed:** MCP search now
+defaults to hybrid and returns errors without results when models are unavailable.
+Keyword-only search requires an explicit user request and carries prominent
+notices; basic reads
+work without models; `get_recent_messages` retrieves the chronological tail even
+before segmentation. Auth/scope, attachment privacy and refresh regression checks
+pass. Full suite: 2,449 passed, followed by additional focused tests. The local
+index schema predates current source (`message.deleted_at` absent), so this task
+made no production migration or server rollout.
+
+**Segmentation pilot completed, production unchanged:** real-model comparison on
+12 sessions / 325 messages retrieved all supporting messages for all 12 authored
+paraphrased questions with either chunker. Simple chunks were far cheaper to build
+but returned about 60% more text. This text-only, small-sample test omitted reranking
+and does not establish real-question quality equivalence. Canonical eval still has
+zero queries/judgments; AT-4 remains unmet. Reproducible experiment:
+`scripts/bench_segmentation.py`; private probes and aggregate results:
+`data_root/eval/segmentation-paraphrase-comparison.json`. Next decision needs a
+larger real-question evaluation with equal context budgets. Overlap is not a
+production setting (current schema requires one segment per message).
+
 **2026-09-24 public readiness + host memory fixes:** git history
 rewritten to remove real contact data used as fixtures; install guide,
 examples, setup doctor, Postgres bootstrap, CI with a public-safety
@@ -22,7 +58,7 @@ host-wide lock, and idle `mcp local` servers unload their models after
 10 minutes. Test suite: 1,847 passed / 477 skipped with every extra
 (no database); ruff clean; mypy reports 96 pre-existing errors.
 
-**2026-09-24 memory protections (not yet deployed):** every model load now
+**2026-09-24 memory protections (source verified deployed October 14; runtime acceptance pending):** every model load now
 asks whether the host has room first (both MCP servers, segment, embed,
 enrich, sync's heavy steps, eval); `imsg mcp local` loads nothing until
 its first retrieval call; heavy background work can be paused (`imsg
@@ -90,6 +126,34 @@ reports success with meaningless results. Phase 1's exit criteria — seed
 completeness (AT-2) and a hand-verified `person` table — are **not** met.
 (2026-09-15)
 
+## Open bugs and agent follow-ups
+
+Recorded 2026-10-15. Both investigations can proceed without another owner
+decision. Before changing code, inspect the current implementation, deployed
+version, branches/worktrees and uncommitted work; establish what already exists
+and reuse it. An unchecked task is not evidence of missing functionality.
+
+- [ ] **Investigate the sync failure.** The October 14 read-only deployment
+  check recorded the sync timer's last exit as `1`, with no process running at
+  that moment. The cause is unknown; an idle timer alone is not a failure.
+  Inspect the existing sync path, launch configuration and private logs to
+  identify the failing stage and verify the cause. Track any required repair
+  here, and close only after a subsequent run's logs and persisted results
+  confirm successful sync. This gates confidence in unattended index freshness;
+  it does not block the caption-impact investigation below.
+- [ ] **Measure caption scheduling and scope impact before asking for a
+  decision.** This is decision preparation, not a confirmed code defect.
+  Inspect existing enrichment scheduling, queue selection, memory safeguards
+  and measurements first. Establish the current queue by kind, including
+  link-preview images and favicons; use existing logs and bounded measurements
+  to quantify production-host throughput, search latency and memory pressure.
+  Report the expected completion time and search impact of nighttime-only
+  versus daytime captioning, with and without those image classes, separating
+  measurements from estimates. This supplies the evidence for the existing
+  [enrichment owner to-do](#owner-to-dos); the schedule and image-scope choices
+  remain open. Recording this task does not start bulk enrichment or change
+  the schedule.
+
 ## Gate ladder
 
 Phases 6 and 7 **must not begin** until Phase 4 produces baseline
@@ -142,7 +206,9 @@ accounts).
   link-preview images (28,603 of the 93,165 images, 2,534 of them
   favicons) need captions at all. Estimates are Studio measurements scaled, not
   measured on the production host; the first night's `imsg enrich`
-  output gives the real per-kind rate.
+  output gives the real per-kind rate. The
+  [agent impact investigation](#open-bugs-and-agent-follow-ups) must supply
+  current evidence before these choices return to the owner.
 - Confirm the host's unified memory before Phase 0 — it selects the
   model ladder. First real inputs (2026-09-14, M2 Ultra 128 GB, one model
   resident at a time, peak per `models/manifest.lock.yaml`): Qwen3.5-35B-A3B

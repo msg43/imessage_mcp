@@ -811,3 +811,41 @@ not open a public issue about it; report it privately as described in
 The design record — architecture rationale, full build spec, and the
 decision log explaining *why* each choice above was made — is kept
 private, since it's written against a specific deployment.
+
+
+### Search while models are offline
+
+`search_messages` accepts `mode: hybrid | keyword` (default `hybrid`). Normal
+search waits for models within the warm-up deadline and returns a clear error
+with no results if they are unavailable. There is no automatic fallback. Clients
+must not switch to keyword mode to work around a model error unless the user
+explicitly requests keyword-only search. `keyword` never starts or calls a model.
+
+Every keyword-only response includes a prominent text notice and structured
+`search_mode`, `model_status`, `degraded`, `warning_code`, and `warning` fields.
+When models are unavailable the notice begins **MODELS OFFLINE — KEYWORD-ONLY
+RESULTS**. Clients must show the warning even for empty results: semantic search,
+visual similarity, and reranking were not used, so differently worded messages
+may be missing. An empty keyword result is not evidence that the archive lacks
+an answer. Explicit keyword mode with ready models says models were not used,
+rather than claiming they are offline.
+
+Conversation reads, people lookup, and already-extracted attachment text do not
+load or wait for models. `get_recent_messages(people?, thread_id?, after?, before?,
+limit=20)` returns messages newest first, including imported messages that have
+not been segmented. People filters select conversations (including groups and
+the owner's replies); use `thread_id` for a specific conversation. It reads the
+index, not live Messages. All public authorization and attachment restrictions
+still apply.
+
+### Isolated segmentation comparison
+
+`scripts/bench_segmentation.py --config /path/to/config.yaml --prompt
+prompts/segment_boundaries.txt --sessions 12` compares real topical segmentation
+with simple time/size chunks on the same deterministic text-only sample. It uses
+real embeddings and keyword/vector rank fusion, and writes aggregate results
+under `data_root/eval`. It never replaces production segments or labels.
+Automatically constructed source excerpts measure rediscovery, not relevance
+on real questions; this experiment cannot establish answer-quality equivalence.
+Overlapping chunks are experimental: the production schema currently assigns
+each message to one segment, so they are not a drop-in indexing setting.

@@ -227,7 +227,7 @@ class Harness:
         return self.settle()
 
     async def search(self, authorization: str | None = f"Bearer {OWNER_TOKEN}") -> types.CallToolResult:
-        params = types.CallToolRequestParams(name="search_messages", arguments={"query": "kites"})
+        params = types.CallToolRequestParams(name="search_messages", arguments={"mode": "hybrid", "query": "kites"})
         context = SimpleNamespace(
             request=SimpleNamespace(
                 headers={} if authorization is None else {"authorization": authorization}

@@ -222,6 +222,7 @@ class RetrievalService:
         before: str | None = None,
         has_attachment: bool | None = None,
         limit: int | None = None,
+        mode: str = "hybrid",
     ) -> SearchMessagesResult:
         """SPEC §9.4's hybrid search. The whole request — model calls and
         the database work between them — runs inside the query-in-flight
@@ -237,6 +238,7 @@ class RetrievalService:
                 before=before,
                 has_attachment=has_attachment,
                 limit=limit,
+                mode=mode,
             )
 
     def _search_messages(
@@ -249,7 +251,10 @@ class RetrievalService:
         before: str | None = None,
         has_attachment: bool | None = None,
         limit: int | None = None,
+        mode: str = "hybrid",
     ) -> SearchMessagesResult:
+        if mode not in {"hybrid", "keyword"}:
+            raise InvalidArgumentError("mode must be hybrid or keyword")
         if not query or not query.strip():
             raise InvalidArgumentError("'query' must not be empty")
         if len(query) > MAX_QUERY_CHARS:
@@ -299,24 +304,26 @@ class RetrievalService:
             self._fts, self._pg, analyzed, predicate, k_fts
         )
 
-        instruction = self._config.embedding.query_instruction
-        query_vec = self._run_model(
-            lambda: self._text_provider.embed_query(analyzed.phrase, instruction=instruction)
-        )
-        seg_vec = vector_search.search_segment_vector(
-            self._pg, query_vec, predicate, k_vector, ef_search=ef_search
-        )
-        att_vec = vector_search.search_attachment_chunk_vector(
-            self._pg, query_vec, predicate, k_vector, ef_search=ef_search
-        )
-
+        seg_vec = att_vec = vector_search.VectorChannelResult((), False)
         mm_channel = None
-        multimodal = self._multimodal_provider
-        if self._config.embedding.multimodal.enabled and multimodal is not None:
-            mm_query_vec = self._run_model(lambda: multimodal.embed_text(analyzed.phrase))
-            mm_channel = vector_search.search_multimodal_vector(
-                self._pg, mm_query_vec, predicate, k_vector, ef_search=ef_search
+        if mode == "hybrid":
+            instruction = self._config.embedding.query_instruction
+            query_vec = self._run_model(
+                lambda: self._text_provider.embed_query(analyzed.phrase, instruction=instruction)
             )
+            seg_vec = vector_search.search_segment_vector(
+                self._pg, query_vec, predicate, k_vector, ef_search=ef_search
+            )
+            att_vec = vector_search.search_attachment_chunk_vector(
+                self._pg, query_vec, predicate, k_vector, ef_search=ef_search
+            )
+
+            multimodal = self._multimodal_provider
+            if self._config.embedding.multimodal.enabled and multimodal is not None:
+                mm_query_vec = self._run_model(lambda: multimodal.embed_text(analyzed.phrase))
+                mm_channel = vector_search.search_multimodal_vector(
+                    self._pg, mm_query_vec, predicate, k_vector, ef_search=ef_search
+                )
 
         lists: dict[str, tuple[int, ...]] = {
             "segment_fts": seg_fts.segment_ids,
@@ -357,7 +364,9 @@ class RetrievalService:
             pool = [r for r in pool if r.segment_id in texts]
 
         reranked: list[tuple[int, float]] = []
-        if pool:
+        if pool and mode == "keyword":
+            reranked = [(r.segment_id, r.score) for r in pool]
+        elif pool:
             documents = [texts[r.segment_id] for r in pool]
             scores = self._run_model(lambda: self._reranker.score(analyzed.phrase, documents))
             reranked = sorted(
@@ -442,6 +451,47 @@ class RetrievalService:
         )
         return {"thread_key": resolution.thread_key, "messages": messages}
 
+    def get_recent_messages(
+        self,
+        context: AccessContext,
+        *,
+        people: list[str] | None = None,
+        thread_id: str | None = None,
+        after: str | None = None,
+        before: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, object]:
+        if not 1 <= limit <= MAX_CONVERSATION_WINDOW:
+            raise InvalidArgumentError("limit must be between 1 and 200")
+        scope = resolve_request_scope(self._pg, context)
+        chat_id = None
+        if thread_id is not None:
+            resolution = segments.resolve_thread(self._pg, thread_id)
+            chat_id = resolution.chat_id
+            if not scope.admits_chat(chat_id):
+                raise NotFoundError(segments.THREAD_NOT_FOUND_MESSAGE)
+        filters = resolve_filters(
+            self._pg,
+            scope,
+            people=people,
+            after=after,
+            before=before,
+            has_attachment=None,
+            timezone=self._config.render.timezone,
+        )
+        messages = segments.fetch_recent_messages(
+            self._pg,
+            scope=scope,
+            filters=filters,
+            chat_id=chat_id,
+            limit=limit,
+            index_unsent=self._config.policy.index_unsent,
+            include_edit_history=self._config.policy.index_edit_history,
+            timezone=self._config.render.timezone,
+            attachment_snippet_chars=self._config.render.attachment_snippet_chars,
+        )
+        return {"messages": messages, "order": "newest_first", "models_used": False}
+
     # -- list_people ------------------------------------------------------
 
     def list_people(
@@ -484,9 +534,7 @@ class RetrievalService:
         self, context: AccessContext, *, attachment_key: str
     ) -> dict[str, object]:
         if not attachment_key or not (16 <= len(attachment_key) <= 128):
-            raise InvalidArgumentError(
-                "'attachment_key' must be between 16 and 128 characters"
-            )
+            raise InvalidArgumentError("'attachment_key' must be between 16 and 128 characters")
         result = directory.get_attachment_text(self._pg, context, attachment_key)
         return {
             "attachment_key": result.attachment_key,

@@ -1,71 +1,16 @@
-"""The local MCP surface (SPEC §10.3): `imsg mcp local` — stdio,
-reached from the Studio as `ssh mini imsg mcp local` over the tailnet,
-full corpus scope. Registers exactly the five in-scope tools
-(`imsg.mcp.tools.schemas.TOOL_DEFINITIONS`) against the official `mcp`
-Python SDK.
+"""Local MCP over stdio with model-independent reads and explicit degradation.
 
-Uses the low-level `mcp.server.lowlevel.Server` API (`on_list_tools`/
-`on_call_tool` callbacks) rather than the higher-level `MCPServer`
-convenience wrapper: the latter's `add_tool` always derives
-`inputSchema` from a Python function's signature via pydantic, which
-cannot reproduce SPEC-exact constraints (`minLength`, `maxItems`,
-`"format": "date"`, `additionalProperties: false`, ...) without a
-bespoke pydantic model per tool — handing the SDK the exact
-hand-authored dict from `imsg.mcp.tools.schemas` directly is simpler
-and more obviously faithful to SPEC §10.2.
+Schema validation and local auditing wrap every call. Search defaults to hybrid:
+model loading is bounded and unavailable models produce an error with no results.
+There is no automatic fallback; keyword mode requires an explicit user request.
+Explicit keyword mode never starts models. Conversation, recent-message, people,
+and stored attachment-text reads do not load or wait for models.
 
-Because a hand-authored `inputSchema` is not automatically enforced by
-the low-level SDK the way a derived one would be, arguments are
-explicitly validated against it here (via `jsonschema`) before a
-handler ever runs — a schema violation becomes an ordinary SPEC §10.1
-`INVALID_ARGUMENT` tool error (audited like any other call), never a
-raw exception.
-
-**Loading on the first call.** The server answers `initialize` and
-`tools/list` at once and, by default, loads no model until the first
-retrieval call (`mcp.local.warm_at_start`, off: most client sessions,
-each with its own server, never search, and a server that loaded at
-start held a full model set regardless). That call starts the warm-up
-(`imsg.retrieval.background_warm_up`), which asks the memory admission
-check first, and waits for it — without blocking the event loop, so
-pings and other requests are still answered — for at most
-`TOOL_CALL_WARM_UP_WAIT_SECONDS`, then gets a `WARMING_UP` tool error
-with an estimate of the seconds remaining. With `warm_at_start` on, the
-warm-up starts as soon as the stdio transport has taken over stdout (see
-`run_local_server`), as it always did before. A warm-up that failed turns
-every tool call into a `WARM_UP_FAILED` error naming the cause. Both are
-ordinary SPEC §10.1-style tool errors, audited like any other; arguments
-that fail the schema are rejected at once, without waiting. So is
-`check_permissions`, which is diagnostics rather than retrieval: it
-answers straight away and carries the warm-up's own state
-(`warm_up_report`), so the operator asking "what is this server doing?"
-gets an answer while it is doing it.
-
-**Unloading when idle.** With an `IdleModelUnloader`
-(`imsg.retrieval.idle_unload`, `mcp.idle_unload_seconds`), the models are
-dropped after that long with no retrieval tool call, and the warm-up's
-state becomes `unloaded`. The next retrieval call starts the reload and
-waits for it exactly as a call during the first warm-up does — up to
-`TOOL_CALL_WARM_UP_WAIT_SECONDS`, then `WARMING_UP` with an estimate. Every
-retrieval call is registered with the unloader for its whole span, the
-wait included, so nothing unloads while one is in flight.
-
-**Loading only when the host has room.** Every load — at startup and at
-each reload — first asks `imsg.memory_admission` whether the host has the
-memory for it. Refused, nothing loads and the warm-up's state becomes
-`memory_busy`; a retrieval call is answered at once with the retryable
-`WARMING_UP` code and a "host memory busy" message naming the numbers
-(`HostMemoryBusyError`), and the next call asks again. The unloader
-also drops loaded models early when the kernel reports critical memory
-pressure (`memory.local_server_release_at`).
-
-**Exiting when the client goes.** The SDK's stdio transport ends
-`server.run` when stdin reaches end-of-file, which is what an SSH client
-that disconnects produces, and nothing here keeps the process alive after
-that: the model thread and the idle watchdog are daemon threads, and a
-call still waiting for the warm-up is cancelled with the rest of the
-server's tasks. (`tests/test_mcp_idle_unload.py` closes a child server's
-stdin during a held warm-up and while a call waits, and requires the exit.)
+Only model-using calls hold the idle-unloader guard while waiting and searching;
+Memory admission,
+idle unloading, and pressure release retain their existing behavior. Model output
+is directed to stderr after the stdio transport starts. Client disconnection
+cancels pending waits and ends the transport; worker/watchdog threads are daemons.
 """
 
 from __future__ import annotations
@@ -88,6 +33,7 @@ from mcp.server.stdio import stdio_server
 from imsg.mcp.tools import handlers
 from imsg.mcp.tools.dispatch import call_tool
 from imsg.mcp.tools.schemas import TOOL_DEFINITIONS, TOOL_DEFINITIONS_BY_NAME, ToolDefinition
+from imsg.mcp.tools.search_status import annotate_search, needs_models, search_arguments
 from imsg.retrieval.access import LOCAL_FULL_ACCESS
 from imsg.retrieval.background_warm_up import WarmUpPhase
 from imsg.retrieval.errors import InvalidArgumentError
@@ -129,6 +75,7 @@ _RETRIEVAL_HANDLERS: dict[
     str, Callable[[RetrievalService, AccessContext, dict[str, Any]], dict[str, Any]]
 ] = {
     "search_messages": handlers.search_messages,
+    "get_recent_messages": handlers.get_recent_messages,
     "get_conversation": handlers.get_conversation,
     "list_people": handlers.list_people,
     "get_attachment_text": handlers.get_attachment_text,
@@ -159,9 +106,8 @@ def warm_up_report(status: WarmUpStatus) -> dict[str, Any]:
     `memory_busy`), what it is loading right now, how many steps are done,
     an estimate of the seconds left, and — when it failed — the cause, or
     — when the host had no memory for the models — why
-    (`memory_detail`). Every retrieval tool is unavailable until this says
-    `ready`, so this is the field that explains a `WARMING_UP` or
-    `WARM_UP_FAILED` answer from any of them."""
+    (`memory_detail`). Hybrid search needs `ready`; other reads and
+    explicitly labeled keyword search remain available without models."""
     return {
         "state": status.phase.value,
         "loading": status.loading,
@@ -297,13 +243,19 @@ class LocalMcpServer:
         with contextlib.ExitStack() as holding:
             if schema_error is None and name != "check_permissions":
                 tool_fn = _RETRIEVAL_HANDLERS[name]
-                holding.enter_context(self._retrieval_call())
-                self._load_on_first_call()
-                warm_up = await self._settled_warm_up()
+                warm_up = self.warm_up.status()
+                requires_models = needs_models(name, arguments, warm_up)
+                if requires_models:
+                    holding.enter_context(self._retrieval_call())
+                    self._load_on_first_call()
+                    warm_up = await self._settled_warm_up()
+                effective = search_arguments(arguments, warm_up) if name == "search_messages" else arguments
 
                 def handler() -> dict[str, Any]:
-                    warm_up.raise_unless_ready(wait_bound_seconds=self.warm_up_wait_seconds)
-                    return tool_fn(self.service, LOCAL_FULL_ACCESS, arguments)
+                    if requires_models:
+                        warm_up.raise_unless_ready(wait_bound_seconds=self.warm_up_wait_seconds)
+                    payload = tool_fn(self.service, LOCAL_FULL_ACCESS, effective)
+                    return annotate_search(payload, effective, warm_up) if name == "search_messages" else payload
 
             result = call_tool(
                 self.audit, tool=name, params=arguments, handler=handler, started=started
@@ -317,7 +269,7 @@ class LocalMcpServer:
 
         payload = result.payload or {}
         return types.CallToolResult(
-            content=[types.TextContent(type="text", text=json.dumps(payload, default=str))],
+            content=[types.TextContent(type="text", text=(str(payload["warning"]) + "\n\n" if payload.get("warning") else "") + json.dumps(payload, default=str))],
             structured_content=payload,
             is_error=False,
         )
