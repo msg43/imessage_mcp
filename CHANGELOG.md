@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-10-15 — Final extraction repair passes remote CI
+
+- CI run `38819507200` passes on `f765e98`: 2,359 tests passed and 720 skipped,
+  plus Ruff and the public-data check. Independent local PostgreSQL tests cover
+  the database-dependent regressions. The optional type check retains 215 errors
+  in 56 files; this is not a clean type-check claim.
+- The migration and matching writers still need a coordinated deployment and
+  a persisted successful sync. Current command access fails before authentication.
+
 ## 2026-10-15 — Extraction preserves distinct source-row observations
 
 - Current scheduled-sync logs show S2 failing on message provenance uniqueness.

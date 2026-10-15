@@ -105,9 +105,11 @@ existing recent-message tool. The local no-PostgreSQL suite passes 2,428 tests w
 counts are distinct from the 57 real database tests above. No product behavior or
 test coverage was removed to accommodate the runner.
 
-**Remote acceptance:** [CI run 38780783017](https://github.com/msg43/imessage_mcp/actions/runs/38780783017)
-passed on `9e1d77f`, including Ruff, the public-data check and the Python 3.12
-suite (2,359 passed, 707 skipped). Its optional type check reports 215 errors in
+**Remote acceptance:** [CI run 38819507200](https://github.com/msg43/imessage_mcp/actions/runs/38819507200)
+passed on `f765e98`, including the extraction repair, Ruff, the public-data check
+and the Python 3.12 suite (2,359 passed, 720 skipped). The database-dependent
+regressions also passed the independent local PostgreSQL checks above. The remote
+optional type check reports 215 errors in
 56 files; the green workflow does not establish a clean type check. These source
 checks close the CI repair, not the outstanding host/runtime gates.
 
