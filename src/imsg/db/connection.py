@@ -13,8 +13,16 @@ import psycopg
 from imsg.config.schema import DatabaseConfig
 
 
-def connect(database: DatabaseConfig, *, autocommit: bool = True) -> psycopg.Connection:
+def connect(
+    database: DatabaseConfig,
+    *,
+    autocommit: bool = True,
+    connect_timeout: int | None = None,
+) -> psycopg.Connection:
     """Connect using `database.dsn`, resolving `database.password` first.
+
+    `connect_timeout` bounds diagnostics when supplied; otherwise the
+    connection behavior of existing callers is unchanged.
 
     Never logs or includes the resolved password in any exception —
     `psycopg` itself is careful about this, and we do not touch the
@@ -57,6 +65,13 @@ def connect(database: DatabaseConfig, *, autocommit: bool = True) -> psycopg.Con
     `conn.transaction()` block, which keeps its atomicity.
     """
     password = database.password.resolve()
+    if connect_timeout is not None:
+        return psycopg.connect(
+            database.dsn,
+            password=password,
+            autocommit=autocommit,
+            connect_timeout=connect_timeout,
+        )
     return psycopg.connect(database.dsn, password=password, autocommit=autocommit)
 
 

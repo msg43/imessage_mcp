@@ -10,6 +10,12 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-10-14 — Setup doctor uses configured database credentials
+
+- The extension check uses the shared database connector and existing secret-reference resolver. Password-authenticated installs no longer report a connection failure merely because the diagnostic omitted their configured password.
+- The diagnostic retains a bounded connection timeout; callers that do not request a timeout retain their existing connection behavior. Installation prerequisites and cluster policy are unchanged.
+- Regression coverage includes environment, Keychain and owner-only file references, credential failures, genuinely absent extensions and timeout forwarding. This local change is not deployed.
+
 ## 2026-09-25 — Search page: filter by who sent a message and by conversation, search by filters alone, save searches on their own, download every result
 
 **Why.** The owner asked to run a filtered search across the whole corpus,

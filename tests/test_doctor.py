@@ -15,6 +15,7 @@ import importlib.util
 import os
 import socket
 import stat
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -22,6 +23,8 @@ from typing import Any
 
 import pytest
 import yaml
+
+from imsg.config.schema import DatabaseConfig
 
 pytestmark = pytest.mark.usefixtures("messages_dir")
 
@@ -42,6 +45,55 @@ def _load_doctor() -> types.ModuleType:
 
 
 doctor = _load_doctor()
+
+
+@pytest.fixture
+def database_config(monkeypatch: pytest.MonkeyPatch) -> DatabaseConfig:
+    monkeypatch.setenv("IMSG_DOCTOR_TEST_PASSWORD", "synthetic-doctor-password")
+    return DatabaseConfig(
+        dsn="postgresql://imsg@127.0.0.1:5433/imsgindex",
+        password="env:IMSG_DOCTOR_TEST_PASSWORD",
+    )
+
+
+@pytest.mark.parametrize("secret_kind", ["env", "keychain", "file"])
+def test_extensions_resolves_configured_password(
+    secret_kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A password-required server works with every supported secret reference."""
+    import psycopg
+
+    expected = "synthetic-doctor-password"
+    if secret_kind == "env":
+        monkeypatch.setenv("IMSG_DOCTOR_TEST_PASSWORD", expected)
+        reference = "env:IMSG_DOCTOR_TEST_PASSWORD"
+    elif secret_kind == "keychain":
+        monkeypatch.setattr(
+            "imsg.config.secrets.subprocess.run",
+            lambda *a, **k: subprocess.CompletedProcess(a, 0, expected + "\n", ""),
+        )
+        reference = "keychain:imsg-doctor-test-password"
+    else:
+        secret_file = tmp_path / "password"
+        secret_file.write_text(expected + "\n")
+        secret_file.chmod(0o600)
+        reference = f"file:{secret_file}"
+    database = DatabaseConfig(
+        dsn="postgresql://imsg@127.0.0.1:5433/imsgindex", password=reference
+    )
+
+    def require_password(*args: Any, **kwargs: Any) -> _FakeConn:
+        if kwargs.get("password") != expected:
+            raise psycopg.OperationalError("no password supplied")
+        assert args == (database.dsn,)
+        assert kwargs["connect_timeout"] == 3
+        assert kwargs["autocommit"] is True
+        return _FakeConn([("vector",), ("pg_prewarm",)])
+
+    monkeypatch.setattr(psycopg, "connect", require_password)
+    result = doctor.check_extensions(database)
+    assert result.passed, result.next_step
+    assert expected not in result.next_step
 
 
 def _fake_config(**overrides: Any) -> types.SimpleNamespace:
@@ -160,41 +212,136 @@ class _FakeConn:
         return None
 
 
-def test_check_extensions_fails_when_both_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_check_extensions_fails_when_both_missing(
+    monkeypatch: pytest.MonkeyPatch, database_config: DatabaseConfig
+) -> None:
     import psycopg
 
     monkeypatch.setattr(psycopg, "connect", lambda *a, **k: _FakeConn([]))
-    result = doctor.check_extensions("postgresql://imsg@127.0.0.1:5433/imsgindex")
+    result = doctor.check_extensions(database_config)
     assert result.passed is False
     assert "CREATE EXTENSION" in result.next_step
     assert "vector" in result.next_step
     assert "pg_prewarm" in result.next_step
 
 
-def test_check_extensions_fails_when_one_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_check_extensions_fails_when_one_missing(
+    monkeypatch: pytest.MonkeyPatch, database_config: DatabaseConfig
+) -> None:
     import psycopg
 
     monkeypatch.setattr(psycopg, "connect", lambda *a, **k: _FakeConn([("vector",)]))
-    result = doctor.check_extensions("postgresql://imsg@127.0.0.1:5433/imsgindex")
+    result = doctor.check_extensions(database_config)
     assert result.passed is False
     assert "pg_prewarm" in result.next_step
     assert "vector" not in result.next_step.split("missing:")[-1]
 
 
-def test_check_extensions_passes_when_both_present(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_check_extensions_passes_when_both_present(
+    monkeypatch: pytest.MonkeyPatch, database_config: DatabaseConfig
+) -> None:
     import psycopg
 
     monkeypatch.setattr(
         psycopg, "connect", lambda *a, **k: _FakeConn([("vector",), ("pg_prewarm",)])
     )
-    result = doctor.check_extensions("postgresql://imsg@127.0.0.1:5433/imsgindex")
+    result = doctor.check_extensions(database_config)
     assert result.passed is True
 
 
-def test_check_extensions_fails_when_unreachable() -> None:
-    result = doctor.check_extensions("postgresql://imsg@127.0.0.1:1/imsgindex", timeout=1.0)
+def test_check_extensions_fails_when_unreachable(database_config: DatabaseConfig) -> None:
+    unreachable = database_config.model_copy(
+        update={"dsn": "postgresql://imsg@127.0.0.1:1/imsgindex"}
+    )
+    result = doctor.check_extensions(unreachable, timeout=1.0)
     assert result.passed is False
-    assert "Postgres reachable" in result.next_step
+    assert "connection" in result.next_step
+
+
+def test_extensions_reports_unresolved_secret_without_connecting(
+    database_config: DatabaseConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import psycopg
+
+    monkeypatch.delenv("IMSG_DOCTOR_TEST_PASSWORD")
+    monkeypatch.setattr(psycopg, "connect", lambda *a, **k: pytest.fail("must resolve first"))
+    result = doctor.check_extensions(database_config)
+    assert not result.passed
+    assert "credentials" in result.next_step
+    assert "not set" in result.next_step
+    assert "CREATE EXTENSION" not in result.next_step
+
+
+def test_extensions_reports_authentication_failure_as_connection_failure(
+    database_config: DatabaseConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import psycopg
+
+    def refused(*args: Any, **kwargs: Any) -> None:
+        raise psycopg.OperationalError("password authentication failed")
+
+    monkeypatch.setattr(psycopg, "connect", refused)
+    result = doctor.check_extensions(database_config)
+    assert not result.passed
+    assert "password authentication failed" in result.next_step
+    assert "CREATE EXTENSION" not in result.next_step
+    assert "synthetic-doctor-password" not in result.next_step
+
+
+def test_extensions_never_turns_a_short_timeout_into_an_unbounded_connection(
+    database_config: DatabaseConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import psycopg
+
+    def capture(*args: Any, **kwargs: Any) -> _FakeConn:
+        assert kwargs["connect_timeout"] == 1
+        return _FakeConn([("vector",), ("pg_prewarm",)])
+
+    monkeypatch.setattr(psycopg, "connect", capture)
+    assert doctor.check_extensions(database_config, timeout=0.5).passed
+
+
+@pytest.mark.parametrize("timeout", [None, 2])
+def test_shared_connector_preserves_defaults_and_forwards_optional_timeout(
+    timeout: int | None, database_config: DatabaseConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import psycopg
+
+    from imsg.db.connection import connect
+
+    calls: list[dict[str, Any]] = []
+
+    def capture(*args: Any, **kwargs: Any) -> _FakeConn:
+        assert args == (database_config.dsn,)
+        calls.append(kwargs)
+        return _FakeConn([])
+
+    monkeypatch.setattr(psycopg, "connect", capture)
+    connect(database_config, autocommit=False, connect_timeout=timeout)
+    assert calls[0]["autocommit"] is False
+    assert calls[0]["password"] == "synthetic-doctor-password"
+    if timeout is None:
+        assert "connect_timeout" not in calls[0]
+    else:
+        assert calls[0]["connect_timeout"] == timeout
+
+
+def test_main_passes_database_config_to_extension_check(
+    tmp_path: Path, config_dict_factory: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config_dict_factory()))
+    observed: list[DatabaseConfig] = []
+
+    def capture(database: DatabaseConfig) -> Any:
+        assert isinstance(database, DatabaseConfig)
+        observed.append(database)
+        return doctor._pass("pgvector + pg_prewarm present")
+
+    monkeypatch.setattr(doctor, "check_extensions", capture)
+    doctor.main(["--config", str(config_path)])
+    assert len(observed) == 1
+    assert observed[0].password.kind == "env"
 
 
 # --------------------------------------------------------------------------
