@@ -10,6 +10,19 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-10-16 — Verify the deployed source-observation repair
+
+- Deploy the reviewed minimal release and migration 0014 after a verified
+  recovery backup, preserving existing provenance and foreign keys.
+- Verify persisted new messages, exact source-text samples and retained
+  conflicting observations after manual and restored scheduled execution.
+- Reuse existing identity matching and naming for uniquely matched new review
+  stubs. Verify historical and unmatched identities remain unchanged; defer
+  their affected search-index updates with the existing pause.
+- Restore the original schedulers and retain the intentional background
+  pause. Search indexing and captions remain gated on owner confirmation
+  that the competing photo import is complete.
+
 ## 2026-10-16 — Preserve every distinct source observation in a minimal repair release
 
 - Port the existing `0c0e798` provenance repair and `f765e98` regression

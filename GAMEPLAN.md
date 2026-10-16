@@ -11,19 +11,37 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
-**2026-10-16 source-observation repair release (prepared, not deployed):**
-This release is based on `adcf4e2` and ports only the existing provenance
-repair from `0c0e798` and its regression assertion from `f765e98`.
-Migration 0014 and matching extraction writers retain every distinct
-message/attachment, source and SQLite rowid association; the details and
-case readers retain stable ordering and distinct attachment source names.
-Deployment requires stopped extraction, a verified backup, measured index
-rebuild space and the matching migration and writers together. Preserve
-any intentional background pause. Independent release review and a real
-post-deployment extraction with committed message evidence remain required.
-The focused extraction, unchanged-row, migration, details and case suite
-passes 71 tests against synthetic PostgreSQL/SQLite; Ruff, DDL lint and
-diff checks pass. No model provider ran during these checks.
+**2026-10-16 source-observation repair is deployed and verified:**
+The minimal release `bb1b368` is based on `adcf4e2` and reuses the existing
+provenance repair from `0c0e798` and regression assertion from `f765e98`.
+Migration 0014 and matching extraction writers preserve distinct
+message/attachment, source and SQLite rowid associations. Reader changes
+retain stable ordering and distinct attachment source names.
+
+A verified recovery backup preceded deployment with extraction stopped.
+The migration preserved existing provenance rows and foreign keys; all
+migration hashes are clean with no pending migration. A manual import and
+an actual run of the restored scheduler both persisted new messages.
+Samples absent before deployment match their original text exactly, and
+the formerly conflicting observations coexist on one canonical message.
+The original scheduler configuration is unchanged. The search page was
+restarted and its login/access checks pass; the public retrieval process
+was preserved.
+
+The intentional background pause remains active. Segmentation, embedding,
+full-text index updates and captions remain deferred; this acceptance
+establishes raw ingestion, not fresh search results. Resumption requires
+the owner to confirm the competing photo import is complete. Caption
+policy remains around the clock with link-preview captions skipped.
+New unnamed contacts from the SSH-run import were checked against Contacts.
+Unique matches were named through the existing identity code; historical
+identities and unmatched entries were preserved. Unmatched contacts remain
+on the normal identity review list.
+
+Validation: 71 focused real database tests, 96 CI compatibility tests and
+hosted CI with 2,279 passed / 702 skipped. Ruff, DDL lint and public-safety
+checks pass. Independent postdeployment review passes all 26 live checks.
+No model or dependency configuration changed.
 Historical status entries below retain their original dates.
 
 **2026-09-25 search page filters, saved searches and result downloads
