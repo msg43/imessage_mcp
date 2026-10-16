@@ -25,6 +25,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install media tools
+        run: brew install ffmpeg poppler
+
       - name: Sync dev dependencies
         run: uv sync --extra dev
 

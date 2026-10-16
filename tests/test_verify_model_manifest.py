@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 import yaml
+from click.utils import strip_ansi
 from typer.testing import CliRunner
 
 from imsg.cli import app
@@ -342,6 +343,7 @@ def test_cli_models_verify_is_registered_and_wired(lock_path: Path, tmp_path: Pa
     runner = CliRunner()
     result = runner.invoke(app, ["models", "verify", "--help"])
     assert result.exit_code == 0
+    help_text = strip_ansi(result.output)
     for flag in [
         "--lock",
         "--data-root",
@@ -350,7 +352,7 @@ def test_cli_models_verify_is_registered_and_wired(lock_path: Path, tmp_path: Pa
         "--skip-artifacts",
         "--skip-runtime",
     ]:
-        assert flag in result.output
+        assert flag in help_text
 
     result = runner.invoke(
         app, ["models", "verify", "--lock", str(lock_path), "--skip-remote", "--skip-runtime"]
