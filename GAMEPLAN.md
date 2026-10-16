@@ -11,6 +11,30 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**October 16 extraction repair is deployed and verified:** release
+`bb1b368515bf946ab99d1c572e031a938ea6b751` runs from the deployed `adcf4e2` base.
+It reuses the exact `0c0e798`/`f765e98` provenance repair plus existing continuous
+integration dependency/help-test fixes; runtime files are unchanged from
+`54cda878`. Migration 0014 is applied with no pending migrations and clean hashes.
+A verified backup preceded migration; provenance counts and foreign keys survived.
+A manual wrapper run and a restored scheduled run both persisted new messages,
+passed exact-content/source sample checks and retained the conflicting message's
+old and new provenance observations. Independent Astra postdeployment review
+accepts live database, sample, job and process evidence with no rollout blocker.
+The extraction uniqueness bug is closed.
+Both wrappers exited 76 because the intentional heavy-work pause remains active.
+Original sync/backup jobs and configuration are restored; the sync interval is
+unchanged. The search page responds and the public server process was preserved.
+
+**Heavy work still requires the owner's photo-import completion confirmation.**
+Segmentation, embedding, full-text search (FTS) indexing and captions remain paused.
+The new messages are extracted; fresh full-text or semantic search coverage is
+not established. Broader main, admission and model changes remain undeployed until
+that import gate clears. Caption policy is already decided: run continuously,
+skipping link-preview captions. Current queue aggregation is complete; throughput,
+search impact and completion estimates remain unmeasured. Command access is
+restored without access-setting changes; the interruption's cause is unestablished.
+
 **Authorized work, October 15:** pending availability changes are committed and
 pushed as `85ed3dd` on `codex/october-availability`; the configured-credential
 doctor fix is `c8f57a5` on `codex/doctor-config-credentials`. Their reviewed deltas
@@ -32,58 +56,35 @@ search still reports model unavailability rather than silently changing meaning.
 The doctor uses the configured secret resolver and bounds connection/Keychain
 waits without displaying partial secret output. Publication is not deployment.
 
-### Open bugs and deferred scheduling decisions
+### Extraction is repaired while heavy indexing remains paused
 
-**Access follow-up, October 15:** direct SSH over the configured local and
-Tailscale paths still closes before authentication. Remote desktop inspection
-confirmed Remote Login and full disk access for remote users are already enabled;
-enabling them again is not the next step. Public metadata and the local sign-in
-page respond, but these checks do not establish authenticated search or freshness.
-Later read-only Console inspection reached current scheduled-sync output:
-extraction repeatedly fails on `message_source_message_id_source_name_key`.
-Deployed rowid history, watermarks and persisted results remain uninspected.
-No host setting, pause or schedule was changed. The private repository retains
-the access and runtime evidence.
-
-- [ ] **Unattended sync exit 1:** the current log isolates failure to S2's
-  provenance uniqueness constraint. A real SQLite/PostgreSQL extraction reproduces
-  that error when the same GUID appears at a new rowid for the same source;
-  reused rowids also misattribute message provenance and erase attachment
-  provenance. These are reproduced mechanisms, not established host history.
-  Migration 0014 and matching writers preserve every distinct entity/source/rowid
-  association, keeping canonical messages and attachments deduplicated by GUID.
-  The implementation run passes 178 affected tests against synthetic
-  PostgreSQL/SQLite. Independent review passes 90 extraction, migration and
-  reader tests, plus a committed-output probe that reproduces the old constraint
-  failure and verifies both observations after the fix. Ruff, DDL lint and diff
-  checks pass; the changed-file public-data scan has zero hard findings and 47
-  reviewed warnings. Deployment and a later real sync with persisted output
-  remain required. Keep intentional pause and resource reservations intact.
-  Deploy the matching migration and writers together while extraction is stopped:
-  old writers are incompatible with the new keys, and migration rebuilds indexes
-  under table locks. Host lock duration and disk headroom remain unmeasured.
-  Incremental selection is unchanged; this fix does not force a rescan of rows
-  below the source watermark.
-- [ ] **Caption scheduling and image scope:** retain the owner's deferred choices.
-  Current queue composition, throughput, search latency and combined memory must
-  be measured before recommending a schedule or completion estimate. Existing
-  routing includes raster previews/favicons; historical measurements are not a
-  current queue forecast. No schedule or bulk-enrichment change has run.
+- [x] **Extraction uniqueness failure:** minimal release and migration are live.
+  Persisted manual and restored scheduled runs verify new canonical messages,
+  exact-content/source samples and both conflicting source observations. The
+  schema/writer pairing, migration hashes and preserved relationships are checked.
+  Incremental selection is unchanged; rows below the watermark are not forcibly
+  rescanned. Exit 76 records the intentional pause rather than extraction failure.
+- [ ] **Caption measurement:** the owner decided September 23 on continuous
+  captions with link-preview captions skipped. That policy is settled. The active
+  photo import gates heavy work. Current queue composition has been
+  measured privately without model calls. Throughput, search latency and combined
+  memory still need measurement after the photo-import gate clears. Historical
+  measurements do not establish today's completion time. Do not lift
+  the pause or start bulk enrichment during the sync rollout.
 
 ### Authorized work status
 
-- [ ] **Diagnose unattended sync:** inspect the actual deployed configuration,
-  watermarks and persisted results. Current stage logs establish a provenance
-  constraint failure; synthetic regressions reproduce and cover the source fix.
-  Independent source QA is complete. Deployment requires usable command access
-  and stopped extraction. Successful sync requires subsequent execution evidence
-  and persisted output, not just a zero exit.
-- [ ] **Measure caption scheduling impact:** inspect current queue kinds,
-  link-preview/favicon coverage and prior measurements, then use the existing
-  planner and bounded synthetic benchmark where appropriate. Report measured
-  throughput, search latency and memory separately from completion estimates
-  for scheduling/scope alternatives. Do not change the schedule or start bulk
-  enrichment; preserve any intentional shared-host pause.
+- [x] **Runtime extraction acceptance:** backup, coordinated minimal deployment,
+  persisted-output checks and restored scheduled extraction are verified. Heavy
+  indexing and broader model/admission rollout remain gated by the photo import.
+- [x] **Automatic naming of new review stubs:** uniquely matched new stubs are
+  named through existing matching/rename logic and verified from a fresh read-only
+  connection. Unmatched new stubs and historical identities remain unchanged
+  under the existing human identity review. Scheduled Contacts access is verified;
+  no permission grant is needed. Affected chats await the permitted indexing run.
+- [ ] **Caption policy measurement:** evaluate the decided continuous-caption
+  policy with link-preview captions skipped when the photo-import gate permits
+  heavy measurement. The scheduling and scope decision is settled.
 - [x] **Reconcile pending source:** port only verified deltas from the published
   availability and doctor branches onto current main. Preserve authorization,
   privacy, sandboxing, model admission and search-priority behavior. Run focused
@@ -94,8 +95,9 @@ the access and runtime evidence.
   scan has zero hard findings and 34 reviewed warnings for changed source; Ruff
   and diff checks pass. QA added the bounded Keychain probe after reproducing its
   missing timeout. Keychain and connection waits are separately bounded; this
-  does not promise a total timeout for all diagnostic queries. Runtime sync and
-  scheduling checks remain access-blocked above; no deployment has run.
+  does not promise a total timeout for all diagnostic queries. Runtime extraction
+  acceptance is complete. Broader availability/runtime acceptance and heavy
+  measurements remain gated as recorded above.
 
 **Full-suite follow-up:** the first remote CI run exposed an outdated tool count,
 colored-help assertions and missing media executables. CI now installs ffmpeg and

@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## 2026-10-16 — Deploy and verify the minimal provenance repair
+
+- Deploy `bb1b368515bf946ab99d1c572e031a938ea6b751` from the deployed base,
+  retaining the exact reviewed provenance repair and existing CI/help-test fixes.
+  The focused release passes 71 real PostgreSQL/SQLite tests and static/public-data
+  checks. Independent release-scope review accepts the minimal rollout plan.
+- Verify the backup, apply migration 0014 and inspect actual keys, indexes,
+  relationships and migration hashes. Manual and restored scheduled extraction
+  persist new messages, pass exact-content/source sample checks and retain both
+  observations that triggered the old uniqueness failure. The extraction bug is
+  closed. Independent Astra postdeployment review accepts the live database, sample,
+  job and process evidence. Original jobs and the intentional pause are preserved.
+- Both wrappers exit 76 with segmentation and embedding deferred. Full-text and
+  semantic search freshness remain unverified. Broader admission/model deployment
+  and heavy indexing/captions wait for the owner's photo-import completion
+  confirmation. Caption policy is settled: continuously, skipping link previews.
+- Read-only queue aggregation is complete without model calls. Throughput,
+  search impact and completion estimates remain unmeasured. Uniquely matched
+  new identity stubs are named and verified through existing logic; unmatched new
+  stubs and historical rows remain unchanged for existing human identity review.
+  Scheduled Contacts access is verified, with no permission grant needed.
+
 ## 2026-10-15 — Final extraction repair passes remote CI
 
 - CI run `38819507200` passes on `f765e98`: 2,359 tests passed and 720 skipped,
