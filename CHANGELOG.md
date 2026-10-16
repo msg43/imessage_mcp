@@ -10,6 +10,19 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
+## 2026-10-16 — Preserve every distinct source observation in a minimal repair release
+
+- Port the existing `0c0e798` provenance repair and `f765e98` regression
+  assertion onto `adcf4e2`. A GUID observed at another SQLite rowid must
+  not fail extraction, and a reused rowid must not refresh or erase
+  another entity's provenance.
+- Migration 0014 keys both provenance tables by entity, source and rowid.
+  Matching writers preserve those associations; details and case readers
+  order them consistently and avoid duplicate attachment source labels.
+- Reuse the synthetic extraction, migration, reader and unchanged-row
+  regressions. Extraction must be stopped while deploying the matching
+  schema and writers; retain existing background pauses.
+
 ## 2026-09-25 — Search page: filter by who sent a message and by conversation, search by filters alone, save searches on their own, download every result
 
 **Why.** The owner asked to run a filtered search across the whole corpus,

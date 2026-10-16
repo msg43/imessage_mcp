@@ -972,8 +972,8 @@ class ExtractResult:
     attachment. `unchanged` means this source had already recorded that
     row. For `message_source` the run id that last read the row still
     moves to this run -- bookkeeping, not corpus content (see
-    `_upsert_message_source`). `replaced` on `attachment_source` means a
-    source row now resolves to a different attachment."""
+    `_upsert_message_source`). Distinct message/attachment and source-row
+    associations are preserved, including when a source reuses a rowid."""
     attachment_location_rows: UpsertCounts = field(default_factory=UpsertCounts)
     """The path this source's chat.db recorded for each attachment it read
     (`imsg.backfill.locations.record_recorded_path`): inserted, or already
@@ -2617,25 +2617,19 @@ def _upsert_attachment(
 def _upsert_attachment_source(
     cur: psycopg.Cursor[Any], source_name: str, source_rowid: int, attachment_id: int
 ) -> UpsertOutcome:
-    """Not evidence-gated, and does not need to be: `attachment_id` is a
-    row id this same transaction just resolved, so it is never absent.
-    The statement records "this source's row N is that attachment", which
-    only the source itself can assert. A source row that now resolves to
-    a different attachment is reported as `REPLACED`."""
+    """Keep each observed attachment/source-row association. Reused rowids
+    must not erase an older attachment's provenance; a GUID observed at
+    another rowid adds an observation, not another canonical attachment."""
     cur.execute(
         """
         INSERT INTO attachment_source (attachment_id, source_name, source_rowid)
         VALUES (%s, %s, %s)
-        ON CONFLICT (source_name, source_rowid) DO UPDATE SET attachment_id = EXCLUDED.attachment_id
-        WHERE attachment_source.attachment_id IS DISTINCT FROM EXCLUDED.attachment_id
-        RETURNING (xmax = 0)
+        ON CONFLICT (attachment_id, source_name, source_rowid) DO NOTHING
+        RETURNING 1
         """,
         (attachment_id, source_name, source_rowid),
     )
-    row = cur.fetchone()
-    if row is None:
-        return UpsertOutcome.UNCHANGED
-    return UpsertOutcome.INSERTED if row[0] else UpsertOutcome.REPLACED
+    return _inserted_or_unchanged(cur)
 
 
 _MESSAGE_COLUMNS: tuple[_Column, ...] = (
@@ -2870,14 +2864,18 @@ def _upsert_message_source(
     downstream watches it, so it drags no re-segmentation behind it:
     the cost is table churn, not 17 hours of recomputed embeddings.
 
-    Reported as `INSERTED` for a row this source had not recorded and
-    `UNCHANGED` for one it had: the mapping itself (`message_id`) is
-    never rewritten, only the bookkeeping run id."""
+    Reported as `INSERTED` for an association this source had not
+    recorded and `UNCHANGED` for one it had. A GUID may appear at a new
+    SQLite rowid, or a rowid may later identify another GUID. Preserve
+    each association and update only the run that last observed that
+    exact tuple; an old association must never appear freshly observed
+    merely because another message reused its rowid."""
     cur.execute(
         """
         INSERT INTO message_source (message_id, source_name, source_rowid, extraction_run_id)
         VALUES (%s, %s, %s, %s)
-        ON CONFLICT (source_name, source_rowid) DO UPDATE SET extraction_run_id = EXCLUDED.extraction_run_id
+        ON CONFLICT (message_id, source_name, source_rowid)
+        DO UPDATE SET extraction_run_id = EXCLUDED.extraction_run_id
         RETURNING (xmax = 0)
         """,
         (message_id, source_name, source_rowid, run_id),

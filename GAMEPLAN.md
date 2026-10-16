@@ -11,6 +11,21 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**2026-10-16 source-observation repair release (prepared, not deployed):**
+This release is based on `adcf4e2` and ports only the existing provenance
+repair from `0c0e798` and its regression assertion from `f765e98`.
+Migration 0014 and matching extraction writers retain every distinct
+message/attachment, source and SQLite rowid association; the details and
+case readers retain stable ordering and distinct attachment source names.
+Deployment requires stopped extraction, a verified backup, measured index
+rebuild space and the matching migration and writers together. Preserve
+any intentional background pause. Independent release review and a real
+post-deployment extraction with committed message evidence remain required.
+The focused extraction, unchanged-row, migration, details and case suite
+passes 71 tests against synthetic PostgreSQL/SQLite; Ruff, DDL lint and
+diff checks pass. No model provider ran during these checks.
+Historical status entries below retain their original dates.
+
 **2026-09-25 search page filters, saved searches and result downloads
 (built, not yet deployed):** "Sent by" a person or me, sent / received,
 one-to-one or group conversations, and one conversation; a search with no
