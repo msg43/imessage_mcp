@@ -546,6 +546,52 @@ def test_pooled_get_conversation_list_people_and_attachment_text_match_too(
             assert have == want
 
 
+@pytest.mark.parametrize("pool_size", [1, 4])
+def test_keyword_and_recent_reads_use_owned_pooled_connections_without_models(
+    scratch_db: psycopg.Connection,
+    shared_fts: apsw.Connection,
+    corpus: Corpus,
+    pools_factory: Callable[[int, int], RetrievalConnections],
+    monkeypatch: pytest.MonkeyPatch,
+    pool_size: int,
+) -> None:
+    sequential = make_service(scratch_db, shared_fts)
+    pooled = make_service(scratch_db, shared_fts, pools_factory(pool_size, pool_size))
+    # These constructor connections are deliberately unusable. Every database
+    # access must use the connection leased for this call, including recent reads.
+    monkeypatch.setattr(pooled, "_pg", None)
+    monkeypatch.setattr(pooled, "_fts", None)
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("a model-independent read invoked a model")
+
+    monkeypatch.setattr(sequential, "_run_model", forbidden)
+    monkeypatch.setattr(pooled, "_run_model", forbidden)
+    nonempty = 0
+    for context, params in _search_battery(corpus):
+        params = {**params, "mode": "keyword"}
+        expected, expected_bytes = _answer(sequential, context, params)
+        got, got_bytes = _answer(pooled, context, params)
+        assert got == expected
+        assert got_bytes == expected_bytes
+        if isinstance(expected, SearchMessagesResult):
+            nonempty += bool(expected.results)
+            assert expected.candidate_lists["segment_vector"] == 0
+            assert expected.candidate_lists["attachment_vector"] == 0
+            assert expected.candidate_lists["multimodal_vector"] == 0
+    assert nonempty > 0
+    for context in (
+        LOCAL_FULL_ACCESS,
+        AccessContext(surface="public", scope="allowlist", subject="1"),
+    ):
+        expected = sequential.get_recent_messages(context, limit=7)
+        assert expected["messages"]
+        assert pooled.get_recent_messages(context, limit=7) == expected
+        assert pooled.get_recent_messages(context, people=[corpus.people["Alice Example"]]) == (
+            sequential.get_recent_messages(context, people=[corpus.people["Alice Example"]])
+        )
+
+
 # ---------------------------------------------------------------------------
 # Concurrency is real
 # ---------------------------------------------------------------------------

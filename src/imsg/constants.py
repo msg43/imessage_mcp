@@ -115,17 +115,18 @@ It has no revision of its own: the provider checks that the directory
 was cut from exactly the multimodal pin before using it."""
 
 ENRICHMENT_YIELD_POLL_INTERVAL_SECONDS = 0.25
-"""How often an enrichment worker paused behind an in-flight query
-re-checks (`imsg.db.enrichment_yield_locks`). Reached only while a query
+"""How often an enrichment worker, or a segmentation or embedding step
+(`imsg.search_yield`), paused behind an in-flight query re-checks
+(`imsg.db.enrichment_yield_locks`). Reached only while a query
 is actually running — the idle check is one round trip and no sleep — so
 it sets how promptly the worker resumes, not what yielding costs."""
 
 ENRICHMENT_YIELD_MAX_PAUSE_SECONDS = 300.0
-"""How long that worker waits for one unit of work before proceeding
-anyway. Not the crash backstop (a killed MCP server's advisory lock dies
-with its database session): the "someone is searching continuously and the
-queue still has to drain overnight" backstop, five minutes out of a
-six-hour window.
+"""How long that worker, or step, waits for one unit of work before
+proceeding anyway. Not the crash backstop (a killed MCP server's advisory
+lock dies with its database session): the "someone is searching
+continuously and the queue still has to drain overnight" backstop, five
+minutes out of a six-hour window.
 
 Here rather than in `imsg.db.enrichment_yield_locks` because
 `imsg.config.schema` defaults to both values and cannot import from

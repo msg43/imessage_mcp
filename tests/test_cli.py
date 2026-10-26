@@ -2555,7 +2555,9 @@ def test_segment_prints_the_backend_line_and_uses_the_factory(
     result = runner.invoke(app, ["segment", "--config", str(mocked_pg_env)])
     assert result.exit_code == 0, result.output
     assert "models: backend=fake" in result.output
-    assert isinstance(captured["provider"], FakeBoundaryProvider)
+    # The factory's provider, wrapped so each call first waits while a
+    # search is in flight (imsg.search_yield).
+    assert isinstance(captured["provider"].inner, FakeBoundaryProvider)
 
 
 def test_embed_prints_the_backend_line_and_uses_the_factory(

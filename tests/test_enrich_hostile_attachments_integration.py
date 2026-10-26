@@ -361,10 +361,11 @@ def test_every_decoder_the_pipeline_runs_is_sandboxed(
     db: psycopg.Connection, data_root: Path, config: Config, launched: list[list[str]]
 ) -> None:
     """PDF text, PDF OCR, audio transcription, and video frame OCR and
-    captions: every `pdfinfo`/`pdftotext`/`pdftoppm`/`ffprobe`/`ffmpeg`
-    runs under `sandbox-exec` with the no-network profile, confined to a
-    work directory under `data_root`. (`file`, the MIME sniffer, is not a
-    decoder and is outside this check.)"""
+    captions: every `file`/`pdfinfo`/`pdftotext`/`pdftoppm`/`ffprobe`/
+    `ffmpeg` runs under `sandbox-exec` with the no-network profile,
+    confined to a work directory under `data_root`. `file`, the MIME
+    sniffer, parses the attachment's bytes too, so it is checked with the
+    rest (2026-09-29)."""
     text_pdf = write_pdf(data_root / "letter.pdf", content=b"BT /F1 12 Tf 72 712 Td (Dear Alice, the kite shop opens at nine and closes at five on weekdays) Tj ET")
     scanned = write_pdf(data_root / "scan.pdf", content=b"BT /F1 12 Tf 72 712 Td (x) Tj ET")
     memo = _media(data_root / "memo.m4a", "-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "aac")
@@ -384,7 +385,8 @@ def test_every_decoder_the_pipeline_runs_is_sandboxed(
         outcome, state, _, last_error, _ = _run(db, config, path, kind, _providers())
         assert (outcome, state) == ("done", "done"), (kind, path.name, last_error)
 
-    decoder_runs = [argv for argv in launched if any(Path(a).name in DECODERS for a in argv)]
+    checked = DECODERS | {"file"}
+    decoder_runs = [argv for argv in launched if any(Path(a).name in checked for a in argv)]
     assert decoder_runs, "no decoder ran at all"
     work_root = (data_root / "artifacts" / "enrich-work").resolve()
     for argv in decoder_runs:
@@ -393,7 +395,31 @@ def test_every_decoder_the_pipeline_runs_is_sandboxed(
         assert Path(argv[2].split("=", 1)[1]).parent == work_root, argv[2]
         assert argv[3] == "-p" and "(deny network*)" in argv[4] and "(deny file-write*)" in argv[4]
     # Every decoder was among them, so the check above covered them all.
-    assert {Path(a).name for argv in decoder_runs for a in argv} >= DECODERS
+    assert {Path(a).name for argv in decoder_runs for a in argv} >= checked
+
+
+def test_a_hung_mime_sniffer_is_stopped_and_fails_the_task(
+    db: psycopg.Connection,
+    data_root: Path,
+    config: Config,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`file` stuck on an attachment is stopped at the task's deadline and
+    the task is recorded failed, like any decoder past its ceiling."""
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_file = fake_bin / "file"
+    fake_file.write_text("#!/bin/sh\nexec /bin/sleep 30\n")
+    fake_file.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    pdf = write_pdf(data_root / "stuck.pdf", content=b"BT /F1 12 Tf 72 712 Td (x) Tj ET")
+    limited = _with_limits(config, task_timeout_seconds=1)
+
+    last_error = _assert_failed_permanently(
+        _run(db, limited, pdf, "pdf_text", _providers()), naming="task_timeout_seconds"
+    )
+    assert last_error.startswith("file on ")
 
 
 # --------------------------------------------------------------------------

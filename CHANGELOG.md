@@ -1,5 +1,108 @@
 # CHANGELOG
 
+## 2026-10-16 — Deploy and verify the minimal provenance repair
+
+- Deploy `bb1b368515bf946ab99d1c572e031a938ea6b751` from the deployed base,
+  retaining the exact reviewed provenance repair and existing CI/help-test fixes.
+  The focused release passes 71 real PostgreSQL/SQLite tests and static/public-data
+  checks. Independent release-scope review accepts the minimal rollout plan.
+- Verify the backup, apply migration 0014 and inspect actual keys, indexes,
+  relationships and migration hashes. Manual and restored scheduled extraction
+  persist new messages, pass exact-content/source sample checks and retain both
+  observations that triggered the old uniqueness failure. The extraction bug is
+  closed. Independent Astra postdeployment review accepts the live database, sample,
+  job and process evidence. Original jobs and the intentional pause are preserved.
+- Both wrappers exit 76 with segmentation and embedding deferred. Full-text and
+  semantic search freshness remain unverified. Broader admission/model deployment
+  and heavy indexing/captions wait for the owner's photo-import completion
+  confirmation. Caption policy is settled: continuously, skipping link previews.
+- Read-only queue aggregation is complete without model calls. Throughput,
+  search impact and completion estimates remain unmeasured. Uniquely matched
+  new identity stubs are named and verified through existing logic; unmatched new
+  stubs and historical rows remain unchanged for existing human identity review.
+  Scheduled Contacts access is verified, with no permission grant needed.
+
+## 2026-10-15 — Final extraction repair passes remote CI
+
+- CI run `38819507200` passes on `f765e98`: 2,359 tests passed and 720 skipped,
+  plus Ruff and the public-data check. Independent local PostgreSQL tests cover
+  the database-dependent regressions. The optional type check retains 215 errors
+  in 56 files; this is not a clean type-check claim.
+- The migration and matching writers still need a coordinated deployment and
+  a persisted successful sync. Current command access fails before authentication.
+
+## 2026-10-15 — Extraction preserves distinct source-row observations
+
+- Current scheduled-sync logs show S2 failing on message provenance uniqueness.
+  Real SQLite/PostgreSQL extraction reproduces the same error when a canonical
+  GUID appears at another rowid under the same source name. Reused rowids also
+  falsely refresh an older message's provenance and erase attachment provenance.
+  The host's actual rowid history remains unverified.
+- Migration 0014 keys provenance by entity, source name and source rowid, preserving
+  existing rows and foreign keys. Writers keep every observed association and
+  refresh only the exact message observation's last-read run. Canonical entities
+  still deduplicate by GUID. Details and citation exports sort same-source
+  observations by rowid; attachment source names appear once.
+- Regressions cover shifted, reused and swapped rowids in live and seed extraction,
+  repeated observations, persisted rows from another connection, populated-schema
+  upgrade, migration reruns, deletion cascades and reader cardinality. All 178
+  affected tests pass against synthetic PostgreSQL/SQLite. Independent review
+  passes 90 extraction, migration and reader tests and a committed-output
+  before/after probe. Ruff, DDL lint, diff and public-data checks pass.
+- Deployment requires stopped extraction and matching migration and writers;
+  old writers cannot use the new keys. Index rebuild duration and disk headroom
+  need host verification. Incremental selection remains unchanged. No production
+  database or schedule changed, and a successful live sync remains unverified.
+
+## 2026-10-15 — Verify remote CI and narrow the runtime access gate
+
+- Actual Python 3.12 CI passes 2,359 tests with 707 skipped, plus Ruff and the
+  public-data check. The optional type check still reports 215 errors in 56 files.
+- Independent triage finds no error in the changed production code or doctor
+  script and no confirmed runtime defect. Changed test files retain typing debt;
+  no claim is made that every reported error predates this work.
+- Read-only desktop inspection confirms Remote Login and remote-user full disk
+  access are already enabled. SSH still fails before authentication; HTTP
+  responses establish liveness only. Current sync evidence and caption queue
+  measurements remain unavailable, with no host settings or scheduling changed.
+
+## 2026-10-15 — Repair full CI after availability integration
+
+- The complete remote suite caught a stale four-tool assertion after recent-message
+  reads were added, ANSI styling splitting help flags, and missing ffmpeg/Poppler
+  executables. Update the asserted surface, compare visible help text and install
+  the required media tools. Keep real parser tests enabled.
+- The 24 affected tests, Ruff and diff checks pass. The full local no-PostgreSQL
+  suite passes 2,428 tests with 659 skipped on Python 3.14; remote CI uses 3.12.
+  Product source and deployment configuration are unchanged by this repair.
+
+## 2026-10-15 — Reconcile availability with current retrieval and secret handling
+
+- Selectively integrate the published availability/doctor deltas after checking
+  current implementation. Keep pooled parallel channels, caller authorization,
+  search priority, admission and sandbox behavior. Explicit keyword fallback and
+  basic/recent reads can run without models; default hybrid search remains explicit
+  about unavailable models. The separate segmentation experiment is not included.
+- Doctor resolves configured secrets with bounded connection and Keychain stages.
+  Astra reproduced an unbounded Keychain subprocess, added its timeout, and checked
+  that timeout errors cannot reveal partial secret output. Ordinary secret callers
+  retain their prior defaults.
+- Independent Astra ultra QA passes 359 focused tests and 57 real synthetic
+  PostgreSQL/SQLite tests. Ruff, diff and public-data checks pass with zero hard
+  findings. Host SSH resets before authentication; sync exit 1 and caption-impact
+  measurements remain tracked open. No deployment, scheduling or corpus change ran.
+
+## 2026-10-15 — Pending source is published before independent reconciliation
+
+- Availability changes `85ed3dd` and doctor fix `c8f57a5` are pushed on their
+  feature branches, with exact remote hashes verified. Initial validation passed
+  1,969 public tests, 48 retrieval/parity tests against synthetic PostgreSQL and
+  94 doctor tests. Public-data checks had no hard findings.
+- GAMEPLAN assigns sync diagnosis, caption-impact measurement and selective
+  integration to an implementation agent, followed by Astra ultra QA. Current
+  main's sandbox, admission and search-priority protections must be preserved.
+  No deployment, schedule change or corpus operation followed the branch pushes.
+
 Dated milestone history, newest-first. Terse bullets explaining the
 **why**, not just the what — link commit hashes where useful. Add the
 entry **in the same commit(s) as the work** whenever something notable
@@ -10,31 +113,244 @@ when in doubt, add the line.
 This is a running document, not a one-time artifact — status must never
 live only in a chat transcript or an assistant's session memory.
 
-## 2026-10-16 — Verify the deployed source-observation repair
+## 2026-09-29 — The MIME sniffer and the caption scaler run in the enrichment sandbox
 
-- Deploy the reviewed minimal release and migration 0014 after a verified
-  recovery backup, preserving existing provenance and foreign keys.
-- Verify persisted new messages, exact source-text samples and retained
-  conflicting observations after manual and restored scheduled execution.
-- Reuse existing identity matching and naming for uniquely matched new review
-  stubs. Verify historical and unmatched identities remain unchanged; defer
-  their affected search-index updates with the existing pause.
-- Restore the original schedulers and retain the intentional background
-  pause. Search indexing and captions remain gated on owner confirmation
-  that the competing photo import is complete.
+**Why.** The QA review (2026-09-24) found, and the owner approved fixing,
+that two enrichment steps still parsed attachment bytes outside the
+sandbox every other decoder got on 2026-09-24: the `file` MIME sniffer and
+the caption provider's downscaled copy (PIL, in the worker process, into
+the system temp directory on the boot volume). Anyone who can send the
+owner an iMessage chooses those bytes.
 
-## 2026-10-16 — Preserve every distinct source observation in a minimal repair release
+- **`file` runs sandboxed.** In a task it runs under `sandbox-exec` with
+  the no-network, writes-only-in-the-work-directory profile, inside the
+  task's budget (wall clock, temp bytes, memory, output size), and within
+  its own time bound: 10 s for one path, 120 s for a batch, as before. The
+  task's work directory is now made before sniffing. The planner
+  (`imsg enrich --plan`) and S5a's enqueue hook run outside any task, so
+  they sniff in a scratch work directory under
+  `data_root/artifacts/enrich-work` (name starts with the process id, so
+  the worker's stale-directory sweep removes one left by a killed
+  process). The unsandboxed `real_sniff_mime` is gone.
+- **The scaled caption image is made by a sandboxed child process**
+  (`python -m imsg.enrich.caption_image_scaler`) inside the task's budget,
+  writing only in a directory inside the task's work directory, removed
+  after the caption. The same PIL steps run as before, so the scaled
+  image is the same. `CaptionProvider.caption` takes the task's budget as
+  a keyword; the pipeline always passes it (images and video frames).
+  Called without one (the model smoke test), the provider makes a
+  private budget in a fresh temp directory.
+- **Failures are recorded, not swallowed.** A sniff or scale past a
+  ceiling or its time bound is `UntrustedAttachmentError`, and the task is
+  recorded `failed` at once. A sandbox refusal of `file` is the sniff
+  failure it always was. A scaler that exits non-zero fails the caption
+  (`EnrichmentError`, retried) instead of showing the model the original.
+- **Tests.** New unit tests launch the real `sandbox-exec`: the sniffer's
+  and the scaler's commands are sandboxed in the right work directory, a
+  hung `file` is stopped at its bound and at the task's deadline, a write
+  outside the work directory is refused (the same command unsandboxed
+  does write), the scaler over the memory ceiling or past the deadline
+  fails the caption, and a scaled copy lands only in the work directory.
+  Two integration tests: `file` is in the every-decoder-is-sandboxed
+  check, and a hung sniffer fails its task permanently. All fail on the
+  previous code.
 
-- Port the existing `0c0e798` provenance repair and `f765e98` regression
-  assertion onto `adcf4e2`. A GUID observed at another SQLite rowid must
-  not fail extraction, and a reused rowid must not refresh or erase
-  another entity's provenance.
-- Migration 0014 keys both provenance tables by entity, source and rowid.
-  Matching writers preserve those associations; details and case readers
-  order them consistently and avoid duplicate attachment source labels.
-- Reuse the synthetic extraction, migration, reader and unchanged-row
-  regressions. Extraction must be stopped while deploying the matching
-  schema and writers; retain existing background pauses.
+No migration and no config change. Deploying needs only a restart of the
+enrichment workers; the planner and S5a's enqueue hook pick it up at
+their next start.
+
+## 2026-09-26 — `imsg sync`'s segmentation and embedding wait while a search is running
+
+**Why.** The owner asked to "make the sync wait while a search is running
+now." The 2026-09-25 reranking investigation measured on the M2 Ultra
+development host that one process embedding in the sync's batch shape
+beside the public server made its reranking 2.3x slower with the bf16
+reranker (3.6x with the mxfp8 one before it), and two such processes
+6.4x (10.4x). The enrichment worker has waited between tasks while a
+search is in flight since 2026-09-17; the sync's heavy steps never did.
+
+- **Where they wait** (new `imsg.search_yield`): segmentation before each
+  call to the boundary model (sync's S4, `imsg segment`, `imsg segment
+  --rebuild`); embedding before each text batch and each image or video
+  (sync's S6, `imsg embed`), where the pause switch and memory pressure are
+  already checked. A unit that has started always finishes.
+- **Same mechanism as enrichment.** The gate is enrichment's
+  (`imsg.db.enrichment_yield_locks`, now named `QueryYieldGate`;
+  `EnrichmentYieldGate` is the same class), probing the same
+  query-in-flight advisory lock. A public or local MCP search holds it for
+  its whole length, the servers' warm-up holds it, and the search page's
+  model API holds it while it computes each embedding or rerank. The model
+  API already did; nothing changed there, and a new integration test pins
+  it.
+- **Bounded, with enrichment's settings.** One wait lasts at most
+  `enrichment.yield_max_pause_seconds` (300 s), then the unit runs anyway;
+  a waiting step re-checks every `enrichment.yield_poll_interval_seconds`
+  (0.25 s); `enrichment.yield_to_queries: false` turns it off for every
+  step. No new config key.
+- **The pause switch and a waiting live server still win.** While a step
+  waits, each poll also asks `BackgroundGate.stop_at_once` (background
+  work paused, or a live MCP server waiting for memory) and stops waiting
+  at once if either is true; the step's usual stop check then decides.
+  Without this, a stream of searches could hold a paused host's sync for
+  up to 300 s. Enrichment's wait is unchanged.
+- **It never slows a search.** A search's marker is a try-lock that never
+  waits, and a step's probe holds the conflicting lock for one round trip.
+  With nobody searching, each unit costs one probe (two statements) and
+  no sleep.
+- **Visible.** Log events `segment.yielding`, `segment.resumed`,
+  `segment.yield_timed_out`, `segment.yield_interrupted`, and the same for
+  `embed`; closing lines such as `sync: embedding yielded to in-flight
+  searches 2 time(s), 3.0s total` (`segment:` and `embed:` when run on
+  their own), printed only when a step waited. `imsg status` adds
+  `segment_yielding_now` and `embed_yielding_now`, read from `pg_locks`:
+  a waiting step holds advisory key 3 (segmentation) or 4 (embedding) in
+  the `imsg` namespace, as enrichment holds key 2.
+- **Measured on the M2 Ultra development host** with the investigation's
+  harness: the public server's model set and model API, now holding the
+  real marker on a scratch Postgres; its timing script (3 warm-up calls,
+  then 20 timed reranks of 20 documents); and a second process embedding
+  in the sync's batch shape (at most 32 rows and 2,048 padded tokens per
+  batch, the embed role's 14 GiB MLX limit), asking the production
+  embedding stop check before each batch. Times are the model API's own
+  `timings_ms.rerank`, two rounds per condition:
+
+  | Beside the server | Back-to-back p50 / p95 (ms) | 3 s apart p50 / p95 (ms) |
+  |---|---|---|
+  | Nothing | 392.5 / 393.6; 393.3 / 394.0 | 419.8 / 436.3; 429.7 / 434.7 |
+  | Embedding load, not waiting (the sync until now) | 1,013.2 / 1,079.2; 1,014.8 / 1,141.4 | 1,046.1 / 1,157.7; 1,035.0 / 1,071.3 |
+  | Embedding load, waiting | 393.2 / 397.9; 392.6 / 393.7 | 1,036.0 / 1,096.0; 999.3 / 1,146.0 |
+
+  - A burst of searches is no longer slowed: 2.6x before, 1.0x now. The
+    slowest waiting-load call was 573 and 708 ms, the first calls of each
+    run, which met the batch already running.
+  - A lone search is still slowed: 2.4-2.5x at p50 either way. Of 20
+    searches 3 s apart, 15 and 16 took over 1.5x their time alone, against
+    20 of 20 without waiting: most arrived while a batch (median 2.6-2.9 s)
+    was running, and a batch that has started runs to the end.
+  - The Qwen3-Embedding-8B weights were not on the host. The server's text
+    embedder and the load both used the production embedding class on a
+    Qwen3-8B mxfp8 checkpoint of the same architecture (36 layers, hidden
+    size 4,096). The load that did not wait slowed reranking 2.6x, against
+    2.3x with the real embedder on 2026-09-25.
+- **What it does not do.**
+  - It does not preempt (above). On the production host the sync's
+    embedding batches took 44-104 s each on 2026-09-25, so there a lone
+    search will usually meet a batch in progress.
+  - A lone search is only protected if the gate keeps waiting between
+    searches. In a harness-only experiment, holding the marker 5 s after
+    each rerank made the 3 s-apart searches 431.6 / 459.6 ms (alone: 419.6
+    / 428.9; load not waiting: 1,069.2 / 1,105.8), and the load started no
+    batch for the 70 s they lasted.
+    Background work would then wait as long as someone keeps searching, up
+    to the 300 s bound per unit. Not built; the owner's call.
+  - The search page's embedding and rerank are two model-API calls with the
+    page's database work between them, and the marker is not held in that
+    gap.
+- **Tests:** 33 new. Against the previous build 30 fail. 5 fail on what
+  they check: the sync's boundary model and an embedding batch each ran
+  while a search held the marker; a search that never ends added no
+  bounded wait; the sync never checked for searches (0 probes where each
+  unit now makes one); a pause during a wait did not stop `imsg embed`.
+  25 fail because the new module, names or status fields do not exist.
+  3 pass on both builds by design: nothing changes with no search in
+  flight, the switch set off asks nothing, and the model API holds the
+  marker while it computes. One existing test now looks through the
+  wrapper for the factory's boundary provider. Full suite against a real
+  Postgres 17 with pgvector: 3,051 passed, 2 skipped (the real-reranker
+  tests, which need a model directory); ruff and strict mypy clean.
+
+## 2026-09-25 — MCP servers load before background work; a refused load is retried every 15 s and says what it waits on
+
+**Why.** On the production host the public MCP server was restarted with
+new code while a scheduled `imsg sync` was segmenting, and it stayed
+without its models for about 12 minutes, so Gemini had no working search.
+Memory admission counted the sync's reservation against it. The server's
+refusal line: 29.4 GiB available, 9.9 GiB of it promised to other model
+processes, and 17.2 GiB needed plus the 8.0 GiB reserve. The sync had
+been admitted for 21.0 GiB (its segmentation footprint) about nine
+minutes earlier and had taken up 11.1 GiB of it (21.0 less 9.9). So 29.4
+covered the server, and 29.4 less the sync's promise did not. Nothing
+asked the sync to stop; it was stopped by hand.
+
+- **Background work gives way to the MCP servers**
+  (`imsg.memory_admission.LiveServerAdmission`, new
+  `imsg.live_server_notice`). The public and local MCP servers answer
+  people. Everything else that loads models (segment, embed, the enrich
+  worker, sync's heavy steps, eval) is background work.
+  - An MCP server whose load is refused posts a notice:
+    `<data_root>/run/live-servers-waiting/<pid>.json`, held under an
+    exclusive `flock` while it waits. The kernel drops the lock when the
+    process exits, so a crashed server holds nothing back, and a leftover
+    file counts for nothing even if its pid is reused.
+  - While a notice is posted, no background load is admitted (the command
+    waits as before, then exits 75). A running background command stops
+    after its current unit of work (one chat, one embedding batch, one
+    enrichment task), drops its models, its reservation and the
+    heavy-model lock, and exits 75. Attachment backfill loads no model and
+    is not stopped.
+  - The server then loads at its next try, with nothing set aside. In the
+    incident, the sync would have stopped after the chat it was on.
+- **A bound for jobs that cannot stop soon** (a long unit; eval, which has
+  no units; a build from before this change): `memory.background_yield_seconds`,
+  60 s. For that long after a server starts waiting, the memory background
+  jobs were admitted for and have not taken up counts against it. After
+  that, only the memory the host really has, the reserve and the pressure
+  level count. Background promises give way; the host's real memory never
+  does. A server that loads past a job's promise keeps its notice up until
+  that job has stopped, so the job cannot grow into that memory afterwards.
+- **Why the promise still counts for the first minute.** A job's promise
+  is real while its model loads, which takes tens of seconds. A server
+  loading into the same memory could push the host to critical pressure,
+  and critical pressure makes the public server unload its own models. So
+  the server first waits for background work to stop, which normally takes
+  one unit of work. 60 s is about one model load: the query models' whole
+  warm-up took 41.8-65.4 s over four cold starts on the M2 Ultra host. No
+  background model's load time has been measured.
+- **Other MCP servers' reservations always count**, so local servers
+  started in the same second are still admitted one at a time.
+- **Emergency release is unchanged:** critical pressure still unloads a
+  server at once, after any call in flight, and the public server still
+  reloads by itself after the 300 s cooldown if admitted. New: the public
+  server's notice stays up through the cooldown until its reload is
+  admitted, so background work does not take that memory meanwhile. A
+  local server does not reload by itself, so it posts nothing when it
+  releases its models. Its notice for a refused load lapses when no call
+  has tried the load for 120 s.
+- **Eval is background work.** It borrows the local server's footprint and
+  now passes `live=False`. Reservation files record `live`; a file written
+  by the previous build is read by its role.
+- **Retry cadence and the log.** The previous build already retried a
+  refused load every `memory.admission_retry_seconds` (15 s): on a fake
+  clock, 41 checks in 10 minutes. But it logged a refusal only every
+  300 s, so its log did not show how often it tried. That is the likely
+  source of the "about every 10 minutes" reading of the incident log [not
+  checked against that host's log or config]. Now a refusal is logged when
+  what the server waits on changes and at least once a minute, each line
+  saying when the load is tried again. The watchdog wakes when a try is
+  due rather than at its next regular pass, so the 15 s holds even with a
+  slower `memory.pressure_check_seconds`.
+- **What a waiting server waits on.** `imsg status` adds
+  `live_servers_waiting` and `mcp_public_waiting_on`: every other
+  reservation the public server's last check saw, with its pid, command,
+  whether it is a live server or background work, what it was admitted
+  for, what it holds, what it has not taken up and whether that counted.
+  `model_processes` rows say live server or background, and
+  `imsg background status` names the server background work gives way
+  to. These show command names (`imsg sync`), pids and byte counts only.
+  The public surface still answers in numbers only.
+- **Config:** `memory.background_yield_seconds` (default 60; 0 means
+  background promises never count against an MCP server).
+- **Tests:** 31 new; one existing test changed for the 60 s log interval.
+  Against the unfixed code all 31 fail. Four fail on what they check:
+  - the incident, reproduced across two processes through `imsg mcp
+    public`: the server stayed `memory_busy`;
+  - a background job was admitted while the server waited;
+  - 1 check in 1.5 s against a 0.2 s retry interval;
+  - a changed refusal cause was not logged.
+
+  The other 27 fail because the new module and names do not exist. Full
+  suite against a real Postgres 17 with pgvector: 3,018 passed, 2 skipped
+  (the real-reranker tests, which need a model directory).
 
 ## 2026-09-25 — Search page: filter by who sent a message and by conversation, search by filters alone, save searches on their own, download every result
 

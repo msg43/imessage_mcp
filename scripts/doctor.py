@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
-    from imsg.config.schema import Config
+    from imsg.config.schema import Config, DatabaseConfig
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 IMSG_DUMP_PATH = REPO_ROOT / "tools" / "imsg-dump" / "target" / "release" / "imsg-dump"
@@ -126,16 +126,16 @@ def check_postgres_reachable(dsn: str, *, timeout: float = 3.0) -> CheckResult:
 REQUIRED_EXTENSIONS = ("vector", "pg_prewarm")
 
 
-def check_extensions(dsn: str, *, timeout: float = 3.0) -> CheckResult:
+def check_extensions(database: DatabaseConfig, *, timeout: float = 3.0) -> CheckResult:
     name = "pgvector + pg_prewarm present"
     try:
-        import psycopg
+        from imsg.db.connection import connect
     except ImportError:
         return _fail(name, "Do this next: run `uv sync --extra dev` (psycopg is missing).")
 
     try:
         with (
-            psycopg.connect(dsn, connect_timeout=int(timeout), autocommit=True) as conn,
+            connect(database, connect_timeout=max(1, int(timeout))) as conn,
             conn.cursor() as cur,
         ):
             cur.execute(
@@ -146,8 +146,8 @@ def check_extensions(dsn: str, *, timeout: float = 3.0) -> CheckResult:
     except Exception as exc:
         return _fail(
             name,
-            "Do this next: make sure Postgres is reachable first (see the "
-            f"'Postgres reachable' check above), then re-run this. ({exc})",
+            "Do this next: check the configured database credentials and "
+            f"Postgres connection, then re-run this. ({exc})",
         )
 
     missing = [ext for ext in REQUIRED_EXTENSIONS if ext not in found]
@@ -319,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if config is not None:
         results.append(run_check(check_postgres_reachable, config.database.dsn))
-        results.append(run_check(check_extensions, config.database.dsn))
+        results.append(run_check(check_extensions, config.database))
         results.append(run_check(check_data_volume, config.paths.data_root))
         results.append(run_check(check_full_disk_access, config.paths.live_chat_db))
     else:

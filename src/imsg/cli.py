@@ -147,6 +147,7 @@ from imsg.export import (
 )
 from imsg.heavy_lock import HeavyModelLock, inspect_heavy_lock
 from imsg.host_memory import PressureLevel, format_gib
+from imsg.live_server_notice import waiting_live_servers
 from imsg.log_rotation import LogRotationError, RotationReport, rotate_logs
 from imsg.mcp.audit import (
     PostgresAuditSink,
@@ -177,6 +178,7 @@ from imsg.mcp.warm_up_readiness import (
     readiness_path,
 )
 from imsg.memory_admission import (
+    LiveServerAdmission,
     MemoryAdmission,
     ModelRole,
     ReservationBook,
@@ -206,6 +208,7 @@ from imsg.retrieval.model_thread import ModelThread
 from imsg.retrieval.service import RetrievalService
 from imsg.search_page.cli import search_page_app
 from imsg.search_page.model_api_server import start_model_api_if_enabled
+from imsg.search_yield import SearchYield, YieldingBoundaryProvider, YieldStep, YieldTally
 from imsg.segment.pipeline import REBUILD_ALL_SENTINEL, run_segment, run_segment_for_chat
 from imsg.stages.extract import ExtractResult, MergeMode, merge_mode_for_source, run_extract
 from imsg.stages.identity import (
@@ -551,7 +554,9 @@ def _unload_enrichment_models(providers: EnrichmentProviders) -> None:
 def _query_marker(cfg: Config) -> QueryInFlightMarker:
     """The "a query is in flight" publisher an MCP server holds while it
     answers (`imsg.db.enrichment_yield_locks`), so the nightly enrichment
-    worker pauses between its units of work.
+    worker pauses between its units of work, and segmentation and
+    embedding pause before their next model call or batch
+    (`imsg.search_yield`).
 
     On its own connection, opened lazily on the first query: a
     session-level advisory lock has to live on a session that lasts as
@@ -562,6 +567,34 @@ def _query_marker(cfg: Config) -> QueryInFlightMarker:
         lambda: connect(cfg.database, autocommit=True),
         enabled=cfg.enrichment.yield_to_queries,
     )
+
+
+def _search_yield(
+    cfg: Config,
+    conn: psycopg.Connection,
+    gate: BackgroundGate,
+    step: YieldStep,
+    *,
+    tally: YieldTally | None = None,
+) -> SearchYield:
+    """`step` waiting, bounded, while a search is in flight
+    (`imsg.search_yield`), on the command's own connection, with the
+    settings the enrichment worker uses. While it waits it also asks the
+    gate's checks that stop at once (paused, a live server waiting), so
+    neither waits behind a search."""
+    return SearchYield.from_config(
+        cfg, conn, step, tally=tally, interrupt=lambda: gate.stop_at_once() is not None
+    )
+
+
+def _echo_search_yield(command: str, cfg: Config, tally: YieldTally, step: str = "") -> None:
+    """The closing line for a step that waited for searches, as `imsg
+    enrich` reports its own yielding: `<command>: [<step> ]yielded to
+    in-flight searches N time(s), X.Xs total`. Nothing when it never
+    waited."""
+    line = tally.describe(cfg.enrichment.yield_max_pause_seconds)
+    if line is not None:
+        typer.echo(f"{command}: {step} {line}" if step else f"{command}: {line}")
 
 
 def _decode_prompt(prompt_bytes: bytes) -> str:
@@ -773,6 +806,7 @@ def _model_process_status_fields(cfg: Config) -> dict[str, object]:
                 "command": process.command,
                 "footprint_bytes": process.footprint_bytes,
                 "reserved_bytes": reservation.reserved_bytes if reservation else None,
+                "live": reservation.is_live if reservation else None,
             }
         )
     for pid, reservation in sorted(reservations.items()):
@@ -784,6 +818,7 @@ def _model_process_status_fields(cfg: Config) -> dict[str, object]:
                 "command": reservation.command,
                 "footprint_bytes": host_memory.process_footprint_bytes(pid),
                 "reserved_bytes": reservation.reserved_bytes,
+                "live": reservation.is_live,
             }
         )
     total = sum(
@@ -819,8 +854,21 @@ def _describe_model_processes(rows: object) -> list[str]:
         reserved = row.get("reserved_bytes")
         held = format_gib(footprint) if isinstance(footprint, int) else "footprint unreadable"
         extra = f", admitted for {format_gib(reserved)}" if isinstance(reserved, int) else ""
-        lines.append(f"  pid {row.get('pid')} {row.get('command')}: {held}{extra}")
+        live = row.get("live")
+        kind = " (live server)" if live is True else " (background)" if live is False else ""
+        lines.append(f"  pid {row.get('pid')} {row.get('command')}{kind}: {held}{extra}")
     return lines
+
+
+def _live_server_status_fields(cfg: Config) -> dict[str, object]:
+    """Live MCP servers waiting for memory right now, which background
+    work gives way to (`imsg.live_server_notice`): the command name, pid
+    and since when, nothing else."""
+    try:
+        waiting = waiting_live_servers(cfg.paths.data_root)
+    except (ImsgError, OSError) as exc:
+        return {"live_servers_waiting": f"unreadable: {type(exc).__name__}: {exc}"}
+    return {"live_servers_waiting": [server.describe() for server in waiting]}
 
 
 @app.command()
@@ -861,6 +909,7 @@ def status(
     memory_state = _host_memory_status_fields()
     pause_state = _background_pause_status_fields(cfg)
     process_state = _model_process_status_fields(cfg)
+    live_state = _live_server_status_fields(cfg)
 
     report = {
         "models_backend": cfg.models.backend,
@@ -877,15 +926,21 @@ def status(
         "at_rest_posture_caveat": posture.caveat,
         "disk_free_bytes": free_bytes,
         # D10.3: is enrichment standing aside for the query side right now?
+        # The same switch covers segmentation and embedding
+        # (imsg.search_yield), each with its own "yielding now".
         "enrichment_yield_enabled": cfg.enrichment.yield_to_queries,
         "enrichment_yielding_now": yield_state.enrichment_paused if yield_state else None,
         "query_in_flight": yield_state.query_in_flight if yield_state else None,
         "enrichment_yield_reason": yield_state.reason if yield_state else None,
+        "segment_yielding_now": yield_state.segment_yielding if yield_state else None,
+        "embed_yielding_now": yield_state.embed_yielding if yield_state else None,
         "mcp_public_warm_up": public_warm_up.state,
         "mcp_public_warm_up_detail": public_warm_up.detail,
         "mcp_public_pid": public_warm_up.pid,
+        "mcp_public_waiting_on": list(public_warm_up.waiting_on),
         **memory_state,
         **pause_state,
+        **live_state,
         **process_state,
         **heavy_lock_state,
         **_pipeline_status_fields(pipeline, pg),
@@ -910,6 +965,11 @@ def status(
             typer.echo("model_processes:")
             for line in _describe_model_processes(value):
                 typer.echo(line)
+            continue
+        if key in ("mcp_public_waiting_on", "live_servers_waiting") and isinstance(value, list):
+            typer.echo(f"{key}:" if value else f"{key}: none")
+            for line in value:
+                typer.echo(f"  {line}")
             continue
         typer.echo(f"{key}: {value}")
 
@@ -1019,9 +1079,10 @@ def background_status(
     config: ConfigOption = None,
     as_json: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
 ) -> None:
-    """Whether heavy background work is paused, by what, and until when."""
+    """Whether heavy background work is paused, by what, and until when,
+    and which live MCP servers it is giving way to."""
     cfg = _load_config_or_die(config)
-    report = _pause_state_report(cfg)
+    report = {**_pause_state_report(cfg), **_live_server_status_fields(cfg)}
     if as_json:
         typer.echo(json.dumps(report, indent=2))
         return
@@ -1034,6 +1095,15 @@ def background_status(
     typer.echo(
         f"background: host pause file: {host_file}" if host_file else "background: host pause file: off"
     )
+    waiting = report["live_servers_waiting"]
+    if isinstance(waiting, list):
+        for line in waiting:
+            typer.echo(
+                f"background: giving way to a live MCP server waiting for memory: {line} "
+                f"(no background load starts; running work stops after its current unit)"
+            )
+    else:
+        typer.echo(f"background: live MCP servers waiting for memory: {waiting}")
 
 
 @models_app.command("verify")
@@ -2017,7 +2087,10 @@ def segment(
     Heavy background work (`imsg.background_gate`): exits 76 without
     loading anything while background work is paused, waits for memory
     and exits 75 if the host never has room, and between chats stops
-    (exit 75/76) when paused or when the host's memory pressure rises."""
+    (exit 75/76) when paused or when the host's memory pressure rises.
+
+    Before each call to the boundary model it waits, bounded, while a
+    search is in flight (`imsg.search_yield`)."""
     cfg = _load_config_or_die(config)
     if rebuild and chat is None:
         typer.echo("imsg: --rebuild requires --chat <id>", err=True)
@@ -2035,6 +2108,8 @@ def segment(
     )
 
     conn = _connect_and_verify_or_die(cfg)
+    search_yield = _search_yield(cfg, conn, gate, YieldStep.SEGMENT)
+    yielding_provider = YieldingBoundaryProvider(provider, search_yield)
     try:
         _acquire_heavy_lock_or_die(heavy_lock)
         _admit_or_exit(gate, admission, heavy_lock, "segment")
@@ -2045,7 +2120,7 @@ def segment(
                 conn,
                 chat,
                 cfg,
-                provider,
+                yielding_provider,
                 prompt_bytes,
                 earliest_changed_at=REBUILD_ALL_SENTINEL,
                 dry_run=dry_run,
@@ -2055,6 +2130,7 @@ def segment(
                 f"segments_deleted={report.segments_deleted} "
                 f"segments_unchanged={report.skipped_unchanged}"
             )
+            _echo_search_yield("segment", cfg, search_yield.tally)
         else:
             chat_ids = {chat} if chat is not None else None
             stopped: StopReason | None = None
@@ -2062,7 +2138,7 @@ def segment(
                 reports = run_segment(
                     conn,
                     cfg,
-                    provider,
+                    yielding_provider,
                     prompt_bytes,
                     chat_ids=chat_ids,
                     dry_run=dry_run,
@@ -2079,6 +2155,7 @@ def segment(
                 f"written, {total_unchanged} left unchanged, "
                 f"{total_fallback} fallback session(s)"
             )
+            _echo_search_yield("segment", cfg, search_yield.tally)
             if stopped is not None:
                 if dry_run:
                     typer.echo(DRY_RUN_MARKER)
@@ -2106,7 +2183,10 @@ def embed(
     Heavy background work (`imsg.background_gate`): exits 76 while
     background work is paused, exits 75 if the host never has memory for
     the models, and between batches stops (committing what is done) when
-    paused or when the host's memory pressure rises."""
+    paused or when the host's memory pressure rises.
+
+    Before each batch, and each image or video, it waits, bounded, while
+    a search is in flight (`imsg.search_yield`)."""
     cfg = _load_config_or_die(config)
     run_guard_mount_or_exit(cfg.paths.data_root)
     gate = _background_gate(cfg, "embed")
@@ -2119,6 +2199,7 @@ def embed(
     multimodal_provider = _build_or_die(lambda: build_multimodal_provider(cfg))
 
     conn = _connect_and_verify_or_die(cfg)
+    search_yield = _search_yield(cfg, conn, gate, YieldStep.EMBED)
     # `_open_fts_conn` creates `fts/` and the sqlite sidecar file on disk
     # (a real filesystem write) — skip it entirely in dry-run mode, since
     # `run_embed(dry_run=True)` never needs it and a dry run must not
@@ -2140,7 +2221,7 @@ def embed(
                 batch_size=cfg.embedding.batch_size,
                 max_batch_tokens=cfg.embedding.max_batch_tokens,
                 dry_run=dry_run,
-                stop_check=None if dry_run else gate.between_units,
+                stop_check=None if dry_run else search_yield.stop_check(gate.between_units),
             )
         except BackgroundWorkDeferred as exc:
             if not isinstance(exc.partial, EmbedRunReport):  # pragma: no cover - run_embed always sets it
@@ -2174,6 +2255,7 @@ def embed(
             f"embed: fts events_applied={sync_report.events_applied} "
             f"(upserts={sync_report.upserts} deletes={sync_report.deletes})"
         )
+        _echo_search_yield("embed", cfg, search_yield.tally)
     if stopped is not None:
         _exit_deferred("embed", stopped)
 
@@ -2185,7 +2267,11 @@ class _SyncHeavySteps:
     `run_sync` records while S1-S3's work stands. A deferral sticks for
     the rest of the command, so later sources skip their heavy steps at
     once instead of waiting again, and it releases the heavy lock at once
-    so other heavy commands are not held up by the light work left."""
+    so other heavy commands are not held up by the light work left.
+
+    Within each step, the next boundary-model call or embedding batch
+    waits while a search is in flight (`imsg.search_yield`); the waits of
+    every source add up in `segment_yields` and `embed_yields`."""
 
     def __init__(self, cfg: Config, heavy_lock: HeavyModelLock, gate: BackgroundGate) -> None:
         self._cfg = cfg
@@ -2193,6 +2279,12 @@ class _SyncHeavySteps:
         self._gate = gate
         self._admission: MemoryAdmission | None = None
         self.deferred: StopReason | None = None
+        self.segment_yields = YieldTally()
+        self.embed_yields = YieldTally()
+
+    def search_yield(self, conn: psycopg.Connection, step: YieldStep) -> SearchYield:
+        tally = self.segment_yields if step is YieldStep.SEGMENT else self.embed_yields
+        return _search_yield(self._cfg, conn, self._gate, step, tally=tally)
 
     def begin(self, role: ModelRole) -> None:
         if self.deferred is not None:
@@ -2234,11 +2326,12 @@ def _make_segment_fn(cfg: Config, steps: _SyncHeavySteps) -> SegmentFn:
 
     def _segment_fn(conn: psycopg.Connection, config: Config, *, dry_run: bool = False) -> object:
         # A dry run asks the boundary model too, so it takes the lock and
-        # passes the gate too.
+        # passes the gate too, and waits for searches too.
         steps.begin(ModelRole.SEGMENT)
+        yielding = YieldingBoundaryProvider(provider, steps.search_yield(conn, YieldStep.SEGMENT))
         try:
             return run_segment(
-                conn, config, provider, prompt_bytes, dry_run=dry_run, stop_check=steps.stop_check
+                conn, config, yielding, prompt_bytes, dry_run=dry_run, stop_check=steps.stop_check
             )
         except BackgroundWorkDeferred as exc:
             steps.note_stopped(exc.reason)
@@ -2273,6 +2366,7 @@ def _make_embed_fn(cfg: Config, steps: _SyncHeavySteps) -> EmbedFn:
                 dry_run=True,
             )
         steps.begin(ModelRole.EMBED)
+        search_yield = steps.search_yield(conn, YieldStep.EMBED)
         stopped: BackgroundWorkDeferred | None = None
         try:
             try:
@@ -2282,7 +2376,7 @@ def _make_embed_fn(cfg: Config, steps: _SyncHeavySteps) -> EmbedFn:
                     multimodal_provider=multimodal_provider,
                     batch_size=config.embedding.batch_size,
                     max_batch_tokens=config.embedding.max_batch_tokens,
-                    stop_check=steps.stop_check,
+                    stop_check=search_yield.stop_check(steps.stop_check),
                 )
             except BackgroundWorkDeferred as exc:
                 stopped, report = exc, exc.partial
@@ -2338,6 +2432,10 @@ def sync(
     so no message is lost — skips segmentation and embedding, says so,
     and exits 76 (paused) or 75 (memory). Between S4 and S6 the boundary
     model is dropped, so the two model sets are never resident together.
+
+    Within S4 and S6, each boundary-model call and each embedding batch
+    first waits, bounded, while a search is in flight
+    (`imsg.search_yield`); the closing lines say how often and how long.
     """
     cfg = _load_config_or_die(config)
     _validate_seed_or_die(cfg, snapshot, source)
@@ -2400,6 +2498,8 @@ def sync(
                 f"{skipped} skipped — {r.deferred.line()}"
             )
             deferred = deferred or r.deferred
+    _echo_search_yield("sync", cfg, steps.segment_yields, YieldStep.SEGMENT.label)
+    _echo_search_yield("sync", cfg, steps.embed_yields, YieldStep.EMBED.label)
     if dry_run:
         typer.echo(DRY_RUN_MARKER)
     if deferred is not None:
@@ -3134,10 +3234,18 @@ def mcp_local(config: ConfigOption = None) -> None:
     # Every load — at startup and after every unload — first asks whether
     # the host has the memory (imsg.memory_admission); refused, retrieval
     # calls answer WARMING_UP (host memory busy) and the next call asks
-    # again. This server is never paused: it only ever defers a load.
+    # again. This server is never paused: it only ever defers a load. It
+    # is a live server, so background work gives way to it: refused, it
+    # posts a notice that stops background work between units and holds
+    # back new background loads, until it loads or its client stops
+    # asking (imsg.memory_admission.LiveServerAdmission).
     memory_probe = host_memory.default_probe()
-    admission = MemoryAdmission.for_role(
-        cfg, ModelRole.LOCAL_SERVER, command="imsg mcp local", probe=memory_probe
+    admission = LiveServerAdmission.for_role(
+        cfg,
+        ModelRole.LOCAL_SERVER,
+        command="imsg mcp local",
+        probe=memory_probe,
+        log=lambda line: typer.echo(f"mcp local: {line}", err=True),
     )
     configure_mlx_memory_limit(cfg, ModelRole.LOCAL_SERVER)
     # Not warmed here: the server answers the MCP handshake first, and
@@ -3169,6 +3277,7 @@ def mcp_local(config: ConfigOption = None) -> None:
             check_seconds=cfg.memory.pressure_check_seconds,
         ),
         after_unload=admission.release,
+        on_watchdog_pass=admission.tick,
     )
     audit = PostgresAuditSink(lambda: connect(cfg.database, autocommit=True))
     # Every client session runs its own copy of this server and most never
@@ -3404,13 +3513,23 @@ def mcp_public(
     # file `imsg status` reads (imsg.mcp.warm_up_readiness).
     readiness = WarmUpReadinessFile(readiness_path(cfg.paths.data_root))
     # As on the local surface, every load first asks whether the host has
-    # the memory (imsg.memory_admission). Unlike it, this server loads
-    # again by itself once admitted (rewarm), since it has to stay warm
-    # for its latency budget, and it releases its models only at
+    # the memory (imsg.memory_admission), and background work gives way to
+    # this live server: refused, it posts a notice that stops background
+    # work between units and holds back new background loads, and what
+    # background jobs were promised stops counting against it after
+    # memory.background_yield_seconds (imsg.memory_admission.
+    # LiveServerAdmission). Unlike the local server, it loads again by
+    # itself once admitted (rewarm), trying every
+    # memory.admission_retry_seconds, since it has to stay warm for its
+    # latency budget, and it releases its models only at
     # memory.public_server_release_at (critical by default, or never).
     memory_probe = host_memory.default_probe()
-    admission = MemoryAdmission.for_role(
-        cfg, ModelRole.PUBLIC_SERVER, command="imsg mcp public", probe=memory_probe
+    admission = LiveServerAdmission.for_role(
+        cfg,
+        ModelRole.PUBLIC_SERVER,
+        command="imsg mcp public",
+        probe=memory_probe,
+        log=lambda line: typer.echo(f"mcp public: {line}", err=True),
     )
     configure_mlx_memory_limit(cfg, ModelRole.PUBLIC_SERVER)
     warm_up = BackgroundWarmUp(
@@ -3420,6 +3539,7 @@ def mcp_public(
         on_status=readiness.publish,
         admission=admission.check,
         admission_retry_seconds=cfg.memory.admission_retry_seconds,
+        retries_by_itself=True,
     )
     release_at = cfg.memory.public_server_release_at
     idle_unloader = IdleModelUnloader(
@@ -3436,6 +3556,11 @@ def mcp_public(
             rewarm_cooldown_seconds=cfg.memory.public_rewarm_cooldown_seconds,
         ),
         after_unload=admission.release,
+        # Unloaded under pressure, it loads again by itself after the
+        # cooldown: its notice goes up so background work does not take
+        # the memory meanwhile.
+        after_pressure_unload=admission.release_for_reload,
+        on_watchdog_pass=admission.tick,
     )
     public = PublicMcpServer(
         service=service,

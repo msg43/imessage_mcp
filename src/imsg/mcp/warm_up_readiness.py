@@ -33,6 +33,15 @@ alive", not "an MCP server is serving". Over the ~4 million pid space of
 a machine that reboots rarely, that is the right trade against the
 alternative (a lock file, which adds a failure mode of its own).
 
+**What a refused load is waiting on (2026-09-25).** While the phase is
+`memory_busy` the file also carries how often the load is tried
+(`memory_retry_seconds`) and every other process's memory reservation the
+last check saw (`waiting_on`: pid, command name, role, whether it is a
+live server or background work, what it was admitted for, holds and has
+not taken up, and whether that counted against the load). Command names
+are the fixed `imsg <subcommand>` strings; no arguments, paths or error
+text.
+
 Nothing here is on the request path: a readiness file that cannot be
 written costs the operator a status field and costs the warm-up nothing
 (`BackgroundWarmUp._publish` swallows what the publisher raises).
@@ -85,6 +94,9 @@ class WarmUpReadinessReport:
     detail: str
     pid: int | None = None
     failure: str | None = None
+    waiting_on: tuple[str, ...] = ()
+    """While `memory_busy`: one line per reservation the last check saw
+    (`describe_waiting_on`)."""
 
 
 class WarmUpReadinessFile:
@@ -127,6 +139,10 @@ class WarmUpReadinessFile:
             ),
             "failure": status.failure,
             "memory_detail": status.detail,
+            "memory_retry_seconds": (
+                status.retry_seconds if status.phase.value == "memory_busy" else None
+            ),
+            "waiting_on": status.admission.waiting_on() if status.admission is not None else [],
             "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         }
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -204,8 +220,51 @@ def read_warm_up_readiness(data_root: Path) -> WarmUpReadinessReport:
             failure=failure,
         )
 
+    rows = document.get("waiting_on")
+    waiting_on = tuple(
+        line
+        for row in (rows if isinstance(rows, list) else [])
+        if (line := describe_waiting_on(row)) is not None
+    )
     return WarmUpReadinessReport(
-        state=phase, detail=_describe(document, phase, failure, age), pid=pid, failure=failure
+        state=phase,
+        detail=_describe(document, phase, failure, age),
+        pid=pid,
+        failure=failure,
+        waiting_on=waiting_on if phase == "memory_busy" else (),
+    )
+
+
+def _gib(value: object) -> str | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"{value / 2**30:.1f} GiB"
+    return None
+
+
+def describe_waiting_on(row: object) -> str | None:
+    """One `waiting_on` entry as a line: a reservation, or a live server
+    another load waits behind. `None` for an entry that is not one."""
+    if not isinstance(row, dict):
+        return None
+    pid, command = row.get("pid"), row.get("command")
+    if not isinstance(pid, int) or not isinstance(command, str):
+        return None
+    kind = "live server" if row.get("live") is True else "background"
+    since = row.get("waiting_since")
+    if isinstance(since, str):
+        return f"{command} pid {pid} ({kind}), waiting for memory since {since}"
+    promised, reserved = _gib(row.get("promised_bytes")), _gib(row.get("reserved_bytes"))
+    held = _gib(row.get("held_bytes")) or "an unreadable footprint"
+    role = row.get("role")
+    what = f"{kind}, {role}" if isinstance(role, str) else kind
+    counted = (
+        "counted against this load"
+        if row.get("counted") is True
+        else "not counted: background work gives way"
+    )
+    return (
+        f"{command} pid {pid} ({what}): admitted for {reserved or '?'}, holds {held}, "
+        f"{promised or '?'} not taken up yet, {counted}"
     )
 
 
@@ -244,9 +303,15 @@ def _describe(document: dict[str, Any], phase: str, failure: str | None, age: fl
     if phase == "memory_busy":
         detail = document.get("memory_detail")
         why = f": {detail}" if isinstance(detail, str) and detail else ""
+        retry = document.get("memory_retry_seconds")
+        every = (
+            f" every {retry:g} s"
+            if isinstance(retry, int | float) and not isinstance(retry, bool)
+            else ""
+        )
         return (
             f"models not loaded — the host did not have the memory for them{why}. Tool "
-            f"calls answer WARMING_UP (host memory busy); the server retries by itself"
+            f"calls answer WARMING_UP (host memory busy); the server retries by itself{every}"
         )
     if phase == "ready":
         elapsed = document.get("elapsed_seconds")
@@ -272,6 +337,7 @@ __all__ = [
     "UNREADABLE",
     "WarmUpReadinessFile",
     "WarmUpReadinessReport",
+    "describe_waiting_on",
     "read_warm_up_readiness",
     "readiness_path",
 ]

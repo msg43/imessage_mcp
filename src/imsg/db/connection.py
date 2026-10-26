@@ -13,8 +13,16 @@ import psycopg
 from imsg.config.schema import DatabaseConfig
 
 
-def connect(database: DatabaseConfig, *, autocommit: bool = True) -> psycopg.Connection:
+def connect(
+    database: DatabaseConfig,
+    *,
+    autocommit: bool = True,
+    connect_timeout: int | None = None,
+) -> psycopg.Connection:
     """Connect using `database.dsn`, resolving `database.password` first.
+
+    `connect_timeout` bounds Keychain resolution and connection establishment
+    separately when supplied; otherwise existing callers are unchanged.
 
     Never logs or includes the resolved password in any exception —
     `psycopg` itself is careful about this, and we do not touch the
@@ -56,7 +64,18 @@ def connect(database: DatabaseConfig, *, autocommit: bool = True) -> psycopg.Con
     multi-statement write in this codebase is already inside a
     `conn.transaction()` block, which keeps its atomicity.
     """
-    password = database.password.resolve()
+    password = (
+        database.password.resolve()
+        if connect_timeout is None
+        else database.password.resolve(timeout=connect_timeout)
+    )
+    if connect_timeout is not None:
+        return psycopg.connect(
+            database.dsn,
+            password=password,
+            autocommit=autocommit,
+            connect_timeout=connect_timeout,
+        )
     return psycopg.connect(database.dsn, password=password, autocommit=autocommit)
 
 

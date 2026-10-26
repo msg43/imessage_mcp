@@ -24,6 +24,7 @@ Takes an already-open `psycopg.Connection`, never owns its lifecycle.
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 import shutil
@@ -47,31 +48,16 @@ from imsg.enrich.queue import (
     skip_task,
 )
 from imsg.enrich.router import PDF_MIME, document_format_for_mime
-from imsg.enrich.sandboxed_decoder import DecoderBudget
+from imsg.enrich.sandboxed_decoder import ENRICH_WORK_SUBDIR, DecoderBudget, enrich_work_root
 from imsg.errors import EnrichmentError, UnsupportedEnrichmentTypeError, UntrustedAttachmentError
 from imsg.hashing import sha256_text
 from imsg.memory_admission import pid_is_running
-from imsg.paths import is_contained_in, join_under_root, resolve_path
+from imsg.paths import is_contained_in, resolve_path
 from imsg.segment.pipeline import find_segment_ids_for_attachment, refresh_segment_rendering
 from imsg.tokens import estimate_tokens
 
 if TYPE_CHECKING:
     import psycopg
-
-ENRICH_WORK_SUBDIR = Path("artifacts") / "enrich-work"
-
-
-def enrich_work_root(data_root: Path) -> Path:
-    """`<data_root>/artifacts/enrich-work`, where each task's work
-    directory is made; refused if it resolves outside `data_root` (an
-    `artifacts` symlink pointing elsewhere)."""
-    root = join_under_root(data_root, ENRICH_WORK_SUBDIR)
-    if not is_contained_in(root, data_root):
-        raise EnrichmentError(
-            f"the enrichment work directory '{root}' resolves outside data_root '{data_root}'"
-        )
-    return resolve_path(root)
-
 
 def _work_dir_prefix(task: EnrichmentTask) -> str:
     """`<pid>-<attachment>-<kind>-`: the owning process id comes first, so
@@ -264,13 +250,13 @@ def _caption_provenance(providers: EnrichmentProviders) -> dict[str, object]:
 
 
 def _run_caption_image(
-    cache_path: Path, config: Config, providers: EnrichmentProviders
+    cache_path: Path, config: Config, providers: EnrichmentProviders, budget: DecoderBudget
 ) -> EnrichmentResult:
     check_file_size(cache_path, max_bytes=config.enrichment.limits.max_file_bytes)
     return EnrichmentResult(
         model=providers.caption.model_id,
         model_version=None,
-        text=providers.caption.caption(cache_path),
+        text=providers.caption.caption(cache_path, budget=budget),
         detail=_caption_provenance(providers) or None,
     )
 
@@ -345,7 +331,11 @@ def _run_caption_video(
 ) -> EnrichmentResult:
     frames_dir = frames_dir_for_attachment(config.paths.data_root, attachment_id)
     per_frame, duration = _sample_and_run(
-        cache_path, config, frames_dir, providers.caption.caption, budget
+        cache_path,
+        config,
+        frames_dir,
+        functools.partial(providers.caption.caption, budget=budget),
+        budget,
     )
     text = "\n\n".join(f"[{f['timestamp_seconds']:.1f}s] {f['text']}" for f in per_frame)
     return EnrichmentResult(
@@ -437,7 +427,7 @@ def _dispatch(
         if mime_type.startswith("video/"):
             return _run_caption_video(cache_path, config, providers, attachment_id, budget)
         if mime_type.startswith("image/"):
-            return _run_caption_image(cache_path, config, providers)
+            return _run_caption_image(cache_path, config, providers, budget)
         raise UnsupportedEnrichmentTypeError(
             f"'caption' has no route for mime type {mime_type!r}"
         )
@@ -519,12 +509,16 @@ def process_one_task(
     providers: EnrichmentProviders,
     task: EnrichmentTask,
     *,
-    mime_sniffer: mime.MimeSnifferFn = mime.real_sniff_mime,
+    mime_sniffer: mime.MimeSnifferFn | None = None,
 ) -> str:
     """Process one already-claimed task end-to-end. Returns
     `'done' | 'skipped' | 'retry' | 'failed'` — the caller
     (`imsg enrich`'s worker loop, later CLI wiring) uses this only for
     logging/metrics; the queue table is already the durable record.
+
+    The MIME type is sniffed by `file` run sandboxed inside the task's
+    budget (`imsg.enrich.mime.sniff_mime`); `mime_sniffer` replaces it in
+    tests only.
     """
     try:
         record = _fetch_attachment(conn, task.attachment_id)
@@ -539,13 +533,16 @@ def process_one_task(
                 f"attachment {task.attachment_id}'s cache_path does not resolve under data_root "
                 f"— refusing to read it"
             )
-        mime_type = mime_sniffer(cache_path)
-        _persist_sniffed_mime_type(conn, task.attachment_id, mime_type)
-
         work_root = enrich_work_root(config.paths.data_root)
         work_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=_work_dir_prefix(task), dir=work_root) as tmp:
             budget = DecoderBudget.for_task(Path(tmp), config.enrichment.limits)
+            if mime_sniffer is None:
+                mime_type = mime.sniff_mime(cache_path, budget=budget)
+            else:
+                mime_type = mime_sniffer(cache_path)
+            _persist_sniffed_mime_type(conn, task.attachment_id, mime_type)
+
             result = _dispatch(
                 task.kind, cache_path, mime_type, config, providers, budget, task.attachment_id
             )

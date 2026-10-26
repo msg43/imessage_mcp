@@ -11,38 +11,161 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
-**2026-10-16 source-observation repair is deployed and verified:**
-The minimal release `bb1b368` is based on `adcf4e2` and reuses the existing
-provenance repair from `0c0e798` and regression assertion from `f765e98`.
-Migration 0014 and matching extraction writers preserve distinct
-message/attachment, source and SQLite rowid associations. Reader changes
-retain stable ordering and distinct attachment source names.
+**October 16 extraction repair is deployed and verified:** release
+`bb1b368515bf946ab99d1c572e031a938ea6b751` runs from the deployed `adcf4e2` base.
+It reuses the exact `0c0e798`/`f765e98` provenance repair plus existing continuous
+integration dependency/help-test fixes; runtime files are unchanged from
+`54cda878`. Migration 0014 is applied with no pending migrations and clean hashes.
+A verified backup preceded migration; provenance counts and foreign keys survived.
+A manual wrapper run and a restored scheduled run both persisted new messages,
+passed exact-content/source sample checks and retained the conflicting message's
+old and new provenance observations. Independent Astra postdeployment review
+accepts live database, sample, job and process evidence with no rollout blocker.
+The extraction uniqueness bug is closed.
+Both wrappers exited 76 because the intentional heavy-work pause remains active.
+Original sync/backup jobs and configuration are restored; the sync interval is
+unchanged. The search page responds and the public server process was preserved.
 
-A verified recovery backup preceded deployment with extraction stopped.
-The migration preserved existing provenance rows and foreign keys; all
-migration hashes are clean with no pending migration. A manual import and
-an actual run of the restored scheduler both persisted new messages.
-Samples absent before deployment match their original text exactly, and
-the formerly conflicting observations coexist on one canonical message.
-The original scheduler configuration is unchanged. The search page was
-restarted and its login/access checks pass; the public retrieval process
-was preserved.
+**Heavy work still requires the owner's photo-import completion confirmation.**
+Segmentation, embedding, full-text search (FTS) indexing and captions remain paused.
+The new messages are extracted; fresh full-text or semantic search coverage is
+not established. Broader main, admission and model changes remain undeployed until
+that import gate clears. Caption policy is already decided: run continuously,
+skipping link-preview captions. Current queue aggregation is complete; throughput,
+search impact and completion estimates remain unmeasured. Command access is
+restored without access-setting changes; the interruption's cause is unestablished.
 
-The intentional background pause remains active. Segmentation, embedding,
-full-text index updates and captions remain deferred; this acceptance
-establishes raw ingestion, not fresh search results. Resumption requires
-the owner to confirm the competing photo import is complete. Caption
-policy remains around the clock with link-preview captions skipped.
-New unnamed contacts from the SSH-run import were checked against Contacts.
-Unique matches were named through the existing identity code; historical
-identities and unmatched entries were preserved. Unmatched contacts remain
-on the normal identity review list.
+**Authorized work, October 15:** pending availability changes are committed and
+pushed as `85ed3dd` on `codex/october-availability`; the configured-credential
+doctor fix is `c8f57a5` on `codex/doctor-config-credentials`. Their reviewed deltas
+are now integrated on main in `c056cb5`, preserving its sandbox, search-priority
+and secret-file support. The original branches remain preserved. This source
+publication does not establish deployment.
 
-Validation: 71 focused real database tests, 96 CI compatibility tests and
-hosted CI with 2,279 passed / 702 skipped. Ruff, DDL lint and public-safety
-checks pass. Independent postdeployment review passes all 26 live checks.
-No model or dependency configuration changed.
-Historical status entries below retain their original dates.
+**October 14 deployment evidence:** the deployed schema contains
+`message.deleted_at`, migrations match deployed source, and memory-protection
+source is present. The timer's last exit was `1`; its cause remains undiagnosed.
+Historical local-schema and undeployed-status paragraphs below retain their
+original dates and must not override the newer component-specific evidence.
+
+**October 15 follow-up:** the implementation agent inspected current code and
+selectively reconciled the availability and doctor changes with current main.
+Explicit keyword fallback and basic/recent reads preserve existing authorization,
+pooled parallel retrieval, model admission and search priority. Default hybrid
+search still reports model unavailability rather than silently changing meaning.
+The doctor uses the configured secret resolver and bounds connection/Keychain
+waits without displaying partial secret output. Publication is not deployment.
+
+### Extraction is repaired while heavy indexing remains paused
+
+- [x] **Extraction uniqueness failure:** minimal release and migration are live.
+  Persisted manual and restored scheduled runs verify new canonical messages,
+  exact-content/source samples and both conflicting source observations. The
+  schema/writer pairing, migration hashes and preserved relationships are checked.
+  Incremental selection is unchanged; rows below the watermark are not forcibly
+  rescanned. Exit 76 records the intentional pause rather than extraction failure.
+- [ ] **Caption measurement:** the owner decided September 23 on continuous
+  captions with link-preview captions skipped. That policy is settled. The active
+  photo import gates heavy work. Current queue composition has been
+  measured privately without model calls. Throughput, search latency and combined
+  memory still need measurement after the photo-import gate clears. Historical
+  measurements do not establish today's completion time. Do not lift
+  the pause or start bulk enrichment during the sync rollout.
+
+### Authorized work status
+
+- [x] **Runtime extraction acceptance:** backup, coordinated minimal deployment,
+  persisted-output checks and restored scheduled extraction are verified. Heavy
+  indexing and broader model/admission rollout remain gated by the photo import.
+- [x] **Automatic naming of new review stubs:** uniquely matched new stubs are
+  named through existing matching/rename logic and verified from a fresh read-only
+  connection. Unmatched new stubs and historical identities remain unchanged
+  under the existing human identity review. Scheduled Contacts access is verified;
+  no permission grant is needed. Affected chats await the permitted indexing run.
+- [ ] **Caption policy measurement:** evaluate the decided continuous-caption
+  policy with link-preview captions skipped when the photo-import gate permits
+  heavy measurement. The scheduling and scope decision is settled.
+- [x] **Reconcile pending source:** port only verified deltas from the published
+  availability and doctor branches onto current main. Preserve authorization,
+  privacy, sandboxing, model admission and search-priority behavior. Run focused
+  tests and the public-data check before publishing integrated code.
+- [x] **Independent QA:** `gpt-6.1-sol` implementation and `gpt-6-astra` ultra
+  review are complete. Astra passes 359 focused tests and 57 real synthetic
+  PostgreSQL/SQLite retrieval, allowlist and concurrency tests. The public-data
+  scan has zero hard findings and 34 reviewed warnings for changed source; Ruff
+  and diff checks pass. QA added the bounded Keychain probe after reproducing its
+  missing timeout. Keychain and connection waits are separately bounded; this
+  does not promise a total timeout for all diagnostic queries. Runtime extraction
+  acceptance is complete. Broader availability/runtime acceptance and heavy
+  measurements remain gated as recorded above.
+
+**Full-suite follow-up:** the first remote CI run exposed an outdated tool count,
+colored-help assertions and missing media executables. CI now installs ffmpeg and
+Poppler, help tests compare visible text, and the concurrency check includes the
+existing recent-message tool. The local no-PostgreSQL suite passes 2,428 tests with
+659 skipped under Python 3.14; the CI runner uses Python 3.12. These environment
+counts are distinct from the 57 real database tests above. No product behavior or
+test coverage was removed to accommodate the runner.
+
+**Remote acceptance:** [CI run 38819507200](https://github.com/msg43/imessage_mcp/actions/runs/38819507200)
+passed on `f765e98`, including the extraction repair, Ruff, the public-data check
+and the Python 3.12 suite (2,359 passed, 720 skipped). The database-dependent
+regressions also passed the independent local PostgreSQL checks above. The remote
+optional type check reports 215 errors in
+56 files; the green workflow does not establish a clean type check. These source
+checks close the CI repair, not the outstanding host/runtime gates.
+
+**Type-check triage:** review of that actual CI output assigns 176 errors to
+tests, 29 to scripts and ten to two unrelated optional Google integration modules.
+No error names a changed production module or `scripts/doctor.py`. The 34 errors
+in changed test files concern fixture/annotation inference and typing interfaces;
+they must not all be labelled preexisting. Inspection of the plausible runtime
+cases found the expected attributes and populated values. No reproducible product
+defect was established, so this remains nonblocking typing debt rather than a
+diagnosis of the live sync failure.
+
+Grounded bug/security fixes found along this path are authorized. Larger features
+belong in the existing roadmap as ownership questions with supporting evidence,
+scope and dependencies. Evaluation and external-exposure gates remain in force.
+The preserved alternative segmentation experiment is an ownership question:
+should it receive a separate quality/throughput evaluation before any algorithm
+change? It is excluded from this availability integration; no benchmark result
+has established that it improves the production corpus.
+
+**2026-09-29 the MIME sniffer and the caption scaler run sandboxed
+(built, not yet deployed):** closes the QA review's last enrichment
+finding. `file` and the caption provider's downscaled copy now run under
+the same sandbox and per-task budget as every other decoder: no network,
+writes only in the task's work directory under `data_root`, and the
+task's time, temp-space and memory ceilings (`file` keeps its 10 s / 120 s
+bound). A hit fails that attachment's task. No migration and no config
+change; deploying needs only a restart of the enrichment workers. See
+`CHANGELOG.md`.
+
+**2026-09-26 the sync waits while a search is running (built, not yet
+deployed):** `imsg sync`'s segmentation waits before each boundary-model
+call and its embedding before each batch while any search is in flight
+(a public or local MCP search, or the search page's model API computing an
+embedding or rerank), at most 300 s per wait, as the enrich worker already
+did; `imsg segment` and `imsg embed` too. On the M2 Ultra development host
+a burst of reranks beside a sync-shaped embedding load went from 2.6x
+slower to 1.0x; a lone search that starts during a batch is still 2.4-2.5x
+slower. No migration and no config change; background commands pick it up
+at their next start, and nothing needs a restart for it. `imsg status` adds
+`segment_yielding_now` and `embed_yielding_now`. See `CHANGELOG.md`.
+
+**2026-09-25 MCP servers load before background work (built, not yet
+deployed):** an MCP server whose model load is refused posts a notice
+(`<data_root>/run/live-servers-waiting/<pid>.json`); while it is up, no
+background model load starts and running background work stops after its
+current unit of work (exit 75). What background jobs were promised counts
+against the server only for the first 60 s of its wait
+(`memory.background_yield_seconds`). A refused load is retried every 15 s
+and logged when its cause changes and at least once a minute; `imsg status`
+shows which servers wait and on what. Deploying needs a restart of
+`imsg mcp public`; no migration and no required config key. Background
+commands and `imsg mcp local` pick up the change at their next start. See
+`CHANGELOG.md`.
 
 **2026-09-25 search page filters, saved searches and result downloads
 (built, not yet deployed):** "Sent by" a person or me, sent / received,

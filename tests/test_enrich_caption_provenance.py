@@ -15,6 +15,7 @@ import pytest
 from imsg.config.loader import load_config_dict
 from imsg.enrich.pipeline import EnrichmentProviders, _caption_provenance, _run_caption_image
 from imsg.enrich.provider import FakeCaptionProvider, FakeOcrProvider, FakeTranscriptionProvider
+from imsg.enrich.sandboxed_decoder import DecoderBudget
 
 pytestmark = pytest.mark.usefixtures("messages_dir")
 
@@ -27,8 +28,12 @@ class _PromptedCaption:
     model_id = "example-org/vlm@rev1"
     prompt_sha256 = PROMPT_SHA
 
-    def caption(self, image_path: Path) -> str:
+    def caption(self, image_path: Path, *, budget: DecoderBudget | None = None) -> str:
         return "a caption"
+
+
+def _budget(tmp_path: Path) -> DecoderBudget:
+    return DecoderBudget.start(tmp_path / "work", timeout_seconds=60, max_temp_bytes=2**30)
 
 
 def _providers(caption: Any) -> EnrichmentProviders:
@@ -42,7 +47,7 @@ def test_caption_detail_records_the_prompt_sha256(config_dict_factory: Any, tmp_
     image = tmp_path / "photo.jpg"
     image.write_bytes(b"jpeg-ish bytes")
 
-    result = _run_caption_image(image, cfg, _providers(_PromptedCaption()))
+    result = _run_caption_image(image, cfg, _providers(_PromptedCaption()), _budget(tmp_path))
 
     assert result.model == "example-org/vlm@rev1"
     assert result.text == "a caption"
@@ -54,7 +59,7 @@ def test_fake_caption_provider_has_no_prompt_to_record(config_dict_factory: Any,
     image = tmp_path / "photo.jpg"
     image.write_bytes(b"jpeg-ish bytes")
 
-    result = _run_caption_image(image, cfg, _providers(FakeCaptionProvider()))
+    result = _run_caption_image(image, cfg, _providers(FakeCaptionProvider()), _budget(tmp_path))
 
     assert result.detail is None
 
@@ -76,6 +81,6 @@ def test_caption_detail_records_the_image_size_bound(config_dict_factory: Any, t
     image = tmp_path / "photo.jpg"
     image.write_bytes(b"jpeg-ish bytes")
 
-    result = _run_caption_image(image, cfg, _providers(_BoundedCaption()))
+    result = _run_caption_image(image, cfg, _providers(_BoundedCaption()), _budget(tmp_path))
 
     assert result.detail == {"prompt_sha256": PROMPT_SHA, "max_image_side": 1920}
