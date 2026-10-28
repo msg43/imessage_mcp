@@ -26,11 +26,23 @@ Both wrappers exited 76 because the intentional heavy-work pause remains active.
 Original sync/backup jobs and configuration are restored; the sync interval is
 unchanged. The search page responds and the public server process was preserved.
 
-**Heavy work still requires the owner's photo-import completion confirmation.**
-Segmentation, embedding, full-text search (FTS) indexing and captions remain paused.
+**Main is deployed on the production host (2026-10-28); heavy work is still paused.**
+The owner confirmed the photo import finished on 2026-10-26. On 2026-10-28 the host
+was timed, then moved from `a482d60` to `92c0f4c` (branch `agent/item-4.5-main-merge`,
+a merge of main into the release lineage whose tree is identical to main `5cd086d`)
+by fast-forward. That commit is not yet published. This installs the admission
+priority (`698e3a8`), sync waiting for searches (`057b81b`), the sandboxed MIME
+sniffer and caption scaler (`16dc5cf`) and the doctor credential fix (`c056cb5`).
+No migration or dependency changed. Checks after the restart: doctor 9/9 pass; a
+sandbox probe refused a write outside the work directory; the public endpoint
+answers metadata 200 and refuses a no-token request with 401. Search through
+`imsg mcp local` (60 warm searches): 1.054 s p50 / 1.142 s p95 before, 1.045 s /
+1.096 s after; reranker 787 ms p50. Sync yielding and server-first admission are
+not yet exercised on the host, because both need background work.
+Segmentation, embedding, full-text search (FTS) indexing and captions remain paused
+until the operator runs `imsg background resume`.
 The new messages are extracted; fresh full-text or semantic search coverage is
-not established. Broader main, admission and model changes remain undeployed until
-that import gate clears. Caption policy is already decided: run continuously,
+not established. Caption policy is already decided: run continuously,
 skipping link-preview captions. Current queue aggregation is complete; throughput,
 search impact and completion estimates remain unmeasured. Command access is
 restored without access-setting changes; the interruption's cause is unestablished.

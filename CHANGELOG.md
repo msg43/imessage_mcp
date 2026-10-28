@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 2026-10-28 — Deploy main's admission, search-yield, sandbox and doctor changes
+
+- The production host moved from `a482d60` to `92c0f4c` by fast-forward. `92c0f4c` merges main into the deployed
+  release lineage; its tree is identical to main `5cd086d` (CI green). No migration, no dependency change, no
+  config edit: the one new key, `memory.background_yield_seconds`, defaults to 60 s.
+- Timed first, with background work paused: plain MLX check 7.40 TFLOPS, reranker 787 ms p50 for 20 documents,
+  search through `imsg mcp local` 1.054 s p50 / 1.142 s p95 (60 warm searches). After the install: 1.045 s / 1.096 s.
+- Verified after the restart: doctor 9/9 pass, including the configured-credential check that previously failed;
+  the MIME sniffer ran under `sandbox-exec` and a write outside the work directory was refused; public endpoint
+  metadata 200, no-token request 401; the scheduled sync ran on the new code and exited 76 (paused).
+- Not yet exercised on the host: sync waiting for a live search, and the MCP server loading ahead of background
+  work. Both need background work, which stays paused until `imsg background resume`.
+
 ## 2026-10-16 — Deploy and verify the minimal provenance repair
 
 - Deploy `bb1b368515bf946ab99d1c572e031a938ea6b751` from the deployed base,
