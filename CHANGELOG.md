@@ -26,6 +26,8 @@ day: keep the search models resident, and caption in a nightly window from 01:00
   runs on its own thread. Past the limit it is cancelled; if it then returns, that image fails permanently. If it
   ignores the cancel, `OcrHungError`: the task is recorded failed and `imsg enrich` exits 77 (new, "start the next
   run") once its lock and reservation are released. The stuck thread cannot be stopped from Python.
+- **Deployed on the mini, 2026-10-29 16:41-16:55 EDT** (GAMEPLAN has the steps and checks). The first night
+  window is 2026-10-30 01:00.
 - Tests: hold behaviour on the unloader (unload, no reload while held, reload after, waits for a call in flight,
   stops a refused load's retries, unreadable hold), the hold file and `--until` parsing, enrich sizing, the Vision
   time limit (stubbed, plus the real-framework tests passing through the new thread on macOS 27), a hung task

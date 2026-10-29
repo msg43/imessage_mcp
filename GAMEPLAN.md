@@ -11,15 +11,17 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
-**Resident search models and a 01:00-09:00 caption window: built and tested, not
-deployed (2026-10-29, branch `claude/resident-models-night-captions`, on the deployed
-`e6ab43b`).** Enrich runs without captions are admitted for 6.0 GiB rather than 24.8;
-`imsg mcp hold-models`/`release-models` lets the night job borrow the public server's
-memory; `scripts/run_night_captions.sh` captions 01:00-09:00; a Vision call past 300 s
-fails its image and ends the run (exit 77). Deploying needs the owner's yes. The steps
-are: set `mcp.public.idle_unload_seconds` to 0; install the 01:00 LaunchAgent; stop the
-round-the-clock caption runner and take it out of `resume-on-boot`; and let the OCR
-runner treat exit 77 as "carry on". See CHANGELOG 2026-10-29.
+**Resident search models and a 01:00-09:00 caption window: deployed on the mini
+2026-10-29 16:41-16:55 EDT (`faacd16`, branch `claude/resident-models-night-captions`,
+not merged to main).** `mcp.public.idle_unload_seconds` is 0 (config backups
+`*.bak-2026-10-29-before-resident-models`). The public server was restarted and loaded.
+A live `hold-models`/`release-models` test unloaded it in 6 s and it loaded again.
+`com.imsgindex.night-captions` runs `scripts/run_night_captions.sh` at 01:00; its
+first night is 2026-10-30. The round-the-clock caption runner is retired, including
+from `resume-on-boot`. The OCR runner treats exit 77 as "carry on" and was restarted
+on the new code: it was admitted for 6.0 GiB beside the loaded public server and did
+401 OCR tasks in its first 2 minutes. Second Vision hang of the day: attachment
+374163, stuck 13:58-16:45, marked failed. Record: mini `ops/resident-models-20261029/`.
 
 **October 16 extraction repair is deployed and verified:** release
 `bb1b368515bf946ab99d1c572e031a938ea6b751` runs from the deployed `adcf4e2` base.
