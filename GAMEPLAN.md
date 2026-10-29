@@ -58,8 +58,11 @@ immediately rather than waiting, so a burst of calls all fail. OCR then failed o
 every image on the host's macOS 27.2: `AppleVisionOcrProvider` passed a Python `{}`
 as Vision's handler options, which pyobjc 12.2.2 on macOS 27 turns into
 "NSInvalidArgumentException - key does not exist"; the OCR runner was stopped
-after one chunk (no task failed permanently). The fix is `e6ab43b` on
-`agent/ocr-vision-options-fix-20261028`, not yet deployed. Core follow-ups: the
+after one chunk (no task failed permanently). The fix, `e6ab43b` on
+`agent/ocr-vision-options-fix-20261028`, was deployed on 2026-10-29 by fast-forward
+(no server restart); 1,172 OCR tasks then completed in under 3 minutes with no
+failures, and the index caught up (8,274 of 8,281 messages since the freeze
+segmented, every segment embedded). Core follow-ups: the
 enrichment estimate does not depend on `--kinds`, so a run without captions is
 charged for the captioner (what such a run really loads is not measured); and
 runner scripts that stop on any non-zero exit should treat 75 as "retry later".

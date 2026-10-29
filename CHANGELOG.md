@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 2026-10-29 — Production host on `e6ab43b`: OCR works again; the index has caught up
+
+- Deployed the Vision-options fix (`e6ab43b`, branch `agent/ocr-vision-options-fix-20261028`) by fast-forward from
+  `92c0f4c`; no dependency change, no server restart (OCR runs only in the enrichment worker).
+- Verified: 17 of 20 images that had failed now go through OCR; in the worker, 1,172 OCR tasks completed in under
+  3 minutes with 0 failures. The scheduled sync caught up: 8,274 of the 8,281 messages since the 2026-09-25 freeze
+  are segmented, and every segment is embedded.
+
 ## 2026-10-28 — Production host: public idle unload enabled; background work and live-server-first verified
 
 - The operator set `mcp.public.idle_unload_seconds: 600` (public server restarted: ready in 10 s, metadata 200,
