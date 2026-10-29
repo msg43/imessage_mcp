@@ -7,6 +7,8 @@
 - Verified: 17 of 20 images that had failed now go through OCR; in the worker, 1,172 OCR tasks completed in under
   3 minutes with 0 failures. The scheduled sync caught up: 8,274 of the 8,281 messages since the 2026-09-25 freeze
   are segmented, and every segment is embedded.
+- Published with the owner's OK: `agent/ocr-vision-options-fix-20261028` and this record branch were pushed as
+  branches, not merged to main, so the code running on the production host is no longer only on local machines.
 
 ## 2026-10-28 — Production host: public idle unload enabled; background work and live-server-first verified
 

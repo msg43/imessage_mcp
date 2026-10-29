@@ -30,7 +30,8 @@ unchanged. The search page responds and the public server process was preserved.
 The owner confirmed the photo import finished on 2026-10-26. On 2026-10-28 the host
 was timed, then moved from `a482d60` to `92c0f4c` (branch `agent/item-4.5-main-merge`,
 a merge of main into the release lineage whose tree is identical to main `5cd086d`)
-by fast-forward. That commit is not yet published. This installs the admission
+by fast-forward. That commit was published on 2026-10-29 inside branch
+`agent/ocr-vision-options-fix-20261028`, with the OCR fix on top. This installs the admission
 priority (`698e3a8`), sync waiting for searches (`057b81b`), the sandboxed MIME
 sniffer and caption scaler (`16dc5cf`) and the doctor credential fix (`c056cb5`).
 No migration or dependency changed. Checks after the restart: doctor 9/9 pass; a
