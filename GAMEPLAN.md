@@ -26,7 +26,7 @@ Both wrappers exited 76 because the intentional heavy-work pause remains active.
 Original sync/backup jobs and configuration are restored; the sync interval is
 unchanged. The search page responds and the public server process was preserved.
 
-**Main is deployed on the production host (2026-10-28); heavy work is still paused.**
+**Main is deployed on the production host (2026-10-28); background work is resumed, but memory admission refuses every background load.**
 The owner confirmed the photo import finished on 2026-10-26. On 2026-10-28 the host
 was timed, then moved from `a482d60` to `92c0f4c` (branch `agent/item-4.5-main-merge`,
 a merge of main into the release lineage whose tree is identical to main `5cd086d`)
@@ -39,8 +39,18 @@ answers metadata 200 and refuses a no-token request with 401. Search through
 `imsg mcp local` (60 warm searches): 1.054 s p50 / 1.142 s p95 before, 1.045 s /
 1.096 s after; reranker 787 ms p50. Sync yielding and server-first admission are
 not yet exercised on the host, because both need background work.
-Segmentation, embedding, full-text search (FTS) indexing and captions remain paused
-until the operator runs `imsg background resume`.
+Background work was resumed the same evening (22:11) and `VACUUM (ANALYZE)` ran.
+Every background load was then refused memory: the enrichment worker (OCR kinds),
+the scheduled sync's segmentation and `imsg embed` each waited 600 s and exited 75
+(`deferred: memory`). Each needs its `memory.footprints` figure plus the 8.0 GiB
+reserve (24.8, 21.0 and 24.9 GiB), and the host had 24.7-26.5 GiB available, less
+1.5 GiB still promised to the public server, which keeps its models loaded because
+`mcp.public.idle_unload_seconds` defaults to 0. Search was unaffected. Until the
+operator enables the public idle unload or frees memory, segmentation, embedding,
+full-text search (FTS) indexing and captions do not run. Core follow-ups: the
+enrichment estimate does not depend on `--kinds`, so a run without captions is
+charged for the captioner (what such a run really loads is not measured); and
+runner scripts that stop on any non-zero exit should treat 75 as "retry later".
 The new messages are extracted; fresh full-text or semantic search coverage is
 not established. Caption policy is already decided: run continuously,
 skipping link-preview captions. Current queue aggregation is complete; throughput,

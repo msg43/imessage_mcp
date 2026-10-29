@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 2026-10-28 — Background work resumed on the production host; memory admission refuses every background load
+
+- `imsg background resume` at 22:11, the enrichment runners restarted, and `VACUUM (ANALYZE)` completed (0.88 s,
+  all 45 tables vacuumed and analyzed).
+- The enrichment worker (OCR kinds), the scheduled sync's segmentation and `imsg embed` each waited
+  `memory.admission_wait_seconds` (600 s) and exited 75 (`deferred: memory`). Needed: footprint plus the 8.0 GiB
+  reserve (24.8 / 21.0 / 24.9 GiB). Available: 24.7-26.5 GiB, less 1.5 GiB still promised to the public server,
+  whose models stay loaded (`mcp.public.idle_unload_seconds` defaults to 0). The sync still ran its light steps.
+- Server-first admission is working as designed and search stayed at full speed, but nothing heavy runs until the
+  operator enables the public idle unload or the host has more free memory.
+- Follow-ups: the enrichment estimate ignores `--kinds`, so a run without captions is charged for the captioner;
+  runner scripts that stop on any non-zero exit should treat 75 as "retry later".
+
 ## 2026-10-28 — Deploy main's admission, search-yield, sandbox and doctor changes
 
 - The production host moved from `a482d60` to `92c0f4c` by fast-forward. `92c0f4c` merges main into the deployed
