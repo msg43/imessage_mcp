@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## 2026-10-28 — Production host: public idle unload enabled; background work and live-server-first verified
+
+- The operator set `mcp.public.idle_unload_seconds: 600` (public server restarted: ready in 10 s, metadata 200,
+  no-token 401) and changed the enrichment runner scripts to retry after exit 75 instead of stopping.
+- The public server unloaded after 10 idle minutes; 15 s later the enrichment worker and a waiting scheduled sync
+  were admitted (38.5 GiB available). The worker handed the heavy-model lock to the sync as designed, and the sync
+  began segmenting the backlog.
+- Live-server-first, first seen on the host: a local MCP search was refused memory and answered `WARMING_UP`; the
+  sync gave way the same second (exit 75, "a live MCP server is waiting"); the server loaded in 8.5 s and answered
+  30 s after the first try. The next 20 searches: 1.062 s p50, 1.140 s p95, 0 errors.
+- Follow-up: a refused server answers `WARMING_UP` at once instead of waiting for memory to free, so a burst of
+  calls (60 in about 1 s) all fail; a short wait on the first call would hide most of that from clients.
+- OCR then failed on every image (the host is on macOS 27.2): a Python `{}` passed as Vision's handler options
+  raises "NSInvalidArgumentException - key does not exist" with pyobjc 12.2.2. The OCR runner was stopped after
+  one chunk; no task failed permanently. Fixed on `agent/ocr-vision-options-fix-20261028` (`e6ab43b`), not deployed.
+
 ## 2026-10-28 — Background work resumed on the production host; memory admission refuses every background load
 
 - `imsg background resume` at 22:11, the enrichment runners restarted, and `VACUUM (ANALYZE)` completed (0.88 s,
