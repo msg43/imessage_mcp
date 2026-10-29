@@ -159,6 +159,20 @@ def footprint_bytes(memory: MemoryConfig, role: ModelRole) -> int:
             return footprints.segment_bytes
 
 
+CAPTION_KIND = "caption"
+"""The one enrichment kind that loads the captioning model."""
+
+
+def enrich_footprint_bytes(memory: MemoryConfig, kinds: Sequence[str]) -> int:
+    """What an enrich run over `kinds` is admitted for: the full enrich
+    footprint if it may caption, else `enrich_without_captions_bytes`
+    (its models load only for the tasks that need them)."""
+    footprints = memory.footprints
+    if CAPTION_KIND in kinds:
+        return footprints.enrich_bytes
+    return footprints.enrich_without_captions_bytes
+
+
 def mlx_memory_limit_bytes(memory: MemoryConfig, role: ModelRole) -> int:
     limits = memory.mlx_memory_limits
     match role:
@@ -632,14 +646,18 @@ class MemoryAdmission:
         copies: int = 1,
         probe: HostMemoryProbe | None = None,
         live: bool | None = None,
+        footprint: int | None = None,
     ) -> MemoryAdmission:
-        """`copies` model sets of `role` (eval pool builds one per variant)."""
+        """`copies` model sets of `role` (eval pool builds one per variant).
+        `footprint` replaces the role's configured footprint for one set
+        (an enrich run that never captions, `enrich_footprint_bytes`)."""
         memory = cfg.memory
+        per_set = footprint if footprint is not None else footprint_bytes(memory, role)
         return cls(
             probe=probe if probe is not None else host_memory.default_probe(),
             book=ReservationBook(cfg.paths.data_root),
             role=role,
-            required_bytes=footprint_bytes(memory, role) * max(1, copies),
+            required_bytes=per_set * max(1, copies),
             reserve_bytes=memory.reserve_bytes,
             max_pressure=PressureLevel(memory.admission_max_pressure),
             command=command,
@@ -945,6 +963,7 @@ class LiveServerAdmission:
 
 __all__ = [
     "ADMISSION_LOCK_FILENAME",
+    "CAPTION_KIND",
     "LIVE_ROLES",
     "NOTICE_LAPSE_SECONDS",
     "RESERVATIONS_SUBDIR",
@@ -959,6 +978,7 @@ __all__ = [
     "ReservationBook",
     "configure_mlx_memory_limit",
     "decide",
+    "enrich_footprint_bytes",
     "footprint_bytes",
     "mlx_memory_limit_bytes",
     "pid_is_running",

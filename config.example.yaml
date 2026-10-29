@@ -80,6 +80,7 @@ enrichment:
     temp_bytes_per_task: 10737418240       # most bytes a task's work directory may hold
     max_image_pixels: 178956970            # images for OCR, and PDF pages rendered for it
     max_decoder_memory_bytes: 4294967296   # a decoder subprocess is stopped past this
+    ocr_timeout_seconds: 300               # one Apple Vision recognition; past it the task fails and a stuck run exits 77
   # Model providers for S5b (defaults shown; all pinned in models/manifest.lock.yaml)
   transcription_model: mlx-community/whisper-large-v3-mlx
   transcription_revision: 49e6aa286ad60c14352c404340ded53710378a11
@@ -237,6 +238,7 @@ memory:
   #   local_server_bytes: 18468359372    # 17.2 GiB
   #   embed_bytes: 26736171417           # 24.9 GiB
   #   enrich_bytes: 26628797235          # 24.8 GiB
+  #   enrich_without_captions_bytes: 6442450944  # 6.0 GiB: an enrich run whose --kinds leave out caption
   #   segment_bytes: 22548578304         # 21.0 GiB
   # mlx_memory_limits:              # mx.set_memory_limit per role; 0 = MLX's own default
   #   public_server_bytes: 12884901888   # 12 GiB

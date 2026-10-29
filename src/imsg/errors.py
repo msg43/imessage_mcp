@@ -118,6 +118,16 @@ class UntrustedAttachmentError(EnrichmentError):
     hang or a silent skip."""
 
 
+class OcrHungError(UntrustedAttachmentError):
+    """Apple Vision did not finish one image within
+    `enrichment.limits.ocr_timeout_seconds` and could not be cancelled.
+    The task is recorded as a permanent failure (the same image would hang
+    again), and then the enrich process must exit: the stuck call holds a
+    thread this process cannot stop (2026-10-29: one JPEG held a worker at
+    0 % CPU for 7 hours, and captions and the scheduled sync waited behind
+    it)."""
+
+
 class EmbeddingError(ImsgError):
     """S6 embedding failed outside its normal per-batch-transaction
     handling (SPEC §8 S6) — e.g. the provider returned a vector of the

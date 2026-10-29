@@ -21,6 +21,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -37,6 +38,7 @@ from imsg.mcp.tools.local_server import LocalMcpServer, warm_up_report
 from imsg.mcp.tools.public_server import PublicMcpServer
 from imsg.mcp.warm_up_readiness import WarmUpReadinessFile, read_warm_up_readiness
 from imsg.memory_admission import AdmissionDecision, decide
+from imsg.public_model_hold import ModelHold
 from imsg.retrieval.background_warm_up import (
     REFUSAL_LOG_INTERVAL_SECONDS,
     BackgroundWarmUp,
@@ -152,8 +154,11 @@ class Harness:
         rewarm: bool = False,
         public: bool = False,
         tmp_path: Path | None = None,
+        held: bool = False,
     ) -> None:
         self.clock = FakeClock()
+        self.hold: ModelHold | None = None
+        """What the hold reader returns; set by a test."""
         self.models = FakeModels()
         self.admission = FakeAdmission(available_gib)
         self.pressure = PressureLevel.NORMAL
@@ -188,6 +193,7 @@ class Harness:
                 rewarm_cooldown_seconds=COOLDOWN,
             ),
             after_unload=self.admission.release,
+            hold=(lambda: self.hold) if held else None,
         )
         self.service = FakeService(self.models)
         self.audit = MemoryAuditSink()
@@ -615,3 +621,121 @@ def test_warm_at_start_restores_loading_before_any_call(model_thread: ModelThrea
         assert h.service.calls == 0
     finally:
         h.unloader.stop()
+
+
+# --------------------------------------------------------------------------
+# a hold: the nightly caption window borrows the public server's memory
+# --------------------------------------------------------------------------
+
+
+def _night_hold() -> ModelHold:
+    return ModelHold(
+        until=datetime.now(UTC) + timedelta(hours=8), reason="nightly caption window"
+    )
+
+
+def test_a_hold_unloads_a_warm_public_server_and_a_call_does_not_reload_it(
+    model_thread: ModelThread,
+) -> None:
+    h = Harness(model_thread, public=True, rewarm=True, held=True)
+    assert h.start() is WarmUpPhase.READY
+
+    h.hold = _night_hold()
+    assert h.unloader.unload_if_held() is True
+    assert h.settle() is WarmUpPhase.UNLOADED
+    assert h.models.events == ["load", "unload"]
+    assert h.admission.releases == 1  # the reservation goes, for the window's job
+
+    result = anyio.run(h.search)  # Gemini asks during the window
+    assert result.is_error
+    assert text_of(result).startswith("WARMING_UP")
+    assert h.settle() is WarmUpPhase.UNLOADED  # the call started no reload
+    assert h.models.events == ["load", "unload"]
+
+    h.clock.advance(COOLDOWN + RETRY)
+    h.unloader.check_once()  # neither the rewarm nor the hold check loads it
+    assert h.settle() is WarmUpPhase.UNLOADED
+    assert h.service.calls == 0
+
+
+def test_the_models_load_again_by_themselves_once_the_hold_ends(
+    model_thread: ModelThread,
+) -> None:
+    h = Harness(model_thread, public=True, rewarm=True, held=True)
+    h.start()
+    h.hold = _night_hold()
+    h.unloader.check_once()
+    assert h.settle() is WarmUpPhase.UNLOADED
+
+    h.hold = None  # released, or its `until` passed
+    h.unloader.check_once()
+    assert h.settle() is WarmUpPhase.READY
+    assert h.models.events == ["load", "unload", "load"]
+    assert any("the model hold has ended" in line for line in h.log)
+    assert not anyio.run(h.search).is_error
+
+
+def test_a_hold_waits_for_the_call_in_flight(model_thread: ModelThread) -> None:
+    h = Harness(model_thread, public=True, rewarm=True, held=True)
+    h.start()
+    h.service.leave.clear()
+    results: list[types.CallToolResult] = []
+    caller = threading.Thread(target=lambda: results.append(anyio.run(h.search)))
+    caller.start()
+    assert h.service.entered.wait(timeout=5)
+
+    h.hold = _night_hold()
+    assert h.unloader.unload_if_held() is False  # never under a call
+    assert h.models.loaded
+    h.service.leave.set()
+    caller.join(timeout=5)
+    assert not results[0].is_error
+    assert h.unloader.unload_if_held() is True
+    assert h.settle() is WarmUpPhase.UNLOADED
+
+
+def test_a_hold_stops_a_refused_load_from_retrying_and_gives_up_its_admission(
+    model_thread: ModelThread,
+) -> None:
+    """A public server refused for memory keeps its notice up, which holds
+    background loads back. A hold must take that away, or the caption job
+    that set it could never load."""
+    h = Harness(model_thread, available_gib=20.0, public=True, rewarm=True, held=True)
+    assert h.start() is WarmUpPhase.MEMORY_BUSY
+    checks = h.admission.checks
+
+    h.hold = _night_hold()
+    h.unloader.check_once()
+    assert h.admission.releases == 1
+    h.clock.advance(RETRY * 4)
+    h.unloader.check_once()
+    assert h.admission.checks == checks  # no retry while held
+
+    h.hold = None
+    h.admission.available_gib = 40.0
+    h.clock.advance(RETRY)
+    h.unloader.check_once()
+    assert h.settle() is WarmUpPhase.READY
+
+
+def test_a_hold_reader_that_fails_means_no_hold(model_thread: ModelThread) -> None:
+    h = Harness(model_thread, public=True, rewarm=True)
+
+    def broken() -> ModelHold | None:
+        raise OSError("disk went away")
+
+    h.unloader = IdleModelUnloader(
+        warm_up=h.warm_up,
+        model_thread=model_thread,
+        unload=h.models.unload,
+        idle_seconds=0,
+        log=h.log.append,
+        clock=h.clock,
+        hold=broken,
+    )
+    h.start()
+    assert h.unloader.unload_if_held() is False
+    assert h.models.loaded
+    assert sum("model hold could not be read" in line for line in h.log) == 1
+    h.unloader.unload_if_held()
+    assert sum("model hold could not be read" in line for line in h.log) == 1
