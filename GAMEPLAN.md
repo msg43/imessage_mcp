@@ -11,6 +11,16 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**Resident search models and a 01:00-09:00 caption window: built and tested, not
+deployed (2026-10-29, branch `claude/resident-models-night-captions`, on the deployed
+`e6ab43b`).** Enrich runs without captions are admitted for 6.0 GiB rather than 24.8;
+`imsg mcp hold-models`/`release-models` lets the night job borrow the public server's
+memory; `scripts/run_night_captions.sh` captions 01:00-09:00; a Vision call past 300 s
+fails its image and ends the run (exit 77). Deploying needs the owner's yes. The steps
+are: set `mcp.public.idle_unload_seconds` to 0; install the 01:00 LaunchAgent; stop the
+round-the-clock caption runner and take it out of `resume-on-boot`; and let the OCR
+runner treat exit 77 as "carry on". See CHANGELOG 2026-10-29.
+
 **October 16 extraction repair is deployed and verified:** release
 `bb1b368515bf946ab99d1c572e031a938ea6b751` runs from the deployed `adcf4e2` base.
 It reuses the exact `0c0e798`/`f765e98` provenance repair plus existing continuous

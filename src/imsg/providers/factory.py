@@ -125,7 +125,8 @@ below rely on (positional required args, keyword-only options):
                          max_length=8192, max_batch_tokens=8192, doc_max_tokens=None,
                          reuse_prefix=True, cache_limit_bytes=8 GiB, model_id=None)
 - ocr:                  (*, recognition_languages=None, minimum_text_height=None,
-                         max_image_pixels=178,956,970, image_dimensions=None)
+                         max_image_pixels=178,956,970, image_dimensions=None,
+                         timeout_seconds=300.0)
 - transcription:        (model_repo, revision, *, language=None, temperature=...,
                          cache_limit_bytes=None)
 - caption:              (model_repo, revision, prompt: str, *, max_tokens=256,
@@ -574,6 +575,7 @@ def build_enrichment_providers(
         recognition_languages=enrichment.ocr_languages,
         minimum_text_height=enrichment.ocr_minimum_text_height,
         max_image_pixels=enrichment.limits.max_image_pixels,
+        timeout_seconds=enrichment.limits.ocr_timeout_seconds,
     )
     transcription = _construct(
         REAL_PROVIDERS["transcription"],

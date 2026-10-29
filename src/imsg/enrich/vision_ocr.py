@@ -27,12 +27,25 @@ typed permanent failure. The default is the ceiling Pillow already puts
 on the caption path (twice `PIL.Image.MAX_IMAGE_PIXELS`: 178,956,970), so
 OCR and captioning refuse the same images. An image ImageIO cannot read
 the size of is refused too: Vision could not decode it either.
+
+**A time limit on every recognition (2026-10-29).** On the production host
+`performRequests:error:` never returned for one JPEG: the worker sat at
+0 % CPU for 7 hours, and the caption runner and the scheduled sync waited
+behind it for the heavy-model lock. So each recognition runs on its own
+thread, and the caller waits at most `timeout_seconds`. Past that the
+request is cancelled (`VNRequest.cancel`) and given `CANCEL_GRACE_SECONDS`
+to return. If it does, the image fails permanently and work goes on. If
+not, the thread cannot be stopped from Python, so the provider marks
+itself unusable and raises `OcrHungError`: the task is recorded failed and
+`imsg enrich` exits, so the next run starts with a fresh process.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,7 +54,7 @@ from typing import Any
 from imsg import constants
 from imsg.enrich.limits import check_image_pixels
 from imsg.enrich.model_runtime import import_runtime_module
-from imsg.errors import EnrichmentError, ImsgError, UntrustedAttachmentError
+from imsg.errors import EnrichmentError, ImsgError, OcrHungError, UntrustedAttachmentError
 from imsg.textnorm import strip_nul
 
 ImageDimensionsFn = Callable[[Path], tuple[int, int]]
@@ -50,6 +63,12 @@ _INSTALL_HINT = (
     "install `pyobjc-framework-Vision` (it brings the Quartz and CoreML bridges with it) "
     "and run on macOS"
 )
+
+DEFAULT_TIMEOUT_SECONDS = 300.0
+"""`enrichment.limits.ocr_timeout_seconds`'s default (config schema)."""
+
+CANCEL_GRACE_SECONDS = 10.0
+"""How long a timed-out recognition gets to return after it is cancelled."""
 
 ROW_OVERLAP_FRACTION = 0.5
 """Two boxes share a row when their vertical overlap exceeds this
@@ -158,6 +177,7 @@ class AppleVisionOcrProvider:
     `max_image_pixels` is the ceiling checked before Vision sees an image
     (module docstring); `None` turns it off. `image_dimensions` reads an
     image's size and defaults to `read_image_dimensions`.
+    `timeout_seconds` bounds each recognition (module docstring).
     """
 
     def __init__(
@@ -167,9 +187,16 @@ class AppleVisionOcrProvider:
         minimum_text_height: float | None = None,
         max_image_pixels: int | None = constants.DEFAULT_MAX_IMAGE_PIXELS,
         image_dimensions: ImageDimensionsFn | None = None,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         if max_image_pixels is not None and max_image_pixels < 1:
             raise ValueError(f"max_image_pixels must be positive or None, got {max_image_pixels}")
+        if timeout_seconds <= 0:
+            raise ValueError(f"timeout_seconds must be positive, got {timeout_seconds}")
+        self.timeout_seconds = float(timeout_seconds)
+        self.hung: str | None = None
+        """Set once a recognition could not be stopped; every later call
+        refuses at once, since Vision is stuck in this process."""
         self.recognition_languages = list(recognition_languages) if recognition_languages else None
         self.minimum_text_height = minimum_text_height
         self.max_image_pixels = max_image_pixels
@@ -180,6 +207,11 @@ class AppleVisionOcrProvider:
         """Every recognized line, one per line, in reading order; the
         empty string when Vision finds no text at all. An image over the
         pixel ceiling is refused before Vision is involved."""
+        if self.hung is not None:
+            raise OcrHungError(
+                f"Apple Vision is stuck in this process ({self.hung}); not starting another "
+                f"recognition on '{image_path}'"
+            )
         if not image_path.is_file():
             raise EnrichmentError(f"OCR input is not a file: '{image_path}'")
         if self.max_image_pixels is not None:
@@ -195,7 +227,7 @@ class AppleVisionOcrProvider:
         vision = import_runtime_module("Vision", install_hint=_INSTALL_HINT)
         foundation = import_runtime_module("Foundation", install_hint=_INSTALL_HINT)
         try:
-            lines = self._recognize(vision, foundation, image_path)
+            lines = self._recognize_within_limit(vision, foundation, image_path)
         except ImsgError:
             raise
         except Exception as exc:
@@ -204,7 +236,54 @@ class AppleVisionOcrProvider:
             ) from exc
         return strip_nul("\n".join(line.text for line in order_lines(lines)))
 
-    def _recognize(self, vision: Any, foundation: Any, image_path: Path) -> list[RecognizedLine]:
+    def _recognize_within_limit(
+        self, vision: Any, foundation: Any, image_path: Path
+    ) -> list[RecognizedLine]:
+        """`_recognize` on its own thread, waited for at most
+        `timeout_seconds`, then cancelled (module docstring)."""
+        outcome: dict[str, Any] = {}
+        requests: list[Any] = []
+
+        def run() -> None:
+            try:
+                outcome["lines"] = self._recognize(
+                    vision, foundation, image_path, on_request=requests.append
+                )
+            except BaseException as exc:  # handed to the waiting thread
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run, name="imsg-vision-ocr", daemon=True)
+        worker.start()
+        worker.join(self.timeout_seconds)
+        if worker.is_alive():
+            for request in requests:
+                # A request that cannot cancel is waited out below.
+                with contextlib.suppress(Exception):
+                    request.cancel()
+            worker.join(CANCEL_GRACE_SECONDS)
+            limit = f"{self.timeout_seconds:g} s (enrichment.limits.ocr_timeout_seconds)"
+            if worker.is_alive():
+                self.hung = f"text recognition on '{image_path}' passed {limit} and ignored cancel"
+                raise OcrHungError(
+                    f"Apple Vision did not finish text recognition on '{image_path}' within "
+                    f"{limit} and did not stop when cancelled"
+                )
+            raise UntrustedAttachmentError(
+                f"Apple Vision text recognition on '{image_path}' passed {limit}; cancelled"
+            )
+        if "error" in outcome:
+            raise outcome["error"]
+        lines: list[RecognizedLine] = outcome["lines"]
+        return lines
+
+    def _recognize(
+        self,
+        vision: Any,
+        foundation: Any,
+        image_path: Path,
+        *,
+        on_request: Callable[[Any], object] | None = None,
+    ) -> list[RecognizedLine]:
         url = foundation.NSURL.fileURLWithPath_(str(image_path))
         # An empty Foundation dictionary, never a Python `{}`: on macOS 27
         # with pyobjc 12.2.2 the bridged empty Python dict makes Vision
@@ -227,6 +306,8 @@ class AppleVisionOcrProvider:
             request.setAutomaticallyDetectsLanguage_(True)
         if self.minimum_text_height is not None:
             request.setMinimumTextHeight_(self.minimum_text_height)
+        if on_request is not None:
+            on_request(request)
 
         # pyobjc hands the trailing `NSError **` out-parameter back as a
         # second tuple element — the same shape `imsg.stages.identity`
@@ -259,6 +340,8 @@ class AppleVisionOcrProvider:
 
 
 __all__ = [
+    "CANCEL_GRACE_SECONDS",
+    "DEFAULT_TIMEOUT_SECONDS",
     "ROW_OVERLAP_FRACTION",
     "AppleVisionOcrProvider",
     "ImageDimensionsFn",

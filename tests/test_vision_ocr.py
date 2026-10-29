@@ -11,6 +11,7 @@ import importlib.util
 import os
 import platform
 import sys
+import threading
 import time
 import types
 from dataclasses import dataclass, field
@@ -23,10 +24,11 @@ import pytest
 from _hostile_attachments import write_png, write_png_bomb
 from _model_runtime_stubs import block_module
 from imsg import constants
+from imsg.enrich import vision_ocr
 from imsg.enrich.model_runtime import ModelRuntimeUnavailableError
 from imsg.enrich.provider import OcrProvider
 from imsg.enrich.vision_ocr import AppleVisionOcrProvider, RecognizedLine, order_lines
-from imsg.errors import EnrichmentError, UntrustedAttachmentError
+from imsg.errors import EnrichmentError, OcrHungError, UntrustedAttachmentError
 
 ACCURATE_LEVEL = object()  # the stub's VNRequestTextRecognitionLevelAccurate constant
 EMPTY_NSDICTIONARY = object()  # the stub's Foundation.NSDictionary.dictionary()
@@ -75,6 +77,11 @@ class VisionStub:
     image_size: tuple[int, int] | None = (1000, 800)
     """What the fake ImageIO reports; `None` means it cannot read one."""
     size_reads: list[str] = field(default_factory=list)
+    perform_block: threading.Event | None = None
+    """When set, `performRequests` waits on it, like the 2026-10-29 hang."""
+    cancel_unblocks: bool = False
+    """Whether `VNRequest.cancel` releases a blocked perform."""
+    cancels: int = 0
 
 
 @pytest.fixture
@@ -116,6 +123,11 @@ def vision(monkeypatch: pytest.MonkeyPatch) -> VisionStub:
         def results(self) -> list[_Observation] | None:
             return self.recognized
 
+        def cancel(self) -> None:
+            stub.cancels += 1
+            if stub.cancel_unblocks and stub.perform_block is not None:
+                stub.perform_block.set()
+
     class Handler:
         def __init__(self) -> None:
             self.url: Any = None
@@ -132,6 +144,8 @@ def vision(monkeypatch: pytest.MonkeyPatch) -> VisionStub:
             return self
 
         def performRequests_error_(self, requests: list[Any], error: Any) -> tuple[bool, Any]:
+            if stub.perform_block is not None:
+                stub.perform_block.wait(timeout=30)
             if stub.perform_exception is not None:
                 raise stub.perform_exception
             for request in requests:
@@ -499,3 +513,54 @@ def test_real_vision_reads_an_image(tmp_path: Path) -> None:
     `{}` for the handler's options made every image fail with
     "NSInvalidArgumentException - key does not exist" (2026-10-28)."""
     assert AppleVisionOcrProvider().recognize_text(write_png(tmp_path / "blank.png", 64, 48)) == ""
+
+
+# --------------------------------------------------------------------------
+# a time limit on every recognition (2026-10-29: one JPEG hung for 7 hours)
+# --------------------------------------------------------------------------
+
+
+def test_a_recognition_that_ignores_cancel_marks_the_provider_hung(
+    vision: VisionStub, image: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(vision_ocr, "CANCEL_GRACE_SECONDS", 0.1)
+    vision.perform_block = threading.Event()  # never set: Vision is stuck
+    provider = AppleVisionOcrProvider(timeout_seconds=0.2)
+    started = time.monotonic()
+    with pytest.raises(OcrHungError, match="did not stop when cancelled"):
+        provider.recognize_text(image)
+    assert time.monotonic() - started < 5
+    assert vision.cancels == 1
+    assert provider.hung is not None
+    # Every later call refuses at once: Vision is stuck in this process.
+    with pytest.raises(OcrHungError, match="stuck in this process"):
+        provider.recognize_text(image)
+    vision.perform_block.set()  # let the stub thread finish
+
+
+def test_a_recognition_that_stops_when_cancelled_fails_only_that_image(
+    vision: VisionStub, image: Path
+) -> None:
+    vision.perform_block = threading.Event()
+    vision.cancel_unblocks = True
+    provider = AppleVisionOcrProvider(timeout_seconds=0.2)
+    with pytest.raises(UntrustedAttachmentError, match="cancelled") as raised:
+        provider.recognize_text(image)
+    assert not isinstance(raised.value, OcrHungError)
+    assert provider.hung is None
+    vision.perform_block = None
+    vision.observations = [_Observation("total 12.00", _box(0.1, 0.5, 0.3, 0.05))]
+    assert provider.recognize_text(image) == "total 12.00"
+
+
+def test_a_framework_error_still_reaches_the_caller_through_the_thread(
+    vision: VisionStub, image: Path
+) -> None:
+    vision.perform_exception = RuntimeError("boom")
+    with pytest.raises(EnrichmentError, match="boom"):
+        AppleVisionOcrProvider(timeout_seconds=5).recognize_text(image)
+
+
+def test_the_time_limit_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        AppleVisionOcrProvider(timeout_seconds=0)
