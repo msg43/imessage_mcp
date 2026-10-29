@@ -346,6 +346,19 @@ Deployment is a human-gated sequence; the step-by-step guide lives in
 the private design-record repo, not here (it names real hosts and
 accounts).
 
+- **Finish the 2026-09-24 history cleanup on GitHub** (checked
+  2026-10-29). The rewritten history is the only one on `main`, but the
+  old pre-rewrite commits are still fetchable from GitHub by exact commit
+  id (`gh api repos/msg43/imessage_mcp/commits/<old id>` returns them),
+  because the repo was not deleted and recreated and no GitHub Support
+  purge was requested. Either delete and recreate the repo from current
+  `main` (needs `gh auth refresh -s delete_repo`; loses traffic history
+  and settings), or file GitHub's "remove sensitive data" request naming
+  the first changed commit from `filter-repo` (the old-to-new commit map
+  is in the private repo). Also replace the repo description, which
+  still claims the repo never held real identifiers. (Private
+  vulnerability reporting, the channel SECURITY.md names, was enabled
+  2026-10-29.)
 - **Deploy the 2026-09-24 operations fixes on the index host** (CHANGELOG
   2026-09-24), in this order: produce the text-tower directory
   (`scripts/convert_pe_core_text_tower.py`, the lock's recorded command,
