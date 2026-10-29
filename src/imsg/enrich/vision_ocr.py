@@ -206,7 +206,13 @@ class AppleVisionOcrProvider:
 
     def _recognize(self, vision: Any, foundation: Any, image_path: Path) -> list[RecognizedLine]:
         url = foundation.NSURL.fileURLWithPath_(str(image_path))
-        handler = vision.VNImageRequestHandler.alloc().initWithURL_options_(url, {})
+        # An empty Foundation dictionary, never a Python `{}`: on macOS 27
+        # with pyobjc 12.2.2 the bridged empty Python dict makes Vision
+        # raise "NSInvalidArgumentException - key does not exist" for every
+        # image (2026-10-28, production host), while an NSDictionary works.
+        handler = vision.VNImageRequestHandler.alloc().initWithURL_options_(
+            url, foundation.NSDictionary.dictionary()
+        )
         request = vision.VNRecognizeTextRequest.alloc().init()
         request.setRecognitionLevel_(vision.VNRequestTextRecognitionLevelAccurate)
         request.setUsesLanguageCorrection_(True)

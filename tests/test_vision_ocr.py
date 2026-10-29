@@ -29,6 +29,7 @@ from imsg.enrich.vision_ocr import AppleVisionOcrProvider, RecognizedLine, order
 from imsg.errors import EnrichmentError, UntrustedAttachmentError
 
 ACCURATE_LEVEL = object()  # the stub's VNRequestTextRecognitionLevelAccurate constant
+EMPTY_NSDICTIONARY = object()  # the stub's Foundation.NSDictionary.dictionary()
 
 
 def _box(x: float, y: float, width: float, height: float) -> Any:
@@ -171,8 +172,15 @@ def vision(monkeypatch: pytest.MonkeyPatch) -> VisionStub:
     vision_module.VNImageRequestHandler = Handler  # type: ignore[attr-defined]
     vision_module.VNRecognizeTextRequest = Request  # type: ignore[attr-defined]
     vision_module.VNRequestTextRecognitionLevelAccurate = ACCURATE_LEVEL  # type: ignore[attr-defined]
+
+    class NSDictionary:
+        @staticmethod
+        def dictionary() -> Any:
+            return EMPTY_NSDICTIONARY
+
     foundation_module = types.ModuleType("Foundation")
     foundation_module.NSURL = NSURL  # type: ignore[attr-defined]
+    foundation_module.NSDictionary = NSDictionary  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "Vision", vision_module)
     monkeypatch.setitem(sys.modules, "Foundation", foundation_module)
     return stub
@@ -312,7 +320,10 @@ def test_handler_is_built_from_the_image_file_url(vision: VisionStub, image: Pat
     assert vision.file_url_paths == [str(image)]
     (handler,) = vision.handlers
     assert handler.url == ("file-url", str(image))
-    assert handler.options == {}
+    # A Foundation empty dictionary, never a Python dict: Vision rejects the
+    # bridged `{}` on macOS 27 (see test_real_vision_reads_an_image below).
+    assert handler.options is EMPTY_NSDICTIONARY
+    assert not isinstance(handler.options, dict)
 
 
 def test_model_id_embeds_the_macos_product_version(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -468,3 +479,23 @@ def test_imageio_refuses_a_file_that_is_not_an_image(tmp_path: Path) -> None:
     junk.write_bytes(b"not an image at all")
     with pytest.raises(UntrustedAttachmentError):
         read_image_dimensions(junk)
+
+
+def _real_vision_available() -> bool:
+    return (
+        platform.system() == "Darwin"
+        and importlib.util.find_spec("Vision") is not None
+        and importlib.util.find_spec("Foundation") is not None
+        and importlib.util.find_spec("Quartz") is not None
+    )
+
+
+@pytest.mark.skipif(
+    not _real_vision_available(), reason="needs macOS with pyobjc Vision (the models extra)"
+)
+def test_real_vision_reads_an_image(tmp_path: Path) -> None:
+    """The real framework, end to end, on a flat grey image: no text,
+    and above all no exception. On macOS 27 with pyobjc 12.2.2 a Python
+    `{}` for the handler's options made every image fail with
+    "NSInvalidArgumentException - key does not exist" (2026-10-28)."""
+    assert AppleVisionOcrProvider().recognize_text(write_png(tmp_path / "blank.png", 64, 48)) == ""

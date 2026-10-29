@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 2026-10-28 — Fix: Apple Vision OCR failed on every image on macOS 27
+
+- `AppleVisionOcrProvider` passed a Python `{}` as `VNImageRequestHandler`'s options. On macOS 27 with pyobjc
+  12.2.2 that bridged empty dict makes Vision raise "NSInvalidArgumentException - key does not exist" for every
+  image; an empty `NSDictionary` (or Swift's `[:]`) works. Found on the production host, where the first OCR chunk
+  after resuming background work sent all 5,000 claimed tasks to retry. Reproduced on a development Mac on macOS
+  27.0.1; OCR last succeeded on the production host on 2026-09-24, before its macOS 27.2 update.
+- The handler now gets `Foundation.NSDictionary.dictionary()`. The stubbed test that asserted `options == {}` now
+  asserts a Foundation dictionary, and a new test runs the real framework on a flat image (skipped off macOS); it
+  fails on the old line with the production error and passes with the fix.
+
 ## 2026-10-16 — Deploy and verify the minimal provenance repair
 
 - Deploy `bb1b368515bf946ab99d1c572e031a938ea6b751` from the deployed base,
