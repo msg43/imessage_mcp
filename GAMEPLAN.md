@@ -11,6 +11,15 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**Off-box backup exists as of 2026-10-27 (closes SPEC §14's "no disaster
+backup" for the database and config, not for attachments):** a weekly
+LaunchAgent (Sunday 06:30) encrypts the newest nightly set plus `private/`
+with `age` and copies it to the NAS, verified by read-back; 8 weeks kept.
+First run and a restore test from the NAS copy passed (CHANGELOG
+2026-10-27). The decryption key exists in one place only until the owner
+stores it (Owner to-dos). `imsg status` does not yet read the offsite
+job's result and still prints the same-device caveat.
+
 **October 16 extraction repair is deployed and verified:** release
 `bb1b368515bf946ab99d1c572e031a938ea6b751` runs from the deployed `adcf4e2` base.
 It reuses the exact `0c0e798`/`f765e98` provenance repair plus existing continuous
@@ -346,6 +355,16 @@ Deployment is a human-gated sequence; the step-by-step guide lives in
 the private design-record repo, not here (it names real hosts and
 accounts).
 
+- **Store the offsite backup's decryption key in your password manager**
+  (added 2026-10-27). It currently exists only in the one location the
+  private deployment notes name; without it the NAS copies cannot be
+  decrypted. Never copy it onto the index host or the NAS.
+
+- **Decide what to do with the older unencrypted index copy on the NAS**
+  (added 2026-10-27): a plaintext copy of a former index folder (database
+  files, config, merged message corpus) predates the encrypted job. Encrypt
+  or delete it now that a verified encrypted copy exists.
+
 - **Finish the 2026-09-24 history cleanup on GitHub** (checked
   2026-10-29). The rewritten history is the only one on `main`, but the
   old pre-rewrite commits are still fetchable from GitHub by exact commit
@@ -359,6 +378,7 @@ accounts).
   still claims the repo never held real identifiers. (Private
   vulnerability reporting, the channel SECURITY.md names, was enabled
   2026-10-29.)
+
 - **Deploy the 2026-09-24 operations fixes on the index host** (CHANGELOG
   2026-09-24), in this order: produce the text-tower directory
   (`scripts/convert_pe_core_text_tower.py`, the lock's recorded command,

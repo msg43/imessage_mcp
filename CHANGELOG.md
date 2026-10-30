@@ -1,5 +1,32 @@
 # CHANGELOG
 
+## 2026-10-27 — Weekly encrypted off-box copy of the nightly backup
+
+- Before this, every copy of the index sat on the drive it protects: the
+  nightly sets live beside the database, and the data volume is excluded
+  from the host's whole-disk backups. The `private/` overlay (config,
+  identity overrides) was in no backup at all. Nothing in either repo, the
+  host's agents or the NAS copied either off the device.
+- Add `scripts/copy_backup_offsite.py`: weekly, take the newest complete
+  nightly set, re-check it against its MANIFEST.json, add a tar of
+  `private/`, encrypt every file with `age` to a public recipient key, copy
+  over ssh to a NAS share, read every file back and compare SHA-256, then
+  rename the `.partial` directory into place. Keeps 8 weekly sets. The
+  decryption key is not on the index host and not on the NAS. Failure
+  writes `run/offsite-backup.FAILED` and posts a macOS notification.
+  Seven unit tests (end-to-end encrypt/copy/decrypt, retention, read-back
+  mismatch, corrupt source) run with a local destination.
+- Deployed on the index host as a Sunday 06:30 LaunchAgent run through
+  `supervise.py` (launchd log paths on the volume fail with exit 78). First
+  run copied the 2026-10-27 set (2.3 GB ciphertext) in 820 s, exit 0; the
+  NAS's own `sha256sum` matches the offsite manifest.
+- Restore test from the NAS copy, in a scratch folder on the encrypted
+  volume: ciphertext hashes match; the decrypted dump matches the nightly
+  MANIFEST; 8,217 `person` rows restored into a throwaway cluster, equal to
+  the count in the local nightly dump; restored `config.yaml` and
+  `identity-overrides.json` are byte-identical to live. The live database
+  was not contacted. Scratch data and the temporary key copy were deleted.
+
 ## 2026-10-16 — Deploy and verify the minimal provenance repair
 
 - Deploy `bb1b368515bf946ab99d1c572e031a938ea6b751` from the deployed base,
