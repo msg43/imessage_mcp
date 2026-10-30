@@ -33,6 +33,7 @@ from _hostile_attachments import (
     write_dense_page_pdf,
     write_huge_text_pdf,
     write_pdf,
+    write_png,
     write_png_bomb,
 )
 from imsg.config.loader import load_config_dict
@@ -41,6 +42,7 @@ from imsg.db.migrations import PostgresMigrationRunner
 from imsg.enrich.pipeline import EnrichmentProviders, process_one_task
 from imsg.enrich.provider import FakeCaptionProvider, FakeOcrProvider, FakeTranscriptionProvider
 from imsg.enrich.queue import claim_tasks, enqueue
+from imsg.errors import OcrHungError
 
 TEST_PG_HOST = os.environ.get("IMSG_TEST_PG_HOST", "/tmp/imsgpg1")
 TEST_PG_PORT = os.environ.get("IMSG_TEST_PG_PORT", "55432")
@@ -325,7 +327,9 @@ def test_a_decompression_bomb_is_refused_before_vision_decodes_it(
             super().__init__()
             self.decoded: list[Path] = []
 
-        def _recognize(self, vision: Any, foundation: Any, image_path: Path) -> list[Any]:
+        def _recognize(
+            self, vision: Any, foundation: Any, image_path: Path, **kwargs: Any
+        ) -> list[Any]:
             self.decoded.append(image_path)
             return []
 
@@ -334,6 +338,36 @@ def test_a_decompression_bomb_is_refused_before_vision_decodes_it(
     result = _run(db, config, bomb, "ocr", _providers(ocr))
     _assert_failed_permanently(result, naming="max_image_pixels")
     assert ocr.decoded == [], "the bomb reached Vision"
+
+
+def test_a_hung_vision_call_fails_the_task_permanently_and_ends_the_run(
+    db: psycopg.Connection, data_root: Path, config: Config
+) -> None:
+    """2026-10-29: Vision never returned on one JPEG and the worker sat at
+    0 % CPU for 7 hours. Now the task is recorded failed, so no later run
+    tries the same image, and `OcrHungError` goes on up so `imsg enrich`
+    exits and the next run starts with a fresh process."""
+
+    class HungOcr(FakeOcrProvider):
+        def recognize_text(self, image_path: Path) -> str:
+            raise OcrHungError(f"Apple Vision did not finish on '{image_path}'")
+
+    image = write_png(data_root / "stuck.png", 40, 30)
+    attachment_id = _attachment(db, image)
+    enqueue(db, attachment_id, ("ocr",))
+    (task,) = claim_tasks(db, worker_id="hostile-test", limit=1, kinds=("ocr",))
+    with pytest.raises(OcrHungError):
+        process_one_task(db, config, _providers(HungOcr()), task)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT state::text, attempts, last_error FROM enrichment "
+            "WHERE attachment_id = %s AND kind = 'ocr'",
+            (attachment_id,),
+        )
+        row = cur.fetchone()
+    assert row is not None
+    assert row[0] == "failed" and row[1] == 1
+    assert "did not finish" in row[2]
 
 
 # --------------------------------------------------------------------------

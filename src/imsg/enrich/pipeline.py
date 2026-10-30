@@ -49,7 +49,12 @@ from imsg.enrich.queue import (
 )
 from imsg.enrich.router import PDF_MIME, document_format_for_mime
 from imsg.enrich.sandboxed_decoder import ENRICH_WORK_SUBDIR, DecoderBudget, enrich_work_root
-from imsg.errors import EnrichmentError, UnsupportedEnrichmentTypeError, UntrustedAttachmentError
+from imsg.errors import (
+    EnrichmentError,
+    OcrHungError,
+    UnsupportedEnrichmentTypeError,
+    UntrustedAttachmentError,
+)
 from imsg.hashing import sha256_text
 from imsg.memory_admission import pid_is_running
 from imsg.paths import is_contained_in, resolve_path
@@ -570,6 +575,8 @@ def process_one_task(
     except UntrustedAttachmentError as exc:
         with conn.transaction():
             fail_task_permanently(conn, task.attachment_id, task.kind, error=str(exc))
+        if isinstance(exc, OcrHungError):
+            raise  # recorded; the process must end (`imsg.errors.OcrHungError`)
         return "failed"
     except EnrichmentError as exc:
         with conn.transaction():

@@ -27,7 +27,7 @@ import textwrap
 import time
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 from typer.testing import CliRunner
@@ -425,6 +425,44 @@ def test_enrich_stops_after_the_task_in_hand_when_paused_mid_run(
     assert "enrich: deferred: paused — heavy background work is paused: import starting" in (
         result.output
     )
+
+
+def test_enrich_exits_77_after_an_ocr_hang_with_the_lock_and_reservation_released(
+    env: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-10-29: a stuck Vision call cannot be stopped from Python, so
+    the run ends outright; the runner starts the next one."""
+    from imsg.enrich.queue import EnrichmentTask
+    from imsg.errors import OcrHungError
+
+    served = iter(range(1, 1000))
+    monkeypatch.setattr(
+        cli_module,
+        "claim_tasks",
+        lambda conn, **kw: [EnrichmentTask(attachment_id=next(served), kind="ocr", attempts=0)],
+    )
+
+    def process(conn: Any, config: Any, providers: Any, task: Any) -> str:
+        raise OcrHungError("Apple Vision did not finish on 'stuck.jpg'")
+
+    monkeypatch.setattr(cli_module, "process_one_task", process)
+    exits: list[int] = []
+
+    def hard_exit(code: int) -> NoReturn:
+        exits.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr(cli_module, "_hard_exit", hard_exit)
+
+    result = runner.invoke(app, ["enrich", "--config", str(env["config"]), "--kinds", "ocr"])
+
+    assert exits == [77], result.output
+    assert result.exit_code == 77
+    assert "Apple Vision did not finish on 'stuck.jpg'" in result.output
+    assert "exits 77" in result.output
+    assert inspect_heavy_lock(env["data_root"]).held is False
+    reservations = env["data_root"] / "run" / "memory-reservations"
+    assert not reservations.exists() or not list(reservations.glob("*.json"))
 
 
 _WAITS_LIKE_SYNC = textwrap.dedent(

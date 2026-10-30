@@ -11,6 +11,18 @@ order is: this file, then `CLAUDE.md`, then the module you're touching.
 
 ## Current status
 
+**Resident search models and a 01:00-09:00 caption window: deployed on the mini
+2026-10-29 16:41-16:55 EDT (`faacd16`, branch `claude/resident-models-night-captions`,
+merged to main 2026-10-30).** `mcp.public.idle_unload_seconds` is 0 (config backups
+`*.bak-2026-10-29-before-resident-models`). The public server was restarted and loaded.
+A live `hold-models`/`release-models` test unloaded it in 6 s and it loaded again.
+`com.imsgindex.night-captions` runs `scripts/run_night_captions.sh` at 01:00; its
+first night is 2026-10-30. The round-the-clock caption runner is retired, including
+from `resume-on-boot`. The OCR runner treats exit 77 as "carry on" and was restarted
+on the new code: it was admitted for 6.0 GiB beside the loaded public server and did
+401 OCR tasks in its first 2 minutes. Second Vision hang of the day: attachment
+374163, stuck 13:58-16:45, marked failed. Record: mini `ops/resident-models-20261029/`.
+
 **Off-box backup exists as of 2026-10-27 (closes SPEC §14's "no disaster
 backup" for the database and config, not for attachments):** a weekly
 LaunchAgent (Sunday 06:30) encrypts the newest nightly set plus `private/`

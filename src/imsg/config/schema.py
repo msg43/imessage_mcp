@@ -243,6 +243,13 @@ class EnrichmentLimits(StrictModel):
     max_decoder_memory_bytes: int = Field(default=constants.DEFAULT_MAX_DECODER_MEMORY_BYTES, gt=0)
     """A decoder subprocess is stopped once its physical memory footprint
     passes this."""
+    ocr_timeout_seconds: float = Field(default=300.0, gt=0)
+    """Wall clock for one Apple Vision text recognition (one image, one PDF
+    page or one video frame). Vision runs inside the worker process, where
+    nothing else bounds it. On the production host an image took about
+    0.7 s on average (5,000 in an hour, 2026-10-29), so 300 s is only ever
+    a hang. Past it the call is cancelled; if it still does not return the
+    task fails permanently and the worker exits (`OcrHungError`)."""
 
 
 _WINDOW_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
@@ -654,7 +661,24 @@ class ModelFootprints(StrictModel):
     worker never loads (`imsg.enrich.pipeline.EnrichmentProviders` holds
     OCR, captioning and transcription only), and without Whisper, which
     it does load for audio (3.66 GiB peak, models/manifest.lock.yaml):
-    28.2 - 7.06 + 3.66 = 24.8."""
+    28.2 - 7.06 + 3.66 = 24.8. This is what an enrich run that may
+    caption is admitted for; one whose kinds leave captions out uses
+    `enrich_without_captions_bytes`."""
+
+    enrich_without_captions_bytes: int = Field(default=_gib(6.0), gt=0)
+    """6.0 GiB: an enrich run whose `--kinds` leave out `caption` (OCR,
+    document and PDF text, transcripts, video-frame OCR). Its models load
+    only when a task needs them (`imsg.enrich.model_runtime`), so it never
+    loads the 20.9 GiB captioner. Built from measured parts: Whisper's
+    3.66 GiB peak (models/manifest.lock.yaml) plus the worker itself, which
+    measured 0.34 GiB physical footprint mid-run on OCR on the production
+    host (`footprint -p`, 2026-10-29), rounded up to 6 for PDF rendering
+    and the attachment being decoded. Video frames are decoded in a
+    separate, capped process (`imsg.enrich.sandboxed_decoder`).
+
+    Why (2026-10-29): with every enrich run charged the full 24.8 GiB, an
+    OCR-only run that held 0.3 GiB kept the public server from reloading
+    (24.5 GiB "promised"), and Gemini's search answered WARMING_UP."""
 
     segment_bytes: int = Field(default=_gib(21.0), gt=0)
     """21.0 GiB: built from measured parts, no whole-process measurement

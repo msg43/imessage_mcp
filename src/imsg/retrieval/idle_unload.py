@@ -64,6 +64,16 @@ posts the notice that the server is waiting to load again, so background
 work does not take the memory during the cooldown
 (`imsg.memory_admission.LiveServerAdmission`). `on_watchdog_pass` runs
 once per pass of the watchdog (the CLI passes the admission's `tick`).
+
+**Held, for a scheduled job (2026-10-29).** Given `hold`, a function that
+returns the active hold or `None` (the public server reads
+`imsg.public_model_hold`), the watchdog also unloads the models while a
+hold is active, as soon as no call is in flight, and nothing reloads them:
+not a tool call, not a refused load's retry. A hold that arrives while a
+refused load is waiting withdraws the server's notice, so the job that set
+the hold can load. When the hold ends the server loads again by itself,
+within one watchdog interval, through the usual admission. That is how
+the nightly caption window borrows the public server's memory.
 """
 
 from __future__ import annotations
@@ -78,6 +88,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from imsg.host_memory import PressureLevel
+from imsg.public_model_hold import ModelHold
 from imsg.retrieval.background_warm_up import BackgroundWarmUp, WarmUpPhase, log_to_stderr
 from imsg.retrieval.model_thread import ModelThread
 
@@ -186,6 +197,7 @@ class IdleModelUnloader:
         after_unload: Callable[[], object] | None = None,
         after_pressure_unload: Callable[[], object] | None = None,
         on_watchdog_pass: Callable[[], object] | None = None,
+        hold: Callable[[], ModelHold | None] | None = None,
     ) -> None:
         if idle_seconds < 0:
             raise ValueError(f"idle_seconds must be >= 0, got {idle_seconds}")
@@ -208,6 +220,12 @@ class IdleModelUnloader:
         self._released_for_pressure_at: float | None = None
         self._release_pending_logged = False
         self._pressure_unreadable_logged = False
+        self._hold = hold
+        self._held = False
+        """Whether the last look found a hold; set by `_active_hold`."""
+        self._unloaded_for_hold = False
+        self._hold_pending_logged = False
+        self._hold_unreadable_logged = False
         self._stop = threading.Event()
         self._watchdog: threading.Thread | None = None
 
@@ -224,6 +242,7 @@ class IdleModelUnloader:
             self.enabled
             or self._pressure_release is not None
             or self._on_watchdog_pass is not None
+            or self._hold is not None
         )
 
     @property
@@ -251,7 +270,9 @@ class IdleModelUnloader:
         warm-up until its answer is computed. While any call is inside,
         nothing unloads. Entering starts the reload if the models were
         unloaded; the caller then waits for the warm-up as it always
-        does."""
+        does. While a hold is active it starts nothing: the caller waits
+        and answers `WARMING_UP`."""
+        held = self._active_hold() is not None
         with self._lock:
             self._in_flight += 1
             self._last_activity = self._clock()
@@ -259,7 +280,11 @@ class IdleModelUnloader:
             # after any unload this lock has already queued. From
             # memory_busy the warm-up itself decides whether enough time
             # has passed to ask the host again.
-            if self._warm_up.status().phase in (WarmUpPhase.UNLOADED, WarmUpPhase.MEMORY_BUSY):
+            if not held and self._warm_up.status().phase in (
+                WarmUpPhase.UNLOADED,
+                WarmUpPhase.MEMORY_BUSY,
+            ):
+                self._unloaded_for_hold = False
                 self._warm_up.start()
         try:
             yield
@@ -267,6 +292,93 @@ class IdleModelUnloader:
             with self._lock:
                 self._in_flight -= 1
                 self._last_activity = self._clock()
+
+    # -- the hold ----------------------------------------------------------------
+
+    def _active_hold(self) -> ModelHold | None:
+        """The active hold, or `None`. A reader that fails means no hold
+        (`imsg.public_model_hold`: fails toward serving), logged once."""
+        if self._hold is None:
+            return None
+        try:
+            hold = self._hold()
+        except Exception as exc:
+            if not self._hold_unreadable_logged:
+                self._hold_unreadable_logged = True
+                self._log(f"the model hold could not be read ({type(exc).__name__}: {exc})")
+            hold = None
+        else:
+            self._hold_unreadable_logged = False
+        self._held = hold is not None
+        return hold
+
+    @property
+    def held(self) -> bool:
+        """Whether the last look found an active hold."""
+        return self._held
+
+    def unload_if_held(self) -> bool:
+        """Unload now if a hold is active, the models are loaded and no call
+        is in flight. A hold that finds a refused load waiting releases the
+        server's admission (its reservation and notice), so the job that set
+        the hold is not held back by it. Returns whether an unload was
+        queued."""
+        hold = self._active_hold()
+        if hold is None:
+            self._hold_pending_logged = False
+            return False
+        with self._lock:
+            phase = self._warm_up.status().phase
+            if phase is WarmUpPhase.MEMORY_BUSY and not self._unloaded_for_hold:
+                self._unloaded_for_hold = True
+                self._log(
+                    f"models held unloaded ({hold.describe()}): not retrying the refused load "
+                    f"until the hold ends"
+                )
+                self._run_after(self._after_unload)
+                return False
+            if phase is not WarmUpPhase.READY:
+                return False
+            if self._in_flight > 0:
+                if not self._hold_pending_logged:
+                    self._hold_pending_logged = True
+                    self._log(
+                        f"a model hold is set ({hold.describe()}): unloading as soon as the "
+                        f"call in flight finishes"
+                    )
+                return False
+            if not self._warm_up.mark_unloaded():
+                return False
+            self._hold_pending_logged = False
+            self._ready_seen = False
+            self._unloads += 1
+            self._released_for_pressure_at = None
+            self._unloaded_for_hold = True
+            self._log(
+                f"models held unloaded ({hold.describe()}): unloading now; retrieval calls "
+                f"answer WARMING_UP until the hold ends, then the models load again by themselves"
+            )
+            self._queue_unload(for_pressure=False)
+            return True
+
+    def reload_after_hold(self) -> bool:
+        """Start loading again once a hold that unloaded the models (or
+        stopped a refused load's retries) has ended. Returns whether
+        `start()` was asked."""
+        if self._hold is None or not self._unloaded_for_hold:
+            return False
+        if self._active_hold() is not None:
+            return False
+        with self._lock:
+            if not self._unloaded_for_hold:
+                return False
+            self._unloaded_for_hold = False
+            phase = self._warm_up.status().phase
+            if phase not in (WarmUpPhase.UNLOADED, WarmUpPhase.MEMORY_BUSY):
+                return False
+            self._log("the model hold has ended: loading the models again")
+            self._warm_up.start()
+            return True
 
     # -- the idle side -----------------------------------------------------------
 
@@ -359,6 +471,8 @@ class IdleModelUnloader:
         release = self._pressure_release
         if release is None or not release.rewarm:
             return False
+        if self._hold is not None and (self._held or self._unloaded_for_hold):
+            return False  # held: `reload_after_hold` loads once it ends
         with self._lock:
             phase = self._warm_up.status().phase
             if phase is WarmUpPhase.READY:
@@ -376,10 +490,12 @@ class IdleModelUnloader:
             return True
 
     def check_once(self) -> None:
-        """One watchdog pass: pressure first (it can unload early), then
-        the idle timer, then a warm server's reload, then
-        `on_watchdog_pass`."""
+        """One watchdog pass: a hold first (unload for it, or reload once it
+        has ended), then pressure (it can unload early), then the idle
+        timer, then a warm server's reload, then `on_watchdog_pass`."""
         checks: list[Callable[[], object]] = [
+            self.unload_if_held,
+            self.reload_after_hold,
             self.release_if_under_pressure,
             self.unload_if_idle,
             self.rewarm_if_due,
@@ -415,6 +531,9 @@ class IdleModelUnloader:
         after = self._after_unload
         if for_pressure and self._after_pressure_unload is not None:
             after = self._after_pressure_unload
+        self._run_after(after)
+
+    def _run_after(self, after: Callable[[], object] | None) -> None:
         if after is not None:
             try:
                 after()
@@ -429,6 +548,8 @@ class IdleModelUnloader:
             intervals.append(max(1.0, min(self._idle_seconds / 10, MAX_CHECK_INTERVAL_SECONDS)))
         if self._pressure_release is not None:
             intervals.append(self._pressure_release.check_seconds)
+        if self._hold is not None:
+            intervals.append(MAX_CHECK_INTERVAL_SECONDS)
         return min(intervals) if intervals else MAX_CHECK_INTERVAL_SECONDS
 
     def next_check_in(self) -> float:

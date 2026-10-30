@@ -1,5 +1,50 @@
 # CHANGELOG
 
+## 2026-10-29 — Search models stay loaded; captions get a 01:00-09:00 window; OCR hangs end the run
+
+Why: a Gemini search on 2026-10-29 answered `WARMING_UP`. The public server had unloaded after 10 idle minutes,
+and its reload was refused because the running OCR-only `imsg enrich` was charged the full 24.8 GiB enrich footprint
+(sized for captioning) while it used 0.34 GiB. The same morning Apple Vision never returned on one JPEG, and that
+worker sat at 0 % CPU for 7 hours, with captions and the scheduled sync waiting behind it. Owner decision the same
+day: keep the search models resident, and caption in a nightly window from 01:00 to 09:00.
+
+- **Enrich is admitted for what its kinds load.** A run whose `--kinds` leave out `caption` is admitted for
+  `memory.footprints.enrich_without_captions_bytes` (6.0 GiB: Whisper's 3.66 GiB peak plus the 0.34 GiB worker,
+  rounded up), not 24.8 GiB (`imsg.memory_admission.enrich_footprint_bytes`). OCR now fits beside the resident
+  public server.
+- **A hold on the public server's models.** `imsg mcp hold-models --until 09:00` and `imsg mcp release-models`
+  write and remove `<data_root>/run/public-models-hold.json` (`imsg.public_model_hold`). While held, the public
+  server unloads once no call is in flight, starts no reload (not for a call, not for a refused load's retry), and
+  gives up its admission notice so the job can load. When the hold ends, or its `until` passes, the server loads
+  again by itself within 15 s. A hold may last at most 12 hours; an unreadable hold file is ignored, so it can never
+  take search away for good.
+- **`scripts/run_night_captions.sh`**: started by launchd at 01:00, it sets the hold, captions in 250-task chunks
+  with `imsg embed` after each, starts no chunk after 08:00, and releases the hold when it ends or is stopped. It
+  refuses to start outside 01:00-08:00 and runs one copy at a time. At 09:00 a chunk still running stops after the
+  caption in hand, because the reloading server asks background work to give way.
+- **A time limit on every Vision recognition** (`enrichment.limits.ocr_timeout_seconds`, 300 s). Each recognition
+  runs on its own thread. Past the limit it is cancelled; if it then returns, that image fails permanently. If it
+  ignores the cancel, `OcrHungError`: the task is recorded failed and `imsg enrich` exits 77 (new, "start the next
+  run") once its lock and reservation are released. The stuck thread cannot be stopped from Python.
+- **Deployed on the mini, 2026-10-29 16:41-16:55 EDT** (GAMEPLAN has the steps and checks). The first night
+  window is 2026-10-30 01:00.
+- Tests: hold behaviour on the unloader (unload, no reload while held, reload after, waits for a call in flight,
+  stops a refused load's retries, unreadable hold), the hold file and `--until` parsing, enrich sizing, the Vision
+  time limit (stubbed, plus the real-framework tests passing through the new thread on macOS 27), a hung task
+  recorded failed against Postgres, and the CLI's exit 77 with the lock and reservation released. The night script
+  was run against stub `imsg` and `psql` commands: full window, outside the window, a second copy, and a stop signal.
+
+## 2026-10-28 — Fix: Apple Vision OCR failed on every image on macOS 27
+
+- `AppleVisionOcrProvider` passed a Python `{}` as `VNImageRequestHandler`'s options. On macOS 27 with pyobjc
+  12.2.2 that bridged empty dict makes Vision raise "NSInvalidArgumentException - key does not exist" for every
+  image; an empty `NSDictionary` (or Swift's `[:]`) works. Found on the production host, where the first OCR chunk
+  after resuming background work sent all 5,000 claimed tasks to retry. Reproduced on a development Mac on macOS
+  27.0.1; OCR last succeeded on the production host on 2026-09-24, before its macOS 27.2 update.
+- The handler now gets `Foundation.NSDictionary.dictionary()`. The stubbed test that asserted `options == {}` now
+  asserts a Foundation dictionary, and a new test runs the real framework on a flat image (skipped off macOS); it
+  fails on the old line with the production error and passes with the fix.
+
 ## 2026-10-27 — Weekly encrypted off-box copy of the nightly backup
 
 - Before this, every copy of the index sat on the drive it protects: the

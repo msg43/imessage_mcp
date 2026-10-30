@@ -45,12 +45,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, NoReturn
 
@@ -130,7 +131,7 @@ from imsg.enrich.queue import (
 )
 from imsg.enrich.router import DEFAULT_CLAIM_ORDER, ENRICHMENT_KINDS, parse_kinds
 from imsg.enrich.worker import HeavyLockHandoff, run_enrich_worker
-from imsg.errors import AgentInstallError, ImsgError
+from imsg.errors import AgentInstallError, ImsgError, OcrHungError
 from imsg.eval.cli import eval_app
 from imsg.export import (
     ExportPlanError,
@@ -183,6 +184,7 @@ from imsg.memory_admission import (
     ModelRole,
     ReservationBook,
     configure_mlx_memory_limit,
+    enrich_footprint_bytes,
     pid_is_running,
 )
 from imsg.mount.guard import run_guard_mount_or_exit
@@ -201,6 +203,13 @@ from imsg.providers.factory import (
     resolve_prompt_path,
 )
 from imsg.providers.manifest import verify_manifest
+from imsg.public_model_hold import (
+    ModelHold,
+    PublicModelHoldError,
+    clear_hold,
+    read_hold,
+    write_hold,
+)
 from imsg.retrieval.background_warm_up import BackgroundWarmUp
 from imsg.retrieval.connections import RetrievalConnections, fts_pool, open_fts_reader
 from imsg.retrieval.idle_unload import IdleModelUnloader, PressureRelease, release_freed_memory
@@ -493,6 +502,17 @@ def _background_gate(cfg: Config, command: str) -> BackgroundGate:
     return BackgroundGate.from_config(
         cfg, log=lambda line: typer.echo(f"{command}: {line}", err=True)
     )
+
+
+EXIT_ENRICH_RESTART = 77
+"""`imsg enrich` stopped because Apple Vision hung on one image inside the
+process (`imsg.errors.OcrHungError`): that task is recorded failed and the
+next run should simply start. This project's own code, like 75 and 76
+(`imsg.background_gate`), not sysexits' meaning for 77."""
+
+
+_hard_exit: Callable[[int], NoReturn] = os._exit
+"""How `imsg enrich` ends after an OCR hang; a test swaps in one that raises."""
 
 
 def _exit_deferred(command: str, reason: StopReason) -> NoReturn:
@@ -2692,8 +2712,14 @@ def enrich(
         max_pause_seconds=cfg.enrichment.yield_max_pause_seconds,
     )
     heavy_lock = _heavy_lock_or_die(cfg, "imsg enrich", no_wait=no_wait, yields_to_waiters=True)
+    # Admitted for what these kinds can load: a run that never captions
+    # does not hold 24.8 GiB of "promised" memory against a live server.
     admission = MemoryAdmission.for_role(
-        cfg, ModelRole.ENRICH, command="imsg enrich", probe=gate.probe
+        cfg,
+        ModelRole.ENRICH,
+        command="imsg enrich",
+        probe=gate.probe,
+        footprint=enrich_footprint_bytes(cfg.memory, claim_order),
     )
 
     def _readmit() -> StopReason | None:
@@ -2710,6 +2736,7 @@ def enrich(
         readmit=_readmit,
         log=lambda line: typer.echo(f"enrich: {line}", err=True),
     )
+    hung: OcrHungError | None = None
     try:
         # Before any claim or reset: waiting here holds no lease.
         _acquire_heavy_lock_or_die(heavy_lock)
@@ -2733,6 +2760,8 @@ def enrich(
             process=process_one_task,
             lock_handoff=handoff,
         )
+    except OcrHungError as exc:
+        hung = exc
     except ImsgError as exc:
         typer.echo(f"imsg: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -2740,6 +2769,18 @@ def enrich(
         admission.release()
         heavy_lock.release()
         conn.close()
+    if hung is not None:
+        # The task is already recorded failed. A thread stuck inside Apple
+        # Vision cannot be stopped, and a normal exit could wait on it, so
+        # end the process outright once the lock and reservation are gone.
+        typer.echo(
+            f"enrich: {hung}. The task is marked failed; this process exits "
+            f"{EXIT_ENRICH_RESTART} so the next run starts fresh",
+            err=True,
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        _hard_exit(EXIT_ENRICH_RESTART)
 
     summary = " ".join(f"{k}={v}" for k, v in sorted(worker.outcomes.items())) or "none"
     typer.echo(f"enrich: claimed={worker.processed} {summary}")
@@ -3561,6 +3602,11 @@ def mcp_public(
         # the memory meanwhile.
         after_pressure_unload=admission.release_for_reload,
         on_watchdog_pass=admission.tick,
+        # A scheduled job (the nightly caption window) can borrow this
+        # server's memory: `imsg mcp hold-models` (imsg.public_model_hold).
+        hold=_public_hold_reader(
+            cfg.paths.data_root, log=lambda line: typer.echo(f"mcp public: {line}", err=True)
+        ),
     )
     public = PublicMcpServer(
         service=service,
@@ -3620,6 +3666,96 @@ def mcp_public(
         audit_pool.close()
         fts_conn.close()
         conn.close()
+
+
+def _public_hold_reader(
+    data_root: Path, *, log: Callable[[str], None]
+) -> Callable[[], ModelHold | None]:
+    """The active hold on the public server's models, read on every
+    watchdog pass; a hold file that is present but unusable is ignored and
+    logged once per distinct problem."""
+    last_problem: list[str | None] = [None]
+
+    def active() -> ModelHold | None:
+        reading = read_hold(data_root)
+        if reading.problem is not None and reading.problem != last_problem[0]:
+            log(reading.problem)
+        last_problem[0] = reading.problem
+        return reading.active_hold()
+
+    return active
+
+
+_CLOCK_TIME_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*$")
+
+
+def _parse_hold_until(text: str, *, now: datetime | None = None) -> datetime:
+    """`--until` for a model hold: a clock time on this host (`09:00`, the
+    next time it comes round), or anything `imsg background pause --until`
+    takes (ISO 8601, or a duration such as `8h`)."""
+    current = (now or datetime.now(UTC)).astimezone()
+    clock = _CLOCK_TIME_RE.match(text)
+    if clock is not None:
+        hour, minute = int(clock.group(1)), int(clock.group(2))
+        if hour > 23 or minute > 59:
+            raise PublicModelHoldError(f"--until {text!r} is not a clock time")
+        target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= current:
+            target += timedelta(days=1)
+        return target.astimezone(UTC)
+    try:
+        return parse_until(text, now=current.astimezone(UTC))
+    except BackgroundPauseError as exc:
+        raise PublicModelHoldError(str(exc)) from exc
+
+
+@mcp_app.command("hold-models")
+def mcp_hold_models(
+    config: ConfigOption = None,
+    until: Annotated[
+        str,
+        typer.Option(
+            "--until",
+            help="When the hold ends by itself: a clock time on this host (09:00, the next "
+            "one), ISO 8601, or a duration (8h). At most 12 hours away.",
+        ),
+    ] = ...,  # type: ignore[assignment]
+    reason: Annotated[
+        str | None, typer.Option("--reason", help="Why, shown in the public server's log.")
+    ] = None,
+) -> None:
+    """Make the public MCP server unload its models until --until (or
+    `imsg mcp release-models`), so a scheduled job can use the memory.
+
+    The server unloads once no call is in flight, within about 15 s; while
+    held, Gemini's retrieval calls answer WARMING_UP. When the hold ends the
+    server loads its models again by itself."""
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    try:
+        hold = write_hold(cfg.paths.data_root, until=_parse_hold_until(until), reason=reason)
+    except PublicModelHoldError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(f"mcp: public models held — {hold.describe()}")
+
+
+@mcp_app.command("release-models")
+def mcp_release_models(config: ConfigOption = None) -> None:
+    """End a hold set by `imsg mcp hold-models`; the public server loads
+    its models again within about 15 s."""
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    try:
+        cleared = clear_hold(cfg.paths.data_root)
+    except PublicModelHoldError as exc:
+        typer.echo(f"imsg: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        "mcp: public model hold released — the server loads its models again"
+        if cleared
+        else "mcp: no public model hold was set"
+    )
 
 
 @mcp_app.command("audit-prune")
