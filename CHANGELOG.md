@@ -1,5 +1,38 @@
 # CHANGELOG
 
+## 2026-11-11 — The night-caption job no longer reads a deferred queue as an empty one
+
+Found while deploying the dirty-chat fix. This morning's window opened at 01:00,
+ran one chunk at 02:18, claimed nothing, logged "done: no caption left to claim"
+and released the models at 02:21 — with 69,719 captions still pending and 6.5
+hours of GPU window left.
+
+Cause confirmed, not inferred: the previous evening's caption experiment parked
+every non-target pending caption with `next_attempt_at = now() + interval '3
+hours'`, so all 69,719 fell due at 02:42:07 — 24 minutes after the job looked
+(`min`/`max next_attempt_at` 02:42:07 on all 69,719, against chunk 1 at
+02:18:25). An empty claim is exactly what a deferred queue looks like, and the
+script treated it as exhaustion.
+
+`scripts/run_night_captions.sh` now asks the queue instead of guessing: on
+`claimed=0` it reads how many captions are still pending and how long until the
+earliest falls due, then waits that long (floored at `NIGHT_CAPTIONS_MIN_WAIT`,
+default 60 s, so an already-due-but-unclaimable queue backs off instead of
+spinning; capped at what is left of the window). It ends the window only when
+the queue is genuinely empty, and stops rather than looping if psql cannot
+answer.
+
+`mins()` strips a leading zero rather than using bash's `10#`, which POSIX sh
+leaves undefined — "08:00" would otherwise be read as octal.
+
+`tests/test_run_night_captions_script.py` drives the real script with fake
+`imsg` and `psql` binaries, no database and no models. Five tests: the
+2026-11-11 case waits instead of ending the window, an empty queue still ends
+it, captioning resumes once deferred work falls due, it never waits past
+`LAST_START`, and an unreadable queue stops rather than spins. The first fails
+against the pre-fix script with the exact symptom from this morning's log,
+which is how the suite was checked.
+
 ## 2026-11-11 — Enrichment never reached the index: captions could not get into a segment
 
 A segment's rendered text quotes an attachment's derived text — caption and
