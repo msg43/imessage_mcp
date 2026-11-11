@@ -35,7 +35,7 @@ every `stable_key` *and* is compared on its own, so a config change
 matches nothing and rewrites everything.
 
 **Cross-stage dependency:** dirty-chat detection below assumes S2
-(edits/retractions) and S3 (identity curation) bump
+(edits/retractions), S3 (identity curation) and S5b (enrichment) bump
 `message.updated_at` on any change to what a segment renders. Migration
 0003's trigger covers every UPDATE of a `message` row, so S2's upserts
 and S3's sender repoints are caught by construction. A name change is
@@ -49,6 +49,15 @@ its first message and the incremental frontier rebuild it from the
 start. Before 2026-09-15 they bumped only `person.updated_at`, which
 nothing here watches, and a rename after segmentation was never
 re-rendered.
+
+S5b is the same shape and was fixed on 2026-11-11: a segment quotes an
+attachment's caption, OCR snippet, transcript or document text, but
+enrichment writes only to `enrichment`, so text produced after a chat
+was segmented never reached `rendered_text`. `imsg.enrich.queue.
+complete_task` now marks the chats carrying the attachment, for the
+kinds in its `RENDERED_KINDS` and only when the text is non-empty.
+OCR had hidden the gap by running before segmentation on the first
+corpus; the 69,996 captions queued behind it would not have.
 """
 
 from __future__ import annotations

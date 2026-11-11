@@ -1,5 +1,53 @@
 # CHANGELOG
 
+## 2026-11-11 — Enrichment never reached the index: captions could not get into a segment
+
+A segment's rendered text quotes an attachment's derived text — caption and
+OCR snippet for an image, transcript for audio, the opening characters of a PDF
+or document. S4 re-segments a chat only when a message's `updated_at` has moved
+past its segment (`find_dirty_chats`), and that module's cross-stage note states
+the contract: whoever changes what a segment renders bumps `message.updated_at`.
+**Enrichment satisfied none of it.** It writes to `enrichment` and never to
+`message`, so text produced *after* a chat was segmented reached
+`attachment_chunk` and nowhere else: the segment, its embedding, its FTS row and
+its export document all kept the empty-snippet placeholder for good.
+
+OCR hid this for months by accident of ordering — it ran before segmentation on
+the first corpus, so its text was present at render time. Captions do not: the
+nightly caption job started 2026-10-29, and all 69,996 of its queued tasks would
+have produced text that never appeared in a single segment. The symptom was
+visible the whole time and read as normal, because a real segment renders as
+`[image: caption "—" | ocr "…"]` whether the caption is missing or merely empty.
+
+`complete_task` now marks the chats carrying the attachment, mirroring
+`imsg.stages.identity._mark_chats_dirty_for_persons`, which exists for exactly
+this class — a change a segment renders that is not an UPDATE of a message row.
+Two bounds keep it from costing anything it should not:
+
+- **Only the kinds the renderer quotes.** `RENDERED_KINDS` is
+  caption / ocr / frame_ocr / transcript / pdf_text / doc_text, with a test
+  pinning the set, because a new kind that renders and is not added would
+  reintroduce the bug one kind at a time. Anything else reaches search through
+  `attachment_chunk` alone and needs no rebuild.
+- **Only non-empty text.** The renderer shows the same placeholder for `None`
+  and for a blank string, so an OCR pass that legitimately found no text in a
+  photo changes no rendered byte, and marking it would re-segment and re-embed a
+  chat to produce an identical row. This is the common case, not an edge one:
+  40,877 of the pending captions sit on photos whose OCR came back empty.
+
+Five DB-gated tests in `tests/test_enrich_marks_chats_dirty_integration.py`
+drive the broken path end to end — segment a chat whose image has no caption,
+finish the caption, watch the chat come back dirty, re-segment, find the caption
+in the text — plus the two cases that must not fire and the constant guard.
+Verified by a negative control: with the mark disabled the two positive tests
+fail and the three negative ones still pass. 3,134 tests pass against a real
+Postgres; ruff and mypy clean.
+
+**On deploy:** only enrichment completed *after* the new code runs gets marked.
+Any caption finished in the gap stays stranded, and the fix is a one-off nudge
+of `message.updated_at` for the attachments involved, followed by `imsg segment`
+and `imsg embed`.
+
 ## 2026-10-29 — Search models stay loaded; captions get a 01:00-09:00 window; OCR hangs end the run
 
 Why: a Gemini search on 2026-10-29 answered `WARMING_UP`. The public server had unloaded after 10 idle minutes,

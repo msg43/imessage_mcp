@@ -21,7 +21,7 @@ import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from imsg.enrich.router import DEFAULT_CLAIM_ORDER
 
@@ -234,6 +234,54 @@ def missing_enrichment_kinds(conn: psycopg.Connection, kinds: Sequence[str]) -> 
     return [kind for kind in kinds if kind not in present]
 
 
+#: The enrichment kinds whose text `imsg.segment.render` puts inside a
+#: segment's `rendered_text`, and therefore the kinds whose arrival has to
+#: mark the chat dirty. Keep this in step with `_format_attachment`:
+#: `caption`/`ocr` (image, video), `transcript` (audio, video), `pdf_text`
+#: (pdf) and `doc_text` (everything else) all render. A kind absent here
+#: reaches search only through `attachment_chunk`, so it needs no rebuild.
+RENDERED_KINDS: frozenset[str] = frozenset(
+    {"caption", "ocr", "frame_ocr", "transcript", "pdf_text", "doc_text"}
+)
+
+
+def _mark_chats_dirty_for_attachment(cur: psycopg.Cursor[Any], attachment_id: int) -> int:
+    """Bump `message.updated_at` for every message carrying `attachment_id`,
+    so S4 re-renders the segments that quote this attachment's text. Returns
+    the number of messages bumped.
+
+    S4 only re-segments a chat when a message's `updated_at` has moved past
+    its segment's `created_at` (`imsg.segment.pipeline.find_dirty_chats`), and
+    that module's cross-stage note states the contract plainly: whoever
+    changes what a segment renders bumps `message.updated_at`. Enrichment
+    writes to `enrichment`, never to `message`, so before this it satisfied
+    none of it — a caption or transcript produced *after* a chat was
+    segmented never reached `rendered_text`, and the segment kept rendering
+    the empty-snippet placeholder for good, along with its embedding, its FTS
+    row and its export document.
+
+    OCR escaped the bug only by accident of ordering: it ran before
+    segmentation on the first corpus, so its text was present at render time.
+    Captions did not, which is how this surfaced — 69,996 pending captions
+    that would all have landed in `attachment_chunk` and nowhere else.
+
+    This mirrors `imsg.stages.identity._mark_chats_dirty_for_persons`, which
+    exists for the same reason: a change that a segment renders but that is
+    not an UPDATE of a message row. Like that one it runs inside the caller's
+    transaction, so a rollback undoes the mark with the write.
+    """
+    cur.execute(
+        """
+        UPDATE message SET updated_at = now()
+        WHERE message_id IN (
+            SELECT message_id FROM message_attachment WHERE attachment_id = %s
+        )
+        """,
+        (attachment_id,),
+    )
+    return max(cur.rowcount, 0)
+
+
 def complete_task(
     conn: psycopg.Connection,
     attachment_id: int,
@@ -244,6 +292,16 @@ def complete_task(
     text: str | None,
     detail: dict[str, object] | None = None,
 ) -> None:
+    """Record a finished task, and — for the kinds a segment renders — mark
+    the chats quoting this attachment for re-segmentation.
+
+    The mark is skipped when the text is empty, because the renderer shows
+    the same empty-snippet placeholder for `None` and for a blank string: an
+    OCR pass that legitimately found no text in a photo changes no rendered
+    byte, and marking it would re-segment and re-embed a chat to produce an
+    identical result. 40,877 of the pending captions sit on photos whose OCR
+    came back empty, so this is the common case, not an edge one.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -262,6 +320,8 @@ def complete_task(
                 kind,
             ),
         )
+        if kind in RENDERED_KINDS and text is not None and text.strip():
+            _mark_chats_dirty_for_attachment(cur, attachment_id)
 
 
 def fail_task(
