@@ -112,6 +112,59 @@ def test_a_refused_mount_gate_stops_the_start(root: Path, tmp_path: Path) -> Non
     assert "guard-mount refused (guard said no)" in (tmp_path / "guard.log").read_text()
 
 
+def test_the_ungated_mode_runs_the_command_with_the_volume_absent_and_writes_nothing_there(
+    tmp_path: Path,
+) -> None:
+    """`--no-mount-gate` is for a command whose job is to notice the volume
+    is missing (`backup-check`). The gated supervisor exits 78 before such a
+    command runs, so it could never say anything. Ungated, the command runs,
+    its exit status reaches launchd, and nothing is created under the data
+    root: no logs directory, no start-history file, no guard-log line."""
+    bare = tmp_path / "volume-absent"
+    bare.mkdir()
+    marker = tmp_path / "ran"
+    done = _run(
+        _argv(
+            bare, _stub_imsg(tmp_path, guard_status=78), tmp_path, "--no-mount-gate",
+            command=_child(f"open({str(marker)!r}, 'w'); raise SystemExit(3)"),
+        )
+    )
+    assert done.returncode == 3, done.stderr
+    assert marker.exists()
+    assert list(bare.iterdir()) == []
+    assert not (tmp_path / "guard.log").exists()
+
+
+def test_the_gate_stays_on_unless_it_is_turned_off_by_name(tmp_path: Path) -> None:
+    bare = tmp_path / "volume-absent"
+    bare.mkdir()
+    marker = tmp_path / "ran"
+    done = _run(
+        _argv(
+            bare, _stub_imsg(tmp_path), tmp_path, "--mount-wait", "0",
+            command=_child(f"open({str(marker)!r}, 'w')"),
+        )
+    )
+    assert done.returncode == EX_CONFIG
+    assert not marker.exists()
+
+
+def test_the_ungated_mode_refuses_secrets_because_they_live_on_the_volume(
+    root: Path, tmp_path: Path
+) -> None:
+    marker = tmp_path / "ran"
+    done = _run(
+        _argv(
+            root, _stub_imsg(tmp_path), tmp_path, "--no-mount-gate", "--env", _secret_file(root),
+            command=_child(f"open({str(marker)!r}, 'w')"),
+        )
+    )
+    assert done.returncode != 0
+    assert "--no-mount-gate cannot be combined with --env" in done.stderr
+    assert not marker.exists()
+    assert SECRET not in done.stdout + done.stderr
+
+
 def test_the_service_gets_its_secret_from_a_0600_file_and_its_status_reaches_launchd(
     root: Path, tmp_path: Path
 ) -> None:

@@ -33,6 +33,13 @@ Why a wrapper, and why this shape
   disconnects clients instead of waiting for them) and every other
   common signal as-is, so `launchctl kill HUP` reaches Postgres as a
   configuration reload.
+- **One command is exempt, by name.** `--no-mount-gate` skips the wait,
+  the gate, the on-volume logs and the crash-loop file, and refuses
+  `--env`. It exists for `imsg backup-check`, whose whole job is to say
+  that the volume or the backup is missing: behind the gate it would exit
+  78 on exactly the night it is needed. The command then does its own
+  gate, writes nothing under `<data_root>`, and is still run as a child of
+  this wrapper so it keeps the same macOS privacy attribution.
 - **A crash loop slows down.** More than `--crash-limit` starts within
   `--crash-window` seconds and the next start waits `--crash-backoff`
   seconds first, so a service that dies at startup does not reload its
@@ -264,6 +271,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--postgres-wait", type=float, default=900.0)
     parser.add_argument("--stop-signal", choices=sorted(STOP_SIGNALS), default="TERM")
     parser.add_argument("--mount-wait", type=float, default=900.0)
+    parser.add_argument(
+        "--no-mount-gate", action="store_true",
+        help="run the command without waiting for or checking the volume, and write "
+        "nothing under the data root (for a command that reports a missing volume itself; "
+        "cannot be combined with --env or --wait-for-postgres)",
+    )
     parser.add_argument("--crash-window", type=float, default=600.0)
     parser.add_argument("--crash-limit", type=int, default=5)
     parser.add_argument("--crash-backoff", type=float, default=300.0)
@@ -293,41 +306,54 @@ def main(argv: Sequence[str] | None = None) -> int:
     data_root: Path = args.data_root
     if not data_root.is_absolute():
         parser.error("--data-root must be an absolute path")
-
-    # 1. The mount: the sentinel, then the real gate.
-    if not wait_for_sentinel(data_root, timeout=args.mount_wait):
-        guard_log_line(
-            f"{args.service}: {data_root / SENTINEL_NAME} absent after {args.mount_wait:.0f} s — "
-            f"encrypted volume not mounted; exit {EX_CONFIG}, launchd will retry",
-            guard_log=args.guard_log,
+    if args.no_mount_gate and (args.env or args.wait_for_postgres):
+        parser.error(
+            "--no-mount-gate cannot be combined with --env or --wait-for-postgres: "
+            "secrets and the database belong behind the gate"
         )
-        return EX_CONFIG
-    ok, detail = run_guard(args.imsg, args.config)
-    if not ok:
-        guard_log_line(
-            f"{args.service}: imsg guard-mount refused ({detail}); exit {EX_CONFIG}",
-            guard_log=args.guard_log,
-        )
-        return EX_CONFIG
 
-    # 2. From here on the service's own logs, on the volume.
-    logs = data_root / "logs"
-    out_fd = open_log(logs / f"imsgindex-{args.service}.out.log")
-    err_fd = open_log(logs / f"imsgindex-{args.service}.err.log")
-    log = _Logger(err_fd, args.service)
+    if args.no_mount_gate:
+        # The command reports a missing volume itself, so it must run when
+        # the volume is missing, and nothing may be created under data_root.
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+        out_fd = err_fd = null_fd
+        log = _Logger(null_fd, args.service)
+    else:
+        # 1. The mount: the sentinel, then the real gate.
+        if not wait_for_sentinel(data_root, timeout=args.mount_wait):
+            guard_log_line(
+                f"{args.service}: {data_root / SENTINEL_NAME} absent after "
+                f"{args.mount_wait:.0f} s — encrypted volume not mounted; exit {EX_CONFIG}, "
+                f"launchd will retry",
+                guard_log=args.guard_log,
+            )
+            return EX_CONFIG
+        ok, detail = run_guard(args.imsg, args.config)
+        if not ok:
+            guard_log_line(
+                f"{args.service}: imsg guard-mount refused ({detail}); exit {EX_CONFIG}",
+                guard_log=args.guard_log,
+            )
+            return EX_CONFIG
 
-    # 3. Crash-loop brake.
-    starts = record_start_and_count(
-        data_root / "run" / f"supervise-{args.service}.starts",
-        now=time.time(),
-        window=args.crash_window,
-    )
-    if starts > args.crash_limit:
-        log(
-            f"{starts} starts in the last {args.crash_window:.0f} s (limit {args.crash_limit}); "
-            f"waiting {args.crash_backoff:.0f} s before starting again"
+        # 2. From here on the service's own logs, on the volume.
+        logs = data_root / "logs"
+        out_fd = open_log(logs / f"imsgindex-{args.service}.out.log")
+        err_fd = open_log(logs / f"imsgindex-{args.service}.err.log")
+        log = _Logger(err_fd, args.service)
+
+        # 3. Crash-loop brake.
+        starts = record_start_and_count(
+            data_root / "run" / f"supervise-{args.service}.starts",
+            now=time.time(),
+            window=args.crash_window,
         )
-        time.sleep(args.crash_backoff)
+        if starts > args.crash_limit:
+            log(
+                f"{starts} starts in the last {args.crash_window:.0f} s (limit "
+                f"{args.crash_limit}); waiting {args.crash_backoff:.0f} s before starting again"
+            )
+            time.sleep(args.crash_backoff)
 
     # 4. The environment, from 0600 files. Names are logged, values never.
     env = dict(os.environ)

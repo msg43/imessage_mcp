@@ -12,9 +12,13 @@ raises a macOS notification, the same mechanism `scripts/copy_backup_offsite.py
 --notify` uses.
 
 A check that cannot tell fails loudly rather than passing: an unreadable
-`backups/` directory, a manifest with an unparseable timestamp and a
-directory with no complete set at all all exit 1, because "nothing to
-report" and "could not look" must not read as healthy.
+`backups/` directory, a manifest with an unparseable timestamp, a
+directory with no complete set at all, a config file that cannot be read
+and an encrypted volume that is not mounted all exit 1, because "nothing
+to report" and "could not look" must not read as healthy. The last is the
+likeliest way for the nightly backup to stop, so the command runs the mount
+gate itself and reports its refusal (the agent is also rendered without the
+supervisor's mount wait, which would exit before the command ran).
 """
 
 from __future__ import annotations
@@ -26,11 +30,16 @@ from typing import Any
 
 from imsg.diagnostics import BACKUP_STALE_AFTER_SECONDS, BackupStatus
 
+STALE_TITLE = "iMessage index backup is stale"
+COULD_NOT_CHECK_TITLE = "iMessage index backup could not be checked"
+
 
 @dataclass(frozen=True, slots=True)
 class FreshnessVerdict:
     ok: bool
     message: str
+    title: str = STALE_TITLE
+    """The notification's title when `ok` is false."""
 
 
 def judge_backup_freshness(status: BackupStatus) -> FreshnessVerdict:
@@ -57,6 +66,7 @@ def judge_backup_freshness(status: BackupStatus) -> FreshnessVerdict:
         False,
         f"backup freshness could not be established: {status.reason or 'no reason given'}"
         f"{partial}",
+        COULD_NOT_CHECK_TITLE,
     )
 
 
@@ -92,4 +102,10 @@ def notify_macos(
     return None
 
 
-__all__ = ["FreshnessVerdict", "judge_backup_freshness", "notify_macos"]
+__all__ = [
+    "COULD_NOT_CHECK_TITLE",
+    "STALE_TITLE",
+    "FreshnessVerdict",
+    "judge_backup_freshness",
+    "notify_macos",
+]

@@ -213,8 +213,13 @@ def _supervised(
     wait_for_postgres: bool = False,
     stop_signal: str = "TERM",
     environment: Mapping[str, str] | None = None,
+    mount_gate: bool = True,
 ) -> dict[str, object]:
-    """One plist whose program is the supervisor wrapping `command`."""
+    """One plist whose program is the supervisor wrapping `command`.
+
+    `mount_gate=False` adds `--no-mount-gate`: for a command that reports
+    a missing volume itself, which the gated supervisor would stop from
+    ever running. It cannot carry secrets or wait for Postgres."""
     overrides = env_files or {}
     arguments = [
         str(binaries.interpreter),
@@ -240,6 +245,8 @@ def _supervised(
         ]
     if stop_signal != "TERM":
         arguments += ["--stop-signal", stop_signal]
+    if not mount_gate:
+        arguments.append("--no-mount-gate")
     return {
         "Label": f"{LABEL_PREFIX}{name}",
         "ProgramArguments": [*arguments, "--", *command],
@@ -295,7 +302,10 @@ def render_agent_plists(
       `ProcessType` Background.
     - `backup-check` — optional, daily at `BACKUP_CHECK_HOUR`; `imsg
       backup-check --notify`, which reads the backup directory only (no
-      database, no secret) and fails when the newest complete set is stale.
+      database, no secret) and fails when the newest complete set is stale
+      or the volume is not mounted. Unlike every other agent it is run
+      with `--no-mount-gate`, so it still starts when the volume is absent
+      and the command itself raises the alert.
     - `sync`, `enrich`, `report` — their schedules, unchanged in shape.
     - `tunnel` — KeepAlive `cloudflared`, only when asked for.
     """
@@ -398,7 +408,11 @@ def render_agent_plists(
         },
         # Only with `only=["backup-check"]`: it reads files, so it needs
         # neither Postgres nor a secret, and a stale backup is exactly when
-        # the database may be the thing that is broken.
+        # the database may be the thing that is broken. It is also the one
+        # agent that must run when the encrypted volume is NOT mounted (the
+        # nightly backup cannot run then either), so it skips the
+        # supervisor's mount wait and gate, which would exit 78 before the
+        # command could notify; the command runs the gate itself.
         "backup-check": lambda: {
             **_supervised(
                 "backup-check",
@@ -406,6 +420,7 @@ def render_agent_plists(
                 data_root=data_root,
                 guard_config=config_path,
                 command=[imsg, "backup-check", "--config", cfg, "--notify"],
+                mount_gate=False,
             ),
             "StartCalendarInterval": {"Hour": BACKUP_CHECK_HOUR, "Minute": 0},
             "ProcessType": "Background",

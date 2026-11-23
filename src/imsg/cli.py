@@ -91,7 +91,12 @@ from imsg.background_pause import (
     read_pause_state,
     write_pause,
 )
-from imsg.backup.freshness import judge_backup_freshness, notify_macos
+from imsg.backup.freshness import (
+    COULD_NOT_CHECK_TITLE,
+    FreshnessVerdict,
+    judge_backup_freshness,
+    notify_macos,
+)
 from imsg.backup.pipeline import OUT_OF_SCOPE_NOTE, SAME_DEVICE_CAVEAT, run_backup
 from imsg.backup.retention import DEFAULT_KEEP
 from imsg.config.loader import default_config_path, load_config
@@ -132,7 +137,7 @@ from imsg.enrich.queue import (
 )
 from imsg.enrich.router import DEFAULT_CLAIM_ORDER, ENRICHMENT_KINDS, parse_kinds
 from imsg.enrich.worker import HeavyLockHandoff, run_enrich_worker
-from imsg.errors import AgentInstallError, ImsgError, OcrHungError
+from imsg.errors import AgentInstallError, ImsgError, MountGateError, OcrHungError
 from imsg.eval.cli import eval_app
 from imsg.export import (
     ExportPlanError,
@@ -188,7 +193,7 @@ from imsg.memory_admission import (
     enrich_footprint_bytes,
     pid_is_running,
 )
-from imsg.mount.guard import run_guard_mount_or_exit
+from imsg.mount.guard import guard_mount, run_guard_mount_or_exit
 from imsg.paths import is_contained_in, is_same_file, resolve_path
 from imsg.providers.factory import (
     ResolvedPrompt,
@@ -4348,6 +4353,30 @@ def backup(
         raise typer.Exit(code=1)
 
 
+def _backup_check_verdict(config_path: Path | None) -> FreshnessVerdict:
+    """Every way `backup-check` can end, as a verdict: it never exits early.
+
+    A check that cannot look is a failure to report, not a reason to stay
+    silent. With the encrypted volume not mounted the nightly backup cannot
+    run either, so the mount gate is called here, inside the command, and
+    its refusal becomes a failing verdict that reaches `--notify`. The
+    config file can sit on that same missing volume, so it is covered too.
+    """
+    try:
+        cfg = load_config(config_path)
+    except ImsgError as exc:
+        return FreshnessVerdict(False, f"backup check could not look: {exc}", COULD_NOT_CHECK_TITLE)
+    try:
+        guard_mount(cfg.paths.data_root)
+    except MountGateError as exc:
+        return FreshnessVerdict(
+            False,
+            f"backup check could not look: the encrypted volume is not available ({exc})",
+            COULD_NOT_CHECK_TITLE,
+        )
+    return judge_backup_freshness(check_backups(cfg))
+
+
 @app.command("backup-check")
 def backup_check(
     config: ConfigOption = None,
@@ -4365,19 +4394,19 @@ def backup_check(
     daily by the optional `backup-check` agent, it turns a nightly backup
     that has stopped producing sets into a failing exit status (and, with
     `--notify`, a notification) instead of a line nobody reads. A stale
-    newest set, no complete set at all and an unreadable `backups/`
-    directory all exit 1, with the reason on stderr. It reads the backup
-    directory only: no database, no secrets.
+    newest set, no complete set at all, an unreadable `backups/`
+    directory, an encrypted volume that is not mounted and a config file
+    that cannot be read all exit 1, with the reason on stderr and, with
+    `--notify`, in the notification. It reads the backup directory only:
+    no database, no secrets.
     """
-    cfg = _load_config_or_die(config)
-    run_guard_mount_or_exit(cfg.paths.data_root)
-    verdict = judge_backup_freshness(check_backups(cfg))
+    verdict = _backup_check_verdict(config)
     if verdict.ok:
         typer.echo(f"backup-check: {verdict.message}")
         return
     typer.echo(f"imsg: backup-check: {verdict.message}", err=True)
     if notify:
-        failure = notify_macos("iMessage index backup is stale", verdict.message[:200])
+        failure = notify_macos(verdict.title, verdict.message[:200])
         if failure is not None:
             typer.echo(f"imsg: backup-check: notification not posted: {failure}", err=True)
     raise typer.Exit(code=1)

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import plistlib
 import subprocess
+import sys
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,6 +40,7 @@ from imsg.backup.retention import MANIFEST_FILENAME, MANIFEST_FORMAT
 from imsg.cli import app
 from imsg.config.loader import load_config_dict
 from imsg.diagnostics import BACKUP_STALE_AFTER_SECONDS, BackupStatus
+from imsg.errors import MountGateError
 from imsg.mount.guard import MountInfo
 
 runner = CliRunner()
@@ -173,7 +175,7 @@ def check(
     """Runs `imsg backup-check` against a temporary data_root; returns the result."""
     monkeypatch.setattr(
         cli_module,
-        "run_guard_mount_or_exit",
+        "guard_mount",
         lambda root: MountInfo(mount_point=root, encrypted=True, volume_name="scratch"),
     )
     config_path = tmp_path / "config.yaml"
@@ -252,6 +254,70 @@ def test_it_reads_the_backup_directory_only(
 
 
 # ---------------------------------------------------------------------------
+# A check that cannot look must still alert (QA 2026-11-23)
+# ---------------------------------------------------------------------------
+#
+# With the encrypted volume not mounted the nightly backup cannot run either,
+# so this is the case the check exists for. It used to exit through the mount
+# gate before it reached `--notify`, so nothing was ever posted.
+
+
+def test_an_unmounted_volume_notifies_and_exits_one_instead_of_dying_in_the_gate(
+    tmp_path: Path,
+    config_dict_factory: ConfigDictFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real gate, not a stand-in: a data root with no volume sentinel
+    is refused, and the command must turn that into a failing verdict."""
+    posted: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        cli_module, "notify_macos", lambda t, m: posted.append((t, m)) or None
+    )
+    config_path = tmp_path / "config.yaml"
+    config = config_dict_factory(**{"paths.data_root": str(tmp_path / "volume-absent")})
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    result = runner.invoke(app, ["backup-check", "--config", str(config_path), "--notify"])
+    assert result.exit_code == 1, result.output
+    assert "backup check could not look" in result.output
+    assert "Traceback" not in result.output
+    assert len(posted) == 1, "the notification is the whole point of the check"
+    title, message = posted[0]
+    assert "could not" in title and "stale" not in title
+    assert "backup check could not look" in message
+
+
+def test_a_refused_mount_gate_exits_one_with_the_reason_and_without_the_flag_posts_nothing(
+    check: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    posted: list[object] = []
+    monkeypatch.setattr(cli_module, "notify_macos", lambda t, m: posted.append(m))
+
+    def refuse(root: Path) -> MountInfo:
+        raise MountGateError("sentinel .imsgindex-volume is missing")
+
+    monkeypatch.setattr(cli_module, "guard_mount", refuse)
+    result = check()
+    assert result.exit_code == 1
+    assert "sentinel .imsgindex-volume is missing" in result.output
+    assert posted == []
+
+
+def test_a_config_that_cannot_be_read_also_notifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The config file can sit on the very volume that is missing."""
+    posted: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        cli_module, "notify_macos", lambda t, m: posted.append((t, m)) or None
+    )
+    missing = tmp_path / "volume-absent" / "config.yaml"
+    result = runner.invoke(app, ["backup-check", "--config", str(missing), "--notify"])
+    assert result.exit_code == 1
+    assert "backup check could not look" in result.output
+    assert len(posted) == 1 and "config file not found" in posted[0][1]
+
+
+# ---------------------------------------------------------------------------
 # The optional LaunchAgent
 # ---------------------------------------------------------------------------
 
@@ -303,6 +369,63 @@ def test_the_agent_runs_daily_under_the_supervisor_with_no_database_and_no_secre
     assert "--wait-for-postgres" not in supervisor
     assert "--env" not in supervisor
     assert command == [str(IMSG), "backup-check", "--config", str(CONFIG_PATH), "--notify"]
+
+
+def test_the_agent_is_not_held_back_by_the_mount_gate_so_it_can_report_a_missing_volume(
+    config_dict_factory: ConfigDictFactory,
+) -> None:
+    """The other agents wait for the encrypted volume and exit 78 without it.
+    This one must run exactly then, so its supervisor is told not to gate
+    and to read no secret."""
+    plist = plistlib.loads(_render(config_dict_factory, only=["backup-check"])[LABEL])
+    arguments = plist["ProgramArguments"]
+    supervisor = arguments[: arguments.index("--")]
+    assert "--no-mount-gate" in supervisor
+    assert "--env" not in supervisor
+    for name in AGENT_NAMES:
+        if name == "tunnel":
+            continue
+        other = plistlib.loads(
+            _render(config_dict_factory, only=[name])[f"{LABEL_PREFIX}{name}"]
+        )["ProgramArguments"]
+        assert "--no-mount-gate" not in other[: other.index("--")], name
+
+
+def test_the_rendered_agent_runs_the_check_when_the_volume_is_absent(
+    config_dict_factory: ConfigDictFactory, tmp_path: Path
+) -> None:
+    """The agent exactly as rendered, run for real against a data root with
+    no volume in it: the command must start (here a stand-in `imsg` that
+    records its arguments and exits 1, as a failing check does), its exit
+    status must reach launchd, and nothing may be written under the data
+    root. Before the fix the supervisor exited 78 and the command never ran."""
+    seen = tmp_path / "seen"
+    stand_in = tmp_path / "bin" / "imsg"
+    stand_in.parent.mkdir()
+    stand_in.write_text(f'#!/bin/sh\necho "$@" > {seen}\nexit 1\n', encoding="utf-8")
+    stand_in.chmod(0o755)
+    absent_root = tmp_path / "volume-absent"
+    absent_root.mkdir()
+    config = load_config_dict(config_dict_factory(**{"paths.data_root": str(absent_root)}))
+    plist = plistlib.loads(
+        render_agent_plists(
+            config,
+            imsg_binary=stand_in,
+            postgres_binary=POSTGRES,
+            cloudflared_binary=None,
+            config_path=tmp_path / "config.yaml",
+            interpreter=Path(sys.executable),
+            only=["backup-check"],
+        )[LABEL]
+    )
+    done = subprocess.run(
+        plist["ProgramArguments"], capture_output=True, text=True, timeout=60, check=False
+    )
+    assert done.returncode == 1, done.stderr
+    assert seen.read_text(encoding="utf-8").split() == [
+        "backup-check", "--config", str(tmp_path / "config.yaml"), "--notify",
+    ]
+    assert list(absent_root.iterdir()) == []
 
 
 def test_the_check_time_catches_a_missed_night_the_same_morning_and_passes_a_good_one() -> None:
