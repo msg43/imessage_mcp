@@ -2,10 +2,28 @@
 
 ## 2026-11-23 — A refused backup names every table it could not read, and a daily check catches a backup that stopped
 
-`pg_dump` stops at the first table its role may not read, so `imsg backup`'s error named one table even when several were blocked. After a nonzero exit it now asks the catalog which tables that role cannot SELECT and lists them all with the remedy (`PgDumpExitError`, `src/imsg/backup/postgres_dump.py`); it only adds words to an error already being raised.
-New `imsg backup-check [--notify]` turns `imsg status`'s `backup_stale` into an exit status: 0 fresh, 1 stale, no complete set or unreadable. `--notify` also posts a macOS notification, the mechanism `scripts/copy_backup_offsite.py --notify` uses.
-New optional agent `backup-check` (`imsg install-agents --only backup-check`) runs it daily at 10:00, after the 04:00 backup; it is not in the default set and nothing installs it.
-Tests: `tests/test_backup_unreadable_tables.py` and `tests/test_backup_freshness.py`; the unreadable-table tests fail without the change, checked with a real `pg_dump` against a scratch Postgres.
+`pg_dump` stops at the first table its role may not read, so `imsg backup`'s error
+named one table even when several were blocked. After a nonzero exit it now asks the
+catalog which tables that role cannot SELECT and lists them all with the remedy
+(`PgDumpExitError`, `src/imsg/backup/postgres_dump.py`).
+
+New `imsg backup-check [--notify]` turns `imsg status`'s `backup_stale` into an exit
+status (0 fresh; 1 stale, no complete set or unreadable) and can post a macOS
+notification, as `scripts/copy_backup_offsite.py --notify` does. The optional agent
+`backup-check` (`imsg install-agents --only backup-check`) runs it daily at 10:00;
+it is not in the default set and nothing installs it.
+
+Tests: `tests/test_backup_unreadable_tables.py` and
+`tests/test_backup_freshness.py`; the first fail without the change, checked with a
+real `pg_dump` against a scratch Postgres.
+
+## 2026-11-11 — Both 11 Nov fixes are running on the production host
+
+The host's checkout is `main` at `40dd39f`, clean (read 2026-11-23). Its reflog
+shows the move to `fc6a034` at 10:04 and the fast-forward to `40dd39f` at 12:02 EST
+on 2026-11-11, so the dirty-chat fix (`fc6a034`) and the night-caption wait
+(`40dd39f`) are live. The one-off nudge for captions that finished before the fix is
+recorded in the private design-record repo.
 
 ## 2026-11-11 — The night-caption job no longer reads a deferred queue as an empty one
 
@@ -88,6 +106,19 @@ Any caption finished in the gap stays stranded, and the fix is a one-off nudge
 of `message.updated_at` for the attachments involved, followed by `imsg segment`
 and `imsg embed`.
 
+## 2026-10-31 — The public GitHub repository was deleted and recreated to drop the pre-rewrite history
+
+The 2026-09-24 history rewrite left the old commits fetchable from GitHub by exact
+id. The owner chose delete-and-recreate. The repository was recreated from `main`
+(created 2026-11-01 00:30 UTC) with the three branches that held unmerged commits;
+private vulnerability reporting is on and the description no longer claims the repo
+never held real identifiers. The old repository's traffic history and its one merged
+pull request page are gone.
+
+Checked 2026-11-23: all 81 rewritten commits' old ids return 404 or 422 from the new
+repository, the 19 commits the rewrite left unchanged keep their ids and return 200,
+and the new repository has no pull requests. Control: 5 of 5 new ids return 200.
+
 ## 2026-10-29 — Search models stay loaded; captions get a 01:00-09:00 window; OCR hangs end the run
 
 Why: a Gemini search on 2026-10-29 answered `WARMING_UP`. The public server had unloaded after 10 idle minutes,
@@ -122,6 +153,17 @@ day: keep the search models resident, and caption in a nightly window from 01:00
   recorded failed against Postgres, and the CLI's exit 77 with the lock and reservation released. The night script
   was run against stub `imsg` and `psql` commands: full window, outside the window, a second copy, and a stop signal.
 
+## 2026-10-29 — Production host on `e6ab43b`: OCR works again; the index has caught up
+
+Deployed the Vision-options fix (`e6ab43b`, from `92c0f4c`) by fast-forward at 00:02
+EDT: no dependency change and no restart, since OCR runs only in the enrichment
+worker. Afterwards 17 of 20 images that had failed went through OCR, 1,172 OCR tasks
+finished in under 3 minutes with none failing, and 8,274 of the 8,281 messages since
+the 2026-09-25 freeze were segmented, every segment embedded. With the owner's OK
+the fix branch and the deploy-record branch were pushed, not merged, so the host's
+code no longer lived only on local machines. Figures as recorded on the day; not
+re-measured.
+
 ## 2026-10-28 — Fix: Apple Vision OCR failed on every image on macOS 27
 
 - `AppleVisionOcrProvider` passed a Python `{}` as `VNImageRequestHandler`'s options. On macOS 27 with pyobjc
@@ -132,6 +174,41 @@ day: keep the search models resident, and caption in a nightly window from 01:00
 - The handler now gets `Foundation.NSDictionary.dictionary()`. The stubbed test that asserted `options == {}` now
   asserts a Foundation dictionary, and a new test runs the real framework on a flat image (skipped off macOS); it
   fails on the old line with the production error and passes with the fix.
+
+## 2026-10-28 — Production host: public idle unload enabled; live-server-first seen working
+
+The operator set `mcp.public.idle_unload_seconds: 600` (public server restarted,
+ready in 10 s) and made the enrichment runner scripts retry after exit 75 instead of
+stopping. After 10 idle minutes the server unloaded; 15 s later the enrichment
+worker and a waiting sync were admitted, and the worker handed the heavy-model lock
+to the sync. A local search then answered `WARMING_UP` and the sync gave way the
+same second (exit 75); the server loaded in 8.5 s and the next 20 searches ran at
+1.140 s p95 with no errors. Found: a refused server answers `WARMING_UP` at once, so
+a burst of 60 calls in about 1 s all failed. Figures as recorded on the day; not
+re-measured.
+
+## 2026-10-28 — Background work resumed on the production host; memory admission refused every background load
+
+`imsg background resume` at 22:11, and `VACUUM (ANALYZE)` completed (0.88 s). The
+enrichment worker, the sync's segmentation and `imsg embed` each waited
+`memory.admission_wait_seconds` (600 s) and exited 75 (`deferred: memory`): each
+needed its footprint plus the 8.0 GiB reserve against 24.7 to 26.5 GiB available,
+with the public server's models resident. Admission worked as designed and search
+stayed at full speed; nothing heavy could run until the idle unload was enabled.
+Follow-up: the enrichment estimate ignores `--kinds`. Figures as recorded on the
+day; not re-measured.
+
+## 2026-10-28 — Deploy main's admission, search-yield, sandbox and doctor changes
+
+The production host moved from `a482d60` to `92c0f4c` by fast-forward at 19:27 EDT;
+its tree is identical to main `5cd086d` (checked 2026-11-23), with no migration,
+dependency change or config edit (the one new key,
+`memory.background_yield_seconds`, defaults to 60 s). Search through `imsg mcp
+local` timed 1.054 s p50 before and 1.045 s after. After the restart: doctor 9 of 9
+including the credential check that had failed, the MIME sniffer ran under
+`sandbox-exec`, and the sync ran on the new code and exited 76 (paused). Not yet
+exercised: sync waiting for a live search, and the server loading ahead of
+background work. Figures as recorded on the day; not re-measured.
 
 ## 2026-10-27 — Weekly encrypted off-box copy of the nightly backup
 
