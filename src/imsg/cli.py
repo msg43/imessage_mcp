@@ -91,6 +91,7 @@ from imsg.background_pause import (
     read_pause_state,
     write_pause,
 )
+from imsg.backup.freshness import judge_backup_freshness, notify_macos
 from imsg.backup.pipeline import OUT_OF_SCOPE_NOTE, SAME_DEVICE_CAVEAT, run_backup
 from imsg.backup.retention import DEFAULT_KEEP
 from imsg.config.loader import default_config_path, load_config
@@ -4345,6 +4346,41 @@ def backup(
     typer.echo(f"backup: {SAME_DEVICE_CAVEAT}")
     if not _rotate_logs_after_backup(cfg, dry_run=dry_run):
         raise typer.Exit(code=1)
+
+
+@app.command("backup-check")
+def backup_check(
+    config: ConfigOption = None,
+    notify: Annotated[
+        bool,
+        typer.Option(
+            "--notify",
+            help="Also raise a macOS notification when the check fails.",
+        ),
+    ] = False,
+) -> None:
+    """Exit 0 if the newest complete backup set is under 26 hours old.
+
+    The unattended version of `imsg status`'s `backup_stale` field: run
+    daily by the optional `backup-check` agent, it turns a nightly backup
+    that has stopped producing sets into a failing exit status (and, with
+    `--notify`, a notification) instead of a line nobody reads. A stale
+    newest set, no complete set at all and an unreadable `backups/`
+    directory all exit 1, with the reason on stderr. It reads the backup
+    directory only: no database, no secrets.
+    """
+    cfg = _load_config_or_die(config)
+    run_guard_mount_or_exit(cfg.paths.data_root)
+    verdict = judge_backup_freshness(check_backups(cfg))
+    if verdict.ok:
+        typer.echo(f"backup-check: {verdict.message}")
+        return
+    typer.echo(f"imsg: backup-check: {verdict.message}", err=True)
+    if notify:
+        failure = notify_macos("iMessage index backup is stale", verdict.message[:200])
+        if failure is not None:
+            typer.echo(f"imsg: backup-check: notification not posted: {failure}", err=True)
+    raise typer.Exit(code=1)
 
 
 def _run_log_rotation(cfg: Config, *, dry_run: bool) -> RotationReport:

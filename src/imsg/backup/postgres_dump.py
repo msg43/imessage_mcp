@@ -10,7 +10,7 @@ logical dump is also the right shape for what these copies are *for*
 disk failure"), because it survives the one class of damage a file copy
 faithfully reproduces.
 
-Three things here exist because the obvious version of each is wrong:
+Four things here exist because the obvious version of each is wrong:
 
 **The version pre-check.** `pg_dump` refuses to dump a server newer than
 itself. It refuses *after* creating the output file, so a naive run
@@ -39,6 +39,16 @@ half truncation, a **one-byte** truncation, and a single flipped byte
 2 kB from the end. The TOC listing is still run — but only for what it
 is actually good for, which is asserting the expected tables are present
 by name.
+
+**A refused dump names every table it could not read.** `pg_dump` locks
+all the tables first, and stops at the first one the connecting role may
+not read, so its message names one table even when several are blocked
+(a table created by an administrator session, say, is owned by that
+role and invisible to the app role). When `pg_dump` exits nonzero, the
+catalog is asked which tables the same role cannot `SELECT`, and the
+error lists them all with the one-line remedy. The listing only adds
+words to an error that is already being raised: it never makes a dump
+that would have worked fail, and if it cannot be read the error says so.
 """
 
 from __future__ import annotations
@@ -68,8 +78,28 @@ the same shape of check `imsg.stages.snapshot.EXPECTED_CORE_TABLES`
 makes for a chat.db snapshot. Deliberately a small, stable core: a
 longer list would turn every future migration into a false alarm here."""
 
+UNREADABLE_TABLES_SQL = """
+SELECT n.nspname, c.relname
+FROM pg_catalog.pg_class AS c
+JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'p', 'm')
+  AND n.nspname <> 'information_schema'
+  AND n.nspname !~ '^pg_'
+  AND NOT pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT')
+ORDER BY n.nspname, c.relname
+"""
+"""Tables, partitioned tables and materialized views outside the system
+schemas that the connected role may not `SELECT`: the ones `pg_dump`
+cannot lock or read as that role."""
+
 _VERSION_RE = re.compile(r"\(PostgreSQL\)\s+(?P<major>\d+)")
 _TOC_TABLE_RE = re.compile(r"^\d+;\s+\d+\s+\d+\s+TABLE\s+\S+\s+(?P<name>\S+)\s", re.MULTILINE)
+
+
+class PgDumpExitError(BackupError):
+    """`pg_dump` ran and exited nonzero (as opposed to not starting, or
+    timing out). Kept apart so only this case asks the catalog which
+    tables were unreadable."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,9 +243,45 @@ def run_pg_dump(*, dsn: str, password: str, dest: Path, pg_dump: Path) -> None:
         raise BackupError(f"could not run '{pg_dump}': {exc}") from exc
     if proc.returncode != 0:
         dest.unlink(missing_ok=True)
-        raise BackupError(f"pg_dump exited {proc.returncode}: {proc.stderr.strip() or '(no stderr)'}")
+        raise PgDumpExitError(
+            f"pg_dump exited {proc.returncode}: {proc.stderr.strip() or '(no stderr)'}"
+        )
     if not dest.is_file():
         raise BackupError(f"pg_dump reported success but wrote no file at '{dest}'")
+
+
+def unreadable_tables(conn: object) -> tuple[str, ...]:
+    """`schema.table` for every table the connected role cannot `SELECT`.
+
+    Run on the connection the backup already holds, which is the role
+    `pg_dump` connects as (same DSN). Empty when the role can read
+    everything.
+    """
+    with conn.cursor() as cur:  # type: ignore[attr-defined]
+        cur.execute(UNREADABLE_TABLES_SQL)
+        rows = cur.fetchall()
+    return tuple(f"{schema}.{name}" for schema, name in rows)
+
+
+def explain_unreadable_tables(conn: object) -> str:
+    """The sentence appended to a `pg_dump` failure; empty when the catalog
+    shows nothing unreadable (the failure then has some other cause and
+    `pg_dump`'s own words stand alone)."""
+    try:
+        names = unreadable_tables(conn)
+    except Exception as exc:
+        return (
+            f" (could not list the tables this role cannot read: "
+            f"{type(exc).__name__}: {exc})"
+        )
+    if not names:
+        return ""
+    return (
+        f" The database role running the backup cannot read {len(names)} table(s): "
+        f"{', '.join(names)}. A table created by another role is owned by that role. "
+        f"Make the backup role the owner of each, or grant it SELECT on each, "
+        f"then run 'imsg backup' again. No new backup set was written."
+    )
 
 
 def _toc_tables(*, dump: Path, pg_restore: Path) -> tuple[str, ...]:
@@ -293,13 +359,19 @@ def dump_postgres(
     pg_dump: Path,
     server_major: int,
 ) -> DumpResult:
-    """Version-check, dump, verify. Any failure removes `dest` and raises."""
-    del conn  # the caller already read what it needed off the connection
+    """Version-check, dump, verify. Any failure removes `dest` and raises.
+
+    `conn` is used only after a failed `pg_dump`, to name the tables the
+    role could not read (`explain_unreadable_tables`).
+    """
     pg_dump_major = binary_major_version(pg_dump)
     check_version_compatibility(
         pg_dump_major=pg_dump_major, server_major=server_major, pg_dump=pg_dump
     )
-    run_pg_dump(dsn=dsn, password=password, dest=dest, pg_dump=pg_dump)
+    try:
+        run_pg_dump(dsn=dsn, password=password, dest=dest, pg_dump=pg_dump)
+    except PgDumpExitError as exc:
+        raise PgDumpExitError(f"{exc}{explain_unreadable_tables(conn)}") from exc
     try:
         tables = verify_dump(dump=dest, pg_dump=pg_dump)
     except BackupError:
@@ -318,13 +390,17 @@ def dump_postgres(
 __all__ = [
     "DUMP_FILENAME",
     "EXPECTED_DUMPED_TABLES",
+    "UNREADABLE_TABLES_SQL",
     "DumpResult",
+    "PgDumpExitError",
     "binary_major_version",
     "check_version_compatibility",
     "database_size_bytes",
     "dump_postgres",
+    "explain_unreadable_tables",
     "resolve_pg_dump",
     "run_pg_dump",
     "server_major_version",
+    "unreadable_tables",
     "verify_dump",
 ]

@@ -109,9 +109,18 @@ LOGS_NOTE = (
 AGENT_NAMES: tuple[str, ...] = ("pg", "sync", "enrich", "mcp-public", "tunnel", "report", "backup")
 """SPEC §5.5's table, in its order."""
 
-OPTIONAL_AGENT_NAMES: tuple[str, ...] = ("search-page",)
+OPTIONAL_AGENT_NAMES: tuple[str, ...] = ("search-page", "backup-check")
 """Agents outside SPEC §5.5's table, rendered only when named in `only`:
-the private local search page (D14), `imsg search-page serve`."""
+the private local search page (D14), `imsg search-page serve`, and the
+daily backup freshness check, `imsg backup-check --notify`."""
+
+BACKUP_CHECK_HOUR = 10
+"""When the `backup-check` agent runs, local time. The nightly backup
+starts at 04:00 and takes minutes, so by 10:00 a good night's set is about
+six hours old and a missed night's newest set is about thirty: past the
+26-hour limit (`imsg.diagnostics.BACKUP_STALE_AFTER_SECONDS`). Once a day
+also means one notification a day while the backup stays broken, not an
+hourly one."""
 
 THROTTLE_SECONDS = 60
 """SPEC §5.4: agents "use ThrottleInterval 60 and simply retry until the
@@ -284,6 +293,9 @@ def render_agent_plists(
     - `backup` — daily 04:00; waits for Postgres, then `imsg backup` with
       the `pg_dump` beside `postgres`, which also rotates the logs;
       `ProcessType` Background.
+    - `backup-check` — optional, daily at `BACKUP_CHECK_HOUR`; `imsg
+      backup-check --notify`, which reads the backup directory only (no
+      database, no secret) and fails when the newest complete set is stale.
     - `sync`, `enrich`, `report` — their schedules, unchanged in shape.
     - `tunnel` — KeepAlive `cloudflared`, only when asked for.
     """
@@ -382,6 +394,20 @@ def render_agent_plists(
                 wait_for_postgres=True,
             ),
             "StartCalendarInterval": {"Hour": 4, "Minute": 0},
+            "ProcessType": "Background",
+        },
+        # Only with `only=["backup-check"]`: it reads files, so it needs
+        # neither Postgres nor a secret, and a stale backup is exactly when
+        # the database may be the thing that is broken.
+        "backup-check": lambda: {
+            **_supervised(
+                "backup-check",
+                binaries=binaries,
+                data_root=data_root,
+                guard_config=config_path,
+                command=[imsg, "backup-check", "--config", cfg, "--notify"],
+            ),
+            "StartCalendarInterval": {"Hour": BACKUP_CHECK_HOUR, "Minute": 0},
             "ProcessType": "Background",
         },
         # Only with `only=["search-page"]`: the page is off unless its

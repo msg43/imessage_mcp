@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## 2026-11-23 — A refused backup names every table it could not read, and a daily check catches a backup that stopped
+
+`pg_dump` stops at the first table its role may not read, so `imsg backup`'s error named one table even when several were blocked. After a nonzero exit it now asks the catalog which tables that role cannot SELECT and lists them all with the remedy (`PgDumpExitError`, `src/imsg/backup/postgres_dump.py`); it only adds words to an error already being raised.
+New `imsg backup-check [--notify]` turns `imsg status`'s `backup_stale` into an exit status: 0 fresh, 1 stale, no complete set or unreadable. `--notify` also posts a macOS notification, the mechanism `scripts/copy_backup_offsite.py --notify` uses.
+New optional agent `backup-check` (`imsg install-agents --only backup-check`) runs it daily at 10:00, after the 04:00 backup; it is not in the default set and nothing installs it.
+Tests: `tests/test_backup_unreadable_tables.py` and `tests/test_backup_freshness.py`; the unreadable-table tests fail without the change, checked with a real `pg_dump` against a scratch Postgres.
+
 ## 2026-11-11 — The night-caption job no longer reads a deferred queue as an empty one
 
 Found while deploying the dirty-chat fix. This morning's window opened at 01:00,
