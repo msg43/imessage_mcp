@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## 2026-11-23 — The backup check reports a missing volume, and the unreadable-table list includes sequences
+
+QA of the entry below found two defects, both confirmed by running them.
+
+With the encrypted volume not mounted the new agent could never alert: the
+supervisor exits 78 before `imsg backup-check` runs, and the command's own mount
+gate exited before `--notify`. The nightly backup fails the same way in that
+state, so the check shared its failure. Now `backup-check` calls the gate itself and
+turns a refusal (or an unreadable config file, which can sit on the same volume)
+into a failing verdict that is notified and exits 1; the agent is rendered with
+`--no-mount-gate`, which skips the supervisor's wait, gate, logs and crash-loop
+file, refuses `--env`, and writes nothing under `data_root`.
+
+The unreadable-table listing missed sequences, so its "grant it SELECT" remedy left
+`pg_dump` failing at `SELECT last_value, is_called FROM <sequence>` with an empty
+listing. The query now includes sequences and the remedy says a grant must cover
+each table and sequence listed.
+
+Tests that fail without the fixes: an end-to-end run of the rendered agent against
+an empty data root, the supervisor with and without the flag, the command with a
+real gate refusal, and two tests with a real `pg_dump` against a scratch Postgres
+(a readable serial table whose sequence is not).
+
 ## 2026-11-23 — A refused backup names every table it could not read, and a daily check catches a backup that stopped
 
 `pg_dump` stops at the first table its role may not read, so `imsg backup`'s error

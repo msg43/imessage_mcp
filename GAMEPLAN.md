@@ -24,8 +24,8 @@ surfaces, a local one and a public one behind a tunnel.
 
 - **Deployed.** The production host runs `main` at `40dd39f`, the same commit as
   GitHub `main`, with a clean checkout (checked 2026-11-23). CI on that commit
-  passed on 2026-11-11. Full suite with no database,
-  2026-11-23 (Python 3.14): 2,423 passed, 728 skipped, 0 failed; Ruff clean.
+  passed on 2026-11-11. Full suite with no database, on the branch tip,
+  2026-11-23 (Python 3.14): 2,433 passed, 730 skipped, 0 failed; Ruff clean.
 - **Background work is running.** The photo-import gate closed on 2026-10-26 (the
   owner confirmed; the 2026-10-28 deploy record says so). The last "heavy work
   paused" sync exit (76) was 2026-10-28. Since 2026-10-29 every scheduled sync has
@@ -46,8 +46,10 @@ surfaces, a local one and a public one behind a tunnel.
 - **Built, not installed.** `imsg backup-check [--notify]` and the optional agent
   `backup-check` (`imsg install-agents --only backup-check`, daily 10:00) turn
   `imsg status`'s `backup_stale` into an exit status and a notification
-  (`CHANGELOG.md` 2026-11-23). Installing the agent on the host needs the owner's
-  go-ahead: render the plist to a scratch directory and review it first.
+  (`CHANGELOG.md` 2026-11-23). It also alerts when the encrypted volume is not
+  mounted: that agent is rendered with `--no-mount-gate`, because the supervisor's
+  mount wait would exit before the check ran. Installing the agent on the host needs
+  the owner's go-ahead: render the plist to a scratch directory and review it first.
 - **Eval and gates.** Per the private design-record repo (not re-measured here): a
   retrieval baseline exists, the Phase 0, 2, 3, 4 and 5 gates are closed (Gate
   ladder), and captions, measured on 2026-11-11, bought nothing detectable at that
