@@ -82,15 +82,23 @@ UNREADABLE_TABLES_SQL = """
 SELECT n.nspname, c.relname
 FROM pg_catalog.pg_class AS c
 JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-WHERE c.relkind IN ('r', 'p', 'm')
+WHERE c.relkind IN ('r', 'p', 'm', 'S')
   AND n.nspname <> 'information_schema'
   AND n.nspname !~ '^pg_'
-  AND NOT pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT')
+  AND NOT CASE c.relkind
+        WHEN 'S' THEN pg_catalog.has_sequence_privilege(current_user, c.oid, 'SELECT')
+        ELSE pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT')
+      END
 ORDER BY n.nspname, c.relname
 """
-"""Tables, partitioned tables and materialized views outside the system
-schemas that the connected role may not `SELECT`: the ones `pg_dump`
-cannot lock or read as that role."""
+"""Tables, partitioned tables, materialized views and sequences outside the
+system schemas that the connected role may not `SELECT`: the ones `pg_dump`
+cannot lock or read as that role. Sequences are listed because `pg_dump`
+reads each one (`SELECT last_value, is_called FROM ...`), so a readable
+table with an unreadable sequence still fails the dump. The privilege
+function is chosen in a `CASE` because `has_sequence_privilege` raises when
+given anything but a sequence, and SQL does not say which `WHERE` term runs
+first."""
 
 _VERSION_RE = re.compile(r"\(PostgreSQL\)\s+(?P<major>\d+)")
 _TOC_TABLE_RE = re.compile(r"^\d+;\s+\d+\s+\d+\s+TABLE\s+\S+\s+(?P<name>\S+)\s", re.MULTILINE)
@@ -251,7 +259,7 @@ def run_pg_dump(*, dsn: str, password: str, dest: Path, pg_dump: Path) -> None:
 
 
 def unreadable_tables(conn: object) -> tuple[str, ...]:
-    """`schema.table` for every table the connected role cannot `SELECT`.
+    """`schema.name` for every table or sequence the connected role cannot `SELECT`.
 
     Run on the connection the backup already holds, which is the role
     `pg_dump` connects as (same DSN). Empty when the role can read
@@ -277,10 +285,12 @@ def explain_unreadable_tables(conn: object) -> str:
     if not names:
         return ""
     return (
-        f" The database role running the backup cannot read {len(names)} table(s): "
-        f"{', '.join(names)}. A table created by another role is owned by that role. "
-        f"Make the backup role the owner of each, or grant it SELECT on each, "
-        f"then run 'imsg backup' again. No new backup set was written."
+        f" The database role running the backup cannot read {len(names)} table(s) or "
+        f"sequence(s): {', '.join(names)}. A table created by another role is owned by "
+        f"that role, and so are the sequences of its serial columns. Make the backup role "
+        f"the owner of each table (its own sequences move with it), or grant it SELECT on "
+        f"each table and each sequence listed, then run 'imsg backup' again. "
+        f"No new backup set was written."
     )
 
 

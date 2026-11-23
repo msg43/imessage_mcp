@@ -136,6 +136,18 @@ def test_the_catalog_question_is_about_the_connected_role_and_skips_system_schem
     assert "information_schema" in sql and "'^pg_'" in sql
 
 
+def test_the_catalog_question_covers_sequences_with_the_sequence_privilege_check() -> None:
+    """`pg_dump` reads every sequence (`SELECT last_value, is_called FROM ...`),
+    so a sequence the role cannot SELECT fails the dump even when its table is
+    readable. `has_sequence_privilege` is called only for sequences: handed a
+    table's oid it raises, and SQL gives no guarantee which `WHERE` term runs
+    first, so the choice sits in a `CASE`."""
+    sql = " ".join(UNREADABLE_TABLES_SQL.split())
+    assert "'S'" in sql
+    assert "has_sequence_privilege(current_user" in sql
+    assert "CASE" in sql
+
+
 def test_nothing_unreadable_adds_no_words() -> None:
     assert explain_unreadable_tables(StubConn(rows=[])) == ""
 
@@ -144,9 +156,18 @@ def test_the_sentence_names_every_table_and_the_remedy() -> None:
     sentence = explain_unreadable_tables(
         StubConn(rows=[("public", "acme_scratch_one"), ("public", "acme_scratch_two")])
     )
-    assert "cannot read 2 table(s)" in sentence
+    assert "cannot read 2 table(s) or sequence(s)" in sentence
     assert "public.acme_scratch_one, public.acme_scratch_two" in sentence
     assert "owner" in sentence and "SELECT" in sentence and "imsg backup" in sentence
+
+
+def test_the_remedy_says_a_grant_must_cover_the_sequences_too() -> None:
+    """The remedy used to say only 'grant it SELECT on each', which leaves a
+    table's sequence unreadable: `pg_dump` still fails and this listing is
+    empty. A grant is correct only if it covers the sequences named."""
+    sentence = explain_unreadable_tables(StubConn(rows=[("public", "acme_scratch_one_id_seq")]))
+    assert "grant it SELECT on each table and each sequence listed" in sentence
+    assert "owner" in sentence and "sequence" in sentence
 
 
 def test_a_catalog_that_cannot_be_read_says_so_instead_of_staying_silent() -> None:
@@ -169,7 +190,7 @@ def test_a_refused_dump_names_every_unreadable_table_not_just_the_first(tmp_path
     assert message.startswith("pg_dump exited 1: pg_dump: error: query failed")
     # ... and the second table, which pg_dump's one-line error never names
     # outside a quoted LOCK statement, is now stated as unreadable.
-    assert "cannot read 2 table(s): public.acme_scratch_one, public.acme_scratch_two" in message
+    assert "cannot read 2 table(s) or sequence(s): public.acme_scratch_one, public.acme_scratch_two" in message
     assert not (tmp_path / "postgres.dump").exists()
     assert isinstance(caught.value, BackupError)
 
@@ -336,7 +357,7 @@ def test_real_pg_dump_refusal_names_both_tables_then_succeeds_once_ownership_is_
             attempt()
         message = str(caught.value)
         assert "permission denied for table" in message  # pg_dump's own words
-        assert "cannot read 2 table(s): public.acme_scratch_one, public.acme_scratch_two" in message
+        assert "cannot read 2 table(s) or sequence(s): public.acme_scratch_one, public.acme_scratch_two" in message
         assert not dest.exists()
 
         # The remedy the message gives, applied: the same call now succeeds
@@ -347,6 +368,94 @@ def test_real_pg_dump_refusal_names_both_tables_then_succeeds_once_ownership_is_
                 f"ALTER TABLE public.acme_scratch_two OWNER TO {role}",
             ],
             dbname=db,
+        )
+        assert unreadable_tables(conn) == ()
+        result = attempt()
+        assert dest.is_file() and dest.stat().st_size > 0
+        assert result.path == dest
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# A readable table whose sequence is not: the case the remedy used to miss
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def blocked_sequence_database() -> Iterator[tuple[str, str]]:
+    """A database whose app role owns the core tables, plus one table with
+    a `serial` column created by the administrator role. The app role is
+    granted SELECT on that table (the remedy as it used to be worded) but
+    not on the table's sequence. Yields (role, database)."""
+    suffix = uuid.uuid4().hex[:8]
+    role, db = f"acme_backup_{suffix}", f"acme_index_{suffix}"
+    _admin_execute([f"CREATE ROLE {role} LOGIN", f"CREATE DATABASE {db} OWNER {role}"])
+    app = psycopg.connect(_role_dsn(role, db), autocommit=True)
+    try:
+        with app.cursor() as cur:
+            for table in ("message", "chat", "person", "segment"):
+                cur.execute(f"CREATE TABLE {table} (id integer)")  # type: ignore[arg-type]
+    finally:
+        app.close()
+    _admin_execute(
+        [
+            "CREATE TABLE public.acme_serial (id serial PRIMARY KEY, body text)",
+            f"GRANT SELECT ON public.acme_serial TO {role}",
+        ],
+        dbname=db,
+    )
+    try:
+        yield role, db
+    finally:
+        _admin_execute([f"DROP DATABASE IF EXISTS {db}"])
+        _admin_execute([f"DROP ROLE IF EXISTS {role}"])
+
+
+@needs_postgres
+def test_real_catalog_lists_a_sequence_the_role_cannot_read_even_when_its_table_is_readable(
+    blocked_sequence_database: tuple[str, str],
+) -> None:
+    role, db = blocked_sequence_database
+    conn = psycopg.connect(_role_dsn(role, db), autocommit=True)
+    try:
+        assert unreadable_tables(conn) == ("public.acme_serial_id_seq",)
+    finally:
+        conn.close()
+
+
+@needs_postgres
+def test_real_pg_dump_still_fails_after_a_table_grant_and_the_message_names_the_sequence(
+    blocked_sequence_database: tuple[str, str], tmp_path: Path
+) -> None:
+    role, db = blocked_sequence_database
+    assert PG_DUMP is not None and SERVER_MAJOR is not None
+    conn = psycopg.connect(_role_dsn(role, db), autocommit=True)
+    try:
+        dest = tmp_path / "postgres.dump"
+
+        def attempt() -> DumpResult:
+            return dump_postgres(
+                conn=conn,
+                dsn=_role_dsn(role, db),
+                password="unused-under-trust-auth",
+                dest=dest,
+                pg_dump=PG_DUMP,
+                server_major=SERVER_MAJOR,
+            )
+
+        with pytest.raises(PgDumpExitError) as caught:
+            attempt()
+        message = str(caught.value)
+        assert "acme_serial_id_seq" in message  # pg_dump's own words
+        assert (
+            "cannot read 1 table(s) or sequence(s): public.acme_serial_id_seq" in message
+        ), "the listing must not be empty while pg_dump is failing"
+        assert not dest.exists()
+
+        # The remedy as now worded: the grant covers the sequence too.
+        _admin_execute(
+            [f"GRANT SELECT ON SEQUENCE public.acme_serial_id_seq TO {role}"], dbname=db
         )
         assert unreadable_tables(conn) == ()
         result = attempt()
