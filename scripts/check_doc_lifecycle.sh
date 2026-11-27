@@ -65,4 +65,24 @@ if [ -n "$report_docs" ]; then
   echo ""
 fi
 
+# ---------------------------------------------------------------------------
+# Check F -- GAMEPLAN.md stays under its size limit.
+# GAMEPLAN.md is the first file every session reads, so its size is paid at
+# every cold start. It counts characters, not lines: a 200-line limit once let
+# a GAMEPLAN reach 64,152 characters because each line was a long paragraph.
+# Over the limit: archive finished work and evidence (CLAUDE.md, "Keep or
+# archive test"); full decisions belong in docs/decisions.md.
+# ---------------------------------------------------------------------------
+GAMEPLAN_MAX_CHARS=${GAMEPLAN_MAX_CHARS:-30000}
+if printf '%s\n' "$staged_any" | grep -x 'GAMEPLAN.md' >/dev/null; then
+  gp_chars="$(git show :GAMEPLAN.md 2>/dev/null | LC_ALL=en_US.UTF-8 wc -m | tr -d ' ')"
+  if [ -n "$gp_chars" ] && [ "$gp_chars" -gt "$GAMEPLAN_MAX_CHARS" ]; then
+    echo "!!  GAMEPLAN.md is ${gp_chars} characters; the limit is ${GAMEPLAN_MAX_CHARS}."
+    echo "    Archive finished work and evidence to CHANGELOG.md or docs/archive/"
+    echo "    (CLAUDE.md, \"Keep or archive test\"); full decisions belong in"
+    echo "    docs/decisions.md. (Warning only -- commit proceeds.)"
+    echo ""
+  fi
+fi
+
 exit 0

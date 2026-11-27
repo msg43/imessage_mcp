@@ -107,6 +107,24 @@ report-shaped doc lands outside an archive location. The warning never
 blocks — don't train yourself to ignore it; satisfy it on the landing
 commit.
 
+### Decisions file and GAMEPLAN size limit
+
+- **`docs/decisions.md`** holds every decision in full: date, who decided,
+  the decision, the reason and what was built, newest first. Write the
+  entry in the same change the decision is made. Never trim it; a reversed
+  decision keeps its entry and gains a line naming the later one. Search
+  it before reopening a settled question.
+- **`GAMEPLAN.md`** keeps one line per decision still shaping work,
+  pointing to that file, and stays under 30,000 characters
+  (`wc -m GAMEPLAN.md`). Past that, archive by this test before anything
+  else: what still shapes future work (strategy, constraints, a decision's
+  reason, an unresolved item, a pitfall that could recur) stays; finished
+  work, evidence and superseded material move to `CHANGELOG.md` or
+  `docs/archive/`. Reread what you removed once.
+- **`CHANGELOG.md`** entries are about five lines; the file is never
+  trimmed. Read only the top of it and of `docs/decisions.md`, and grep
+  the rest.
+
 # GAMEPLAN.md is the cold-start file
 
 A new session should get the project's direction from `GAMEPLAN.md` for a few thousand tokens, instead of carrying the history in a long conversation. That only works if the file is short, keeps everything that still shapes future work, and is updated on a schedule.
